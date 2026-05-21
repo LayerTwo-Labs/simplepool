@@ -33,8 +33,11 @@ endif
 # --- Flags -------------------------------------------------------------------
 WARNFLAGS := -Wall -Wextra -Werror -Wpedantic -Wshadow -Wstrict-prototypes
 HARDEN    := -fstack-protector-strong -D_FORTIFY_SOURCE=2
+# Strict -std=c11 hides POSIX functions (clock_gettime, localtime_r, ...) behind
+# feature-test macros; request POSIX.1-2008 so they're declared on glibc.
+POSIX     := -D_POSIX_C_SOURCE=200809L
 
-CFLAGS  ?= -std=c11 $(WARNFLAGS) -O2 -g $(HARDEN) \
+CFLAGS  ?= -std=c11 $(WARNFLAGS) -O2 -g $(HARDEN) $(POSIX) \
            -Iinclude -Isrc -Isrc/cjson $(PLATFORM_CFLAGS)
 LDFLAGS ?= $(PLATFORM_LDFLAGS)
 LDLIBS  ?= -lsqlite3 -lcurl -lpthread
