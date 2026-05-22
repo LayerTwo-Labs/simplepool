@@ -43,6 +43,12 @@
 #define RECENT_JOBS    8
 #define RECENT_JOB_TTL_MS 60000
 
+/* BIP320 reserved version-rolling bits (ASICBoost). Advertised in
+ * mining.configure; only these block-header version bits may be rolled by a
+ * miner, and a per-connection mask (this ANDed with the client's request) is
+ * applied to every submitted version. */
+#define VERSION_ROLLING_MASK 0x1fffe000u
+
 /* ============================================================== job ===== */
 
 struct stratum_job {
@@ -167,6 +173,7 @@ struct stratum_conn {
     double   difficulty;
     int      subscribed;
     int      authorized;
+    uint32_t version_mask;         /* negotiated version-rolling bits; 0 = off */
     char     worker_name[129];     /* full stratum username (sanitized) */
     char     payout_address[128];  /* validated bech32/base58 */
 
@@ -180,7 +187,8 @@ struct stratum_conn {
     size_t   cb2_len;
     char     cb_for_job_id[32];
 
-    /* Dedupe ring. Each entry is a small hash of (job_id|en2|ntime|nonce). */
+    /* Dedupe ring. Each entry is a small hash of
+     * (job_id|en2|ntime|nonce|version). */
     uint64_t dedupe[DEDUPE_RING];
     size_t   dedupe_head;
 
@@ -374,10 +382,19 @@ static cJSON *make_notify_params(const stratum_job_t *j,
     cJSON *p = cJSON_CreateArray();
     cJSON_AddItemToArray(p, cJSON_CreateString(j->job_id));
 
-    /* prev_hash: stratum sends in "natural" word-reversed form. The Rust
-     * server emits the prev_hash_le bytes as hex directly; we mirror. */
+    /* prev_hash: mining.notify uses the stratum convention where the 32-byte
+     * hash is sent with each 4-byte word byte-reversed (word order preserved).
+     * prev_hash_le holds the header-internal little-endian bytes, so we
+     * word-swap before emitting; the miner word-swaps again to recover the
+     * exact bytes that go into the block header. Sending the raw little-endian
+     * bytes makes standard ASICs hash the wrong header (every share rejected
+     * as "low difficulty"). */
     char hex[65];
-    bytes_to_hex(j->prev_hash_le, 32, hex);
+    uint8_t prev_ws[32];
+    for (int wi = 0; wi < 8; ++wi)
+        for (int bi = 0; bi < 4; ++bi)
+            prev_ws[wi * 4 + bi] = j->prev_hash_le[wi * 4 + 3 - bi];
+    bytes_to_hex(prev_ws, 32, hex);
     cJSON_AddItemToArray(p, cJSON_CreateString(hex));
 
     char *cb1_hex = malloc(cb1_len * 2 + 1);
@@ -559,6 +576,56 @@ static int handle_subscribe(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     return emit_response(buf, len, id, result, NULL);
 }
 
+/* mining.configure (BIP310). Only the version-rolling extension is supported.
+ * params = [ [extension names...], { extension parameters... } ]. We negotiate
+ * the version-rolling mask as (client mask AND our BIP320 mask) and report it
+ * back; other requested extensions are silently left unacknowledged. */
+static int handle_configure(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
+                            cJSON *params, char **buf, size_t *len) {
+    (void)s;
+    cJSON *exts = NULL, *args = NULL;
+    if (cJSON_IsArray(params)) {
+        exts = cJSON_GetArrayItem(params, 0);
+        args = cJSON_GetArrayItem(params, 1);
+    }
+
+    int wants_vr = 0;
+    if (cJSON_IsArray(exts)) {
+        int n = cJSON_GetArraySize(exts);
+        for (int i = 0; i < n; ++i) {
+            cJSON *e = cJSON_GetArrayItem(exts, i);
+            if (cJSON_IsString(e) &&
+                strcmp(e->valuestring, "version-rolling") == 0) {
+                wants_vr = 1;
+            }
+        }
+    }
+
+    cJSON *result = cJSON_CreateObject();
+    if (wants_vr) {
+        /* Client mask defaults to "roll everything" when omitted; we clamp it
+         * to the bits we actually allow. */
+        uint32_t client_mask = 0xffffffffu;
+        if (cJSON_IsObject(args)) {
+            cJSON *m = cJSON_GetObjectItemCaseSensitive(args,
+                                                        "version-rolling.mask");
+            uint32_t parsed;
+            if (cJSON_IsString(m) && parse_u32_hex(m->valuestring, &parsed) == 0) {
+                client_mask = parsed;
+            }
+        }
+        c->version_mask = client_mask & VERSION_ROLLING_MASK;
+
+        char mask_hex[9];
+        snprintf(mask_hex, sizeof mask_hex, "%08x", c->version_mask);
+        cJSON_AddItemToObject(result, "version-rolling", cJSON_CreateTrue());
+        cJSON_AddStringToObject(result, "version-rolling.mask", mask_hex);
+        LOG_INFO("stratum: version-rolling negotiated, mask=%s", mask_hex);
+    }
+
+    return emit_response(buf, len, id, result, NULL);
+}
+
 static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                             cJSON *params, char **buf, size_t *len) {
     const char *worker = NULL;
@@ -620,10 +687,12 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
 }
 
 static int dedupe_check_and_add(stratum_conn_t *c, const char *jid,
-                                const char *en2, const char *ntime, const char *nonce) {
+                                const char *en2, const char *ntime,
+                                const char *nonce, uint32_t version) {
     char key[256];
-    snprintf(key, sizeof(key), "%s|%s|%s|%s",
-             jid ? jid : "", en2 ? en2 : "", ntime ? ntime : "", nonce ? nonce : "");
+    snprintf(key, sizeof(key), "%s|%s|%s|%s|%08x",
+             jid ? jid : "", en2 ? en2 : "", ntime ? ntime : "", nonce ? nonce : "",
+             version);
     uint64_t h = fnv1a(key);
     for (size_t i = 0; i < DEDUPE_RING; ++i) {
         if (c->dedupe[i] == h) return 1;
@@ -685,7 +754,28 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         cJSON *err = make_error(21, "stale or unknown job");
         return emit_response(buf, len, id, NULL, err);
     }
-    if (dedupe_check_and_add(c, jid, en2, ntime, nonce)) {
+
+    /* Version rolling (BIP310): the optional 6th submit param carries the
+     * version the miner actually hashed. Keep the job's version bits outside
+     * the negotiated mask and take the miner's bits inside it; with no param
+     * (or no negotiation) this leaves job->version unchanged. We fall back to
+     * the standard BIP320 mask if a version arrives without prior configure,
+     * so miners that roll by default still verify correctly. */
+    int32_t submit_version = job->version;
+    if (cJSON_GetArraySize(params) >= 6) {
+        cJSON *v = cJSON_GetArrayItem(params, 5);
+        uint32_t rolled = 0;
+        if (!cJSON_IsString(v) || parse_u32_hex(v->valuestring, &rolled) != 0) {
+            cJSON *err = make_error(20, "bad version hex");
+            return emit_response(buf, len, id, NULL, err);
+        }
+        uint32_t mask = c->version_mask ? c->version_mask : VERSION_ROLLING_MASK;
+        submit_version =
+            (int32_t)(((uint32_t)job->version & ~mask) | (rolled & mask));
+    }
+
+    if (dedupe_check_and_add(c, jid, en2, ntime, nonce,
+                             (uint32_t)submit_version)) {
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
                              "duplicate share");
@@ -740,7 +830,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                               job->branch_count, merkle_root_le);
 
     uint8_t header[80];
-    build_header(job->version, job->prev_hash_le, merkle_root_le,
+    build_header(submit_version, job->prev_hash_le, merkle_root_le,
                  ntime_v, job->nbits, nonce_v, header);
 
     uint8_t hash_be[32];
@@ -749,9 +839,27 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     uint8_t worker_target[32];
     worker_diff_to_target(c->difficulty, worker_target);
 
+    char sent_hash_hex[65] = {0};
+    char worker_target_hex[65] = {0};
+    char network_target_hex[65] = {0};
+
+    // Convert the 32-byte big-endian fields into readable strings
+    bytes_to_hex(hash_be, 32, sent_hash_hex);
+    bytes_to_hex(worker_target, 32, worker_target_hex);
+    bytes_to_hex(job->network_target_be, 32, network_target_hex);
+
+    LOG_INFO("stratum: [SUBMIT CHECK] Worker: %s\n"
+             "  -> Sent Hash:     %s\n"
+             "  -> Worker Target: %s\n"
+             "  -> Network Tgt:   %s\n"
+             "  -> Version:       job=%08x rolled=%08x mask=%08x",
+             c->worker_name, sent_hash_hex, worker_target_hex, network_target_hex,
+             (uint32_t)job->version, (uint32_t)submit_version, c->version_mask);
+
     int is_block = 0;
     char block_hash_hex[65] = {0};
-    if (be32_cmp(hash_be, worker_target) > 0) {
+    if (be32_cmp(hash_be, worker_target) >= 0) {
+	LOG_INFO("stratum: reject from worker '%s' - Reason: low difficulty (Sent Hash > Worker Target)", c->worker_name);
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
                              "low difficulty");
@@ -806,7 +914,9 @@ int stratum_handle_message(stratum_server_t *s, stratum_conn_t *c,
         return -1;
     }
     int rc = 0;
-    if (strcmp(method->valuestring, "mining.subscribe") == 0) {
+    if (strcmp(method->valuestring, "mining.configure") == 0) {
+        rc = handle_configure(s, c, id, params, out_buf, out_len);
+    } else if (strcmp(method->valuestring, "mining.subscribe") == 0) {
         rc = handle_subscribe(s, c, id, out_buf, out_len);
     } else if (strcmp(method->valuestring, "mining.authorize") == 0) {
         rc = handle_authorize(s, c, id, params, out_buf, out_len);
