@@ -110,8 +110,62 @@ Run it on a timer (cron / systemd-timer / launchd), e.g. every minute:
 * * * * * sqlite3 /path/to/data/shares.db ".backup /path/to/data/shares.snapshot.db"
 ```
 
-The dashboard reads `data/shares.snapshot.db` by default — see
+The dashboard reads `data/shares.db` (the live DB) by default. Point it
+at a snapshot via `PROXY_DB_PATH` if you want — see
 [`dashboard/README.md`](dashboard/README.md).
+
+## Deploy to a server
+
+There's a one-shot deploy script that brings a fresh Ubuntu 24.04 box
+from nothing to fully serving stratum + dashboard behind nginx. It is
+idempotent: re-run it after every code change.
+
+```
+./scripts/deploy-to-server.sh \
+    --host     user@host \
+    --root     /home/user/simplepool \
+    --hostname pool.example.com \
+    --ssh-key  ~/.ssh/id_yourkey
+```
+
+What the script does, end to end:
+
+1.  `git fetch && git reset --hard origin/main` on the remote checkout.
+2.  `apt-get install` build deps + nodejs + sqlite3 + nginx + ufw.
+3.  `make` the C proxy.
+4.  `npm install` in `dashboard/`.
+5.  Initialise `data/shares.db` from `schema.sql` if missing.
+6.  Run the one-shot ms→seconds timestamp migration (idempotent — it
+    only updates rows where `ts > 10^10`, which can only be milliseconds).
+7.  Render the two systemd unit templates in [`deploy/systemd/`](deploy/systemd/)
+    with the right user / root path, install to `/etc/systemd/system/`,
+    `enable --now` both.
+8.  Drop the nginx vhost from [`deploy/nginx/`](deploy/nginx/) into
+    `sites-available`, symlink to `sites-enabled`, `nginx -t && reload`.
+    Open ports 80 / 443 / 3334 via `ufw` if active.
+
+Files in [`deploy/`](deploy/) are templates with `@USER@` and `@ROOT@`
+placeholders the script substitutes — feel free to hand-install them if
+you want to do the steps yourself.
+
+Stratum is raw TCP, not HTTP, so it does **not** go through nginx by
+default. Miners connect directly to `host:3334`. Point your stratum
+hostname (e.g. `stratum.example.com`) at the box's IP via DNS; if you
+ever need TLS for stratum, you'd add a `stream { ... }` block to nginx
+or use `stunnel`.
+
+### Operations
+
+```
+sudo systemctl status   simplepool simplepool-dashboard nginx
+sudo journalctl -u simplepool           -f      # stratum log
+sudo journalctl -u simplepool-dashboard -f      # dashboard log
+sudo systemctl restart  simplepool              # after pulling new code
+```
+
+To pull edits made directly on a server back into a local checkout (so
+you can commit + push from here), use
+[`scripts/sync-from-server.sh`](scripts/sync-from-server.sh).
 
 ## Config keys
 

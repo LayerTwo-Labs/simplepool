@@ -1,0 +1,27 @@
+[Unit]
+Description=simplepool dashboard (read-only web UI)
+Documentation=https://github.com/rsantacroce/simplepool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=@ROOT@/dashboard
+Environment=PORT=8081
+Environment=PROXY_DB_PATH=@ROOT@/data/shares.db
+ExecStart=/usr/bin/node @ROOT@/dashboard/server.js
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadOnlyPaths=@ROOT@
+
+[Install]
+WantedBy=multi-user.target

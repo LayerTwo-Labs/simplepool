@@ -1,0 +1,26 @@
+[Unit]
+Description=simplepool stratum proxy
+Documentation=https://github.com/rsantacroce/simplepool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=@ROOT@
+ExecStart=@ROOT@/build/simplepool @ROOT@/proxy.conf
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Light hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@ROOT@/data
+
+[Install]
+WantedBy=multi-user.target
