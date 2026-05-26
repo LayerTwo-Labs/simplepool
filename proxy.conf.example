@@ -9,7 +9,7 @@ bitcoind_poll_interval_ms = 30000
 # Miners are paid directly: the stratum username must be the miner's
 # bitcoin address (`<address>` or `<address>.<rig_label>`). The configured
 # operator_address below receives a fee_bps cut of every block reward.
-operator_address = bcrt1q...
+operator_address = bc1qREPLACEME   # REPLACE with a real address for your network (bc1 mainnet / tb1 testnet / bcrt1 regtest)
 fee_bps = 100              # 100 = 1%; valid range 0..1000 (max 10%)
 coinbase_tag = /simplepool/
 

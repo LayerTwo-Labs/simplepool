@@ -344,6 +344,24 @@ int main(int argc, char **argv) {
         fprintf(stderr, "config error: %s\n", err);
         return 2;
     }
+    /* Fail fast on a misconfigured operator_address — otherwise every
+     * coinbase render at runtime would warn and drop the job. This catches
+     * the proxy.conf.example placeholder ("bcrt1q...") and any typo. */
+    {
+        uint8_t op_spk[64];
+        size_t  op_spk_len = sizeof op_spk;
+        char    op_err[256] = {0};
+        if (coinbase_address_to_script(cfg.operator_address, op_spk,
+                                       sizeof op_spk, &op_spk_len,
+                                       op_err, sizeof op_err) < 0) {
+            fprintf(stderr,
+                    "config error: invalid operator_address '%s': %s\n"
+                    "  set operator_address in %s to a real bitcoin "
+                    "address (e.g. bc1q... on mainnet)\n",
+                    cfg.operator_address, op_err, cfg_path);
+            return 2;
+        }
+    }
     log_init(cfg.log_level);
     LOG_INFO("simplepool starting (config=%s)", cfg_path);
 
