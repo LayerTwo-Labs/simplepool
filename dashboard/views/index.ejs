@@ -33,13 +33,35 @@ const ago = (t) => {
         <% } %>
 
         <section class="card">
-            <h2>Overview · last 24h</h2>
+            <h2>Pool hashrate</h2>
             <div class="grid">
-                <div><label>Hashrate</label><strong><%= fmtHashrate(ov.hashrate) %></strong></div>
+                <div><label>Last 5 min</label><strong><%= fmtHashrate(ov.hashrate_5m) %></strong></div>
+                <div><label>Last 1 h</label><strong><%= fmtHashrate(ov.hashrate_1h) %></strong></div>
+                <div><label>Last 24 h avg</label><strong><%= fmtHashrate(ov.hashrate) %></strong></div>
+                <div><label>Active workers (24h)</label><strong><%= fmtN(ov.workers_active) %></strong></div>
+                <div><label>Last share</label><strong title="<%= fmtTs(ov.last_share_ts) %>"><%= ago(ov.last_share_ts) %></strong></div>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>Shares · last 24h</h2>
+            <div class="grid">
                 <div><label>Accepted</label><strong><%= fmtN(ov.accepted) %></strong></div>
                 <div><label>Rejected</label><strong><%= fmtN(ov.rejected) %></strong></div>
-                <div><label>Blocks</label><strong><%= fmtN(ov.blocks) %></strong></div>
-                <div><label>Active workers</label><strong><%= fmtN(ov.workers_active) %></strong></div>
+                <div><label>Reject rate</label><strong><%= ov.reject_rate_pct.toFixed(2) %>%</strong></div>
+                <div><label>Blocks found</label><strong><%= fmtN(ov.blocks) %></strong></div>
+                <div><label>Best share (24h)</label><strong><%= fmtN(Math.round(ov.best_share_24h)) %></strong></div>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>Lifetime totals</h2>
+            <div class="grid">
+                <div><label>Shares</label><strong><%= fmtN(ov.shares_lifetime) %></strong></div>
+                <div><label>Rejects</label><strong><%= fmtN(ov.rejects_lifetime) %></strong></div>
+                <div><label>Blocks</label><strong><%= fmtN(ov.blocks_lifetime) %></strong></div>
+                <div><label>Best share ever</label><strong><%= fmtN(Math.round(ov.best_share_lifetime)) %></strong></div>
+                <div><label>Tracking since</label><strong title="<%= fmtTs(ov.oldest_share_ts) %>"><%= ago(ov.oldest_share_ts) %></strong></div>
             </div>
         </section>
 
@@ -78,7 +100,7 @@ const ago = (t) => {
             <% } else { %>
             <table class="lb">
                 <thead>
-                    <tr><th>#</th><th>Worker</th><th>Shares</th><th>Hashrate</th><th>Pool %</th><th>Last seen</th></tr>
+                    <tr><th>#</th><th>Worker</th><th>Shares (24h)</th><th>5m</th><th>1h</th><th>24h avg</th><th>Pool %</th><th>Last seen</th></tr>
                 </thead>
                 <tbody>
                 <% lb.forEach((w, i) => { %>
@@ -86,6 +108,8 @@ const ago = (t) => {
                         <td><%= i + 1 %></td>
                         <td><a href="/worker/<%= encodeURIComponent(w.name) %>"><%= w.name %></a></td>
                         <td><%= fmtN(w.shares) %></td>
+                        <td><%= fmtHashrate(w.hashrate_5m) %></td>
+                        <td><%= fmtHashrate(w.hashrate_1h) %></td>
                         <td><%= fmtHashrate(w.hashrate_est) %></td>
                         <td><%= w.share_of_pool_pct.toFixed(2) %>%</td>
                         <td title="<%= fmtTs(w.last_seen) %>"><%= ago(w.last_seen) %></td>

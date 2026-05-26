@@ -22,26 +22,55 @@ function db(handle) {
     return handle.get();
 }
 
+/* Hashrate over an arbitrary window. Uses the standard estimator
+ * H/s ≈ sum(difficulty) * 2^32 / windowSec. */
+function hashrateOver(d, nowSec, windowSec) {
+    const row = d.prepare(
+        'SELECT COALESCE(SUM(difficulty),0) AS sum_diff FROM shares WHERE ts >= ?'
+    ).get(nowSec - windowSec);
+    return (row.sum_diff * TWO_32) / windowSec;
+}
+
 export function overview(handle, windowSec = 86400) {
     const d = db(handle);
     if (!d) return { ...EMPTY_OVERVIEW, window_sec: windowSec };
-    const since = Math.floor(Date.now() / 1000) - windowSec;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const since = nowSec - windowSec;
 
     const acc = d.prepare(
-        'SELECT COUNT(*) AS n, COALESCE(SUM(difficulty),0) AS sum_diff FROM shares WHERE ts >= ?'
+        'SELECT COUNT(*) AS n, COALESCE(SUM(difficulty),0) AS sum_diff, COALESCE(MAX(difficulty),0) AS best FROM shares WHERE ts >= ?'
     ).get(since);
     const rej = d.prepare('SELECT COUNT(*) AS n FROM rejects WHERE ts >= ?').get(since);
     const blk = d.prepare('SELECT COUNT(*) AS n FROM blocks_found WHERE ts >= ?').get(since);
     const wk = d.prepare(
         'SELECT COUNT(DISTINCT worker_id) AS n FROM shares WHERE ts >= ?'
     ).get(since);
+    const lifetime = d.prepare(
+        'SELECT COUNT(*) AS shares, COALESCE(MAX(difficulty),0) AS best, MIN(ts) AS oldest_ts FROM shares'
+    ).get();
+    const last = d.prepare('SELECT MAX(ts) AS ts FROM shares').get();
+    const totalRej = d.prepare('SELECT COUNT(*) AS n FROM rejects').get();
+    const totalBlk = d.prepare('SELECT COUNT(*) AS n FROM blocks_found').get();
+
+    const total24h = acc.n + rej.n;
+    const rejectRate24h = total24h > 0 ? (rej.n / total24h) * 100 : 0;
 
     return {
         accepted: acc.n,
         rejected: rej.n,
         blocks: blk.n,
         workers_active: wk.n,
-        hashrate: (acc.sum_diff * TWO_32) / windowSec,
+        hashrate: (acc.sum_diff * TWO_32) / windowSec,   // 24h estimate
+        hashrate_1h: hashrateOver(d, nowSec, 3600),
+        hashrate_5m: hashrateOver(d, nowSec, 300),
+        best_share_24h: acc.best,
+        best_share_lifetime: lifetime.best,
+        reject_rate_pct: rejectRate24h,
+        shares_lifetime: lifetime.shares,
+        rejects_lifetime: totalRej.n,
+        blocks_lifetime: totalBlk.n,
+        oldest_share_ts: lifetime.oldest_ts,
+        last_share_ts: last.ts,
         window_sec: windowSec,
         db_ready: true,
     };
@@ -50,12 +79,18 @@ export function overview(handle, windowSec = 86400) {
 export function leaderboard(handle, windowSec = 86400, limit = 50) {
     const d = db(handle);
     if (!d) return [];
-    const since = Math.floor(Date.now() / 1000) - windowSec;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const since = nowSec - windowSec;
+    const since1h = nowSec - 3600;
+    const since5m = nowSec - 300;
 
+    // One pass for the 24h totals, then per-worker short-window sums.
     const rows = d.prepare(`
-        SELECT w.name           AS name,
-               COUNT(s.id)      AS shares,
-               MAX(s.ts)        AS last_seen,
+        SELECT w.id              AS id,
+               w.name            AS name,
+               w.payout_address  AS payout_address,
+               COUNT(s.id)       AS shares,
+               MAX(s.ts)         AS last_seen,
                COALESCE(SUM(s.difficulty), 0) AS sum_diff
           FROM shares s
           JOIN workers w ON w.id = s.worker_id
@@ -65,14 +100,25 @@ export function leaderboard(handle, windowSec = 86400, limit = 50) {
          LIMIT ?
     `).all(since, limit);
 
+    const sumShort = d.prepare(
+        'SELECT COALESCE(SUM(difficulty),0) AS sd FROM shares WHERE worker_id = ? AND ts >= ?'
+    );
+
     const totalDiff = rows.reduce((a, r) => a + r.sum_diff, 0);
-    return rows.map(r => ({
-        name: r.name,
-        shares: r.shares,
-        last_seen: r.last_seen,
-        hashrate_est: (r.sum_diff * TWO_32) / windowSec,
-        share_of_pool_pct: totalDiff > 0 ? (r.sum_diff / totalDiff) * 100 : 0,
-    }));
+    return rows.map(r => {
+        const sd1h = sumShort.get(r.id, since1h).sd;
+        const sd5m = sumShort.get(r.id, since5m).sd;
+        return {
+            name: r.name,
+            payout_address: r.payout_address || null,
+            shares: r.shares,
+            last_seen: r.last_seen,
+            hashrate_est: (r.sum_diff * TWO_32) / windowSec,
+            hashrate_1h: (sd1h * TWO_32) / 3600,
+            hashrate_5m: (sd5m * TWO_32) / 300,
+            share_of_pool_pct: totalDiff > 0 ? (r.sum_diff / totalDiff) * 100 : 0,
+        };
+    });
 }
 
 /* Roll up the leaderboard by payout_address. Useful when one miner runs

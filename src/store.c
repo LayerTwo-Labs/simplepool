@@ -208,11 +208,14 @@ static int64_t resolve_worker_id(store_t *s, const char *name,
     int64_t id = cache_lookup(s, name);
     int cached = (id >= 0);
 
+    /* Schema stores Unix seconds; callers pass milliseconds. */
+    const sqlite3_int64 ts_s = (sqlite3_int64)(ts_ms / 1000);
+
     sqlite3_reset(s->st_upsert_worker);
     sqlite3_clear_bindings(s->st_upsert_worker);
     sqlite3_bind_text(s->st_upsert_worker, 1, name, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s->st_upsert_worker, 2, (sqlite3_int64)ts_ms);
-    sqlite3_bind_int64(s->st_upsert_worker, 3, (sqlite3_int64)ts_ms);
+    sqlite3_bind_int64(s->st_upsert_worker, 2, ts_s);
+    sqlite3_bind_int64(s->st_upsert_worker, 3, ts_s);
     if (payout_address && payout_address[0]) {
         sqlite3_bind_text(s->st_upsert_worker, 4, payout_address, -1,
                           SQLITE_TRANSIENT);
@@ -244,7 +247,7 @@ static void process_event(store_t *s, const event_t *ev) {
         sqlite3_reset(s->st_insert_share);
         sqlite3_clear_bindings(s->st_insert_share);
         sqlite3_bind_int64(s->st_insert_share, 1, wid);
-        sqlite3_bind_int64(s->st_insert_share, 2, (sqlite3_int64)ev->ts_ms);
+        sqlite3_bind_int64(s->st_insert_share, 2, (sqlite3_int64)(ev->ts_ms / 1000));
         sqlite3_bind_double(s->st_insert_share, 3, ev->difficulty);
         sqlite3_bind_int(s->st_insert_share, 4, ev->is_block);
         if (ev->hash[0])
@@ -264,7 +267,7 @@ static void process_event(store_t *s, const event_t *ev) {
             sqlite3_bind_text(s->st_insert_reject, 1, ev->worker_name, -1, SQLITE_TRANSIENT);
         else
             sqlite3_bind_null(s->st_insert_reject, 1);
-        sqlite3_bind_int64(s->st_insert_reject, 2, (sqlite3_int64)ev->ts_ms);
+        sqlite3_bind_int64(s->st_insert_reject, 2, (sqlite3_int64)(ev->ts_ms / 1000));
         sqlite3_bind_text(s->st_insert_reject, 3, ev->reason, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(s->st_insert_reject) != SQLITE_DONE) {
             atomic_fetch_add(&s->pg_errors, 1);
@@ -279,7 +282,7 @@ static void process_event(store_t *s, const event_t *ev) {
                                        ev->payout_address, ev->ts_ms);
         sqlite3_reset(s->st_insert_block);
         sqlite3_clear_bindings(s->st_insert_block);
-        sqlite3_bind_int64(s->st_insert_block, 1, (sqlite3_int64)ev->ts_ms);
+        sqlite3_bind_int64(s->st_insert_block, 1, (sqlite3_int64)(ev->ts_ms / 1000));
         sqlite3_bind_int(s->st_insert_block, 2, ev->height);
         sqlite3_bind_text(s->st_insert_block, 3, ev->hash, -1, SQLITE_TRANSIENT);
         if (finder >= 0)
