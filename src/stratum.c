@@ -192,6 +192,12 @@ struct stratum_conn {
     uint64_t dedupe[DEDUPE_RING];
     size_t   dedupe_head;
 
+    /* Vardiff window state — counts accepted shares since vd_window_start_ms.
+     * Every cfg.vardiff_window_sec the rate is compared to vardiff_target_spm
+     * and `difficulty` is multiplied/divided to converge on the target. */
+    uint64_t vd_window_start_ms;
+    uint32_t vd_window_shares;
+
     pthread_mutex_t write_lock;
 
     struct stratum_conn *next;  /* server->conns_head linked list */
@@ -530,6 +536,62 @@ static void send_set_difficulty(char **buf, size_t *len, double diff) {
     emit_notification(buf, len, "mining.set_difficulty", p);
 }
 
+/* Vardiff: every cfg.vardiff_window_sec, look at how many shares the
+ * connection submitted in that window and rescale its difficulty so the
+ * rate converges on cfg.vardiff_target_spm shares/minute. Called from
+ * handle_submit() after each accepted share.
+ *
+ * Conservative algorithm:
+ *   ratio = observed_spm / target_spm
+ *   if  ratio in [0.5, 2.0] → leave it (avoid jitter)
+ *   else                    → new_diff = old_diff * ratio, clamped
+ * Always emits a single mining.set_difficulty when diff changes. The
+ * client picks it up for the next job notify; we don't force a re-notify
+ * because the active job is still valid against the worker target. */
+static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
+                                   uint64_t now,
+                                   char **buf, size_t *len)
+{
+    if (!s->cfg.vardiff_enabled) return;
+    if (c->vd_window_start_ms == 0) {
+        c->vd_window_start_ms = now;
+        c->vd_window_shares = 0;
+        return;
+    }
+    uint64_t elapsed_ms = now - c->vd_window_start_ms;
+    uint64_t window_ms  = (uint64_t)s->cfg.vardiff_window_sec * 1000ULL;
+    if (elapsed_ms < window_ms) return;
+
+    /* Observed shares per minute over this window. */
+    double observed_spm = ((double)c->vd_window_shares * 60000.0) /
+                          (double)elapsed_ms;
+    double target_spm = s->cfg.vardiff_target_spm;
+    double ratio = observed_spm / target_spm;
+
+    double old_diff = c->difficulty;
+    double new_diff = old_diff;
+    if (ratio > 2.0 || ratio < 0.5) {
+        new_diff = old_diff * ratio;
+        /* Cap each adjustment to a 4x step to avoid wild swings on small
+         * windows. */
+        if (new_diff > old_diff * 4.0) new_diff = old_diff * 4.0;
+        if (new_diff < old_diff / 4.0) new_diff = old_diff / 4.0;
+        if (new_diff < s->cfg.vardiff_min) new_diff = s->cfg.vardiff_min;
+        if (new_diff > s->cfg.vardiff_max) new_diff = s->cfg.vardiff_max;
+    }
+
+    /* Reset the window regardless of whether we changed diff. */
+    c->vd_window_start_ms = now;
+    c->vd_window_shares = 0;
+
+    if (new_diff != old_diff) {
+        c->difficulty = new_diff;
+        LOG_INFO("stratum: vardiff %s: %.0f -> %.0f (%.1f spm observed, %.1f target)",
+                 c->worker_name, old_diff, new_diff, observed_spm, target_spm);
+        send_set_difficulty(buf, len, new_diff);
+    }
+}
+
 /* Send mining.notify for the current job to a specific connection, using
  * that connection's rendered coinbase. Skips silently if the conn is not
  * yet authorized (we have no payout address to render against). */
@@ -676,6 +738,9 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     sanitize_worker(worker, c->worker_name, sizeof(c->worker_name));
     c->authorized = 1;
     if (c->difficulty <= 0) c->difficulty = s->cfg.initial_diff;
+    /* Arm vardiff window for this connection. */
+    c->vd_window_start_ms = now_ms();
+    c->vd_window_shares = 0;
 
     /* respond true */
     emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
@@ -888,6 +953,10 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         s->cfg.on_share(s->cfg.ctx, c->worker_name, c->payout_address,
                         ts_now, c->difficulty, is_block, sent_hash_hex);
     }
+    /* Tick vardiff: count this accepted share toward the window. May emit
+     * a mining.set_difficulty notification if the window has elapsed. */
+    c->vd_window_shares++;
+    vardiff_maybe_retarget(s, c, now_ms(), buf, len);
     if (is_block && s->cfg.on_block_found) {
         int64_t fee_sats = 0;
         if (s->cfg.fee_bps > 0 && s->cfg.operator_address[0]) {

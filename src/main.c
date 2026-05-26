@@ -436,6 +436,11 @@ int main(int argc, char **argv) {
     stcfg.fee_bps      = cfg.fee_bps;
     snprintf(stcfg.coinbase_tag, sizeof stcfg.coinbase_tag, "%s",
              cfg.coinbase_tag);
+    stcfg.vardiff_enabled    = cfg.vardiff_enabled;
+    stcfg.vardiff_target_spm = cfg.vardiff_target_spm;
+    stcfg.vardiff_min        = cfg.vardiff_min;
+    stcfg.vardiff_max        = cfg.vardiff_max;
+    stcfg.vardiff_window_sec = cfg.vardiff_window_sec;
     stcfg.ctx            = &sctx;
     stcfg.on_share       = on_share_cb;
     stcfg.on_reject      = on_reject_cb;
