@@ -7,7 +7,11 @@ import * as stats from './lib/stats.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '8081', 10);
-const DB_PATH = process.env.PROXY_DB_PATH || '../data/shares.snapshot.db';
+// Default to the live SQLite database. WAL mode + readonly handle is safe
+// to point at the file the proxy is actively writing to. The snapshot path
+// (data/shares.snapshot.db) is still supported for users who run the cron
+// `.backup` job documented in the README — set PROXY_DB_PATH to override.
+const DB_PATH = process.env.PROXY_DB_PATH || '../data/shares.db';
 
 const app = express();
 app.engine('ejs', renderFile);
@@ -21,9 +25,10 @@ const db = openDb(path.resolve(__dirname, DB_PATH));
 app.get('/', (req, res) => {
     const ov = stats.overview(db);
     const lb = stats.leaderboard(db);
+    const lbAddr = stats.leaderboardByAddress(db);
     const blocks = stats.recentBlocks(db, 5);
     res.render('index', {
-        ov, lb, blocks,
+        ov, lb, lbAddr, blocks,
         fmtHashrate: stats.fmtHashrate,
         fmtBtc: stats.fmtBtc,
     });
@@ -47,6 +52,7 @@ app.get('/blocks', (req, res) => {
 
 app.get('/api/overview', (req, res) => res.json(stats.overview(db)));
 app.get('/api/leaderboard', (req, res) => res.json(stats.leaderboard(db)));
+app.get('/api/leaderboard/by-address', (req, res) => res.json(stats.leaderboardByAddress(db)));
 app.get('/api/worker/:name', (req, res) => {
     const w = stats.worker(db, req.params.name);
     if (!w.worker) return res.status(404).json({ error: 'unknown worker' });

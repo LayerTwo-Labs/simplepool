@@ -41,6 +41,9 @@ if (n > 1) {
     <main class="wrap">
         <section class="card">
             <h2><%= worker.name %></h2>
+            <% if (worker.payout_address) { %>
+                <p class="muted small mono">payout → <%= worker.payout_address %></p>
+            <% } %>
             <div class="grid">
                 <div><label>Hashrate (24h)</label><strong><%= fmtHashrate(worker.window_hashrate) %></strong></div>
                 <div><label>Shares (24h)</label><strong><%= fmtN(worker.window_shares) %></strong></div>

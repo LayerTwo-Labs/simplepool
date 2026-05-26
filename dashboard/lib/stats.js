@@ -75,6 +75,53 @@ export function leaderboard(handle, windowSec = 86400, limit = 50) {
     }));
 }
 
+/* Roll up the leaderboard by payout_address. Useful when one miner runs
+ * several rigs under the same address (`bc1q….rig1`, `bc1q….rig2`, …):
+ * each rig appears as its own row in `leaderboard()`, but here we collapse
+ * them into one entry keyed by payout_address and list the rig labels. */
+export function leaderboardByAddress(handle, windowSec = 86400, limit = 50) {
+    const d = db(handle);
+    if (!d) return [];
+    const since = Math.floor(Date.now() / 1000) - windowSec;
+
+    // Aggregate shares per (payout_address). Workers with no payout_address
+    // recorded (legacy rows) fall back to their `name` as the key so they
+    // still show up rather than collapsing into one nameless bucket.
+    const rows = d.prepare(`
+        SELECT COALESCE(NULLIF(w.payout_address, ''), w.name) AS addr,
+               COUNT(s.id)                                    AS shares,
+               MAX(s.ts)                                      AS last_seen,
+               COALESCE(SUM(s.difficulty), 0)                 AS sum_diff,
+               COUNT(DISTINCT w.id)                           AS rigs,
+               GROUP_CONCAT(DISTINCT w.name)                  AS worker_names
+          FROM shares s
+          JOIN workers w ON w.id = s.worker_id
+         WHERE s.ts >= ?
+         GROUP BY addr
+         ORDER BY sum_diff DESC
+         LIMIT ?
+    `).all(since, limit);
+
+    const totalDiff = rows.reduce((a, r) => a + r.sum_diff, 0);
+    return rows.map(r => {
+        // Extract just the .label parts so we can show "rig1, rig2, rig3"
+        // instead of repeating the address.
+        const labels = (r.worker_names || '').split(',').map(n => {
+            const dot = n.indexOf('.');
+            return dot >= 0 ? n.slice(dot + 1) : '';
+        }).filter(Boolean);
+        return {
+            address: r.addr,
+            rigs: r.rigs,
+            labels,
+            shares: r.shares,
+            last_seen: r.last_seen,
+            hashrate_est: (r.sum_diff * TWO_32) / windowSec,
+            share_of_pool_pct: totalDiff > 0 ? (r.sum_diff / totalDiff) * 100 : 0,
+        };
+    });
+}
+
 export function worker(handle, name, windowSec = 86400) {
     const d = db(handle);
     if (!d) return { worker: null, shares: [], buckets: [] };
@@ -129,6 +176,7 @@ export function worker(handle, name, windowSec = 86400) {
     return {
         worker: {
             name: w.name,
+            payout_address: w.payout_address || null,
             first_seen: w.first_seen,
             last_seen: w.last_seen,
             window_shares: sumRow.n,

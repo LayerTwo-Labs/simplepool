@@ -44,7 +44,35 @@ const ago = (t) => {
         </section>
 
         <section class="card">
-            <h2>Worker leaderboard · last 24h</h2>
+            <h2>Miners by payout address · last 24h</h2>
+            <% if (!lbAddr || lbAddr.length === 0) { %>
+                <p class="muted">No miners active in the last 24h.</p>
+            <% } else { %>
+            <table class="lb">
+                <thead>
+                    <tr><th>#</th><th>Address</th><th>Rigs</th><th>Shares</th><th>Hashrate</th><th>Pool %</th><th>Last seen</th></tr>
+                </thead>
+                <tbody>
+                <% lbAddr.forEach((m, i) => { %>
+                    <tr>
+                        <td><%= i + 1 %></td>
+                        <td class="mono small"><%= m.address %><% if (m.labels && m.labels.length) { %>
+                            <div class="muted small">rigs: <%= m.labels.join(', ') %></div>
+                        <% } %></td>
+                        <td><%= fmtN(m.rigs) %></td>
+                        <td><%= fmtN(m.shares) %></td>
+                        <td><%= fmtHashrate(m.hashrate_est) %></td>
+                        <td><%= m.share_of_pool_pct.toFixed(2) %>%</td>
+                        <td title="<%= fmtTs(m.last_seen) %>"><%= ago(m.last_seen) %></td>
+                    </tr>
+                <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
+
+        <section class="card">
+            <h2>Worker leaderboard · last 24h <span class="muted small">(per-rig)</span></h2>
             <% if (lb.length === 0) { %>
                 <p class="muted">No workers active in the last 24h.</p>
             <% } else { %>
