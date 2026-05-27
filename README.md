@@ -6,11 +6,15 @@ miner connections on TCP `:3334`, builds block templates via `bitcoind`'s
 accepted share into a local SQLite database. A separate Node.js dashboard
 reads that file for stats.
 
-## About Sidepool
+Created by **Roberto Santacroce** —
+source: <https://github.com/rsantacroce/simplepool>.
 
-> Sidepool is a PPS (Pay-Per-Share) mining pool that pays out using
-> **Thunder**. We've released a solo-mining version alongside what we
-> believe will be a genuinely useful tool for miners.
+## About simplepool
+
+> simplepool is the foundation for a PPS (Pay-Per-Share) mining pool
+> that will eventually pay out using **Thunder**. We've released a
+> solo-mining version alongside what we believe will be a genuinely
+> useful tool for miners.
 >
 > The current implementation of shares, calculations, and related
 > mechanics exists primarily to establish the **data model and
@@ -21,7 +25,7 @@ reads that file for stats.
 > with pools, we've observed that auditing your own contributions is
 > extremely difficult, often nearly impossible. Miners are forced to
 > trust the pool's reporting, with little ability to independently
-> verify what they're owed. Sidepool aims to address this transparency
+> verify what they're owed. simplepool aims to address this transparency
 > gap. (Hopefully!)
 
 This repository is the **solo build** — every share lands in the local
@@ -60,7 +64,7 @@ hold even though this is currently solo-mode:
   churn schema, queries, EJS templates, and any external consumer.
 - The meaning shift between solo and PPS is *semantic*, not lexical.
   We surface it with an explanatory banner on the dashboard and with
-  the Sidepool quote above, rather than by renaming things.
+  the project blurb above, rather than by renaming things.
 
 **In this solo build**, a share is an accepted Proof-of-Work submission
 below the connection's worker target. It is *not* a payout claim and
@@ -374,7 +378,7 @@ dashboard/           # Node/Express read-only stats UI
 ## Roadmap
 
 The solo build is intentionally minimal; the items below extend it
-toward the full Sidepool PPS pool without changing the share/block data
+toward the full simplepool PPS pool without changing the share/block data
 model that already lives in `schema.sql`.
 
 1. **Move persistence behind Redis.** Add a Redis-backed write path
@@ -407,8 +411,16 @@ model that already lives in `schema.sql`.
    That keeps the dashboard's read pattern from ever touching the hot
    write path.
 
+## Author
+
+**Roberto Santacroce** — <https://github.com/rsantacroce/simplepool>
+
+Issues, pull requests, and notes from miners running this in the wild
+are all welcome.
+
 ## License
 
-simplepool is released under the **MIT License** (see [`LICENSE`](LICENSE)).
+simplepool is released under the **MIT License**, © 2026 Roberto
+Santacroce (see [`LICENSE`](LICENSE)).
 The vendored cJSON code in `src/cjson/` is also MIT-licensed (see
 [`src/cjson/README.md`](src/cjson/README.md)).

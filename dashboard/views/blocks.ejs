@@ -72,7 +72,13 @@ const shortAddr = (a) => a ? (a.length > 18 ? a.slice(0, 10) + '…' + a.slice(-
 
         <p><a href="/">← back to overview</a></p>
     </main>
-    <footer class="foot"><span>read-only · auto-refresh 60s</span></footer>
+    <footer class="foot">
+        <span>read-only · auto-refresh 60s</span>
+        <span class="sep">·</span>
+        <span>built by Roberto Santacroce</span>
+        <span class="sep">·</span>
+        <a href="https://github.com/rsantacroce/simplepool" target="_blank" rel="noopener">source on GitHub</a>
+    </footer>
     <script src="/static/script.js" defer></script>
 </body>
 </html>

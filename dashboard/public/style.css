@@ -117,3 +117,5 @@ table.lb tr:hover { background: rgba(255, 255, 255, 0.02); }
     padding: 24px;
     font-size: 12px;
 }
+.foot .sep { margin: 0 6px; opacity: 0.5; }
+.foot a { color: var(--accent); }
