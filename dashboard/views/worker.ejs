@@ -66,19 +66,26 @@ if (n > 1) {
         </section>
 
         <section class="card">
-            <h2>Recent shares</h2>
+            <h2>Recent shares <span class="muted small">(last 200; worker target diff = <%= fmtN(worker.window_shares > 0 && shares.length ? shares[0].difficulty : 1) %>)</span></h2>
             <% if (shares.length === 0) { %>
                 <p class="muted">No shares recorded.</p>
             <% } else { %>
             <table class="lb">
-                <thead><tr><th>When</th><th>Difficulty</th><th>Block?</th><th>Hash</th></tr></thead>
+                <thead><tr>
+                    <th>When</th>
+                    <th title="Worker target difficulty assigned by the proxy">Target</th>
+                    <th title="Actual difficulty of this share: how 'lucky' was the hash">Actual</th>
+                    <th>Share hash <span class="muted small">(BE hex; BLOCK if &le; network target)</span></th>
+                </tr></thead>
                 <tbody>
                 <% shares.forEach(s => { %>
                     <tr<% if (s.is_block) { %> class="block"<% } %>>
                         <td title="<%= fmtTs(s.ts) %>"><%= ago(s.ts) %></td>
                         <td><%= fmtN(s.difficulty) %></td>
-                        <td><%= s.is_block ? 'BLOCK' : '' %></td>
-                        <td class="mono small"><%= s.block_hash || '' %></td>
+                        <td><%= s.actual_diff != null ? fmtN(Math.round(s.actual_diff)) : '—' %></td>
+                        <td class="mono small">
+                            <% if (s.is_block) { %><strong>BLOCK </strong><% } %><%= s.share_hash || '—' %>
+                        </td>
                     </tr>
                 <% }) %>
                 </tbody>
@@ -88,7 +95,13 @@ if (n > 1) {
 
         <p><a href="/">← back to overview</a></p>
     </main>
-    <footer class="foot"><span>read-only · auto-refresh 15s</span></footer>
+    <footer class="foot">
+        <span>read-only · auto-refresh 15s</span>
+        <span class="sep">·</span>
+        <span>built by Layer Two Labs team</span>
+        <span class="sep">·</span>
+        <a href="https://github.com/LayerTwo-Labs/simplepool" target="_blank" rel="noopener">source on GitHub</a>
+    </footer>
     <script src="/static/script.js" defer></script>
 </body>
 </html>

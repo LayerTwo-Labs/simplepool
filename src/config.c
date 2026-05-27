@@ -39,6 +39,12 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->commit_max_shares = 100;
 
     cfg->log_level = 1; /* info */
+
+    cfg->vardiff_enabled    = 1;
+    cfg->vardiff_target_spm = 12.0;   /* ~1 share every 5s per connection */
+    cfg->vardiff_min        = 1.0;
+    cfg->vardiff_max        = 1e12;
+    cfg->vardiff_window_sec = 30;
 }
 
 static char *strtrim(char *s) {
@@ -124,6 +130,11 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
             return -3;
         }
         else if (strcmp(k, "coinbase_tag")              == 0) copy_str(cfg->coinbase_tag, sizeof cfg->coinbase_tag, v);
+        else if (strcmp(k, "vardiff_enabled")           == 0) cfg->vardiff_enabled = atoi(v);
+        else if (strcmp(k, "vardiff_target_spm")        == 0) cfg->vardiff_target_spm = atof(v);
+        else if (strcmp(k, "vardiff_min")               == 0) cfg->vardiff_min = atof(v);
+        else if (strcmp(k, "vardiff_max")               == 0) cfg->vardiff_max = atof(v);
+        else if (strcmp(k, "vardiff_window_sec")        == 0) cfg->vardiff_window_sec = atoi(v);
         else if (strcmp(k, "db_path")                   == 0) copy_str(cfg->db_path, sizeof cfg->db_path, v);
         else if (strcmp(k, "commit_window_ms")          == 0) cfg->commit_window_ms = atoi(v);
         else if (strcmp(k, "commit_max_shares")         == 0) cfg->commit_max_shares = atoi(v);

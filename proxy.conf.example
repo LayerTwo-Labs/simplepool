@@ -13,6 +13,16 @@ operator_address = bc1qREPLACEME   # REPLACE with a real address for your networ
 fee_bps = 100              # 100 = 1%; valid range 0..1000 (max 10%)
 coinbase_tag = /simplepool/
 
+# vardiff — auto-adjust each connection's difficulty to keep the share
+# rate near `target_spm` shares/minute. Set vardiff_enabled = 0 to pin
+# every connection to initial_diff (legacy behaviour).
+initial_diff       = 1
+vardiff_enabled    = 1
+vardiff_target_spm = 12       # ~1 share every 5 seconds per connection
+vardiff_min        = 1
+vardiff_max        = 1e12
+vardiff_window_sec = 30       # how often to retarget
+
 db_path = ./data/shares.db
 commit_window_ms = 100
 commit_max_shares = 100

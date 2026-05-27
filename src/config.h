@@ -10,6 +10,15 @@ typedef struct {
     int  max_conns;
     double initial_diff;
 
+    /* vardiff — auto-adjust each connection's difficulty to keep the
+     * share rate near `target_spm` shares/minute. Set vardiff_enabled = 0
+     * to pin every connection to initial_diff (the legacy behaviour). */
+    int    vardiff_enabled;       /* default 1 */
+    double vardiff_target_spm;    /* default 12 shares/min (one every 5s) */
+    double vardiff_min;           /* default 1.0 */
+    double vardiff_max;           /* default 1e12; clamped by network diff */
+    int    vardiff_window_sec;    /* retarget interval, default 30 */
+
     /* bitcoind */
     char bitcoind_url[512];
     char bitcoind_user[128];

@@ -225,12 +225,49 @@ static void test_build_coinbase_split_fee_math(void) {
     printf("ok: coinbase split fee math\n");
 }
 
+/* BIP34 small-height regression: Bitcoin Core encodes heights 1..16 as
+ * OP_N (single byte 0x50+n), not as the 2-byte push-data form. Getting
+ * this wrong shows up on fresh regtest/signet chains as 'bad-cb-height'. */
+static void test_bip34_small_height_uses_opn(void) {
+    coinbase_parts_t parts;
+    memset(&parts, 0, sizeof parts);
+    char err[256] = {0};
+    /* height = 5 should produce scriptSig starting with OP_5 = 0x55. */
+    int rc = coinbase_build(5, 5000000000LL,
+                            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+                            NULL, "/simplepool/", 4, 4,
+                            &parts, err, sizeof err);
+    assert(rc == 0);
+
+    /* Walk to the scriptSig as in the structural test. */
+    size_t total = parts.cb1_len + 8 + parts.cb2_len;
+    uint8_t *tx = (uint8_t *)malloc(total);
+    assert(tx);
+    memcpy(tx, parts.cb1, parts.cb1_len);
+    memset(tx + parts.cb1_len, 0xaa, 4);
+    memset(tx + parts.cb1_len + 4, 0xbb, 4);
+    memcpy(tx + parts.cb1_len + 8, parts.cb2, parts.cb2_len);
+
+    size_t off = 4; /* version */
+    uint64_t in_count = 0;
+    assert(read_varint(tx, total, &off, &in_count) == 0);
+    off += 32 + 4; /* prev hash + idx */
+    uint64_t ss_len = 0;
+    assert(read_varint(tx, total, &off, &ss_len) == 0);
+    /* OP_5 (0x55) as the first byte of scriptSig. */
+    assert(tx[off] == 0x55);
+    free(tx);
+    coinbase_parts_free(&parts);
+    printf("ok: bip34 small-height uses OP_N\n");
+}
+
 int main(void) {
     test_p2pkh_address();
     test_p2wpkh_address();
     test_regtest_p2wpkh();
     test_build_coinbase_structural();
     test_build_coinbase_split_fee_math();
+    test_bip34_small_height_uses_opn();
     printf("test_coinbase: all tests passed\n");
     return 0;
 }

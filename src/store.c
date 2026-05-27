@@ -61,7 +61,17 @@ static const char *SCHEMA_SQL =
     "  reward_sats     INTEGER,"
     "  fee_sats        INTEGER"
     ");"
-    "CREATE INDEX IF NOT EXISTS blocks_found_ts_idx ON blocks_found(ts);";
+    "CREATE INDEX IF NOT EXISTS blocks_found_ts_idx ON blocks_found(ts);"
+    /* Single-row mirror of the upstream bitcoind tip. Updated on every
+     * tip-watcher poll. The dashboard reads this for 'latest block' /
+     * 'time since last block' without needing any RPC of its own. */
+    "CREATE TABLE IF NOT EXISTS node_status ("
+    "  id              INTEGER PRIMARY KEY CHECK (id = 1),"
+    "  tip_height      INTEGER,"
+    "  tip_hash        TEXT,"
+    "  tip_observed_at INTEGER,"
+    "  updated_at      INTEGER"
+    ");";
 
 /* Forward-compat: ALTER existing DBs to add columns that didn't exist in
  * earlier schemas. Duplicate-column errors are silently ignored. */
@@ -111,6 +121,8 @@ struct store {
     sqlite3_stmt *st_insert_share;
     sqlite3_stmt *st_insert_reject;
     sqlite3_stmt *st_insert_block;
+    sqlite3_stmt *st_upsert_node_tip;
+    pthread_mutex_t node_tip_mu;   /* serialise binds on st_upsert_node_tip */
 
     /* Ring buffer */
     event_t  *ring;
@@ -469,11 +481,30 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         "INSERT INTO blocks_found "
         "  (ts, height, hash, finder_id, finder_address, reward_sats, fee_sats) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)";
+    /* Single-row upsert keyed on id=1. tip_observed_at is only set when
+     * the tip actually changes (height or hash differ from the stored
+     * row), so 'time since last tip change' stays meaningful across
+     * repeated polls of the same tip. */
+    static const char *Q_UPSERT_NODE_TIP =
+        "INSERT INTO node_status (id, tip_height, tip_hash, tip_observed_at, updated_at) "
+        "VALUES (1, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "  tip_height = excluded.tip_height, "
+        "  tip_hash   = excluded.tip_hash, "
+        "  tip_observed_at = CASE "
+        "    WHEN node_status.tip_hash IS NULL OR node_status.tip_hash != excluded.tip_hash "
+        "      THEN excluded.tip_observed_at "
+        "    ELSE node_status.tip_observed_at "
+        "  END, "
+        "  updated_at = excluded.updated_at";
+
+    pthread_mutex_init(&s->node_tip_mu, NULL);
 
     if (sqlite3_prepare_v2(s->db, Q_UPSERT, -1, &s->st_upsert_worker, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(s->db, Q_INS_SHARE, -1, &s->st_insert_share, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(s->db, Q_INS_REJECT, -1, &s->st_insert_reject, NULL) != SQLITE_OK ||
-        sqlite3_prepare_v2(s->db, Q_INS_BLOCK, -1, &s->st_insert_block, NULL) != SQLITE_OK)
+        sqlite3_prepare_v2(s->db, Q_INS_BLOCK, -1, &s->st_insert_block, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(s->db, Q_UPSERT_NODE_TIP, -1, &s->st_upsert_node_tip, NULL) != SQLITE_OK)
     {
         LOG_ERROR("store: prepare failed: %s", sqlite3_errmsg(s->db));
         store_close(s);
@@ -507,7 +538,9 @@ void store_close(store_t *s) {
     if (s->st_insert_share)  sqlite3_finalize(s->st_insert_share);
     if (s->st_insert_reject) sqlite3_finalize(s->st_insert_reject);
     if (s->st_insert_block)  sqlite3_finalize(s->st_insert_block);
+    if (s->st_upsert_node_tip) sqlite3_finalize(s->st_upsert_node_tip);
     if (s->db) sqlite3_close(s->db);
+    pthread_mutex_destroy(&s->node_tip_mu);
     pthread_mutex_destroy(&s->mu);
     pthread_cond_destroy(&s->cv_not_empty);
     pthread_cond_destroy(&s->cv_drained);
@@ -518,16 +551,16 @@ void store_close(store_t *s) {
 
 int store_record_share(store_t *s, const char *worker_name,
                        uint64_t ts_ms, double difficulty,
-                       int is_block, const char *block_hash_or_null)
+                       int is_block, const char *share_hash_or_null)
 {
     return store_record_share_addr(s, worker_name, NULL, ts_ms, difficulty,
-                                   is_block, block_hash_or_null);
+                                   is_block, share_hash_or_null);
 }
 
 int store_record_share_addr(store_t *s, const char *worker_name,
                             const char *payout_address,
                             uint64_t ts_ms, double difficulty,
-                            int is_block, const char *block_hash_or_null)
+                            int is_block, const char *share_hash_or_null)
 {
     if (!s || !worker_name) return -1;
     event_t ev;
@@ -539,8 +572,8 @@ int store_record_share_addr(store_t *s, const char *worker_name,
     strncpy(ev.worker_name, worker_name, WORKER_NAME_MAX - 1);
     if (payout_address)
         strncpy(ev.payout_address, payout_address, ADDR_MAX - 1);
-    if (block_hash_or_null) {
-        strncpy(ev.hash, block_hash_or_null, HASH_STR_MAX - 1);
+    if (share_hash_or_null) {
+        strncpy(ev.hash, share_hash_or_null, HASH_STR_MAX - 1);
     }
     if (enqueue(s, &ev) != 0) {
         atomic_fetch_add(&s->shares_dropped, 1);
@@ -614,6 +647,27 @@ int store_flush(store_t *s) {
 
     /* Avoid unused-warning suppression */
     (void)now_ms;
+    return 0;
+}
+
+int store_record_node_tip(store_t *s, int height, const char *hash,
+                          uint64_t observed_ts_s, uint64_t updated_ts_s)
+{
+    if (!s || !hash) return -1;
+    pthread_mutex_lock(&s->node_tip_mu);
+    sqlite3_reset(s->st_upsert_node_tip);
+    sqlite3_clear_bindings(s->st_upsert_node_tip);
+    sqlite3_bind_int (s->st_upsert_node_tip, 1, height);
+    sqlite3_bind_text(s->st_upsert_node_tip, 2, hash, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s->st_upsert_node_tip, 3, (sqlite3_int64)observed_ts_s);
+    sqlite3_bind_int64(s->st_upsert_node_tip, 4, (sqlite3_int64)updated_ts_s);
+    int rc = sqlite3_step(s->st_upsert_node_tip);
+    sqlite3_reset(s->st_upsert_node_tip);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    if (rc != SQLITE_DONE) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
     return 0;
 }
 

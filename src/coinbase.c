@@ -79,14 +79,35 @@ static int bbuf_push_varint(bbuf_t *b, uint64_t n) {
     return bbuf_push_u64_le(b, n);
 }
 
-/* ---------- BIP34 height push ---------- */
-
-/* Returns number of bytes written (always <= 5). */
+/* ---------- BIP34 height push ----------
+ *
+ * Bitcoin Core validates the coinbase scriptSig by comparing it against
+ * `CScript() << nHeight`. That operator overload calls push_int64(), which
+ * has three branches:
+ *
+ *   n == 0            -> OP_0  (single byte 0x00)
+ *   1 <= n <= 16      -> OP_N  (single byte 0x50 + n)            <-- short form
+ *   otherwise         -> length-prefixed CScriptNum::serialize(n)
+ *
+ * On a fresh chain (regtest / signet / drivechain testnet) the first 16
+ * blocks therefore expect the OP_N short form. Encoding a height of 5 as
+ * {0x01,0x05} instead of {0x55} causes ContextualCheckBlock to reject the
+ * block with "bad-cb-height". Mainnet is unaffected because every accepted
+ * block has height >= 17.
+ *
+ * Returns number of bytes written (always <= 6). */
 static size_t bip34_height_push(uint32_t height, uint8_t out[8]) {
     if (height == 0) {
-        out[0] = 0x00;
+        out[0] = 0x00;        /* OP_0 */
         return 1;
     }
+    if (height <= 16) {
+        out[0] = (uint8_t)(0x50 + height);   /* OP_1 .. OP_16 */
+        return 1;
+    }
+    /* CScriptNum minimal little-endian encoding with length prefix. The
+     * extra zero byte handles the sign bit so high values aren't read as
+     * negative. */
     uint8_t bytes[5];
     size_t n = 0;
     uint32_t v = height;

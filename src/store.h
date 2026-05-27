@@ -22,10 +22,14 @@ void store_close(store_t *s);
 
 /* Record an accepted share. Thread-safe. Returns immediately - the actual
  * INSERT is batched on the writer thread. Returns 0 if queued, negative if
- * the queue is full (caller may log/drop). */
+ * the queue is full (caller may log/drop).
+ *
+ * share_hash_or_null is the SHA256 of the share's block header in big-endian
+ * hex. When is_block=1 it is also the block hash. For older callers / tests
+ * that still pass NULL the row is stored with NULL in the hash column. */
 int store_record_share(store_t *s, const char *worker_name,
                        uint64_t ts_ms, double difficulty,
-                       int is_block, const char *block_hash_or_null);
+                       int is_block, const char *share_hash_or_null);
 
 /* Record a rejected share. */
 int store_record_reject(store_t *s, const char *worker_name,
@@ -40,11 +44,21 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
                        int64_t reward_sats, int64_t fee_sats);
 
 /* Record an accepted share with the miner's payout_address so the worker
- * row can be tagged. payout_address may be NULL (legacy/tests). */
+ * row can be tagged. payout_address may be NULL (legacy/tests). The
+ * share_hash semantics match store_record_share() above. */
 int store_record_share_addr(store_t *s, const char *worker_name,
                             const char *payout_address,
                             uint64_t ts_ms, double difficulty,
-                            int is_block, const char *block_hash_or_null);
+                            int is_block, const char *share_hash_or_null);
+
+/* Record / refresh the upstream bitcoind tip the proxy is mining on.
+ * Single-row upsert keyed on id=1. tip_observed_at is preserved when
+ * (height, hash) match the existing row, so 'time since last tip change'
+ * stays meaningful across repeated polls of the same tip. Synchronous —
+ * not routed through the writer thread (it's called at most once per
+ * bitcoind_poll_interval_ms). */
+int store_record_node_tip(store_t *s, int height, const char *hash,
+                          uint64_t observed_ts_s, uint64_t updated_ts_s);
 
 /* Flush and wait until all currently-queued events are committed. Useful
  * for tests and clean shutdown before exit. Returns 0 ok, negative on

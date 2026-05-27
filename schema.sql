@@ -40,3 +40,15 @@ CREATE TABLE IF NOT EXISTS blocks_found (
   fee_sats        INTEGER
 );
 CREATE INDEX IF NOT EXISTS blocks_found_ts_idx ON blocks_found(ts);
+
+/* Single-row mirror of the upstream bitcoind tip the proxy is currently
+ * mining on. Written by the proxy's tip watcher on every successful
+ * getblocktemplate poll. Lets the dashboard show "latest block from the
+ * node" and "time since last block" without any RPC of its own. */
+CREATE TABLE IF NOT EXISTS node_status (
+  id              INTEGER PRIMARY KEY CHECK (id = 1),
+  tip_height      INTEGER,
+  tip_hash        TEXT,
+  tip_observed_at INTEGER,  /* unix seconds — when we first saw this tip */
+  updated_at      INTEGER   /* unix seconds — last successful poll */
+);

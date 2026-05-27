@@ -59,6 +59,14 @@ typedef struct {
     char   operator_address[128];
     int    fee_bps;
     char   coinbase_tag[64];
+
+    /* Vardiff (see config.h for prose). 0 disables and pins to initial_diff. */
+    int    vardiff_enabled;
+    double vardiff_target_spm;
+    double vardiff_min;
+    double vardiff_max;
+    int    vardiff_window_sec;
+
     void  *ctx;
     share_observer_fn  on_share;
     reject_observer_fn on_reject;
