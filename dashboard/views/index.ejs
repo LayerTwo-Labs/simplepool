@@ -33,6 +33,20 @@ const ago = (t) => {
         <% } %>
 
         <section class="card">
+            <h2>Bitcoin node tip</h2>
+            <% if (!node || node.tip_height == null) { %>
+                <p class="muted">The proxy hasn't reported a tip yet — usually means it can't reach bitcoind.</p>
+            <% } else { %>
+            <div class="grid">
+                <div><label>Height</label><strong><%= fmtN(node.tip_height) %></strong></div>
+                <div><label>Time since last block</label><strong title="<%= fmtTs(node.tip_observed_at) %>"><%= ago(node.tip_observed_at) %></strong></div>
+                <div><label>Last poll</label><strong title="<%= fmtTs(node.updated_at) %>"><%= ago(node.updated_at) %></strong></div>
+            </div>
+            <p class="mono small muted" style="margin-top:0.5em; word-break:break-all"><%= node.tip_hash %></p>
+            <% } %>
+        </section>
+
+        <section class="card">
             <h2>Pool hashrate</h2>
             <div class="grid">
                 <div><label>Last 5 min</label><strong><%= fmtHashrate(ov.hashrate_5m) %></strong></div>

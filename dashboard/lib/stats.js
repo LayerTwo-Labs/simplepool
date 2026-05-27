@@ -257,6 +257,26 @@ export function worker(handle, name, windowSec = 86400) {
     };
 }
 
+/* Latest tip the C proxy is mining on, mirrored from getblocktemplate.
+ * Returns null if the proxy hasn't recorded a tip yet (fresh DB). */
+export function nodeStatus(handle) {
+    const d = db(handle);
+    if (!d) return null;
+    const row = d.prepare(
+        'SELECT tip_height, tip_hash, tip_observed_at, updated_at FROM node_status WHERE id = 1'
+    ).get();
+    if (!row) return null;
+    const nowSec = Math.floor(Date.now() / 1000);
+    return {
+        tip_height: row.tip_height,
+        tip_hash: row.tip_hash,
+        tip_observed_at: row.tip_observed_at,
+        updated_at: row.updated_at,
+        seconds_since_tip:    row.tip_observed_at ? nowSec - row.tip_observed_at : null,
+        seconds_since_update: row.updated_at      ? nowSec - row.updated_at      : null,
+    };
+}
+
 export function recentBlocks(handle, limit = 25) {
     const d = db(handle);
     if (!d) return [];

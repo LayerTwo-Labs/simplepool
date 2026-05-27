@@ -51,6 +51,15 @@ int store_record_share_addr(store_t *s, const char *worker_name,
                             uint64_t ts_ms, double difficulty,
                             int is_block, const char *share_hash_or_null);
 
+/* Record / refresh the upstream bitcoind tip the proxy is mining on.
+ * Single-row upsert keyed on id=1. tip_observed_at is preserved when
+ * (height, hash) match the existing row, so 'time since last tip change'
+ * stays meaningful across repeated polls of the same tip. Synchronous —
+ * not routed through the writer thread (it's called at most once per
+ * bitcoind_poll_interval_ms). */
+int store_record_node_tip(store_t *s, int height, const char *hash,
+                          uint64_t observed_ts_s, uint64_t updated_ts_s);
+
 /* Flush and wait until all currently-queued events are committed. Useful
  * for tests and clean shutdown before exit. Returns 0 ok, negative on
  * timeout (default 5s). */

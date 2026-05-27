@@ -27,8 +27,9 @@ app.get('/', (req, res) => {
     const lb = stats.leaderboard(db);
     const lbAddr = stats.leaderboardByAddress(db);
     const blocks = stats.recentBlocks(db, 5);
+    const node = stats.nodeStatus(db);
     res.render('index', {
-        ov, lb, lbAddr, blocks,
+        ov, lb, lbAddr, blocks, node,
         fmtHashrate: stats.fmtHashrate,
         fmtBtc: stats.fmtBtc,
     });
@@ -51,6 +52,7 @@ app.get('/blocks', (req, res) => {
 });
 
 app.get('/api/overview', (req, res) => res.json(stats.overview(db)));
+app.get('/api/node', (req, res) => res.json(stats.nodeStatus(db) || {}));
 app.get('/api/leaderboard', (req, res) => res.json(stats.leaderboard(db)));
 app.get('/api/leaderboard/by-address', (req, res) => res.json(stats.leaderboardByAddress(db)));
 app.get('/api/worker/:name', (req, res) => {

@@ -284,6 +284,15 @@ static void *tip_watcher(void *arg) {
             continue;
         }
 
+        /* GBT returns the height of the NEXT block to mine and the hash
+         * of the current tip in prev_hash_hex. Mirror that into the DB
+         * so the dashboard can show 'latest block from the node' and
+         * 'time since the last block' without any RPC of its own.
+         * The upsert preserves tip_observed_at when the tip is the same. */
+        uint64_t now_s = (uint64_t)time(NULL);
+        store_record_node_tip(s->store, t->height - 1, t->prev_hash_hex,
+                              now_s, now_s);
+
         int need_rebuild = 0;
         pthread_mutex_lock(&s->lock);
         if (t->height != s->last_height ||
@@ -423,6 +432,14 @@ int main(int argc, char **argv) {
     sctx.last_height = tmpl->height;
     snprintf(sctx.last_prev_hash, sizeof sctx.last_prev_hash, "%s", tmpl->prev_hash_hex);
     sctx.last_built_ms = now_ms();
+
+    /* Seed node_status from the initial template so the dashboard has data
+     * to show before the first watcher poll fires. */
+    {
+        uint64_t now_s = (uint64_t)time(NULL);
+        store_record_node_tip(store, tmpl->height - 1, tmpl->prev_hash_hex,
+                              now_s, now_s);
+    }
 
     /* Start stratum server. */
     stratum_cfg_t stcfg;
