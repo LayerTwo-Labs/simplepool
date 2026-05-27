@@ -49,6 +49,7 @@ a:hover { text-decoration: underline; }
     margin-bottom: 20px;
 }
 .card.warn { border-color: var(--warn); }
+.card.info { border-left: 3px solid var(--accent); }
 .card h2 {
     margin: 0 0 14px;
     font-size: 13px;

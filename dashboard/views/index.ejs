@@ -32,6 +32,21 @@ const ago = (t) => {
             </div>
         <% } %>
 
+        <section class="card info">
+            <h2>About the numbers on this page</h2>
+            <p class="muted small">
+                This is the <strong>solo build</strong> of simplepool / Sidepool. <strong>Shares</strong>
+                here are accepted Proof-of-Work submissions below your worker
+                target — they are <em>not</em> payout claims and they do not
+                accrue a balance. You only get paid when a share also crosses
+                the network target and becomes a block: in that case the
+                miner's address in the coinbase receives ~99% of the subsidy
+                directly on chain. Shares are kept for hashrate estimation,
+                per-rig accountability, and to seed the same data model that
+                the upcoming PPS pool will bill against.
+            </p>
+        </section>
+
         <section class="card">
             <h2>Bitcoin node tip</h2>
             <% if (!node || node.tip_height == null) { %>

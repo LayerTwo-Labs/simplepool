@@ -44,6 +44,30 @@ height. The `shares` and `workers` tables exist purely so the dashboard
 can show a leaderboard, per-worker drilldown, and historical "blocks
 found by the pool" view.
 
+### A note on terminology: "share" vs "work"
+
+The codebase, schema, dashboard, and API all call accepted submissions
+**shares** — never "work units." That's a deliberate choice we want to
+hold even though this is currently solo-mode:
+
+- *Share* is the canonical stratum term every miner knows. ASIC
+  firmware, mining-pool dashboards, monitoring tools, and blog posts
+  all use it. Reusing a different word here would just confuse the
+  audience.
+- The same column / table / API names will carry through to the PPS
+  build, where shares **are** the unit of account that gets billed.
+  Renaming `shares` → `work_units` now and back again later would
+  churn schema, queries, EJS templates, and any external consumer.
+- The meaning shift between solo and PPS is *semantic*, not lexical.
+  We surface it with an explanatory banner on the dashboard and with
+  the Sidepool quote above, rather than by renaming things.
+
+**In this solo build**, a share is an accepted Proof-of-Work submission
+below the connection's worker target. It is *not* a payout claim and
+does not accrue a balance — it exists for hashrate estimation,
+per-rig accountability, and as the data primitive the upcoming PPS
+billing engine will consume.
+
 ### How the solo flow actually works
 
 ```mermaid
