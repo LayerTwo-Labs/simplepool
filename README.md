@@ -44,6 +44,84 @@ height. The `shares` and `workers` tables exist purely so the dashboard
 can show a leaderboard, per-worker drilldown, and historical "blocks
 found by the pool" view.
 
+### How the solo flow actually works
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as Miner (ASIC)
+    participant P as simplepool<br/>(stratum :3334)
+    participant B as bitcoind<br/>(JSON-RPC)
+    participant S as SQLite<br/>(shares.db)
+    participant D as Dashboard<br/>(read-only)
+
+    Note over P,B: startup — fetch initial template
+    P->>B: getblocktemplate
+    B-->>P: height, prev_hash, txs, network_target, value_sats
+    P->>P: build initial stratum_job_t (merkle branches, nbits, ntime)
+
+    Note over M,P: per-connection setup
+    M->>P: TCP connect :3334
+    M->>P: mining.subscribe
+    P-->>M: extranonce1 (4B, per-conn), en2_size
+    M->>P: mining.authorize "<bc1q…>[.rig_label]"
+    P->>P: validate bech32/base58 → cache payout_address<br/>arm vardiff window
+    P-->>M: result: true
+    P-->>M: mining.set_difficulty (initial_diff)
+    P-->>M: mining.notify (current job, clean=true)<br/>cb1 / cb2 rendered against THIS miner's address
+
+    Note over P,B: background tip watcher
+    loop every bitcoind_poll_interval_ms
+        P->>B: getblocktemplate
+        B-->>P: template
+        alt new tip
+            P->>P: rebuild stratum_job_t
+            P-->>M: mining.notify (new job, clean=true) — broadcast to all conns
+        end
+    end
+
+    Note over M,P: hot loop — submit shares
+    loop until disconnect
+        M->>P: mining.submit (job_id, en2, ntime, nonce, version_bits)
+        P->>P: assemble coinbase, recompute merkle root,<br/>hash header, compare to worker target
+        alt below worker target (good share)
+            P-->>M: result: true
+            P->>S: INSERT share (worker_id, ts, diff,<br/>is_block, share_hash)
+            alt also ≤ network target (BLOCK!)
+                P->>B: submitblock <full hex>
+                B-->>P: null / "inconclusive" / reject reason
+                P->>S: INSERT blocks_found (height, hash,<br/>finder, reward, fee)
+            end
+            P->>P: vardiff tick — if window elapsed,<br/>retarget difficulty
+            opt diff changed
+                P-->>M: mining.set_difficulty (new diff)
+            end
+        else above worker target
+            P-->>M: error: low difficulty
+            P->>S: INSERT reject (worker_name, reason)
+        end
+    end
+
+    Note over D,S: read-only dashboard
+    D->>S: SELECT … (overview / leaderboard / worker / blocks)
+    D-->>D: render http://pool.…/
+```
+
+Key invariants the diagram glosses over but the code enforces:
+
+- **Per-connection coinbase.** Each miner's `cb1`/`cb2` pay *that*
+  miner's address; the operator fee output is identical across miners.
+  Two ASICs on the same address but different `.rig_label` get
+  distinct `extranonce1` values, so their work never overlaps.
+- **WAL writes are batched.** `store_record_share` enqueues into a
+  lock-free ring; the writer thread commits batches every
+  `commit_window_ms` (default 100) or every `commit_max_shares`
+  (default 100), whichever first.
+- **vardiff doesn't invalidate the active job.** A
+  `mining.set_difficulty` only relaxes/tightens the per-share check;
+  the current `mining.notify` stays valid against it. We do not force
+  a re-notify on a difficulty change.
+
 ### Stratum username convention
 
 The `mining.authorize` username must start with the miner's Bitcoin
