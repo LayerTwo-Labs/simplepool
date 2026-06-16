@@ -417,6 +417,108 @@ static void test_build_from_template_fee_split(void) {
     printf("ok: coinbase_build_from_template fee split\n");
 }
 
+/* Drivechain-from-template: the server-supplied coinbase has its spendable
+ * output replaced by [OP_DRIVECHAIN, OP_RETURN(dest), operator fee],
+ * while the BIP301 commitment and witness commitment are preserved in
+ * place. */
+static void test_build_drivechain_from_template(void) {
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+    int has_witness = -1;
+    int64_t miner_sats = 0, fee_sats = 0;
+    const uint8_t payload[] = "PoolReserveAddrBytes";
+
+    int rc = coinbase_build_drivechain_from_template(
+        ENF_COINBASE_HEX, 9,
+        payload, sizeof payload - 1,
+        ENF_ADDR, /*fee_bps=*/100, "/x/",
+        4, 4,
+        &parts, &has_witness, &miner_sats, &fee_sats, err, sizeof err);
+    if (rc != 0) fprintf(stderr, "drivechain_from_template err: %s\n", err);
+    assert(rc == 0);
+    assert(has_witness == 1);
+    assert(fee_sats   == 50000000LL);
+    assert(miner_sats == 4950000000LL);
+
+    size_t total = parts.cb1_len + 8 + parts.cb2_len;
+    uint8_t *tx = (uint8_t *)malloc(total);
+    memcpy(tx, parts.cb1, parts.cb1_len);
+    memset(tx + parts.cb1_len, 0xaa, 4);
+    memset(tx + parts.cb1_len + 4, 0xbb, 4);
+    memcpy(tx + parts.cb1_len + 8, parts.cb2, parts.cb2_len);
+
+    /* Skip header to outputs. */
+    size_t off = 4;
+    uint64_t in_count = 0;
+    assert(read_varint(tx, total, &off, &in_count) == 0);
+    off += 36;
+    uint64_t ss_len = 0;
+    assert(read_varint(tx, total, &off, &ss_len) == 0);
+    off += ss_len + 4;
+    uint64_t out_count = 0;
+    assert(read_varint(tx, total, &off, &out_count) == 0);
+    /* Source had 3 outputs (commitment, spendable, witness). We replace
+     * the spendable with 3 (drivechain + op_return + operator), so total = 5. */
+    assert(out_count == 5);
+
+    /* out0: preserved BIP301 commitment (value=0, OP_RETURN). */
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 0);
+    uint64_t l = 0;
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(l == 6 && tx[off] == 0x6a);
+    off += l;
+
+    /* out1: OP_DRIVECHAIN(9), value = miner_sats. */
+    v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 4950000000ULL);
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(l == 4 && tx[off] == 0xb4 && tx[off + 1] == 0x01 &&
+           tx[off + 2] == 0x09 && tx[off + 3] == 0x51);
+    off += l;
+
+    /* out2: OP_RETURN <payload>, immediately after the drivechain output. */
+    v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 0);
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(tx[off] == 0x6a);
+    assert(tx[off + 1] == (uint8_t)(sizeof payload - 1));
+    assert(memcmp(tx + off + 2, payload, sizeof payload - 1) == 0);
+    off += l;
+
+    /* out3: operator fee (P2WPKH, 50_000_000 sats). */
+    v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 50000000ULL);
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(l == 22 && tx[off] == 0x00 && tx[off + 1] == 0x14);
+    off += l;
+
+    /* out4: witness commitment preserved at the end. */
+    v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 0);
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(l == 38 && tx[off] == 0x6a && tx[off + 1] == 0x24);
+    off += l;
+
+    for (int i = 0; i < 4; i++) assert(tx[off + i] == 0);
+    off += 4;
+    assert(off == total);
+
+    free(tx);
+    coinbase_parts_free(&parts);
+    printf("ok: drivechain_from_template (replace spendable, preserve commitments)\n");
+}
+
 /* Drivechain coinbase: parse outputs to confirm layout matches the BIP300
  * enforcer expectation [DRIVECHAIN, OP_RETURN(dest), operator, witness]. */
 static void test_build_drivechain(void) {
@@ -582,6 +684,7 @@ int main(void) {
     test_build_drivechain();
     test_build_drivechain_no_fee();
     test_build_drivechain_payload_too_big();
+    test_build_drivechain_from_template();
     printf("test_coinbase: all tests passed\n");
     return 0;
 }

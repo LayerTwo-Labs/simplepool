@@ -125,4 +125,36 @@ int coinbase_build_drivechain(uint32_t height, int64_t value_sats,
                               int64_t *out_miner_sats, int64_t *out_fee_sats,
                               char *errbuf, size_t errlen);
 
+/* Drivechain variant of coinbase_build_from_template. Takes a backend-supplied
+ * coinbase (e.g. from the CUSF enforcer, which already speaks BIP300 for the
+ * mainchain side), parses its outputs, and rewrites the single spendable
+ * output into the drivechain-deposit triplet:
+ *
+ *   <preserved server outputs ... >
+ *   [k+0] OP_DRIVECHAIN(side)     value = miner_sats
+ *   [k+1] OP_RETURN <payload>     value = 0
+ *   [k+2] operator fee (optional) value = fee_sats
+ *   <preserved server outputs ... >
+ *
+ * Other server outputs (BIP301 ack commitments, witness commitment, etc.)
+ * are preserved byte-for-byte and in order. has_witness mirrors the source
+ * tx's serialization (caller re-attaches the witness reserved value at
+ * block-assembly time).
+ *
+ * Returns 0 ok, negative on error (errbuf populated). */
+int coinbase_build_drivechain_from_template(const char *coinbase_tx_hex,
+                                            int sidechain_number,
+                                            const uint8_t *op_return_payload,
+                                            size_t op_return_payload_len,
+                                            const char *operator_address,
+                                            int fee_bps,
+                                            const char *coinbase_tag,
+                                            size_t extranonce1_size,
+                                            size_t extranonce2_size,
+                                            coinbase_parts_t *out,
+                                            int *out_has_witness,
+                                            int64_t *out_miner_sats,
+                                            int64_t *out_fee_sats,
+                                            char *errbuf, size_t errlen);
+
 #endif

@@ -459,25 +459,29 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
     char err[256] = {0};
     int rc;
     if (s->cfg.pps_enabled) {
-        /* PPS / Thunder: every miner's coinbase is identical — the reward is
-         * deposited to the pool's Thunder reserve via BIP300; per-miner
-         * accounting happens off-chain via pps_credits. The backend-coinbase
-         * (coinbasetxn) path is not supported in PPS mode yet because
-         * redirecting the server reward to a drivechain output requires
-         * mutating its OP_RETURN; the CUSF enforcer backend already speaks
-         * BIP300 and can be lit up later. */
+        /* PPS / Thunder: every miner's coinbase is identical — the reward
+         * is deposited to the pool's Thunder reserve via BIP300; per-miner
+         * accounting happens off-chain via pps_credits. */
         if (job->coinbasetxn_hex) {
-            LOG_WARN("stratum: pps mode with backend coinbasetxn not supported yet");
-            return -1;
+            rc = coinbase_build_drivechain_from_template(
+                job->coinbasetxn_hex,
+                s->cfg.thunder_sidechain_number,
+                s->cfg.pps_op_return_payload,
+                s->cfg.pps_op_return_payload_len,
+                s->cfg.operator_address, s->cfg.fee_bps,
+                s->cfg.coinbase_tag,
+                job->en1_size, job->en2_size,
+                &parts, NULL, NULL, NULL, err, sizeof err);
+        } else {
+            rc = coinbase_build_drivechain(job->height, job->value_sats,
+                                           s->cfg.thunder_sidechain_number,
+                                           s->cfg.pps_op_return_payload,
+                                           s->cfg.pps_op_return_payload_len,
+                                           s->cfg.operator_address, s->cfg.fee_bps,
+                                           job->wc_hex, s->cfg.coinbase_tag,
+                                           job->en1_size, job->en2_size,
+                                           &parts, NULL, NULL, err, sizeof err);
         }
-        rc = coinbase_build_drivechain(job->height, job->value_sats,
-                                       s->cfg.thunder_sidechain_number,
-                                       s->cfg.pps_op_return_payload,
-                                       s->cfg.pps_op_return_payload_len,
-                                       s->cfg.operator_address, s->cfg.fee_bps,
-                                       job->wc_hex, s->cfg.coinbase_tag,
-                                       job->en1_size, job->en2_size,
-                                       &parts, NULL, NULL, err, sizeof err);
     } else if (job->coinbasetxn_hex) {
         /* Backend dictated the coinbase (e.g. CUSF enforcer): build from it,
          * redirecting the reward output to this miner and preserving the
