@@ -417,6 +417,159 @@ static void test_build_from_template_fee_split(void) {
     printf("ok: coinbase_build_from_template fee split\n");
 }
 
+/* Drivechain coinbase: parse outputs to confirm layout matches the BIP300
+ * enforcer expectation [DRIVECHAIN, OP_RETURN(dest), operator, witness]. */
+static void test_build_drivechain(void) {
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+    int64_t miner_sats = 0, fee_sats = 0;
+
+    /* witness commitment OP_RETURN bytes (same as the structural test). */
+    char wc_hex[2 + 2 + 8 + 64 + 1] = {0};
+    snprintf(wc_hex, sizeof wc_hex, "6a24aa21a9ed");
+    for (int i = 0; i < 32; i++) strcat(wc_hex, "cd");
+
+    const uint8_t payload[] = "TPoolReserve1abcdefgh";  /* opaque to coinbase */
+    int rc = coinbase_build_drivechain(
+        800000, 5000000000LL,
+        /*sidechain=*/9,
+        payload, sizeof payload - 1,
+        /*operator=*/"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+        /*fee_bps=*/100,
+        wc_hex, "/simplepool/",
+        4, 4,
+        &parts, &miner_sats, &fee_sats, err, sizeof err);
+    if (rc != 0) fprintf(stderr, "build_drivechain err: %s\n", err);
+    assert(rc == 0);
+    assert(fee_sats   == 50000000LL);
+    assert(miner_sats == 4950000000LL);
+
+    size_t total = parts.cb1_len + 8 + parts.cb2_len;
+    uint8_t *tx = (uint8_t *)malloc(total);
+    assert(tx);
+    memcpy(tx, parts.cb1, parts.cb1_len);
+    memset(tx + parts.cb1_len, 0xaa, 4);
+    memset(tx + parts.cb1_len + 4, 0xbb, 4);
+    memcpy(tx + parts.cb1_len + 8, parts.cb2, parts.cb2_len);
+
+    /* Walk to outputs. */
+    size_t off = 4;
+    uint64_t in_count = 0;
+    assert(read_varint(tx, total, &off, &in_count) == 0);
+    off += 36;
+    uint64_t ss_len = 0;
+    assert(read_varint(tx, total, &off, &ss_len) == 0);
+    off += ss_len + 4;
+    uint64_t out_count = 0;
+    assert(read_varint(tx, total, &off, &out_count) == 0);
+    assert(out_count == 4); /* drivechain + op_return + operator + witness */
+
+    /* out0: OP_DRIVECHAIN(9), value = miner_sats. */
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 4950000000ULL);
+    uint64_t l = 0;
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(l == 4);
+    assert(tx[off]     == 0xb4);   /* OP_NOP5 */
+    assert(tx[off + 1] == 0x01);   /* PUSH1 */
+    assert(tx[off + 2] == 0x09);   /* sidechain 9 */
+    assert(tx[off + 3] == 0x51);   /* OP_TRUE */
+    off += l;
+
+    /* out1: OP_RETURN <payload>, value = 0. MUST be immediately after [0]. */
+    v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 0);
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(tx[off] == 0x6a);
+    /* OP_PUSHBYTES_<len> for payloads <= 75. */
+    assert(tx[off + 1] == (uint8_t)(sizeof payload - 1));
+    assert(memcmp(tx + off + 2, payload, sizeof payload - 1) == 0);
+    off += l;
+
+    /* out2: operator BTC fee. */
+    v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 50000000ULL);
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(l == 22 && tx[off] == 0x00 && tx[off + 1] == 0x14);
+    off += l;
+
+    /* out3: witness commitment preserved. */
+    v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 0);
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(l == 38 && tx[off] == 0x6a && tx[off + 1] == 0x24);
+    off += l;
+
+    for (int i = 0; i < 4; i++) assert(tx[off + i] == 0); /* locktime */
+    off += 4;
+    assert(off == total);
+
+    free(tx);
+    coinbase_parts_free(&parts);
+    printf("ok: drivechain coinbase layout\n");
+}
+
+/* Drivechain coinbase with fee_bps=0: only [drivechain, op_return, witness]. */
+static void test_build_drivechain_no_fee(void) {
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+    int64_t miner_sats = 0, fee_sats = 0;
+    const uint8_t payload[] = "destination-bytes";
+
+    int rc = coinbase_build_drivechain(
+        800000, 5000000000LL, 9,
+        payload, sizeof payload - 1,
+        /*operator=*/NULL, /*fee_bps=*/0,
+        /*witness=*/NULL, "/simplepool/",
+        4, 4,
+        &parts, &miner_sats, &fee_sats, err, sizeof err);
+    assert(rc == 0);
+    assert(fee_sats == 0);
+    assert(miner_sats == 5000000000LL);
+
+    /* Outputs count = 2 (no fee, no witness). */
+    size_t total = parts.cb1_len + 8 + parts.cb2_len;
+    uint8_t *tx = (uint8_t *)malloc(total);
+    memcpy(tx, parts.cb1, parts.cb1_len);
+    memset(tx + parts.cb1_len, 0, 8);
+    memcpy(tx + parts.cb1_len + 8, parts.cb2, parts.cb2_len);
+    size_t off = 4;
+    uint64_t in_count = 0;
+    assert(read_varint(tx, total, &off, &in_count) == 0);
+    off += 36;
+    uint64_t ss_len = 0;
+    assert(read_varint(tx, total, &off, &ss_len) == 0);
+    off += ss_len + 4;
+    uint64_t out_count = 0;
+    assert(read_varint(tx, total, &off, &out_count) == 0);
+    assert(out_count == 2);
+    free(tx);
+    coinbase_parts_free(&parts);
+    printf("ok: drivechain coinbase no-fee\n");
+}
+
+/* Drivechain rejects oversized OP_RETURN payloads (>80 bytes). */
+static void test_build_drivechain_payload_too_big(void) {
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+    uint8_t big[100];
+    memset(big, 'x', sizeof big);
+    int rc = coinbase_build_drivechain(
+        800000, 5000000000LL, 9,
+        big, sizeof big, NULL, 0, NULL, NULL,
+        4, 4, &parts, NULL, NULL, err, sizeof err);
+    assert(rc < 0);
+    printf("ok: drivechain rejects >80-byte op_return\n");
+}
+
 int main(void) {
     test_p2pkh_address();
     test_p2wpkh_address();
@@ -426,6 +579,9 @@ int main(void) {
     test_bip34_small_height_uses_opn();
     test_build_from_template();
     test_build_from_template_fee_split();
+    test_build_drivechain();
+    test_build_drivechain_no_fee();
+    test_build_drivechain_payload_too_big();
     printf("test_coinbase: all tests passed\n");
     return 0;
 }
