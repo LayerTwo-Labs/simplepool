@@ -71,6 +71,15 @@ static const char *SCHEMA_SQL =
     "  tip_hash        TEXT,"
     "  tip_observed_at INTEGER,"
     "  updated_at      INTEGER"
+    ");"
+    /* PPS accrual ledger. One row per worker; the C proxy only INCREMENTS
+     * accrued_sats. paid_sats is updated by a downstream payout service
+     * that issues Thunder transactions to drain accrued - paid. */
+    "CREATE TABLE IF NOT EXISTS pps_credits ("
+    "  worker_id     INTEGER PRIMARY KEY REFERENCES workers(id),"
+    "  accrued_sats  INTEGER NOT NULL DEFAULT 0,"
+    "  paid_sats     INTEGER NOT NULL DEFAULT 0,"
+    "  last_updated  INTEGER NOT NULL"
     ");";
 
 /* Forward-compat: ALTER existing DBs to add columns that didn't exist in
@@ -85,6 +94,7 @@ static const char *MIGRATIONS_SQL[] = {
 #define EV_SHARE   1
 #define EV_REJECT  2
 #define EV_BLOCK   3
+#define EV_CREDIT  4
 
 #define WORKER_NAME_MAX 128
 #define HASH_STR_MAX    96
@@ -101,8 +111,9 @@ typedef struct {
     int      height;
     int64_t  reward_sats;       /* EV_BLOCK only */
     int64_t  fee_sats;          /* EV_BLOCK only */
+    int64_t  delta_sats;        /* EV_CREDIT only */
     char     worker_name[WORKER_NAME_MAX];
-    char     payout_address[ADDR_MAX];   /* EV_SHARE, EV_BLOCK: may be empty */
+    char     payout_address[ADDR_MAX];   /* EV_SHARE, EV_BLOCK, EV_CREDIT: may be empty */
     char     hash[HASH_STR_MAX];
     char     reason[REASON_MAX];
 } event_t;
@@ -122,6 +133,7 @@ struct store {
     sqlite3_stmt *st_insert_reject;
     sqlite3_stmt *st_insert_block;
     sqlite3_stmt *st_upsert_node_tip;
+    sqlite3_stmt *st_upsert_credit;
     pthread_mutex_t node_tip_mu;   /* serialise binds on st_upsert_node_tip */
 
     /* Ring buffer */
@@ -150,6 +162,7 @@ struct store {
     _Atomic uint64_t rejects_queued;
     _Atomic uint64_t rejects_committed;
     _Atomic uint64_t blocks_committed;
+    _Atomic uint64_t credits_committed;
     _Atomic uint64_t batches;
     _Atomic uint64_t pg_errors;
 
@@ -320,6 +333,24 @@ static void process_event(store_t *s, const event_t *ev) {
             atomic_fetch_add(&s->blocks_committed, 1);
         }
         sqlite3_reset(s->st_insert_block);
+    } else if (ev->kind == EV_CREDIT) {
+        int64_t wid = resolve_worker_id(s, ev->worker_name,
+                                        ev->payout_address, ev->ts_ms);
+        if (wid < 0) {
+            atomic_fetch_add(&s->pg_errors, 1);
+            return;
+        }
+        sqlite3_reset(s->st_upsert_credit);
+        sqlite3_clear_bindings(s->st_upsert_credit);
+        sqlite3_bind_int64(s->st_upsert_credit, 1, wid);
+        sqlite3_bind_int64(s->st_upsert_credit, 2, ev->delta_sats);
+        sqlite3_bind_int64(s->st_upsert_credit, 3, (sqlite3_int64)(ev->ts_ms / 1000));
+        if (sqlite3_step(s->st_upsert_credit) != SQLITE_DONE) {
+            atomic_fetch_add(&s->pg_errors, 1);
+        } else {
+            atomic_fetch_add(&s->credits_committed, 1);
+        }
+        sqlite3_reset(s->st_upsert_credit);
     }
 }
 
@@ -497,6 +528,15 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         "    ELSE node_status.tip_observed_at "
         "  END, "
         "  updated_at = excluded.updated_at";
+    /* PPS credit: increment accrued_sats for this worker_id. The downstream
+     * payout worker reads (accrued_sats - paid_sats) and updates paid_sats
+     * after a successful Thunder tx. */
+    static const char *Q_UPSERT_CREDIT =
+        "INSERT INTO pps_credits (worker_id, accrued_sats, paid_sats, last_updated) "
+        "VALUES (?, ?, 0, ?) "
+        "ON CONFLICT(worker_id) DO UPDATE SET "
+        "  accrued_sats = pps_credits.accrued_sats + excluded.accrued_sats, "
+        "  last_updated = excluded.last_updated";
 
     pthread_mutex_init(&s->node_tip_mu, NULL);
 
@@ -504,7 +544,8 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         sqlite3_prepare_v2(s->db, Q_INS_SHARE, -1, &s->st_insert_share, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(s->db, Q_INS_REJECT, -1, &s->st_insert_reject, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(s->db, Q_INS_BLOCK, -1, &s->st_insert_block, NULL) != SQLITE_OK ||
-        sqlite3_prepare_v2(s->db, Q_UPSERT_NODE_TIP, -1, &s->st_upsert_node_tip, NULL) != SQLITE_OK)
+        sqlite3_prepare_v2(s->db, Q_UPSERT_NODE_TIP, -1, &s->st_upsert_node_tip, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(s->db, Q_UPSERT_CREDIT, -1, &s->st_upsert_credit, NULL) != SQLITE_OK)
     {
         LOG_ERROR("store: prepare failed: %s", sqlite3_errmsg(s->db));
         store_close(s);
@@ -539,6 +580,7 @@ void store_close(store_t *s) {
     if (s->st_insert_reject) sqlite3_finalize(s->st_insert_reject);
     if (s->st_insert_block)  sqlite3_finalize(s->st_insert_block);
     if (s->st_upsert_node_tip) sqlite3_finalize(s->st_upsert_node_tip);
+    if (s->st_upsert_credit) sqlite3_finalize(s->st_upsert_credit);
     if (s->db) sqlite3_close(s->db);
     pthread_mutex_destroy(&s->node_tip_mu);
     pthread_mutex_destroy(&s->mu);
@@ -618,6 +660,26 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
     if (finder_name) strncpy(ev.worker_name, finder_name, WORKER_NAME_MAX - 1);
     if (finder_address)
         strncpy(ev.payout_address, finder_address, ADDR_MAX - 1);
+    if (enqueue(s, &ev) != 0) {
+        atomic_fetch_add(&s->shares_dropped, 1);
+        return -1;
+    }
+    return 0;
+}
+
+int store_record_credit(store_t *s, const char *worker_name,
+                        const char *payout_address,
+                        uint64_t ts_ms, int64_t delta_sats)
+{
+    if (!s || !worker_name || delta_sats <= 0) return -1;
+    event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = EV_CREDIT;
+    ev.ts_ms = ts_ms;
+    ev.delta_sats = delta_sats;
+    strncpy(ev.worker_name, worker_name, WORKER_NAME_MAX - 1);
+    if (payout_address)
+        strncpy(ev.payout_address, payout_address, ADDR_MAX - 1);
     if (enqueue(s, &ev) != 0) {
         atomic_fetch_add(&s->shares_dropped, 1);
         return -1;

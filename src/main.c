@@ -244,6 +244,26 @@ static void on_share_cb(void *ctx, const char *worker_name,
         broadcast_share(s->bcast, worker_name, payout_address,
                         ts_ms, difficulty, is_block, block_hash_or_null);
     }
+    /* PPS accrual. Credit the worker proportional to share difficulty.
+     * Truncates to whole sats; sub-sat dust accumulates per-share so
+     * over many shares the rounding error is bounded by 1 sat per row. */
+    if (s && s->cfg && strcmp(s->cfg->pool_mode, "pps") == 0 &&
+        s->cfg->pps_sats_per_diff > 0.0) {
+        int64_t delta = (int64_t)(difficulty * s->cfg->pps_sats_per_diff);
+        if (delta > 0) {
+            if (s->store) {
+                store_record_credit(s->store, worker_name, payout_address,
+                                    ts_ms, delta);
+            }
+            if (s->bcast) {
+                /* accrued_total is the running balance after this credit.
+                 * Since the writer thread is async we don't know it
+                 * exactly; pass 0 and let consumers query SQLite for the
+                 * authoritative number. */
+                broadcast_credit(s->bcast, worker_name, ts_ms, delta, 0);
+            }
+        }
+    }
 }
 
 static void on_reject_cb(void *ctx, const char *worker_name, uint64_t ts_ms,
@@ -509,6 +529,48 @@ int main(int argc, char **argv) {
     stcfg.vardiff_min        = cfg.vardiff_min;
     stcfg.vardiff_max        = cfg.vardiff_max;
     stcfg.vardiff_window_sec = cfg.vardiff_window_sec;
+
+    /* PPS / Thunder. Precompute the OP_RETURN bytes for the drivechain
+     * coinbase: either the explicit hex from config, or the ASCII of the
+     * pool's base58 Thunder address (matches Thunder's wallet behaviour). */
+    static uint8_t pps_payload[80];
+    size_t pps_payload_len = 0;
+    stcfg.pps_enabled = (strcmp(cfg.pool_mode, "pps") == 0);
+    stcfg.thunder_sidechain_number = cfg.thunder_sidechain_number;
+    if (stcfg.pps_enabled) {
+        if (cfg.thunder_op_return_hex[0]) {
+            size_t hlen = strlen(cfg.thunder_op_return_hex);
+            if (hlen % 2 != 0 || hlen / 2 > sizeof pps_payload) {
+                fprintf(stderr, "config: invalid thunder_op_return_hex (length)\n");
+                return 9;
+            }
+            for (size_t i = 0; i < hlen / 2; i++) {
+                int hi = hex_nibble(cfg.thunder_op_return_hex[2*i]);
+                int lo = hex_nibble(cfg.thunder_op_return_hex[2*i + 1]);
+                if (hi < 0 || lo < 0) {
+                    fprintf(stderr, "config: invalid thunder_op_return_hex (chars)\n");
+                    return 9;
+                }
+                pps_payload[i] = (uint8_t)((hi << 4) | lo);
+            }
+            pps_payload_len = hlen / 2;
+        } else {
+            size_t alen = strlen(cfg.pool_thunder_reserve_address);
+            if (alen == 0 || alen > sizeof pps_payload) {
+                fprintf(stderr,
+                        "config: pool_thunder_reserve_address empty or too long\n");
+                return 9;
+            }
+            memcpy(pps_payload, cfg.pool_thunder_reserve_address, alen);
+            pps_payload_len = alen;
+        }
+        stcfg.pps_op_return_payload     = pps_payload;
+        stcfg.pps_op_return_payload_len = pps_payload_len;
+        LOG_INFO("pool_mode=pps: sidechain=%d, op_return_payload=%zu bytes, "
+                 "pps_sats_per_diff=%.2f",
+                 cfg.thunder_sidechain_number, pps_payload_len,
+                 cfg.pps_sats_per_diff);
+    }
     stcfg.ctx            = &sctx;
     stcfg.on_share       = on_share_cb;
     stcfg.on_reject      = on_reject_cb;

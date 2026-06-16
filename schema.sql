@@ -52,3 +52,14 @@ CREATE TABLE IF NOT EXISTS node_status (
   tip_observed_at INTEGER,  /* unix seconds — when we first saw this tip */
   updated_at      INTEGER   /* unix seconds — last successful poll */
 );
+
+/* PPS accrual ledger. One row per worker. The C proxy only INCREMENTs
+ * accrued_sats; a separate payout service updates paid_sats after
+ * issuing Thunder transactions for (accrued_sats - paid_sats). Empty in
+ * solo mode. */
+CREATE TABLE IF NOT EXISTS pps_credits (
+  worker_id     INTEGER PRIMARY KEY REFERENCES workers(id),
+  accrued_sats  INTEGER NOT NULL DEFAULT 0,
+  paid_sats     INTEGER NOT NULL DEFAULT 0,
+  last_updated  INTEGER NOT NULL
+);

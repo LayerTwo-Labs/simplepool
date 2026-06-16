@@ -61,11 +61,29 @@ typedef struct {
     int    bind_port;
     int    max_conns;            /* default 500 */
     double initial_diff;         /* default 1.0 */
-    /* Coinbase split — every connection's coinbase pays the miner directly
-     * and routes (value * fee_bps / 10000) to operator_address. */
+    /* Coinbase split — in solo mode each connection's coinbase pays the
+     * miner directly. In PPS mode (pps_enabled=1) every coinbase instead
+     * deposits to the pool's Thunder reserve via the BIP300 drivechain
+     * output. In both modes (value * fee_bps / 10000) goes to operator_address
+     * as a BTC fee. */
     char   operator_address[128];
     int    fee_bps;
     char   coinbase_tag[64];
+
+    /* PPS / Thunder. When pps_enabled = 1:
+     *  - mining.authorize accepts Thunder addresses (base58 of 20-byte hash)
+     *  - per-connection coinbase rendering uses coinbase_build_drivechain
+     *    with the precomputed OP_RETURN payload below
+     *  - the share observer's payout_address argument is the miner's
+     *    Thunder address (for PPS accrual), not a Bitcoin address.
+     */
+    int     pps_enabled;
+    int     thunder_sidechain_number;
+    /* OP_RETURN payload bytes that ride next to every drivechain output.
+     * Typically the ASCII of the pool's base58 Thunder address. Owned by
+     * the caller (main.c precomputes from config). */
+    const uint8_t *pps_op_return_payload;
+    size_t  pps_op_return_payload_len;
 
     /* Vardiff (see config.h for prose). 0 disables and pins to initial_diff. */
     int    vardiff_enabled;

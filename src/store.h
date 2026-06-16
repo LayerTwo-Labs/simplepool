@@ -51,6 +51,13 @@ int store_record_share_addr(store_t *s, const char *worker_name,
                             uint64_t ts_ms, double difficulty,
                             int is_block, const char *share_hash_or_null);
 
+/* PPS credit: add delta_sats to the worker's accrued_sats in pps_credits.
+ * Async (writer thread). delta_sats must be > 0. payout_address (the
+ * miner's Thunder address) is tagged onto the workers row as usual. */
+int store_record_credit(store_t *s, const char *worker_name,
+                        const char *payout_address,
+                        uint64_t ts_ms, int64_t delta_sats);
+
 /* Record / refresh the upstream bitcoind tip the proxy is mining on.
  * Single-row upsert keyed on id=1. tip_observed_at is preserved when
  * (height, hash) match the existing row, so 'time since last tip change'

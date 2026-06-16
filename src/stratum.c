@@ -18,6 +18,7 @@
 #include "coinbase.h"
 #include "share.h"
 #include "log.h"
+#include "thunder.h"
 #include "cjson/cJSON.h"
 
 #include <arpa/inet.h>
@@ -457,7 +458,27 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
     coinbase_parts_t parts = {0};
     char err[256] = {0};
     int rc;
-    if (job->coinbasetxn_hex) {
+    if (s->cfg.pps_enabled) {
+        /* PPS / Thunder: every miner's coinbase is identical — the reward is
+         * deposited to the pool's Thunder reserve via BIP300; per-miner
+         * accounting happens off-chain via pps_credits. The backend-coinbase
+         * (coinbasetxn) path is not supported in PPS mode yet because
+         * redirecting the server reward to a drivechain output requires
+         * mutating its OP_RETURN; the CUSF enforcer backend already speaks
+         * BIP300 and can be lit up later. */
+        if (job->coinbasetxn_hex) {
+            LOG_WARN("stratum: pps mode with backend coinbasetxn not supported yet");
+            return -1;
+        }
+        rc = coinbase_build_drivechain(job->height, job->value_sats,
+                                       s->cfg.thunder_sidechain_number,
+                                       s->cfg.pps_op_return_payload,
+                                       s->cfg.pps_op_return_payload_len,
+                                       s->cfg.operator_address, s->cfg.fee_bps,
+                                       job->wc_hex, s->cfg.coinbase_tag,
+                                       job->en1_size, job->en2_size,
+                                       &parts, NULL, NULL, err, sizeof err);
+    } else if (job->coinbasetxn_hex) {
         /* Backend dictated the coinbase (e.g. CUSF enforcer): build from it,
          * redirecting the reward output to this miner and preserving the
          * mandatory commitment outputs. The witness commitment is already in
@@ -744,22 +765,43 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     memcpy(c->payout_address, worker, addr_len);
     c->payout_address[addr_len] = '\0';
 
-    uint8_t spk[64];
-    size_t  spk_len = 0;
     char    derr[128] = {0};
-    if (coinbase_address_to_script(c->payout_address, spk, sizeof spk,
-                                   &spk_len, derr, sizeof derr) < 0) {
-        if (s->cfg.on_reject) {
-            char rmsg[192];
-            snprintf(rmsg, sizeof rmsg, "invalid payout address: %s", derr);
-            s->cfg.on_reject(s->cfg.ctx, worker, now_ms(), rmsg);
+    if (s->cfg.pps_enabled) {
+        /* Thunder address: 20-byte hash160 in plain base58, or the
+         * 's<n>_<base58>_<hex6>' deposit-format wrapper. We don't need the
+         * decoded bytes here — the coinbase pays the pool reserve, not the
+         * miner — but we validate so a typo'd username can't accrue PPS. */
+        uint8_t th[20];
+        if (thunder_address_decode(c->payout_address, th, derr, sizeof derr) < 0) {
+            if (s->cfg.on_reject) {
+                char rmsg[192];
+                snprintf(rmsg, sizeof rmsg, "invalid thunder address: %s", derr);
+                s->cfg.on_reject(s->cfg.ctx, worker, now_ms(), rmsg);
+            }
+            c->payout_address[0] = '\0';
+            char emsg[192];
+            snprintf(emsg, sizeof emsg,
+                     "invalid thunder address in stratum username: %s", derr);
+            cJSON *err = make_error(24, emsg);
+            return emit_response(buf, len, id, NULL, err);
         }
-        c->payout_address[0] = '\0';
-        char emsg[192];
-        snprintf(emsg, sizeof emsg,
-                 "invalid payout address in stratum username: %s", derr);
-        cJSON *err = make_error(24, emsg);
-        return emit_response(buf, len, id, NULL, err);
+    } else {
+        uint8_t spk[64];
+        size_t  spk_len = 0;
+        if (coinbase_address_to_script(c->payout_address, spk, sizeof spk,
+                                       &spk_len, derr, sizeof derr) < 0) {
+            if (s->cfg.on_reject) {
+                char rmsg[192];
+                snprintf(rmsg, sizeof rmsg, "invalid payout address: %s", derr);
+                s->cfg.on_reject(s->cfg.ctx, worker, now_ms(), rmsg);
+            }
+            c->payout_address[0] = '\0';
+            char emsg[192];
+            snprintf(emsg, sizeof emsg,
+                     "invalid payout address in stratum username: %s", derr);
+            cJSON *err = make_error(24, emsg);
+            return emit_response(buf, len, id, NULL, err);
+        }
     }
 
     sanitize_worker(worker, c->worker_name, sizeof(c->worker_name));
