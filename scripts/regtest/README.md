@@ -42,13 +42,17 @@ proves the coinbase shape is correct.
 ## Quickstart
 
 ```
-scripts/regtest/setup.sh         # download prebuilts + write configs
-scripts/regtest/start.sh         # bring up bitcoind, electrs, enforcer
-scripts/regtest/status.sh        # ps-style summary
-scripts/regtest/validate.sh      # mine some blocks, probe GBT, print runbook
-scripts/regtest/inspect-coinbase.sh   # after mining: parse tip's coinbase
+scripts/regtest/setup.sh             # download prebuilts + write configs
+scripts/regtest/start.sh             # bring up bitcoind, electrs, enforcer
+scripts/regtest/status.sh            # ps-style summary
+scripts/regtest/activate-thunder.sh  # propose + ack sidechain #9 until active
+scripts/regtest/validate.sh          # activate, mine 150, probe GBT, print runbook
+scripts/regtest/inspect-coinbase.sh  # after mining: parse tip's coinbase
 scripts/regtest/stop.sh
 ```
+
+`activate-thunder.sh` requires `grpcurl` (`brew install grpcurl`).
+It's idempotent — re-running once Thunder is active is a no-op.
 
 Everything lives under `.regtest/` (gitignored): binaries in
 `.regtest/bin/`, chain state in `.regtest/data/`, logs in
@@ -69,23 +73,22 @@ on the enforcer, and prints the next-step runbook.
 
 ## What's NOT yet verified end-to-end
 
-Two prerequisites still need wiring before we can assert "a simplepool
+One prerequisite still needs wiring before we can assert "a simplepool
 block was accepted as a deposit":
 
-1. **Sidechain #9 activation.** BIP300 requires a propose-then-ack
-   flow before any sidechain accepts deposits. Even on regtest this
-   means calling the enforcer's RPC (port 8123) to `proposesidechain`
-   and then mining ~K blocks (regtest K is small) of ack votes. The
-   exact RPC method names and the regtest activation window aren't
-   yet captured in `validate.sh` — flagged as TODO.
+- **A real stratum miner finding work** against simplepool at regtest
+  difficulty. Regtest difficulty is `0x207fffff` — trivially low — so
+  any cpuminer/ckpool client wired at `127.0.0.1:13334` finds a
+  block in seconds. Not scripted because miner choice depends on the
+  developer's environment.
 
-2. **A real stratum miner finding work** against simplepool at regtest
-   difficulty. Regtest difficulty is `0x207fffff` — trivially low — so
-   any cpuminer/ckpool client wired at `127.0.0.1:13334` finds a
-   block in seconds. Not scripted because miner choice depends on the
-   developer's environment.
+Sidechain #9 activation **is** now scripted by `activate-thunder.sh`
+(called from `validate.sh`). It uses the enforcer's gRPC
+(`cusf.mainchain.v1.WalletService/CreateSidechainProposal` +
+`GenerateBlocks` with `ack_all_proposals=true`) and on regtest the
+proposal activates after 6 votes.
 
-Once those two land, the final check is:
+Once a stratum miner finds a block, the final check is:
 
 ```
 scripts/regtest/inspect-coinbase.sh

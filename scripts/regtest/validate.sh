@@ -34,6 +34,10 @@ echo "==> sanity check stack"
 "$ROOT/scripts/regtest/status.sh"
 
 echo ""
+echo "==> activate sidechain #9 (Thunder)"
+"$ROOT/scripts/regtest/activate-thunder.sh"
+
+echo ""
 echo "==> bootstrap chain (mine 150 to miner wallet so coinbase matures)"
 ADDR="$(cli -rpcwallet=miner getnewaddress '' bech32)"
 echo "  miner address: $ADDR"
