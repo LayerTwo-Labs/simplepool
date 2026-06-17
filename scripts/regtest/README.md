@@ -71,34 +71,95 @@ Running `start.sh` brings up the full stack cleanly on aarch64-darwin
 `validate.sh` mines 150 blocks to a P2WPKH miner address, calls GBT
 on the enforcer, and prints the next-step runbook.
 
-## What's NOT yet verified end-to-end
+## End-to-end validation status
 
-One prerequisite still needs wiring before we can assert "a simplepool
-block was accepted as a deposit":
+**All infra steps verified.** A tiny CPU stratum miner
+([`cpuminer.js`](cpuminer.js)) connects to a `pool_mode=pps` simplepool
+running against the enforcer, finds a regtest block in seconds, and
+submits it. The block is accepted into the regtest chain by bitcoind-
+patched and the enforcer; bitcoind classifies the coinbase output as
+`"type": "drivechain"`; the OP_RETURN destination immediately follows;
+`inspect-coinbase.sh` confirms the 5-output layout.
 
-- **A real stratum miner finding work** against simplepool at regtest
-  difficulty. Regtest difficulty is `0x207fffff` — trivially low — so
-  any cpuminer/ckpool client wired at `127.0.0.1:13334` finds a
-  block in seconds. Not scripted because miner choice depends on the
-  developer's environment.
+**Critical finding from running the loop:** the enforcer DOES NOT
+credit coinbase outputs as drivechain deposits. A side-by-side test:
 
-Sidechain #9 activation **is** now scripted by `activate-thunder.sh`
-(called from `validate.sh`). It uses the enforcer's gRPC
-(`cusf.mainchain.v1.WalletService/CreateSidechainProposal` +
-`GenerateBlocks` with `ack_all_proposals=true`) and on regtest the
-proposal activates after 6 votes.
+| deposit source | enforcer Ctip update |
+| --- | --- |
+| simplepool coinbase, OP_DRIVECHAIN(9) value 49.5 BTC | NO (Ctip stays empty) |
+| `WalletService/CreateDepositTransaction` 1 BTC | YES (Ctip → 100,000,000 sats) |
 
-Once a stratum miner finds a block, the final check is:
+Both blocks are accepted into the chain. The difference is at the
+consensus-level deposit-recognition layer of the enforcer: it requires
+the deposit tx to spend real, mature, post-coinbase UTXOs to prove the
+BTC committed for crossover was actually spendable. Coinbase outputs
+fail that check.
+
+This empirically answers the question my early research flagged as
+unclear: "Can a coinbase output be a valid Thunder deposit?" The
+answer is **no**, at least against the current LayerTwo-Labs enforcer.
+
+### Architectural impact
+
+The PPS design's working assumption — "every block's coinbase deposits
+directly to Thunder, so the pool never custodies BTC" — needs revision.
+Options for the follow-up:
+
+1. **Two-step deposit.** Coinbase pays the pool's BTC P2WPKH; a separate
+   service spends accumulated coinbase UTXOs into a proper
+   `CreateDepositTransaction` periodically. Pool DOES custody BTC,
+   briefly. Lowest implementation cost.
+2. **Per-block deposit tx.** Pool builds and broadcasts a deposit tx
+   in the same block as the coinbase. Higher coordination cost.
+3. **Re-examine the enforcer's deposit rule for a path that does work**
+   (e.g. is there a flag, or did the rule change in a recent release?).
+
+The drivechain coinbase builders we landed are still useful — they
+produce a well-formed (if not Ctip-crediting) coinbase shape, and the
+parsing/structural assertions stand. The shape becomes useful again
+if option 3 turns up a way to make the rule permit it.
+
+### Running it
 
 ```
+scripts/regtest/setup.sh         # one-time, downloads prebuilts
+scripts/regtest/start.sh
+scripts/regtest/validate.sh      # activates sidechain #9, bootstraps,
+                                 # prints a proxy.conf snippet
+# in another terminal — start the pool with the printed config:
+./build/simplepool /tmp/regtest-proxy.conf
+# in a third terminal — find a block:
+node scripts/regtest/cpuminer.js --timeout 60
+
+# after a block lands, parse its coinbase:
 scripts/regtest/inspect-coinbase.sh
+
 # expect:
-#   [k]   value=49.5  OP_NOP5 OP_PUSHBYTES_1 0x09 OP_TRUE
-#   [k+1] value=0     OP_RETURN <payload>
-#   [k+2] value=0.5   <P2WPKH operator>
-#
-# then grep enforcer log:
-#   "Deposit ... sidechain_id=9"
+#   output count: 5
+#   [N]   value=49.5  type=drivechain  asm=OP_NOP5 9 1
+#   [N+1] value=0     type=nulldata    asm=OP_RETURN <payload>
+#   [N+2] value=0.5   type=witness_v0_keyhash
+```
+
+To verify the deposit-recognition finding for yourself, side-by-side
+with a canonical deposit:
+
+```
+# Ctip BEFORE a canonical deposit (after the coinbase deposit attempt):
+grpcurl -plaintext -d '{"sidechain_number":9}' 127.0.0.1:50051 \
+  cusf.mainchain.v1.ValidatorService/GetCtip
+# → {} (no Ctip — coinbase deposit was ignored)
+
+# Issue a canonical deposit:
+grpcurl -plaintext -d '{"sidechain_id":9, "address":"11111111111111111111", "value_sats":100000000, "fee_sats":1000}' \
+  127.0.0.1:50051 cusf.mainchain.v1.WalletService/CreateDepositTransaction
+grpcurl -plaintext -d '{"blocks":1}' 127.0.0.1:50051 \
+  cusf.mainchain.v1.WalletService/GenerateBlocks
+
+# Ctip AFTER:
+grpcurl -plaintext -d '{"sidechain_number":9}' 127.0.0.1:50051 \
+  cusf.mainchain.v1.ValidatorService/GetCtip
+# → {"ctip": {"txid": {...}, "value": "100000000"}}
 ```
 
 ## Why this is structured as a runbook, not a one-shot test

@@ -1,11 +1,24 @@
 # `pps-thunder` branch — overview & testing
 
-Ten commits on top of `main` that turn simplepool from a pure solo-mining
-proxy into a dual-mode proxy that can also run as a Thunder-paying PPS
-pool, with at-most-once payouts, a regtest validation stack that
-self-activates BIP300 sidechain #9, and a statistical fraud audit. SQLite
-remains the source of truth; Redis is added as a real-time event stream
-alongside it.
+> **⚠ Architectural finding from end-to-end regtest:** the BIP300
+> enforcer does NOT credit coinbase outputs as drivechain deposits — a
+> side-by-side test showed a canonical deposit updates the sidechain
+> Ctip while a coinbase-shaped deposit does not. The PPS design's
+> "every coinbase deposits directly to Thunder" working assumption
+> needs revision; see [scripts/regtest/README.md](scripts/regtest/README.md)
+> for the empirical evidence and architectural impact discussion. The
+> drivechain coinbase builders and PPS plumbing landed on this branch
+> are still useful — the shape is correct and the pieces compose — but
+> a follow-up "two-step deposit" service is needed to actually move BTC
+> into Thunder.
+
+Twelve commits on top of `main` that turn simplepool from a pure solo-
+mining proxy into a dual-mode proxy that can also run as a Thunder-
+paying PPS pool, with at-most-once payouts, a regtest validation stack
+that self-activates BIP300 sidechain #9, a tiny CPU stratum miner that
+closes the validation loop, and a statistical fraud audit. SQLite
+remains the source of truth; Redis is added as a real-time event
+stream alongside it.
 
 ```
 1ebcea1 Add block-withholding statistical audit (payout/audit.js)

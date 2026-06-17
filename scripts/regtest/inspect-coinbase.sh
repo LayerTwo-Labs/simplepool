@@ -22,9 +22,10 @@ print(json.dumps(cb))
 
 echo "==> tip: $TIP"
 echo "==> coinbase outputs:"
-echo "$CB" | python3 <<'PY'
-import json, sys
-cb = json.loads(sys.stdin.read())
+# Pass CB via env var because a heredoc would steal stdin from the pipe.
+CB="$CB" python3 - <<'PY'
+import json, os, sys
+cb = json.loads(os.environ['CB'])
 outs = cb['vout']
 print(f'  output count: {len(outs)}')
 for i, o in enumerate(outs):
