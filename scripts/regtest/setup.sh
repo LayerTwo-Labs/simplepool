@@ -21,7 +21,7 @@ REGTEST="$ROOT/.regtest"
 BIN="$REGTEST/bin"
 DATA="$REGTEST/data"
 LOGS="$REGTEST/logs"
-mkdir -p "$BIN" "$DATA/bitcoind" "$DATA/electrs" "$DATA/enforcer" "$LOGS"
+mkdir -p "$BIN" "$DATA/bitcoind" "$DATA/electrs" "$DATA/enforcer" "$DATA/thunder" "$LOGS"
 
 # ---- arch detection ----
 UNAME_M="$(uname -m)"
@@ -57,8 +57,10 @@ extract_to_bin() {
     # -j strips directories. Some zips have only one file (electrs).
     unzip -qq -j -o "$zip" "$match" -d "$BIN"
     # Find the most-recently-extracted file and rename to $final if needed.
+    # Exclude already-canonical filenames so each extraction is idempotent
+    # regardless of what got extracted before it.
     local actual
-    actual="$(ls -t "$BIN" | grep -v -E '\.zip$|^bitcoind$|^bitcoin-cli$|^electrs$|^bip300301_enforcer$' | head -1 || true)"
+    actual="$(ls -t "$BIN" | grep -v -E '\.zip$|^(bitcoind|bitcoin-cli|electrs|bip300301_enforcer|thunder|thunder-cli)$' | head -1 || true)"
     if [[ -n "$actual" && "$actual" != "$final" ]]; then
         mv "$BIN/$actual" "$BIN/$final"
     fi
@@ -72,11 +74,13 @@ case "$ARCH" in
         BITCOIN_ZIP_URL="https://releases.drivechain.info/L1-bitcoin-patched-v30.2-aarch64-apple-darwin.zip"
         ENFORCER_ZIP_URL="https://releases.drivechain.info/bip300301-enforcer-latest-aarch64-apple-darwin.zip"
         ELECTRS_ZIP_URL="https://releases.drivechain.info/electrs-latest-aarch64-apple-darwin.zip"
+        THUNDER_ZIP_URL="https://releases.drivechain.info/L2-S9-Thunder-latest-aarch64-apple-darwin.zip"
         ;;
     x86_64-apple-darwin)
         BITCOIN_ZIP_URL="https://releases.drivechain.info/L1-bitcoin-patched-latest-x86_64-apple-darwin.zip"
         ENFORCER_ZIP_URL="https://releases.drivechain.info/bip300301-enforcer-latest-x86_64-apple-darwin.zip"
         ELECTRS_ZIP_URL="https://releases.drivechain.info/electrs-latest-x86_64-apple-darwin.zip"
+        THUNDER_ZIP_URL="https://releases.drivechain.info/L2-S9-Thunder-latest-x86_64-apple-darwin.zip"
         ;;
     *)
         echo "no prebuilt binaries for $ARCH — build from source" >&2
@@ -87,12 +91,15 @@ esac
 fetch_zip "$BITCOIN_ZIP_URL"  "$BIN/bitcoind.zip"
 fetch_zip "$ENFORCER_ZIP_URL" "$BIN/enforcer.zip"
 fetch_zip "$ELECTRS_ZIP_URL"  "$BIN/electrs.zip"
+fetch_zip "$THUNDER_ZIP_URL"  "$BIN/thunder.zip"
 
 echo "==> extracting binaries"
 extract_to_bin "$BIN/bitcoind.zip"  '*/bitcoind'                 bitcoind
 extract_to_bin "$BIN/bitcoind.zip"  '*/bitcoin-cli'              bitcoin-cli
 extract_to_bin "$BIN/enforcer.zip"  '*bip300301-enforcer*'       bip300301_enforcer
 extract_to_bin "$BIN/electrs.zip"   '*electrs*'                  electrs
+extract_to_bin "$BIN/thunder.zip"   'thunder-latest-*'           thunder
+extract_to_bin "$BIN/thunder.zip"   'thunder-cli-latest-*'       thunder-cli
 
 echo "==> binaries ready in $BIN"
 ls -la "$BIN" | tail -n +2

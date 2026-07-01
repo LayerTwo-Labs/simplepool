@@ -33,26 +33,26 @@ LayerTwo-Labs enforcer.
 - **electrs**: Electrum server the enforcer's wallet uses for sync.
 - **bip300301_enforcer**: validates BIP300 deposits, serves the
   `getblocktemplate` simplepool talks to.
-
-Thunder itself is intentionally NOT in this stack. There's no
-aarch64-darwin prebuilt for it, and the enforcer is the authoritative
-deposit validator — observing a Deposit event tagged with sidechain 9
-proves the coinbase shape is correct.
+- **thunder** (L2-S9): the actual sidechain node, connected to the
+  enforcer via gRPC on 50051, RPC on 6009 (matches what
+  `payout/lib/thunder.js` expects out of the box).
 
 ## Quickstart
 
 ```
 scripts/regtest/setup.sh             # download prebuilts + write configs
-scripts/regtest/start.sh             # bring up bitcoind, electrs, enforcer
+scripts/regtest/start.sh             # bring up bitcoind, electrs, enforcer, thunder
 scripts/regtest/status.sh            # ps-style summary
 scripts/regtest/activate-thunder.sh  # propose + ack sidechain #9 until active
+scripts/regtest/thunder-init.sh      # generate Thunder wallet mnemonic + address
 scripts/regtest/validate.sh          # activate, mine 150, probe GBT, print runbook
 scripts/regtest/inspect-coinbase.sh  # after mining: parse tip's coinbase
 scripts/regtest/stop.sh
 ```
 
-`activate-thunder.sh` requires `grpcurl` (`brew install grpcurl`).
-It's idempotent — re-running once Thunder is active is a no-op.
+`activate-thunder.sh` and `thunder-init.sh` are both idempotent —
+re-running once the state is set up is a no-op.
+Requires `grpcurl` (`brew install grpcurl`).
 
 Everything lives under `.regtest/` (gitignored): binaries in
 `.regtest/bin/`, chain state in `.regtest/data/`, logs in

@@ -298,29 +298,60 @@ PAYOUT_DB_PATH=./shares.db node /Users/rob/projects/simplepool/payout/audit.js
 ## 10 · BIP300 regtest stack (infra) — `b0da16f` + `6037a25`
 
 ```
-scripts/regtest/setup.sh       # ~50 MB of prebuilt binaries
+scripts/regtest/setup.sh       # ~90 MB of prebuilt binaries incl. Thunder
 scripts/regtest/start.sh
 scripts/regtest/status.sh
 ```
 
-- [ ] `status.sh` shows all three processes `up`.
+- [ ] `status.sh` shows all **four** processes `up`: `bitcoind`,
+      `electrs`, `bip300301_enforcer`, `thunder`.
+- [ ] Thunder log ends with
+      `Verified existence of cusf.mainchain.v1.ValidatorService` and
+      `starting RPC server at 127.0.0.1:6009`.
 - [ ] `curl -sS -u user:password -H 'content-type: application/json' \
       --data '{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}' \
       http://127.0.0.1:18443/` returns a number.
+- [ ] `curl -sS -H 'content-type: application/json' \
+      --data '{"jsonrpc":"2.0","id":1,"method":"balance","params":[]}' \
+      http://127.0.0.1:6009/` returns
+      `{"result":{"total_sats":0,"available_sats":0}}` — Thunder RPC
+      is reachable (matches what the payout worker expects).
 
-Activate Thunder:
+Activate the sidechain, then set up Thunder's wallet:
 
 ```
 scripts/regtest/activate-thunder.sh
+scripts/regtest/thunder-init.sh
 ```
 
-- [ ] First run prints `sidechain 9 is now ACTIVE` with proposalHeight
-      and activationHeight (regtest activates after 6 votes).
-- [ ] Second run prints `sidechain 9 already active. nothing to do.`
-      (idempotent).
-- [ ] `grpcurl -plaintext 127.0.0.1:50051
-      cusf.mainchain.v1.ValidatorService/GetSidechains` shows sidechain
-      9 in the active list.
+- [ ] `activate-thunder.sh` first run prints `sidechain 9 is now
+      ACTIVE`; second run is a no-op.
+- [ ] `thunder-init.sh` prints a fresh mnemonic + wallet address +
+      formatted deposit string (`s9_<base58>_<hex6>`); second run
+      short-circuits with `already initialised`.
+
+Issue a canonical deposit to the Thunder-owned address it printed,
+then observe the enforcer's TwoWayPeg event stream:
+
+```
+DEP='<paste the deposit format from thunder-init.sh>'
+grpcurl -plaintext -d "{\"sidechain_id\":9,\"address\":\"$DEP\",\"value_sats\":100000000,\"fee_sats\":1000}" \
+  127.0.0.1:50051 cusf.mainchain.v1.WalletService/CreateDepositTransaction
+grpcurl -plaintext -d '{"blocks":1}' \
+  127.0.0.1:50051 cusf.mainchain.v1.WalletService/GenerateBlocks
+grpcurl -plaintext -d '{"sidechain_number":9}' \
+  127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetCtip
+```
+
+- [ ] Ctip returns non-empty with `value: "100000000"` (or the running
+      total if earlier deposits happened).
+
+Note: Thunder's own balance staying at 0 after a canonical deposit is
+expected until Thunder produces a sidechain block via BMM. BMM is a
+Thunder-side concern (thunder-cli's `mine` command blocks on
+mainchain coordination) — outside the scope of the pool. The
+enforcer-side Ctip update is the authoritative signal that the
+deposit was consensus-accepted.
 
 ---
 

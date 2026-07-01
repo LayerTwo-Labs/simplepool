@@ -14,7 +14,7 @@ LOGS="$REGTEST/logs"
 RUN="$REGTEST/run"
 mkdir -p "$RUN"
 
-for b in bitcoind bitcoin-cli bip300301_enforcer electrs; do
+for b in bitcoind bitcoin-cli bip300301_enforcer electrs thunder thunder-cli; do
     if [[ ! -x "$BIN/$b" ]]; then
         echo "missing $BIN/$b — run scripts/regtest/setup.sh first" >&2
         exit 1
@@ -105,6 +105,22 @@ start_if_dead bip300301_enforcer \
     --serve-grpc-addr=127.0.0.1:50051
 
 wait_for bip300301_enforcer "nc -z 127.0.0.1 18444" 30
+# Thunder connects to the enforcer's gRPC — make sure that's actually
+# up before launching it (18444 GBT can come up first).
+wait_for enforcer-grpc "nc -z 127.0.0.1 50051" 15
+
+echo "==> starting thunder (sidechain #9)"
+start_if_dead thunder \
+    "$BIN/thunder" \
+    --headless \
+    --datadir "$DATA/thunder" \
+    --network regtest \
+    --mainchain-grpc-url http://127.0.0.1:50051 \
+    --net-addr 127.0.0.1:4009 \
+    --rpc-addr 127.0.0.1:6009 \
+    --log-level INFO
+
+wait_for thunder "nc -z 127.0.0.1 6009" 30
 
 echo ""
 echo "stack up. endpoints:"
@@ -113,5 +129,7 @@ echo "  electrs:         127.0.0.1:60401"
 echo "  enforcer GBT:    127.0.0.1:18444  (point simplepool at this)"
 echo "  enforcer JSONRPC: 127.0.0.1:8123"
 echo "  enforcer gRPC:    127.0.0.1:50051"
+echo "  thunder RPC:     127.0.0.1:6009   (point payout worker at this)"
+echo "  thunder P2P:     127.0.0.1:4009"
 echo ""
 echo "next: scripts/regtest/validate.sh"

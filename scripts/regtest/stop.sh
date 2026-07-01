@@ -4,7 +4,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN="$ROOT/.regtest/run"
 
-for name in bip300301_enforcer electrs bitcoind; do
+for name in thunder bip300301_enforcer electrs bitcoind; do
     pidfile="$RUN/$name.pid"
     [[ -f "$pidfile" ]] || continue
     pid="$(cat "$pidfile")"
