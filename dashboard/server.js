@@ -23,6 +23,10 @@ app.use('/static', express.static(path.join(__dirname, 'public'), { maxAge: '1h'
 
 const db = openDb(path.resolve(__dirname, DB_PATH));
 
+/* Shown on the public "Connect a miner" card. Env-driven so the shipped
+ * template doesn't hardcode any particular deployment's host. */
+const PUBLIC_STRATUM_URL = process.env.PUBLIC_STRATUM_URL || 'stratum+tcp://<pool-host>:3334';
+
 app.get('/', (req, res) => {
     const ov = stats.overview(db);
     const lb = stats.leaderboard(db);
@@ -31,6 +35,7 @@ app.get('/', (req, res) => {
     const node = stats.nodeStatus(db);
     res.render('index', {
         ov, lb, lbAddr, blocks, node,
+        stratumUrl: PUBLIC_STRATUM_URL,
         fmtHashrate: stats.fmtHashrate,
         fmtBtc: stats.fmtBtc,
     });

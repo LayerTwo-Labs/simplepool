@@ -11,6 +11,10 @@ Group=@USER@
 WorkingDirectory=@ROOT@/dashboard
 Environment=PORT=8081
 Environment=PROXY_DB_PATH=@ROOT@/data/shares.db
+# Rendered on the public "Connect a miner" card. Set to the actual
+# host miners should point their ASIC at. Leave unset to show
+# 'stratum+tcp://<pool-host>:3334' as a placeholder.
+# Environment=PUBLIC_STRATUM_URL=stratum+tcp://pool.example.com:3334
 # --- PPS admin panel — /admin route ---
 # When ADMIN_USER + ADMIN_PASSWORD are both set, /admin serves the pool
 # operator view (reserve balance, ledger totals, per-worker owed,

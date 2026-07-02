@@ -8,18 +8,26 @@ background on why the design looks like this).
 
 ## Quick reference
 
+Substitute your own pool's public IP/hostname for `<pool-host>` and your
+SSH key file for `<ssh-key>` below. On the deployment I built alongside
+this doc, the real values are stashed in a gitignored `FORKNET_CHEATSHEET.md`
+at the repo root — do NOT paste real hosts / passwords into anything
+tracked by git.
+
 | what | where | credentials |
 | --- | --- | --- |
-| Public dashboard | http://45.33.100.24:8081/ | none |
-| **Admin dashboard** | **http://45.33.100.24:8081/admin** | **`admin` / `4DqSK1d6jkefposLEw5DEP5luPT`** |
-| Admin JSON API | http://45.33.100.24:8081/api/admin/summary | same basic auth |
-| Stratum (miner endpoint) | `stratum+tcp://45.33.100.24:3334` | username = Thunder base58 address |
-| SSH | `root@45.33.100.24` | `~/.ssh/id_epitetus` |
+| Public dashboard | `http://<pool-host>:8081/` | none |
+| **Admin dashboard** | `http://<pool-host>:8081/admin` | **`admin` / `<see /root/simplepool-admin-cred.txt on the box>`** |
+| Admin JSON API | `http://<pool-host>:8081/api/admin/summary` | same basic auth |
+| Stratum (miner endpoint) | `stratum+tcp://<pool-host>:3334` | username = Thunder base58 address |
+| SSH | `root@<pool-host>` | `<ssh-key>` |
 
-The admin password is also stashed at `/root/simplepool-admin-cred.txt`
-on the box (root-only). To rotate, edit
+The admin password is stashed at `/root/simplepool-admin-cred.txt` on the
+box (root-only). To rotate, edit
 `/etc/systemd/system/simplepool-dashboard.service.d/pps-thunder.conf`
-and `systemctl daemon-reload && systemctl restart simplepool-dashboard`.
+and `systemctl daemon-reload && systemctl restart simplepool-dashboard`
+— there's a scripted version in [Rotating the admin
+password](#rotating-the-admin-password) below.
 
 ---
 
@@ -114,7 +122,7 @@ reconciliation.
 **Currently manual — no admin button yet.** The runbook:
 
 ```sh
-ssh -i ~/.ssh/id_epitetus root@45.33.100.24
+ssh -i <ssh-key> root@<pool-host>
 
 # 1. Get a Thunder-owned deposit address (formatted for the mainchain wallet)
 TCLI=/home/forknet/forknet-software/thunder-rust/target/debug/thunder_app_cli
@@ -214,7 +222,7 @@ finalize crashed" without Thunder-side mempool/chain lookup.
 Nothing on the pool side. The miner points their ASIC firmware at:
 
 ```
-stratum+tcp://45.33.100.24:3334
+stratum+tcp://<pool-host>:3334
 username: <their-Thunder-address>[.<rig_label>]
 password: (anything)
 ```
@@ -239,7 +247,7 @@ view.
 ## Rotating the admin password
 
 ```sh
-ssh -i ~/.ssh/id_epitetus root@45.33.100.24
+ssh -i <ssh-key> root@<pool-host>
 NEW_PASS=$(openssl rand -base64 21 | tr -d '=+/')
 sed -i "s/^Environment=ADMIN_PASSWORD=.*/Environment=ADMIN_PASSWORD=$NEW_PASS/" \
   /etc/systemd/system/simplepool-dashboard.service.d/pps-thunder.conf
