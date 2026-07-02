@@ -44,17 +44,16 @@ typedef struct {
      * existing per-block direct-payout flow. pool_mode = "pps" enables
      * Thunder drivechain deposits in the coinbase and per-share PPS
      * accrual in the database. */
-    char pool_mode[16];                       /* "solo" | "pps"
-                                               * TODO(pps-classic): add
-                                               * a "pps-classic" value —
-                                               * traditional coinbase to
-                                               * pool_btc_address, with
-                                               * operator-driven Thunder
-                                               * deposits via the admin
-                                               * dashboard. See
-                                               * CLASSIC_PAYOUTS.md. */
+    char pool_mode[16];                       /* "solo" | "pps" | "pps-classic" */
+    /* pps-classic: coinbase pays this BTC address (P2WPKH/P2PKH/P2SH), NOT
+     * the Thunder reserve. The operator later batches this BTC into Thunder
+     * via the admin dashboard's deposit action. Required when
+     * pool_mode = pps-classic; ignored otherwise. */
+    char pool_btc_address[128];
     char pool_thunder_reserve_address[128];   /* base58 Thunder address that
-                                               * receives every block's deposit */
+                                               * receives every block's deposit
+                                               * — pps mode only, ignored in
+                                               * pps-classic */
     int  thunder_sidechain_number;            /* 9 for Thunder */
     /* OP_RETURN payload bytes following the OP_DRIVECHAIN output, hex-
      * encoded. If empty, the configured pool_thunder_reserve_address is

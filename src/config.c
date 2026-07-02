@@ -54,6 +54,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->redis_reconnect_backoff_ms = 2000;
 
     snprintf(cfg->pool_mode, sizeof cfg->pool_mode, "%s", "solo");
+    cfg->pool_btc_address[0] = '\0';
     cfg->pool_thunder_reserve_address[0] = '\0';
     cfg->thunder_sidechain_number = 9;
     cfg->thunder_op_return_hex[0] = '\0';
@@ -155,6 +156,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "redis_publish_timeout_ms")  == 0) cfg->redis_publish_timeout_ms = atoi(v);
         else if (strcmp(k, "redis_reconnect_backoff_ms")== 0) cfg->redis_reconnect_backoff_ms = atoi(v);
         else if (strcmp(k, "pool_mode")                 == 0) copy_str(cfg->pool_mode, sizeof cfg->pool_mode, v);
+        else if (strcmp(k, "pool_btc_address")          == 0) copy_str(cfg->pool_btc_address, sizeof cfg->pool_btc_address, v);
         else if (strcmp(k, "pool_thunder_reserve_address") == 0) copy_str(cfg->pool_thunder_reserve_address, sizeof cfg->pool_thunder_reserve_address, v);
         else if (strcmp(k, "thunder_sidechain_number")  == 0) cfg->thunder_sidechain_number = atoi(v);
         else if (strcmp(k, "thunder_op_return_hex")     == 0) copy_str(cfg->thunder_op_return_hex, sizeof cfg->thunder_op_return_hex, v);
@@ -184,14 +186,25 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                 cfg->fee_bps);
         return -4;
     }
-    if (strcmp(cfg->pool_mode, "solo") != 0 &&
-        strcmp(cfg->pool_mode, "pps")  != 0) {
+    if (strcmp(cfg->pool_mode, "solo")        != 0 &&
+        strcmp(cfg->pool_mode, "pps")         != 0 &&
+        strcmp(cfg->pool_mode, "pps-classic") != 0) {
         set_err(errbuf, errlen,
-                "config: 'pool_mode' must be 'solo' or 'pps', got '%s'",
+                "config: 'pool_mode' must be 'solo', 'pps' or 'pps-classic', got '%s'",
                 cfg->pool_mode);
         return -5;
     }
-    if (strcmp(cfg->pool_mode, "pps") == 0) {
+    int is_pps         = (strcmp(cfg->pool_mode, "pps")         == 0);
+    int is_pps_classic = (strcmp(cfg->pool_mode, "pps-classic") == 0);
+    if (is_pps || is_pps_classic) {
+        if (cfg->pps_sats_per_diff <= 0.0) {
+            set_err(errbuf, errlen,
+                    "config: 'pps_sats_per_diff' must be > 0 when pool_mode=%s",
+                    cfg->pool_mode);
+            return -8;
+        }
+    }
+    if (is_pps) {
         if (cfg->pool_thunder_reserve_address[0] == '\0') {
             set_err(errbuf, errlen,
                     "config: 'pool_thunder_reserve_address' is required when pool_mode=pps");
@@ -203,10 +216,12 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                     cfg->thunder_sidechain_number);
             return -7;
         }
-        if (cfg->pps_sats_per_diff <= 0.0) {
+    }
+    if (is_pps_classic) {
+        if (cfg->pool_btc_address[0] == '\0') {
             set_err(errbuf, errlen,
-                    "config: 'pps_sats_per_diff' must be > 0 when pool_mode=pps");
-            return -8;
+                    "config: 'pool_btc_address' is required when pool_mode=pps-classic");
+            return -9;
         }
     }
     return 0;

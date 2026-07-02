@@ -40,18 +40,32 @@ redis_url =
 redis_publish_timeout_ms = 200
 redis_reconnect_backoff_ms = 2000
 
-# PPS / Thunder mode. "solo" preserves the original per-block direct-payout
-# flow. "pps" makes every block's coinbase deposit to the configured
-# pool_thunder_reserve_address via a BIP300 drivechain deposit (sidechain
-# 9 = Thunder), credits each accepted share to the worker's pps_credits
-# row, and expects stratum usernames to be Thunder addresses (base58).
+# pool_mode controls the coinbase shape and the username validation:
+#   solo        default. Coinbase pays the miner (stratum username is a
+#               BTC address) minus the operator fee. No PPS accrual.
+#   pps         Every block's coinbase carries a BIP300 drivechain deposit
+#               output for the configured pool_thunder_reserve_address.
+#               Miners authorize with a Thunder address (base58 of a
+#               20-byte hash). WARNING: the LayerTwo-Labs enforcer does
+#               not credit coinbase-source deposits; this mode produces a
+#               well-formed but effectively unspendable OP_DRIVECHAIN
+#               output. Kept for shape-validation only.
+#   pps-classic Coinbase pays a pool BTC address (pool_btc_address below)
+#               as a normal P2WPKH/P2PKH output. Miners authorize with a
+#               Thunder address and accrue in pps_credits, same as pps.
+#               The operator batches accumulated BTC into Thunder from
+#               the admin dashboard.
 pool_mode = solo
+
+# pps-classic
+# pool_btc_address = REPLACE_WITH_POOL_BTC_ADDRESS
+
+# pps (only)
 # pool_thunder_reserve_address = REPLACE_WITH_BASE58_THUNDER_ADDRESS
 # thunder_sidechain_number = 9
-# Optional override for the OP_RETURN payload after the OP_DRIVECHAIN output.
-# When empty, the ASCII bytes of pool_thunder_reserve_address are embedded
-# (matches Thunder's wallet behaviour).
-# thunder_op_return_hex =
-# pps_sats_per_diff = 1000      # sats credited per unit of share difficulty
+# thunder_op_return_hex =         # optional override; else ASCII of the address
+
+# pps + pps-classic — sats credited per unit of share difficulty
+# pps_sats_per_diff = 1000
 
 log_level = info

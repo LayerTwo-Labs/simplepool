@@ -64,6 +64,22 @@ CREATE TABLE IF NOT EXISTS pps_credits (
   last_updated  INTEGER NOT NULL
 );
 
+/* Ledger of operator-triggered mainchain → Thunder deposits, used by
+ * pool_mode=pps-classic. The C proxy does not touch this table; the
+ * admin dashboard is the only writer. */
+CREATE TABLE IF NOT EXISTS deposits (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts                INTEGER NOT NULL,          /* unix seconds */
+  btc_txid          TEXT    NOT NULL,          /* mainchain deposit tx */
+  sats_deposited    INTEGER NOT NULL,
+  fee_sats          INTEGER NOT NULL,
+  thunder_recipient TEXT    NOT NULL,          /* s9_<base58>_<hex6> */
+  ctip_seq_before   INTEGER,
+  ctip_seq_after    INTEGER,
+  notes             TEXT
+);
+CREATE INDEX IF NOT EXISTS deposits_ts_idx ON deposits(ts);
+
 /* In-flight payout ledger. The payout worker INSERTs a row before
  * broadcasting a Thunder transaction; on successful broadcast it
  * atomically (in one tx) sets txid, increments pps_credits.paid_sats,

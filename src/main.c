@@ -246,8 +246,12 @@ static void on_share_cb(void *ctx, const char *worker_name,
     }
     /* PPS accrual. Credit the worker proportional to share difficulty.
      * Truncates to whole sats; sub-sat dust accumulates per-share so
-     * over many shares the rounding error is bounded by 1 sat per row. */
-    if (s && s->cfg && strcmp(s->cfg->pool_mode, "pps") == 0 &&
+     * over many shares the rounding error is bounded by 1 sat per row.
+     * Fires for both pool_mode=pps (drivechain coinbase) and pool_mode=
+     * pps-classic (traditional coinbase, operator-driven deposits). */
+    if (s && s->cfg &&
+        (strcmp(s->cfg->pool_mode, "pps") == 0 ||
+         strcmp(s->cfg->pool_mode, "pps-classic") == 0) &&
         s->cfg->pps_sats_per_diff > 0.0) {
         int64_t delta = (int64_t)(difficulty * s->cfg->pps_sats_per_diff);
         if (delta > 0) {
@@ -530,14 +534,37 @@ int main(int argc, char **argv) {
     stcfg.vardiff_max        = cfg.vardiff_max;
     stcfg.vardiff_window_sec = cfg.vardiff_window_sec;
 
-    /* PPS / Thunder. Precompute the OP_RETURN bytes for the drivechain
-     * coinbase: either the explicit hex from config, or the ASCII of the
-     * pool's base58 Thunder address (matches Thunder's wallet behaviour). */
+    /* PPS / Thunder. Both pps and pps-classic modes require Thunder-address
+     * usernames and produce PPS accruals; they differ only in the coinbase
+     * shape (drivechain vs traditional). */
     static uint8_t pps_payload[80];
     size_t pps_payload_len = 0;
-    stcfg.pps_enabled = (strcmp(cfg.pool_mode, "pps") == 0);
+    stcfg.pps_enabled         = (strcmp(cfg.pool_mode, "pps")         == 0 ||
+                                 strcmp(cfg.pool_mode, "pps-classic") == 0);
+    stcfg.pps_classic_enabled = (strcmp(cfg.pool_mode, "pps-classic") == 0);
     stcfg.thunder_sidechain_number = cfg.thunder_sidechain_number;
-    if (stcfg.pps_enabled) {
+    snprintf(stcfg.pool_btc_address, sizeof stcfg.pool_btc_address, "%s",
+             cfg.pool_btc_address);
+
+    if (stcfg.pps_classic_enabled) {
+        /* Fail fast on a misconfigured pool_btc_address so we don't drop
+         * every rendered job at runtime. */
+        uint8_t spk[64];
+        size_t  spk_len = sizeof spk;
+        char    perr[256] = {0};
+        if (coinbase_address_to_script(cfg.pool_btc_address, spk, sizeof spk,
+                                       &spk_len, perr, sizeof perr) < 0) {
+            fprintf(stderr,
+                    "config error: invalid pool_btc_address '%s': %s\n",
+                    cfg.pool_btc_address, perr);
+            return 2;
+        }
+        LOG_INFO("pool_mode=pps-classic: pool_btc_address=%s, pps_sats_per_diff=%.2f",
+                 cfg.pool_btc_address, cfg.pps_sats_per_diff);
+    } else if (stcfg.pps_enabled) {
+        /* pool_mode=pps — precompute the OP_RETURN bytes for the drivechain
+         * coinbase: either the explicit hex from config, or the ASCII of the
+         * pool's base58 Thunder address (matches Thunder's wallet behaviour). */
         if (cfg.thunder_op_return_hex[0]) {
             size_t hlen = strlen(cfg.thunder_op_return_hex);
             if (hlen % 2 != 0 || hlen / 2 > sizeof pps_payload) {
@@ -566,6 +593,9 @@ int main(int argc, char **argv) {
         }
         stcfg.pps_op_return_payload     = pps_payload;
         stcfg.pps_op_return_payload_len = pps_payload_len;
+        LOG_WARN("pool_mode=pps: coinbase deposits will NOT credit the Thunder "
+                 "Ctip on the LayerTwo-Labs enforcer — this mode strands the "
+                 "block reward. Use pool_mode=pps-classic for real deployments.");
         LOG_INFO("pool_mode=pps: sidechain=%d, op_return_payload=%zu bytes, "
                  "pps_sats_per_diff=%.2f",
                  cfg.thunder_sidechain_number, pps_payload_len,

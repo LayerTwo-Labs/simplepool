@@ -72,16 +72,27 @@ typedef struct {
 
     /* PPS / Thunder. When pps_enabled = 1:
      *  - mining.authorize accepts Thunder addresses (base58 of 20-byte hash)
-     *  - per-connection coinbase rendering uses coinbase_build_drivechain
-     *    with the precomputed OP_RETURN payload below
      *  - the share observer's payout_address argument is the miner's
      *    Thunder address (for PPS accrual), not a Bitcoin address.
+     *
+     * The coinbase behavior then depends on pps_classic_enabled:
+     *  - 0 (pool_mode=pps): render with coinbase_build_drivechain using
+     *    the OP_RETURN payload below. Deposits into Thunder via BIP300 —
+     *    but the enforcer does NOT credit coinbase-source deposits, so
+     *    this shape does not actually move value onto Thunder.
+     *  - 1 (pool_mode=pps-classic): render with coinbase_build_split
+     *    paying pool_btc_address for the miner-share and operator_address
+     *    for the fee. Traditional coinbase; deposits to Thunder happen
+     *    off-band via the admin dashboard.
      */
     int     pps_enabled;
+    int     pps_classic_enabled;
     int     thunder_sidechain_number;
+    char    pool_btc_address[128];   /* pps-classic: coinbase spendable output */
     /* OP_RETURN payload bytes that ride next to every drivechain output.
      * Typically the ASCII of the pool's base58 Thunder address. Owned by
-     * the caller (main.c precomputes from config). */
+     * the caller (main.c precomputes from config). Unused when
+     * pps_classic_enabled = 1. */
     const uint8_t *pps_op_return_payload;
     size_t  pps_op_return_payload_len;
 
