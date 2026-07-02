@@ -44,7 +44,15 @@ typedef struct {
      * existing per-block direct-payout flow. pool_mode = "pps" enables
      * Thunder drivechain deposits in the coinbase and per-share PPS
      * accrual in the database. */
-    char pool_mode[16];                       /* "solo" | "pps" */
+    char pool_mode[16];                       /* "solo" | "pps"
+                                               * TODO(pps-classic): add
+                                               * a "pps-classic" value —
+                                               * traditional coinbase to
+                                               * pool_btc_address, with
+                                               * operator-driven Thunder
+                                               * deposits via the admin
+                                               * dashboard. See
+                                               * CLASSIC_PAYOUTS.md. */
     char pool_thunder_reserve_address[128];   /* base58 Thunder address that
                                                * receives every block's deposit */
     int  thunder_sidechain_number;            /* 9 for Thunder */
