@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { renderFile } from 'ejs';
 import { openDb } from './lib/db.js';
 import * as stats from './lib/stats.js';
+import * as admin from './lib/admin.js';        /* PPS ADMIN PATCH */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '8081', 10);
@@ -66,6 +67,56 @@ app.get('/api/blocks', (req, res) => {
     res.json(stats.allBlocks(db, { limit, beforeTs }));
 });
 app.get('/healthz', (req, res) => res.json({ ok: true, db_ready: db.ready() }));
+
+
+/* PPS ADMIN PATCH — pool operator view. Basic auth via ADMIN_USER /
+ * ADMIN_PASSWORD env vars; both required or the routes 503 (so we
+ * fail closed if someone forgets to set them). */
+const ADMIN_USER = process.env.ADMIN_USER || '';
+const ADMIN_PASS = process.env.ADMIN_PASSWORD || '';
+const RESERVE_ADDRESS = process.env.POOL_THUNDER_RESERVE_ADDRESS || '(unset)';
+const THUNDER_RPC_URL = process.env.THUNDER_RPC_URL || 'http://127.0.0.1:6009';
+
+function requireAdminAuth(req, res, next) {
+    if (!ADMIN_USER || !ADMIN_PASS) {
+        return res.status(503).send('admin disabled — set ADMIN_USER + ADMIN_PASSWORD');
+    }
+    const h = req.headers.authorization || '';
+    if (h.startsWith('Basic ')) {
+        const [u, p] = Buffer.from(h.slice(6), 'base64').toString('utf8').split(':');
+        if (u === ADMIN_USER && p === ADMIN_PASS) return next();
+    }
+    res.setHeader('WWW-Authenticate', 'Basic realm="simplepool admin"');
+    return res.status(401).send('unauthorised');
+}
+
+async function adminSummary() {
+    const [reserve, totals, workers, inFlight] = await Promise.all([
+        admin.thunderBalance(THUNDER_RPC_URL),
+        Promise.resolve(admin.poolTotals(db)),
+        Promise.resolve(admin.perWorkerBalances(db)),
+        Promise.resolve(admin.inFlight(db)),
+    ]);
+    return { reserve, reserveAddress: RESERVE_ADDRESS, totals, workers, inFlight };
+}
+
+app.get('/admin', requireAdminAuth, async (req, res) => {
+    try {
+        const data = await adminSummary();
+        res.render('admin', data);
+    } catch (e) {
+        res.status(500).send('admin: ' + e.message);
+    }
+});
+
+app.get('/api/admin/summary', requireAdminAuth, async (req, res) => {
+    try {
+        res.json(await adminSummary());
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+/* END PPS ADMIN PATCH */
 
 app.use((req, res) => res.status(404).render('404', { what: 'page' }));
 

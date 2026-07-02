@@ -11,6 +11,14 @@ Group=@USER@
 WorkingDirectory=@ROOT@/dashboard
 Environment=PORT=8081
 Environment=PROXY_DB_PATH=@ROOT@/data/shares.db
+# --- PPS admin panel — /admin route ---
+# When ADMIN_USER + ADMIN_PASSWORD are both set, /admin serves the pool
+# operator view (reserve balance, ledger totals, per-worker owed,
+# in-flight payouts). Without both, /admin returns 503 (fail-closed).
+Environment=THUNDER_RPC_URL=http://127.0.0.1:6009
+# Environment=POOL_THUNDER_RESERVE_ADDRESS=<paste from proxy.conf>
+# Environment=ADMIN_USER=admin
+# Environment=ADMIN_PASSWORD=<generate with `openssl rand -base64 21`>
 ExecStart=/usr/bin/node @ROOT@/dashboard/server.js
 Restart=on-failure
 RestartSec=3

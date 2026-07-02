@@ -1,0 +1,152 @@
+<%
+const fmtN   = (n) => new Intl.NumberFormat('en-US').format(n || 0);
+const fmtTs  = (t) => t ? new Date(t * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—';
+const ago = (t) => {
+    if (!t) return '—';
+    const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+    return Math.floor(s / 86400) + 'd ago';
+};
+const fmtSats = (sats) => {
+    if (!sats) return '0 sats';
+    const btc = sats / 1e8;
+    if (btc >= 0.01) return fmtN(sats) + ' sats (' + btc.toFixed(8) + ' BTC)';
+    return fmtN(sats) + ' sats';
+};
+%>
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="15">
+    <title>admin · simplepool</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header class="top">
+        <a href="/" class="brand">simplepool</a>
+        <span class="tag">pool operator</span>
+    </header>
+    <main class="wrap">
+        <section class="card info">
+            <h2>Pool operator view</h2>
+            <p class="muted small">
+                Read-only. Reserve balance is a live probe of Thunder's
+                JSON-RPC; everything else is the same SQLite the pool
+                writes. Reconciliation is manual — see
+                <code>payout/README.md</code> for the runbook.
+            </p>
+        </section>
+
+        <section class="card">
+            <h2>Thunder reserve</h2>
+            <% if (reserve.ok) { %>
+                <div class="grid">
+                    <div><label>Available</label><strong><%= fmtSats(reserve.available_sats) %></strong></div>
+                    <div><label>Total</label><strong><%= fmtSats(reserve.total_sats) %></strong></div>
+                </div>
+                <p class="mono small muted" style="margin-top:0.5em;word-break:break-all"><%= reserveAddress %></p>
+            <% } else { %>
+                <p class="muted">Thunder RPC unreachable: <em><%= reserve.error %></em></p>
+                <p class="mono small muted" style="margin-top:0.5em;word-break:break-all"><%= reserveAddress %></p>
+            <% } %>
+        </section>
+
+        <section class="card">
+            <h2>PPS ledger totals</h2>
+            <div class="grid">
+                <div><label>Owed (needs payout)</label><strong><%= fmtSats(totals.owed) %></strong></div>
+                <div><label>Accrued (all time)</label><strong><%= fmtSats(totals.accrued) %></strong></div>
+                <div><label>Paid (all time)</label><strong><%= fmtSats(totals.paid) %></strong></div>
+                <div><label>Workers with a balance</label><strong><%= fmtN(totals.workers) %></strong></div>
+            </div>
+            <% if (reserve.ok && totals.owed > reserve.available_sats) { %>
+                <p class="muted small" style="margin-top:0.75em;color:#c66">
+                    ⚠ Reserve is short by
+                    <%= fmtSats(totals.owed - reserve.available_sats) %>.
+                    The payout worker will keep skipping ticks until this is closed
+                    (deposit BTC into the reserve via the two-step deposit service).
+                </p>
+            <% } %>
+        </section>
+
+        <section class="card">
+            <h2>Per-worker balances</h2>
+            <% if (workers.length === 0) { %>
+                <p class="muted">No workers have a PPS balance yet.</p>
+            <% } else { %>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Worker</th>
+                        <th>Thunder address</th>
+                        <th>Owed</th>
+                        <th>Accrued</th>
+                        <th>Paid</th>
+                        <th>Updated</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <% workers.forEach(w => { %>
+                    <tr>
+                        <td class="mono small"><%= w.worker_name %></td>
+                        <td class="mono small"><%= w.thunder_address %></td>
+                        <td><strong><%= fmtSats(w.owed) %></strong></td>
+                        <td><%= fmtSats(w.accrued) %></td>
+                        <td><%= fmtSats(w.paid) %></td>
+                        <td class="muted small" title="<%= fmtTs(w.last_updated) %>"><%= ago(w.last_updated) %></td>
+                    </tr>
+                    <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
+
+        <section class="card">
+            <h2>In-flight payouts</h2>
+            <% if (inFlight.length === 0) { %>
+                <p class="muted">Nothing in flight — clean.</p>
+            <% } else { %>
+            <p class="muted small">
+                Rows here need operator attention. Empty <em>txid</em>
+                means the Thunder broadcast may not have gone out; a
+                set <em>txid</em> means the broadcast succeeded but the
+                DB finalize crashed. Never auto-resolved.
+            </p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Worker</th>
+                        <th>Amount</th>
+                        <th>Age</th>
+                        <th>txid</th>
+                        <th>State</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <% inFlight.forEach(r => { %>
+                    <tr>
+                        <td><%= r.id %></td>
+                        <td class="mono small"><%= r.worker_name %></td>
+                        <td><%= fmtSats(r.sats) %></td>
+                        <td class="muted small" title="<%= fmtTs(r.started_at) %>"><%= ago(r.started_at) %></td>
+                        <td class="mono small"><%= r.txid || '—' %></td>
+                        <td><%= r.txid ? 'broadcast, finalize pending' : 'unbroadcast' %></td>
+                    </tr>
+                    <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
+    </main>
+    <footer class="foot">
+        <span>read-only · auto-refresh 15s</span>
+        <span class="sep">·</span>
+        <span>pool operator view</span>
+    </footer>
+</body>
+</html>
