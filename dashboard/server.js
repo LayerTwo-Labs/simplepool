@@ -26,6 +26,10 @@ const db = openDb(path.resolve(__dirname, DB_PATH));
 /* Shown on the public "Connect a miner" card. Env-driven so the shipped
  * template doesn't hardcode any particular deployment's host. */
 const PUBLIC_STRATUM_URL = process.env.PUBLIC_STRATUM_URL || 'stratum+tcp://<pool-host>:3334';
+/* Read once here so the public per-worker page can render the audit
+ * cross-check for the miner without needing admin auth. The admin
+ * patch block below also reads this — the constant is shared. */
+const PPS_SATS_PER_DIFF = parseFloat(process.env.POOL_PPS_SATS_PER_DIFF || '1000');
 
 app.get('/', (req, res) => {
     const ov = stats.overview(db);
@@ -42,7 +46,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/worker/:name', (req, res) => {
-    const w = stats.worker(db, req.params.name);
+    const w = stats.worker(db, req.params.name, 86400, PPS_SATS_PER_DIFF);
     if (!w.worker) return res.status(404).render('404', { what: 'worker' });
     res.render('worker', { ...w, name: req.params.name, fmtHashrate: stats.fmtHashrate });
 });
@@ -81,10 +85,8 @@ const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASS = process.env.ADMIN_PASSWORD || '';
 const RESERVE_ADDRESS = process.env.POOL_THUNDER_RESERVE_ADDRESS || '(unset)';
 const THUNDER_RPC_URL = process.env.THUNDER_RPC_URL || 'http://127.0.0.1:6009';
-/* The rate the C proxy uses to convert difficulty → sats. Must match
- * proxy.conf's pps_sats_per_diff or the worker-audit cross-check goes
- * red. Passed via the same env-driven config path as the admin creds. */
-const PPS_SATS_PER_DIFF = parseFloat(process.env.POOL_PPS_SATS_PER_DIFF || '1000');
+/* PPS_SATS_PER_DIFF is declared at the top of the file so both the
+ * public /worker/:name view and the admin routes can share it. */
 
 function requireAdminAuth(req, res, next) {
     if (!ADMIN_USER || !ADMIN_PASS) {

@@ -242,6 +242,36 @@ export function worker(handle, name, windowSec = 86400) {
         });
     }
 
+    /* Self-service PPS audit — same cross-check the admin view runs,
+     * but scoped to this one worker. Returns null in solo mode (no row
+     * in pps_credits). `rate` is passed in by the caller (from env). */
+    let ppsAudit = null;
+    const credit = d.prepare(`
+        SELECT accrued_sats, paid_sats, last_updated
+          FROM pps_credits WHERE worker_id = ?
+    `).get(w.id);
+    if (credit) {
+        const rate = Number(arguments[3] || 0);
+        const totals = d.prepare(`
+            SELECT COUNT(*)                                          AS share_count,
+                   COALESCE(SUM(difficulty), 0)                      AS sum_difficulty,
+                   COALESCE(SUM(CAST(difficulty * ? AS INTEGER)), 0) AS accrued_computed
+              FROM shares
+             WHERE worker_id = ?
+        `).get(rate, w.id);
+        const accrued = Number(credit.accrued_sats || 0);
+        const paid    = Number(credit.paid_sats    || 0);
+        ppsAudit = {
+            rate,
+            accrued, paid, owed: accrued - paid,
+            last_updated: Number(credit.last_updated || 0),
+            share_count:      Number(totals.share_count),
+            sum_difficulty:   Number(totals.sum_difficulty),
+            accrued_computed: Number(totals.accrued_computed),
+            matches:          Number(totals.accrued_computed) === accrued,
+        };
+    }
+
     return {
         worker: {
             name: w.name,
@@ -254,6 +284,7 @@ export function worker(handle, name, windowSec = 86400) {
         shares,
         buckets,
         window_sec: windowSec,
+        pps_audit: ppsAudit,
     };
 }
 
