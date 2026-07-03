@@ -60,33 +60,35 @@ int thunder_address_decode(const char *addr,
     }
     size_t alen = strlen(addr);
 
-    /* Deposit-format: 's' <digits> '_' <base58> '_' <hex6>.
-     * Strip the prefix and checksum suffix; keep the base58 middle.
+    /* Accept ONLY the bare base58 form (raw base58 of 20 hash bytes).
      *
-     * We don't verify the checksum here — that's the wallet's job and
-     * its bytes (3-byte sha256 prefix of the rest) are constructed
-     * client-side. We only need the raw 20 bytes for accounting. */
-    const char *b58_start = addr;
-    size_t b58_len = alen;
-    if (addr[0] == 's' || addr[0] == 'S') {
-        const char *first_us = strchr(addr, '_');
-        if (first_us) {
-            const char *last_us = strrchr(addr, '_');
-            if (last_us && last_us != first_us) {
-                b58_start = first_us + 1;
-                b58_len   = (size_t)(last_us - b58_start);
-            }
-        }
-    }
-    if (b58_len < 20 || b58_len > 40) {
+     * The deposit-format wrapper `s<sc>_<base58>_<hex6>` looks like a
+     * Thunder address but is a display-only string that neither Thunder's
+     * wallet nor its OP_RETURN parser recognizes at the byte level — a
+     * pool that stores wrapper strings as workers.payout_address ends up
+     * with unpayable balances (thunder.transfer rejects the wrapper).
+     * To catch this at authorize time rather than payout time we treat
+     * any character outside the base58 alphabet as a hard error.
+     *
+     * '_' isn't in base58, so the wrapper's underscores make b58_decode
+     * fail below — but we bail early with a friendlier message so a
+     * miner using the wrong form gets an actionable stratum reject. */
+    if (strchr(addr, '_') != NULL) {
         set_err(errbuf, errlen,
-                "thunder address base58 length %zu out of range", b58_len);
+                "thunder address contains '_' — looks like the "
+                "'s<n>_<base58>_<hex6>' deposit-format wrapper; use "
+                "the bare base58 (thunder-cli get-new-address) instead");
+        return -1;
+    }
+    if (alen < 20 || alen > 40) {
+        set_err(errbuf, errlen,
+                "thunder address base58 length %zu out of range", alen);
         return -1;
     }
 
     uint8_t buf[64];
     size_t  dec_len = 0;
-    if (b58_decode(b58_start, b58_len, buf, sizeof buf, &dec_len) < 0) {
+    if (b58_decode(addr, alen, buf, sizeof buf, &dec_len) < 0) {
         set_err(errbuf, errlen, "thunder address base58 decode failed");
         return -1;
     }

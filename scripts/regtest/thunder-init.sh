@@ -22,9 +22,7 @@ fi
 # succeeds silently when yes; errors "no seed" to stderr when no.
 if ADDR="$($TCLI get-new-address 2>/dev/null)" && [[ -n "$ADDR" ]]; then
     echo "==> Thunder wallet already initialised"
-    DEP="$($TCLI format-deposit-address "$ADDR" 2>/dev/null)"
-    echo "  new address:    $ADDR"
-    echo "  deposit format: $DEP"
+    echo "  new address: $ADDR"
     exit 0
 fi
 
@@ -36,15 +34,17 @@ echo "==> setting seed"
 $TCLI set-seed-from-mnemonic "$MNEMONIC" >/dev/null
 
 ADDR="$($TCLI get-new-address)"
-DEP="$($TCLI format-deposit-address "$ADDR")"
 
 echo ""
 echo "Thunder wallet ready."
-echo "  new address:    $ADDR"
-echo "  deposit format: $DEP"
+echo "  new address: $ADDR"
 echo ""
+# NOTE: pass the BARE base58 address to CreateDepositTransaction. The
+# display-only 's<n>_<base58>_<hex6>' wrapper from format-deposit-address
+# is NOT recognized by Thunder's OP_RETURN parser — deposits to it are
+# logged as 'Ignoring invalid deposit address' and end up unpayable.
 echo "To send a deposit into this wallet from the mainchain:"
-echo "  grpcurl -plaintext -d '{\"sidechain_id\":9, \"address\":\"$DEP\","
+echo "  grpcurl -plaintext -d '{\"sidechain_id\":9, \"address\":\"$ADDR\","
 echo "    \"value_sats\":100000000, \"fee_sats\":1000}' \\"
 echo "    127.0.0.1:50051 cusf.mainchain.v1.WalletService/CreateDepositTransaction"
 echo "  grpcurl -plaintext -d '{\"blocks\":1}' \\"

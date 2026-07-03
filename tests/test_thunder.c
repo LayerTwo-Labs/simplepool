@@ -71,8 +71,11 @@ static void test_roundtrip_random_pattern(void) {
     CHECK(memcmp(got, in, 20) == 0);
 }
 
-static void test_deposit_format(void) {
-    /* s9_<base58>_<checksum hex> — the wrapper format. */
+/* The `s<n>_<base58>_<hex6>` wrapper is a display-only string produced
+ * by `thunder-cli format-deposit-address`. Thunder's own transfer RPC
+ * refuses it, so we must reject it at authorize time; otherwise a
+ * miner authorizes fine but their PPS balance is unpayable forever. */
+static void test_rejects_wrapper_form(void) {
     uint8_t in[20];
     for (int i = 0; i < 20; i++) in[i] = (uint8_t)(i * 11 + 1);
     char b58[64];
@@ -82,11 +85,13 @@ static void test_deposit_format(void) {
     snprintf(wrapped, sizeof wrapped, "s9_%s_a1b2c3", b58);
 
     uint8_t got[20];
-    char err[128];
+    char err[192];
     int rc = thunder_address_decode(wrapped, got, err, sizeof err);
-    if (rc != 0) fprintf(stderr, "deposit decode err: %s\n", err);
-    CHECK(rc == 0);
-    CHECK(memcmp(got, in, 20) == 0);
+    CHECK(rc < 0);
+    /* Error message must mention the wrapper so miners know what to do. */
+    CHECK(strstr(err, "wrapper") != NULL ||
+          strstr(err, "deposit-format") != NULL ||
+          strstr(err, "_") != NULL);
 }
 
 static void test_rejects_garbage(void) {
@@ -102,7 +107,7 @@ static void test_rejects_garbage(void) {
 int main(void) {
     test_roundtrip_bare();
     test_roundtrip_random_pattern();
-    test_deposit_format();
+    test_rejects_wrapper_form();
     test_rejects_garbage();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);

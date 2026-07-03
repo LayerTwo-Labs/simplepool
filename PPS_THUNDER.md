@@ -46,8 +46,10 @@ b1f3537 Add Redis broadcast for pool events alongside SQLite
 ### 2. PPS / Thunder pool mode
 - New config key `pool_mode = solo | pps` (default `solo`, behaviour
   unchanged). In `pps`:
-  - Stratum usernames must be **Thunder addresses** (base58 of the
-    20-byte hash, or the `s9_<base58>_<hex6>` deposit-format wrapper).
+  - Stratum usernames must be **bare Thunder addresses** — base58 of
+    the 20-byte hash. The `s9_<base58>_<hex6>` deposit-format wrapper
+    is rejected (Thunder itself doesn't recognize it at the byte level,
+    so a miner authorized with it would accrue unpayable PPS balance).
     Validated in [src/thunder.c](src/thunder.c).
   - Every block's coinbase is a **BIP300 drivechain deposit** into the
     configured `pool_thunder_reserve_address` instead of paying the

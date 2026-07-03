@@ -124,27 +124,40 @@ reconciliation.
 ```sh
 ssh -i <ssh-key> root@<pool-host>
 
-# 1. Get a Thunder-owned deposit address (formatted for the mainchain wallet)
+# 1. Get a Thunder-owned deposit address (BARE base58 — 20-byte hash).
+#    Do NOT use `format-deposit-address`; that produces the display-only
+#    `s<n>_<base58>_<hex6>` wrapper that Thunder's own OP_RETURN parser
+#    rejects. Empirically verified — deposits to the wrapper form are
+#    logged as "Ignoring invalid deposit address" and end up unpayable.
 TCLI=/home/forknet/forknet-software/thunder-rust/target/debug/thunder_app_cli
 POOL_ADDR=$(sudo -u forknet $TCLI get-new-address)
-DEP=$(sudo -u forknet $TCLI format-deposit-address "$POOL_ADDR")
-echo "deposit target: $DEP"
+echo "deposit target: $POOL_ADDR"
 
 # 2. Trigger the deposit via the enforcer's wallet. AMOUNT + FEE are yours to pick.
 GRPCURL=/home/forknet/forknet-software/grpcurl
 AMOUNT_SATS=1000000     # 0.01 BTC = 1_000_000 sats
 FEE_SATS=1000
 $GRPCURL -plaintext \
-  -d "{\"sidechain_id\":9,\"address\":\"$DEP\",\"value_sats\":$AMOUNT_SATS,\"fee_sats\":$FEE_SATS}" \
+  -d "{\"sidechain_id\":9,\"address\":\"$POOL_ADDR\",\"value_sats\":$AMOUNT_SATS,\"fee_sats\":$FEE_SATS}" \
   127.0.0.1:50051 cusf.mainchain.v1.WalletService/CreateDepositTransaction
 
-# 3. Wait for a mainchain block. If you want to force one on the test:
+# 3. Wait for a natural mainchain block from your miner (or on regtest,
+#    force one with GenerateBlocks).
 $GRPCURL -plaintext -d '{"blocks":1}' \
   127.0.0.1:50051 cusf.mainchain.v1.WalletService/GenerateBlocks
 
 # 4. Confirm the Ctip moved
 $GRPCURL -plaintext -d '{"sidechain_number":9}' \
   127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetCtip
+
+# 5. Poke Thunder to include the new deposit in a sidechain block.
+#    `mine` may time out on the client side but the block gets produced.
+curl -sS --max-time 15 -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"mine","params":[]}' \
+  http://127.0.0.1:6009/
+
+# 6. Confirm Thunder's wallet balance grew
+sudo -u forknet $TCLI balance
 ```
 
 **About the "enforcer's wallet"**: the enforcer runs its own on-box BTC
