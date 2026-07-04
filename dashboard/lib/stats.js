@@ -272,6 +272,35 @@ export function worker(handle, name, windowSec = 86400) {
         };
     }
 
+    /* Payouts to this worker — same table the admin dashboard reads;
+     * miners can verify their own txids from the public view. */
+    let payouts = [];
+    try {
+        payouts = d.prepare(`
+            SELECT id, sats, fee_sats, txid, paid_at, note
+            FROM   payouts
+            WHERE  worker_id = ?
+            ORDER  BY paid_at DESC, id DESC
+            LIMIT  100
+        `).all(w.id).map(r => ({
+            id: r.id, sats: Number(r.sats), fee_sats: Number(r.fee_sats),
+            txid: r.txid, paid_at: Number(r.paid_at), note: r.note,
+        }));
+    } catch { /* payouts table missing on very old DBs — fine */ }
+
+    /* Blocks found BY this worker specifically. */
+    const workerBlocks = d.prepare(`
+        SELECT id, ts, height, hash, reward_sats, fee_sats
+        FROM   blocks_found
+        WHERE  finder_id = ?
+        ORDER  BY ts DESC, id DESC
+        LIMIT  25
+    `).all(w.id).map(r => ({
+        id: r.id, ts: Number(r.ts), height: Number(r.height), hash: r.hash,
+        reward_sats: Number(r.reward_sats || 0),
+        fee_sats:    Number(r.fee_sats || 0),
+    }));
+
     return {
         worker: {
             name: w.name,
@@ -285,6 +314,8 @@ export function worker(handle, name, windowSec = 86400) {
         buckets,
         window_sec: windowSec,
         pps_audit: ppsAudit,
+        payouts,
+        blocks: workerBlocks,
     };
 }
 

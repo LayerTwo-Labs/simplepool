@@ -123,6 +123,84 @@ if (n > 1) {
                 without exposing other miners' data on this public page.
             </p>
         </section>
+
+        <section class="card">
+            <h2>Payouts to your Thunder address</h2>
+            <% if (!payouts || payouts.length === 0) { %>
+                <p class="muted">
+                    No payouts recorded yet. Once the operator's Thunder
+                    reserve has enough BTC and the payout worker fires,
+                    each Thunder tx paying you will appear here with its
+                    txid so you can verify it in your own Thunder wallet.
+                </p>
+            <% } else { %>
+            <p class="muted small" style="margin-top:0">
+                Each row is one Thunder transaction the pool sent to your
+                address. Verify by looking the txid up in your own Thunder
+                wallet — the same tx should show as an incoming credit.
+            </p>
+            <table class="lb">
+                <thead><tr>
+                    <th>When</th>
+                    <th>Amount</th>
+                    <th>Fee</th>
+                    <th>Thunder txid <span class="muted small">(click to copy)</span></th>
+                </tr></thead>
+                <tbody>
+                <% payouts.forEach(p => { %>
+                    <tr>
+                        <td title="<%= fmtTs(p.paid_at) %>"><%= ago(p.paid_at) %></td>
+                        <td><strong><%= fmtSats(p.sats) %></strong></td>
+                        <td class="muted small"><%= fmtSats(p.fee_sats) %></td>
+                        <td class="mono small" style="word-break:break-all"><%= p.txid %></td>
+                    </tr>
+                <% }) %>
+                </tbody>
+            </table>
+            <p class="muted small" style="margin-top:0.75em">
+                Total paid to date:
+                <strong><%= fmtSats(payouts.reduce((a, p) => a + p.sats, 0)) %></strong>
+                across <%= payouts.length %> transaction<%= payouts.length === 1 ? '' : 's' %>.
+            </p>
+            <% } %>
+        </section>
+
+        <% if (blocks && blocks.length > 0) { %>
+        <section class="card">
+            <h2>Blocks you found</h2>
+            <p class="muted small" style="margin-top:0">
+                Blocks where <em>your</em> share crossed the network target.
+                Even though PPS pays you the same per share regardless of
+                whether a share becomes a block, blocks are what actually
+                fund the pool BTC wallet that later gets deposited to
+                Thunder to pay you. Look up the coinbase of each block
+                with <code>bitcoin-cli getblock &lt;hash&gt; 2</code>.
+            </p>
+            <table class="lb">
+                <thead><tr>
+                    <th>When</th>
+                    <th>Height</th>
+                    <th>Reward</th>
+                    <th>Fees</th>
+                    <th>Block hash</th>
+                </tr></thead>
+                <tbody>
+                <% blocks.forEach(b => { %>
+                    <tr>
+                        <td title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
+                        <td><%= fmtN(b.height) %></td>
+                        <td><%= fmtSats(b.reward_sats) %></td>
+                        <td class="muted small"><%= fmtSats(b.fee_sats) %></td>
+                        <td class="mono small" style="word-break:break-all"><%= b.hash %></td>
+                    </tr>
+                <% }) %>
+                </tbody>
+            </table>
+            <p class="muted small" style="margin-top:0.75em">
+                <%= blocks.length %> block<%= blocks.length === 1 ? '' : 's' %> found · pool BTC earned:
+                <strong><%= fmtSats(blocks.reduce((a, b) => a + b.reward_sats + b.fee_sats, 0)) %></strong>
+            </p>
+        </section>
         <% } %>
 
         <section class="card">
