@@ -347,6 +347,153 @@ Read the payout log. Common causes:
   never authorized cleanly — check the `rejects` table for that
   worker_name)
 
+### "⚠ Reserve is short by N sats" banner on /admin
+
+The admin dashboard's PPS ledger card is telling you the payout worker's
+next tick will see less BTC in Thunder than the sum of everything the
+pool owes. The worker keeps skipping ticks (correctly — its policy is
+"pay everyone or nobody" to prevent partial-payout states) until you
+close the gap by moving BTC through the two-step deposit flow.
+
+**Where BTC lives at each step:**
+
+```
+     coinbase                                (manual: sendtoaddress)
+        │                                       │
+        ▼                                       ▼
+┌─────────────────┐  step 1     ┌──────────────────┐  step 2  ┌────────────────┐
+│ operator BTC    │────────────▶│ enforcer wallet  │─────────▶│ Thunder wallet │
+│ wallet          │             │ (on-box, BIP300  │  (Create-│ (BMM confirms) │
+│ pool_btc_addr   │             │  aware)          │  Deposit-│                │
+└─────────────────┘             └──────────────────┘  Tx)     └───────┬────────┘
+      accumulates                     spends into                     │ step 3
+       coinbase                       drivechain deposits             │ payout worker
+                                                                      ▼
+                                                              ┌────────────────┐
+                                                              │ miner Thunder  │
+                                                              │ wallets        │
+                                                              └────────────────┘
+```
+
+The banner means "step 1 + step 2 haven't happened recently enough."
+Runbook to close it:
+
+**How much to deposit.** Rule of thumb: **1.1× the current owed**,
+i.e. enough to cover the debt plus headroom for the fee_sats budget +
+new shares landing while you deposit. Read `totals.owed` off
+`/api/admin/summary` (admin auth) for the current number.
+
+**Step 1 — fund the enforcer wallet from the operator wallet.**
+
+```sh
+ssh -i <ssh-key> root@<pool-host>
+GRPCURL=/home/forknet/forknet-software/grpcurl
+BCLI="/home/forknet/forknet-software/drivechain-forknet/build/bin/bitcoin-cli \
+    -datadir=/home/forknet/.drivechain-forknet \
+    -rpcuser=<rpcuser> -rpcpassword=<rpcpassword> \
+    -rpcwallet=<wallet-name>"
+
+# Fresh enforcer-owned receive address (one per deposit).
+ENF=$($GRPCURL -plaintext 127.0.0.1:50051 \
+      cusf.mainchain.v1.WalletService/CreateNewAddress \
+      | python3 -c "import json,sys; print(json.load(sys.stdin)['address'])")
+echo "enforcer receive: $ENF"
+
+# Send the target amount from the operator wallet. Wait for the next
+# natural mainchain block (30-60s in a healthy miner) to confirm.
+$BCLI sendtoaddress "$ENF" <btc_amount>
+```
+
+**Step 2 — deposit from the enforcer wallet into Thunder.**
+
+```sh
+TCLI=/home/forknet/forknet-software/thunder-rust/target/debug/thunder_app_cli
+
+# BARE Thunder address ONLY. Do NOT use `format-deposit-address` — the
+# 's<n>_<base58>_<hex6>' wrapper is rejected by Thunder's OP_RETURN
+# parser and any deposit to it ends up at a fallback address the pool
+# doesn't own. Empirically verified; the C-side authorize check now
+# rejects wrapper-form usernames for the same reason.
+POOL_ADDR=$(sudo -u forknet $TCLI get-new-address)
+echo "deposit target: $POOL_ADDR"
+
+# Capture Ctip before so we can verify it moves.
+CTIP_BEFORE=$($GRPCURL -plaintext -d '{"sidechain_number":9}' \
+    127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetCtip)
+echo "$CTIP_BEFORE"
+
+# Deposit — value is in sats. E.g. 5 BTC = 500_000_000, 50 BTC = 5_000_000_000.
+DEPOSIT_SATS=<sats>
+$GRPCURL -plaintext \
+    -d "{\"sidechain_id\":9,\"address\":\"$POOL_ADDR\",\
+\"value_sats\":$DEPOSIT_SATS,\"fee_sats\":1000}" \
+    127.0.0.1:50051 cusf.mainchain.v1.WalletService/CreateDepositTransaction
+```
+
+Wait for a mainchain block, then confirm the Ctip grew by roughly
+`DEPOSIT_SATS`:
+
+```sh
+$GRPCURL -plaintext -d '{"sidechain_number":9}' \
+    127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetCtip
+```
+
+**Step 3 — poke Thunder to include the deposit in a sidechain block.**
+
+```sh
+curl -sS --max-time 15 -H 'content-type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"mine","params":[]}' \
+    http://127.0.0.1:6009/
+
+# balance should now show the new sats
+sudo -u forknet $TCLI balance
+```
+
+Client-side `mine` sometimes times out at ~12s but the block gets
+produced anyway — the timeout is on the RPC response, not the actual
+work. Re-check `balance` after 30s if the first check still shows 0.
+
+**Step 4 — log it so the admin dashboard's "Deposits" card shows the row.**
+
+```sh
+scripts/log-deposit.sh \
+    --db /home/forknet/pps-thunder-test/data/shares.db \
+    --txid <mainchain txid from step 2> \
+    --sats $DEPOSIT_SATS --fee 1000 \
+    --recipient $POOL_ADDR \
+    --ctip-before <n> --ctip-after <n> \
+    --note "top-up to cover payout backlog"
+```
+
+The payout worker's next tick (max 30s later) then sees
+`available_sats >= totals.owed + fees`, drops the warning banner, and
+starts firing Thunder transfers. Each one lands in the admin's
+"Recent payouts" card with its txid; miners see the same txid on their
+public per-worker page.
+
+**Doing it in smaller rounds.** The current all-or-nothing worker policy
+(pay everyone or nobody) means even 90% of the owed sum still won't
+trip the gate — save yourself the disappointment and either close the
+gap completely in one round, or land the partial-payout policy first
+(sort due workers by `owed ASC`, pay whoever fits, stop when the next
+one won't fit; ~15 LoC in `payout/lib/payout.js`).
+
+**If the Ctip moves but Thunder balance stays at 0.** BMM is stalled.
+Restart Thunder to unblock it:
+
+```sh
+pkill -x thunder_app
+sudo -u forknet -H bash -c "
+    /home/forknet/forknet-software/thunder-rust/target/debug/thunder_app \
+        --headless --datadir /home/forknet/pps-thunder-test/thunder-data \
+        --network forknet --mainchain-grpc-url http://127.0.0.1:50051 \
+        --net-addr 127.0.0.1:4009 --rpc-addr 127.0.0.1:6009 \
+        --log-level INFO \
+        > /home/forknet/pps-thunder-test/logs/thunder.log 2>&1 &"
+```
+
+Give it ~30s to sync and re-run step 3.
+
 ---
 
 ## Open items on the operator side
