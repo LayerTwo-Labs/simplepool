@@ -174,6 +174,86 @@ export function workerAudit(handle, workerId, { rate, recentLimit = 100, dayLimi
     };
 }
 
+/* Most recent successful payouts, newest first. Joined to workers so
+ * the operator can eyeball who was paid + jump to their audit page. */
+export function recentPayouts(handle, limit = 25) {
+    const db = unwrap(handle);
+    if (!db) return [];
+    return db.prepare(`
+        SELECT  p.id, p.worker_id, w.name AS worker_name,
+                w.payout_address AS thunder_address,
+                p.sats, p.fee_sats, p.txid, p.paid_at, p.note
+        FROM    payouts p
+        JOIN    workers w ON w.id = p.worker_id
+        ORDER   BY p.paid_at DESC, p.id DESC
+        LIMIT   ?
+    `).all(limit).map(r => ({
+        ...r,
+        sats:     Number(r.sats),
+        fee_sats: Number(r.fee_sats),
+        paid_at:  Number(r.paid_at),
+    }));
+}
+
+/* Payouts for a specific worker (used on the per-worker audit page). */
+export function payoutsForWorker(handle, workerId, limit = 100) {
+    const db = unwrap(handle);
+    if (!db) return [];
+    return db.prepare(`
+        SELECT id, sats, fee_sats, txid, paid_at, note
+        FROM   payouts
+        WHERE  worker_id = ?
+        ORDER  BY paid_at DESC, id DESC
+        LIMIT  ?
+    `).all(workerId, limit).map(r => ({
+        ...r,
+        sats:     Number(r.sats),
+        fee_sats: Number(r.fee_sats),
+        paid_at:  Number(r.paid_at),
+    }));
+}
+
+/* Mainchain → Thunder deposits the operator has made, newest first. */
+export function recentDeposits(handle, limit = 25) {
+    const db = unwrap(handle);
+    if (!db) return [];
+    return db.prepare(`
+        SELECT id, ts, btc_txid, sats_deposited, fee_sats, thunder_recipient,
+               ctip_seq_before, ctip_seq_after, notes
+        FROM   deposits
+        ORDER  BY ts DESC, id DESC
+        LIMIT  ?
+    `).all(limit).map(r => ({
+        ...r,
+        ts:              Number(r.ts),
+        sats_deposited:  Number(r.sats_deposited),
+        fee_sats:        Number(r.fee_sats),
+    }));
+}
+
+/* Recent blocks the pool has found — same query the public dashboard
+ * uses (block.hash is the identifier; the coinbase txid is derivable
+ * from `bitcoin-cli getblock <hash>`). Included here so admin ops see
+ * the full BTC-flow chain in one place. */
+export function recentBlocksFound(handle, limit = 15) {
+    const db = unwrap(handle);
+    if (!db) return [];
+    return db.prepare(`
+        SELECT b.id, b.ts, b.height, b.hash, b.finder_id, b.finder_address,
+               b.reward_sats, b.fee_sats,
+               w.name AS finder_name
+        FROM   blocks_found b
+        LEFT   JOIN workers w ON w.id = b.finder_id
+        ORDER  BY b.ts DESC, b.id DESC
+        LIMIT  ?
+    `).all(limit).map(r => ({
+        ...r,
+        ts:          Number(r.ts),
+        reward_sats: Number(r.reward_sats || 0),
+        fee_sats:    Number(r.fee_sats || 0),
+    }));
+}
+
 /* Minimal Thunder JSON-RPC client — we only need `balance()`. Short
  * timeout so the admin page renders promptly even when Thunder is
  * unreachable. */

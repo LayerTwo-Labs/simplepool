@@ -142,6 +142,36 @@ const drift = audit.totals.accrued_computed - naiveAccrued;
         </section>
 
         <section class="card">
+            <h2>Payouts to this worker</h2>
+            <% if (!audit.payouts || audit.payouts.length === 0) { %>
+                <p class="muted">No payouts yet. Once the payout worker fires a Thunder tx to this address, each one gets a row here with its txid.</p>
+            <% } else { %>
+            <table>
+                <thead>
+                    <tr>
+                        <th>When</th>
+                        <th>Amount</th>
+                        <th>Fee</th>
+                        <th>Thunder txid</th>
+                        <th>Note</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <% audit.payouts.forEach(p => { %>
+                    <tr>
+                        <td class="muted small" title="<%= fmtTs(p.paid_at) %>"><%= ago(p.paid_at) %></td>
+                        <td><strong><%= fmtSats(p.sats) %></strong></td>
+                        <td class="muted small"><%= fmtSats(p.fee_sats) %></td>
+                        <td class="mono small"><%= p.txid %></td>
+                        <td class="muted small"><%= p.note || '' %></td>
+                    </tr>
+                    <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
+
+        <section class="card">
             <h2>Recent shares (last <%= withRunning.length %>, newest first)</h2>
             <% if (withRunning.length === 0) { %>
                 <p class="muted">No shares recorded.</p>

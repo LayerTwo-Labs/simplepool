@@ -84,7 +84,7 @@ export async function runOnce(ctx, log) {
             continue;
         }
         try {
-            finalizePayout(db, rowId, r.worker_id, r.owed_sats, txid, now_s);
+            finalizePayout(db, rowId, r.worker_id, r.owed_sats, TX_FEE_SATS, txid, now_s);
             log.info(`payout: ${r.worker_name} -> ${r.thunder_address} ` +
                      `${r.owed_sats} sats txid=${txid}`);
             paid++;

@@ -102,13 +102,20 @@ function requireAdminAuth(req, res, next) {
 }
 
 async function adminSummary() {
-    const [reserve, totals, workers, inFlight] = await Promise.all([
+    const [reserve, totals, workers, inFlight, payouts, deposits, blocks] = await Promise.all([
         admin.thunderBalance(THUNDER_RPC_URL),
         Promise.resolve(admin.poolTotals(db)),
         Promise.resolve(admin.perWorkerBalances(db)),
         Promise.resolve(admin.inFlight(db)),
+        Promise.resolve(admin.recentPayouts(db, 25)),
+        Promise.resolve(admin.recentDeposits(db, 25)),
+        Promise.resolve(admin.recentBlocksFound(db, 15)),
     ]);
-    return { reserve, reserveAddress: RESERVE_ADDRESS, totals, workers, inFlight };
+    return {
+        reserve, reserveAddress: RESERVE_ADDRESS,
+        totals, workers, inFlight,
+        payouts, deposits, blocks,
+    };
 }
 
 app.get('/admin', requireAdminAuth, async (req, res) => {
@@ -132,6 +139,7 @@ app.get('/api/admin/summary', requireAdminAuth, async (req, res) => {
 function workerAuditFor(workerId) {
     const audit = admin.workerAudit(db, workerId, { rate: PPS_SATS_PER_DIFF });
     if (!audit) return null;
+    audit.payouts = admin.payoutsForWorker(db, workerId, 100);
     return audit;
 }
 

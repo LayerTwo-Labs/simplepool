@@ -69,11 +69,12 @@ export function beginPayout(db, workerId, sats, nowSec) {
 /* Atomic finalize after a successful Thunder broadcast:
  *   1. record the txid on the in-flight row (audit trail)
  *   2. increment pps_credits.paid_sats
- *   3. delete the in-flight row
- * All three happen in one SQLite transaction so a crash inside this
- * window leaves the row with the txid set, and the startup sweep can
- * finish what step 2/3 didn't. */
-export function finalizePayout(db, rowId, workerId, sats, txid, nowSec) {
+ *   3. append to the permanent payouts ledger
+ *   4. delete the in-flight row
+ * All four happen in one SQLite transaction — so on any crash inside
+ * this window the state stays consistent (either everything applied or
+ * nothing did), and the startup sweep can finish what 3/4 didn't. */
+export function finalizePayout(db, rowId, workerId, sats, feeSats, txid, nowSec) {
     db.transaction(() => {
         db.prepare(`
             UPDATE payouts_in_flight SET txid = ? WHERE id = ?
@@ -84,6 +85,10 @@ export function finalizePayout(db, rowId, workerId, sats, txid, nowSec) {
                    last_updated = ?
              WHERE worker_id    = ?
         `).run(Number(sats), nowSec, workerId);
+        db.prepare(`
+            INSERT INTO payouts (worker_id, sats, fee_sats, txid, paid_at, note)
+            VALUES (?, ?, ?, ?, ?, NULL)
+        `).run(workerId, Number(sats), Number(feeSats), txid, nowSec);
         db.prepare(`
             DELETE FROM payouts_in_flight WHERE id = ?
         `).run(rowId);

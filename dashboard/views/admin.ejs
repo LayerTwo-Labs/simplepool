@@ -144,6 +144,114 @@ const fmtSats = (sats) => {
             </table>
             <% } %>
         </section>
+
+        <section class="card">
+            <h2>Recent payouts (Thunder)</h2>
+            <% if (payouts.length === 0) { %>
+                <p class="muted">No successful payouts yet. Populates once the payout worker sends a Thunder tx (or after a manual reconcile).</p>
+            <% } else { %>
+            <table>
+                <thead>
+                    <tr>
+                        <th>When</th>
+                        <th>Worker</th>
+                        <th>Amount</th>
+                        <th>Fee</th>
+                        <th>Thunder txid</th>
+                        <th>Note</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <% payouts.forEach(p => { %>
+                    <tr>
+                        <td class="muted small" title="<%= fmtTs(p.paid_at) %>"><%= ago(p.paid_at) %></td>
+                        <td class="mono small"><a href="/admin/worker/<%= p.worker_id %>"><%= p.worker_name %></a></td>
+                        <td><strong><%= fmtSats(p.sats) %></strong></td>
+                        <td class="muted small"><%= fmtSats(p.fee_sats) %></td>
+                        <td class="mono small" title="<%= p.txid %>"><%= p.txid.slice(0,16) %>…<%= p.txid.slice(-6) %></td>
+                        <td class="muted small"><%= p.note || '' %></td>
+                    </tr>
+                    <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
+
+        <section class="card">
+            <h2>Deposits (mainchain → Thunder)</h2>
+            <% if (deposits.length === 0) { %>
+                <p class="muted">No deposits recorded. See <code>OPERATOR_GUIDE.md</code> or use <code>scripts/log-deposit.sh</code> after issuing a CreateDepositTransaction.</p>
+            <% } else { %>
+            <table>
+                <thead>
+                    <tr>
+                        <th>When</th>
+                        <th>Amount</th>
+                        <th>Fee</th>
+                        <th>Thunder recipient</th>
+                        <th>Mainchain txid</th>
+                        <th>Ctip seq</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <% deposits.forEach(d => { %>
+                    <tr>
+                        <td class="muted small" title="<%= fmtTs(d.ts) %>"><%= ago(d.ts) %></td>
+                        <td><strong><%= fmtSats(d.sats_deposited) %></strong></td>
+                        <td class="muted small"><%= fmtSats(d.fee_sats) %></td>
+                        <td class="mono small"><%= d.thunder_recipient %></td>
+                        <td class="mono small" title="<%= d.btc_txid %>"><%= d.btc_txid.slice(0,16) %>…<%= d.btc_txid.slice(-6) %></td>
+                        <td class="muted small"><%= d.ctip_seq_before %> → <%= d.ctip_seq_after %></td>
+                    </tr>
+                    <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
+
+        <section class="card">
+            <h2>Recent blocks (coinbase → pool BTC wallet)</h2>
+            <% if (blocks.length === 0) { %>
+                <p class="muted">No blocks recorded yet.</p>
+            <% } else { %>
+            <p class="muted small" style="margin-top:0">
+                Every block's coinbase pays the pool's <code>pool_btc_address</code> (in pps-classic
+                mode) for <em>reward</em>. Operator batches accumulated BTC into Thunder via the
+                deposits above. To see the coinbase txid on-chain:
+                <code>bitcoin-cli getblock &lt;hash&gt; 2</code>.
+            </p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>When</th>
+                        <th>Height</th>
+                        <th>Block hash</th>
+                        <th>Finder</th>
+                        <th>Reward</th>
+                        <th>Fee</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <% blocks.forEach(b => { %>
+                    <tr>
+                        <td class="muted small" title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
+                        <td><%= fmtN(b.height) %></td>
+                        <td class="mono small" title="<%= b.hash %>"><%= b.hash.slice(0,16) %>…<%= b.hash.slice(-6) %></td>
+                        <td class="mono small">
+                            <% if (b.finder_id) { %>
+                                <a href="/admin/worker/<%= b.finder_id %>"><%= b.finder_name || b.finder_address || 'unknown' %></a>
+                            <% } else { %>
+                                <span class="muted">(unattributed)</span>
+                            <% } %>
+                        </td>
+                        <td><%= fmtSats(b.reward_sats) %></td>
+                        <td class="muted small"><%= fmtSats(b.fee_sats) %></td>
+                    </tr>
+                    <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
     </main>
     <footer class="foot">
         <span>read-only · auto-refresh 15s</span>

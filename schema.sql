@@ -66,19 +66,36 @@ CREATE TABLE IF NOT EXISTS pps_credits (
 
 /* Ledger of operator-triggered mainchain → Thunder deposits, used by
  * pool_mode=pps-classic. The C proxy does not touch this table; the
- * admin dashboard is the only writer. */
+ * admin dashboard + a helper CLI are the writers. */
 CREATE TABLE IF NOT EXISTS deposits (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   ts                INTEGER NOT NULL,          /* unix seconds */
   btc_txid          TEXT    NOT NULL,          /* mainchain deposit tx */
   sats_deposited    INTEGER NOT NULL,
   fee_sats          INTEGER NOT NULL,
-  thunder_recipient TEXT    NOT NULL,          /* s9_<base58>_<hex6> */
+  thunder_recipient TEXT    NOT NULL,          /* bare base58 Thunder addr */
   ctip_seq_before   INTEGER,
   ctip_seq_after    INTEGER,
   notes             TEXT
 );
 CREATE INDEX IF NOT EXISTS deposits_ts_idx ON deposits(ts);
+
+/* Permanent ledger of successful miner payouts. One row per settled
+ * Thunder transfer — populated by the payout worker inside the same
+ * atomic finalize transaction that increments pps_credits.paid_sats
+ * and drops the payouts_in_flight row. Only append; never mutate
+ * after write (audit trail). Empty in solo mode. */
+CREATE TABLE IF NOT EXISTS payouts (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  worker_id    INTEGER NOT NULL REFERENCES workers(id),
+  sats         INTEGER NOT NULL,
+  fee_sats     INTEGER NOT NULL,
+  txid         TEXT    NOT NULL,        /* Thunder tx id (hex) */
+  paid_at      INTEGER NOT NULL,        /* unix seconds */
+  note         TEXT                     /* 'manual' for hand-driven, else NULL */
+);
+CREATE INDEX IF NOT EXISTS payouts_worker_ts_idx ON payouts(worker_id, paid_at);
+CREATE INDEX IF NOT EXISTS payouts_paid_at_idx   ON payouts(paid_at);
 
 /* In-flight payout ledger. The payout worker INSERTs a row before
  * broadcasting a Thunder transaction; on successful broadcast it
