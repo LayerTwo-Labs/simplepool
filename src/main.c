@@ -533,6 +533,7 @@ int main(int argc, char **argv) {
     stcfg.vardiff_min        = cfg.vardiff_min;
     stcfg.vardiff_max        = cfg.vardiff_max;
     stcfg.vardiff_window_sec = cfg.vardiff_window_sec;
+    stcfg.idle_timeout_sec   = cfg.idle_timeout_sec;
 
     /* PPS / Thunder. Both pps and pps-classic modes require Thunder-address
      * usernames and produce PPS accruals; they differ only in the coinbase

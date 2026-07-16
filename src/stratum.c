@@ -212,6 +212,11 @@ struct stratum_conn {
     uint64_t vd_window_start_ms;
     uint32_t vd_window_shares;
 
+    /* Monotonic timestamp of the most recent recv() that got any bytes.
+     * The conn thread checks this against cfg.idle_timeout_sec after each
+     * SO_RCVTIMEO wake-up so silent connections are reaped. */
+    uint64_t last_activity_ms;
+
     pthread_mutex_t write_lock;
 
     struct stratum_conn *next;  /* server->conns_head linked list */
@@ -1160,6 +1165,53 @@ static int write_all(int fd, const char *buf, size_t len) {
     return 0;
 }
 
+/* Configure an accepted socket so idle miners get reaped instead of
+ * clogging fds/threads indefinitely. Two mechanisms, belt-and-suspenders:
+ *
+ *   1. Application-level: SO_RCVTIMEO gives recv() a bounded wake so we
+ *      can compare last_activity_ms against cfg.idle_timeout_sec. Catches
+ *      miners that hold the TCP open but never send anything (e.g. bad
+ *      username, misconfigured worker).
+ *   2. OS-level: SO_KEEPALIVE + tightened TCP_KEEPIDLE/INTVL/CNT so Linux
+ *      drops the socket after ~5 min of unacked probes. Catches half-open
+ *      TCPs where the miner box vanished from the network without FIN.
+ *
+ * idle_timeout_sec <= 0 disables the read-timeout path (legacy blocking
+ * recv). Returns 0 on success, -1 on fatal setsockopt failure. */
+static int conn_socket_setup(int fd, int idle_timeout_sec) {
+    int one = 1;
+    /* TCP_NODELAY: stratum is tiny latency-sensitive JSON, don't Nagle. */
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    /* Kernel keepalive. Default kernel setting is ~2h before probes even
+     * start, useless for our purposes — override with tight values. */
+    (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_KEEPIDLE
+    int idle = 120;   /* start probing after 2 min of inactivity */
+    int intvl = 30;   /* probe every 30s */
+    int cnt = 3;      /* drop after 3 unacked probes ≈ 3.5 min total */
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+#endif
+
+    if (idle_timeout_sec > 0) {
+        /* Poll interval: min(idle_timeout, 30s). Longer wastes the tail
+         * of the timeout; shorter costs one recv wake per fd per interval
+         * (500 conns × wake/30s = ~16/s, negligible). */
+        int poll_s = idle_timeout_sec < 30 ? idle_timeout_sec : 30;
+        struct timeval tv = { .tv_sec = poll_s, .tv_usec = 0 };
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int stratum_socket_setup_for_test(int fd, int idle_timeout_sec) {
+    return conn_socket_setup(fd, idle_timeout_sec);
+}
+
 static void conn_register(stratum_server_t *s, stratum_conn_t *c) {
     pthread_mutex_lock(&s->conns_lock);
     c->next = s->conns_head;
@@ -1183,9 +1235,34 @@ static void *conn_thread(void *arg) {
     char buf[MAX_LINE_BYTES + 1];
     size_t blen = 0;
 
+    /* Seed activity tracking at connect time — a client that never sends
+     * a single byte is still governed by cfg.idle_timeout_sec. */
+    c->last_activity_ms = mono_ms();
+    const uint64_t idle_timeout_ms =
+        s->cfg.idle_timeout_sec > 0
+            ? (uint64_t)s->cfg.idle_timeout_sec * 1000u
+            : 0;
+
     while (!atomic_load(&s->stop)) {
         ssize_t n = recv(c->fd, buf + blen, sizeof(buf) - 1 - blen, 0);
-        if (n <= 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* SO_RCVTIMEO wake. Drop iff we've been silent past the
+                 * configured budget. Otherwise loop and try again. */
+                if (idle_timeout_ms > 0 &&
+                    mono_ms() - c->last_activity_ms > idle_timeout_ms) {
+                    LOG_INFO("stratum: idle timeout after %us — closing fd=%d worker='%s'",
+                             s->cfg.idle_timeout_sec, c->fd,
+                             c->worker_name[0] ? c->worker_name : "(unauthorized)");
+                    goto done;
+                }
+                continue;
+            }
+            break;  /* real socket error */
+        }
+        if (n == 0) break;  /* peer closed */
+        c->last_activity_ms = mono_ms();
         blen += (size_t)n;
         buf[blen] = '\0';
         for (;;) {
@@ -1234,8 +1311,12 @@ static void *listener_thread(void *arg) {
             close(fd);
             continue;
         }
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        if (conn_socket_setup(fd, s->cfg.idle_timeout_sec) < 0) {
+            LOG_WARN("stratum: socket setup failed for accepted fd: %s",
+                     strerror(errno));
+            close(fd);
+            continue;
+        }
         stratum_conn_t *c = stratum_conn_new_for_test(s);
         if (!c) { close(fd); continue; }
         c->fd = fd;
@@ -1261,6 +1342,9 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     s->cfg = *cfg;
     if (s->cfg.max_conns <= 0) s->cfg.max_conns = 500;
     if (s->cfg.initial_diff <= 0) s->cfg.initial_diff = 1.0;
+    /* Negative → explicit disable. 0 → apply default (10 min). Positive kept. */
+    if (s->cfg.idle_timeout_sec == 0) s->cfg.idle_timeout_sec = 600;
+    else if (s->cfg.idle_timeout_sec < 0) s->cfg.idle_timeout_sec = 0;
     pthread_rwlock_init(&s->job_lock, NULL);
     pthread_mutex_init(&s->recent_lock, NULL);
     pthread_mutex_init(&s->conns_lock, NULL);

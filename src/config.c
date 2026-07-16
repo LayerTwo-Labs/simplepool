@@ -48,6 +48,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->vardiff_min        = 1.0;
     cfg->vardiff_max        = 1e12;
     cfg->vardiff_window_sec = 30;
+    cfg->idle_timeout_sec   = 600;    /* 10 min silent recv → reap */
 
     cfg->redis_url[0] = '\0';
     cfg->redis_publish_timeout_ms   = 200;
@@ -149,6 +150,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "vardiff_min")               == 0) cfg->vardiff_min = atof(v);
         else if (strcmp(k, "vardiff_max")               == 0) cfg->vardiff_max = atof(v);
         else if (strcmp(k, "vardiff_window_sec")        == 0) cfg->vardiff_window_sec = atoi(v);
+        else if (strcmp(k, "idle_timeout_sec")          == 0) cfg->idle_timeout_sec = atoi(v);
         else if (strcmp(k, "db_path")                   == 0) copy_str(cfg->db_path, sizeof cfg->db_path, v);
         else if (strcmp(k, "commit_window_ms")          == 0) cfg->commit_window_ms = atoi(v);
         else if (strcmp(k, "commit_max_shares")         == 0) cfg->commit_max_shares = atoi(v);

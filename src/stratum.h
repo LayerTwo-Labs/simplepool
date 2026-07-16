@@ -103,6 +103,11 @@ typedef struct {
     double vardiff_max;
     int    vardiff_window_sec;
 
+    /* Drop a connection whose recv() has been silent for this long. Guards
+     * against half-open TCPs from crashed miners and misconfigured clients
+     * that connect but never authenticate. 0 disables (legacy). Default 600. */
+    int    idle_timeout_sec;
+
     void  *ctx;
     share_observer_fn  on_share;
     reject_observer_fn on_reject;
@@ -136,6 +141,12 @@ const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);
 const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c);
 int         stratum_conn_authorized_for_test(const stratum_conn_t *c);
 int         stratum_conn_subscribed_for_test(const stratum_conn_t *c);
+
+/* Apply the same socket options the listener applies to every accepted
+ * connection: TCP_NODELAY, SO_KEEPALIVE + TCP_KEEP{IDLE,INTVL,CNT}, and
+ * SO_RCVTIMEO (poll interval derived from idle_timeout_sec). Exposed for
+ * tests. */
+int stratum_socket_setup_for_test(int fd, int idle_timeout_sec);
 
 /* Process one JSON-RPC line. Appends one or more newline-delimited JSON
  * messages to *out_buf (caller-owned, will be realloc'd). Returns 0 on
