@@ -11,6 +11,21 @@ Group=@USER@
 WorkingDirectory=@ROOT@/dashboard
 Environment=PORT=8081
 Environment=PROXY_DB_PATH=@ROOT@/data/shares.db
+# Rendered on the public "Connect a miner" card. Set to the actual
+# host miners should point their ASIC at. Leave unset to show
+# 'stratum+tcp://<pool-host>:3334' as a placeholder.
+# Environment=PUBLIC_STRATUM_URL=stratum+tcp://pool.example.com:3334
+# --- PPS admin panel — /admin route ---
+# When ADMIN_USER + ADMIN_PASSWORD are both set, /admin serves the pool
+# operator view (reserve balance, ledger totals, per-worker owed,
+# in-flight payouts). Without both, /admin returns 503 (fail-closed).
+Environment=THUNDER_RPC_URL=http://127.0.0.1:6009
+# Environment=POOL_THUNDER_RESERVE_ADDRESS=<paste from proxy.conf>
+# Environment=ADMIN_USER=admin
+# Environment=ADMIN_PASSWORD=<generate with `openssl rand -base64 21`>
+# Must equal proxy.conf's pps_sats_per_diff — used by the per-worker
+# audit view to cross-check the C proxy's accrual math.
+Environment=POOL_PPS_SATS_PER_DIFF=1000
 ExecStart=/usr/bin/node @ROOT@/dashboard/server.js
 Restart=on-failure
 RestartSec=3

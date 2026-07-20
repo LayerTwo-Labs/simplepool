@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -280,6 +283,43 @@ static void test_authorize_address_with_label(void) {
     stratum_server_free(s);
 }
 
+/* Idle-socket reaper: verify the accepted-socket setup path applies
+ * SO_RCVTIMEO derived from idle_timeout_sec. We can't cheaply test the
+ * "silent client gets dropped" path in a unit test — that would need a
+ * real 3s+ sleep — but confirming SO_RCVTIMEO is present is enough to
+ * guarantee the recv loop wakes and gets to check last_activity_ms. */
+static void test_socket_setup_applies_rcvtimeo(void) {
+    int sp[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+    /* idle_timeout=45 → poll interval clamped to 30s (SO_RCVTIMEO ceiling). */
+    CHECK(stratum_socket_setup_for_test(sp[0], 45) == 0);
+    struct timeval tv = {0};
+    socklen_t len = sizeof tv;
+    CHECK(getsockopt(sp[0], SOL_SOCKET, SO_RCVTIMEO, &tv, &len) == 0);
+    CHECK(tv.tv_sec == 30);
+    /* idle_timeout=5 → poll interval matches (below the 30s clamp). */
+    CHECK(stratum_socket_setup_for_test(sp[1], 5) == 0);
+    struct timeval tv2 = {0};
+    socklen_t len2 = sizeof tv2;
+    CHECK(getsockopt(sp[1], SOL_SOCKET, SO_RCVTIMEO, &tv2, &len2) == 0);
+    CHECK(tv2.tv_sec == 5);
+    close(sp[0]);
+    close(sp[1]);
+}
+
+/* idle_timeout_sec=0 leaves SO_RCVTIMEO unset — legacy blocking recv. */
+static void test_socket_setup_disabled(void) {
+    int sp[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+    CHECK(stratum_socket_setup_for_test(sp[0], 0) == 0);
+    struct timeval tv = {0};
+    socklen_t len = sizeof tv;
+    CHECK(getsockopt(sp[0], SOL_SOCKET, SO_RCVTIMEO, &tv, &len) == 0);
+    CHECK(tv.tv_sec == 0 && tv.tv_usec == 0);
+    close(sp[0]);
+    close(sp[1]);
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -287,6 +327,8 @@ int main(void) {
     test_submit_share_and_dedupe();
     test_authorize_rejects_non_address();
     test_authorize_address_with_label();
+    test_socket_setup_applies_rcvtimeo();
+    test_socket_setup_disabled();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

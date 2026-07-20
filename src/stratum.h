@@ -61,11 +61,40 @@ typedef struct {
     int    bind_port;
     int    max_conns;            /* default 500 */
     double initial_diff;         /* default 1.0 */
-    /* Coinbase split — every connection's coinbase pays the miner directly
-     * and routes (value * fee_bps / 10000) to operator_address. */
+    /* Coinbase split — in solo mode each connection's coinbase pays the
+     * miner directly. In PPS mode (pps_enabled=1) every coinbase instead
+     * deposits to the pool's Thunder reserve via the BIP300 drivechain
+     * output. In both modes (value * fee_bps / 10000) goes to operator_address
+     * as a BTC fee. */
     char   operator_address[128];
     int    fee_bps;
     char   coinbase_tag[64];
+
+    /* PPS / Thunder. When pps_enabled = 1:
+     *  - mining.authorize accepts Thunder addresses (base58 of 20-byte hash)
+     *  - the share observer's payout_address argument is the miner's
+     *    Thunder address (for PPS accrual), not a Bitcoin address.
+     *
+     * The coinbase behavior then depends on pps_classic_enabled:
+     *  - 0 (pool_mode=pps): render with coinbase_build_drivechain using
+     *    the OP_RETURN payload below. Deposits into Thunder via BIP300 —
+     *    but the enforcer does NOT credit coinbase-source deposits, so
+     *    this shape does not actually move value onto Thunder.
+     *  - 1 (pool_mode=pps-classic): render with coinbase_build_split
+     *    paying pool_btc_address for the miner-share and operator_address
+     *    for the fee. Traditional coinbase; deposits to Thunder happen
+     *    off-band via the admin dashboard.
+     */
+    int     pps_enabled;
+    int     pps_classic_enabled;
+    int     thunder_sidechain_number;
+    char    pool_btc_address[128];   /* pps-classic: coinbase spendable output */
+    /* OP_RETURN payload bytes that ride next to every drivechain output.
+     * Typically the ASCII of the pool's base58 Thunder address. Owned by
+     * the caller (main.c precomputes from config). Unused when
+     * pps_classic_enabled = 1. */
+    const uint8_t *pps_op_return_payload;
+    size_t  pps_op_return_payload_len;
 
     /* Vardiff (see config.h for prose). 0 disables and pins to initial_diff. */
     int    vardiff_enabled;
@@ -73,6 +102,11 @@ typedef struct {
     double vardiff_min;
     double vardiff_max;
     int    vardiff_window_sec;
+
+    /* Drop a connection whose recv() has been silent for this long. Guards
+     * against half-open TCPs from crashed miners and misconfigured clients
+     * that connect but never authenticate. 0 disables (legacy). Default 600. */
+    int    idle_timeout_sec;
 
     void  *ctx;
     share_observer_fn  on_share;
@@ -107,6 +141,12 @@ const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);
 const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c);
 int         stratum_conn_authorized_for_test(const stratum_conn_t *c);
 int         stratum_conn_subscribed_for_test(const stratum_conn_t *c);
+
+/* Apply the same socket options the listener applies to every accepted
+ * connection: TCP_NODELAY, SO_KEEPALIVE + TCP_KEEP{IDLE,INTVL,CNT}, and
+ * SO_RCVTIMEO (poll interval derived from idle_timeout_sec). Exposed for
+ * tests. */
+int stratum_socket_setup_for_test(int fd, int idle_timeout_sec);
 
 /* Process one JSON-RPC line. Appends one or more newline-delimited JSON
  * messages to *out_buf (caller-owned, will be realloc'd). Returns 0 on

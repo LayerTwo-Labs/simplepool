@@ -21,10 +21,12 @@ ifeq ($(UNAME_S),Darwin)
     endif
     PLATFORM_CFLAGS  := -I$(BREW_PREFIX)/include \
                         -I$(BREW_PREFIX)/opt/sqlite/include \
-                        -I$(BREW_PREFIX)/opt/curl/include
+                        -I$(BREW_PREFIX)/opt/curl/include \
+                        -I$(BREW_PREFIX)/opt/hiredis/include
     PLATFORM_LDFLAGS := -L$(BREW_PREFIX)/lib \
                         -L$(BREW_PREFIX)/opt/sqlite/lib \
-                        -L$(BREW_PREFIX)/opt/curl/lib
+                        -L$(BREW_PREFIX)/opt/curl/lib \
+                        -L$(BREW_PREFIX)/opt/hiredis/lib
 else
     PLATFORM_CFLAGS  :=
     PLATFORM_LDFLAGS :=
@@ -40,7 +42,7 @@ POSIX     := -D_POSIX_C_SOURCE=200809L
 CFLAGS  ?= -std=c11 $(WARNFLAGS) -O2 -g $(HARDEN) $(POSIX) \
            -Iinclude -Isrc -Isrc/cjson $(PLATFORM_CFLAGS)
 LDFLAGS ?= $(PLATFORM_LDFLAGS)
-LDLIBS  ?= -lsqlite3 -lcurl -lpthread
+LDLIBS  ?= -lsqlite3 -lcurl -lhiredis -lpthread
 
 BUILD_DIR := build
 BIN       := $(BUILD_DIR)/simplepool
@@ -48,7 +50,7 @@ BIN       := $(BUILD_DIR)/simplepool
 # Sources compiled in this wave. More modules land in later waves.
 SRCS := src/main.c src/log.c src/config.c src/coinbase.c \
         src/share.c src/sha256.c src/stratum.c src/store.c \
-        src/bitcoind.c src/cjson/cJSON.c
+        src/bitcoind.c src/broadcast.c src/thunder.c src/cjson/cJSON.c
 OBJS := $(SRCS:%.c=$(BUILD_DIR)/%.o)
 DEPS := $(OBJS:.o=.d)
 
@@ -74,13 +76,17 @@ include tests/test_bitcoind.mk
 include tests/test_stratum.mk
 include tests/test_store.mk
 include tests/test_coinbase.mk
+include tests/test_broadcast.mk
+include tests/test_thunder.mk
 
-test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase
+test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder
 	./build/test_share
 	./build/test_bitcoind
 	./build/test_stratum
 	./build/test_store
 	./build/test_coinbase
+	./build/test_broadcast
+	./build/test_thunder
 
 format:
 	@if command -v clang-format >/dev/null 2>&1; then \

@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "bitcoind.h"
+#include "broadcast.h"
 #include "coinbase.h"
 #include "config.h"
 #include "log.h"
@@ -109,6 +110,7 @@ static size_t compute_merkle_branches_for_idx0(const uint8_t (*txids_le)[32],
 typedef struct {
     bitcoind_client_t *btc;
     store_t           *store;
+    broadcast_t       *bcast;
     stratum_server_t  *srv;
     proxy_config_t    *cfg;
 
@@ -238,6 +240,34 @@ static void on_share_cb(void *ctx, const char *worker_name,
                                 ts_ms, difficulty, is_block,
                                 block_hash_or_null);
     }
+    if (s && s->bcast) {
+        broadcast_share(s->bcast, worker_name, payout_address,
+                        ts_ms, difficulty, is_block, block_hash_or_null);
+    }
+    /* PPS accrual. Credit the worker proportional to share difficulty.
+     * Truncates to whole sats; sub-sat dust accumulates per-share so
+     * over many shares the rounding error is bounded by 1 sat per row.
+     * Fires for both pool_mode=pps (drivechain coinbase) and pool_mode=
+     * pps-classic (traditional coinbase, operator-driven deposits). */
+    if (s && s->cfg &&
+        (strcmp(s->cfg->pool_mode, "pps") == 0 ||
+         strcmp(s->cfg->pool_mode, "pps-classic") == 0) &&
+        s->cfg->pps_sats_per_diff > 0.0) {
+        int64_t delta = (int64_t)(difficulty * s->cfg->pps_sats_per_diff);
+        if (delta > 0) {
+            if (s->store) {
+                store_record_credit(s->store, worker_name, payout_address,
+                                    ts_ms, delta);
+            }
+            if (s->bcast) {
+                /* accrued_total is the running balance after this credit.
+                 * Since the writer thread is async we don't know it
+                 * exactly; pass 0 and let consumers query SQLite for the
+                 * authoritative number. */
+                broadcast_credit(s->bcast, worker_name, ts_ms, delta, 0);
+            }
+        }
+    }
 }
 
 static void on_reject_cb(void *ctx, const char *worker_name, uint64_t ts_ms,
@@ -245,6 +275,9 @@ static void on_reject_cb(void *ctx, const char *worker_name, uint64_t ts_ms,
     server_ctx_t *s = (server_ctx_t *)ctx;
     if (s && s->store) {
         store_record_reject(s->store, worker_name, ts_ms, reason);
+    }
+    if (s && s->bcast) {
+        broadcast_reject(s->bcast, worker_name, ts_ms, reason);
     }
 }
 
@@ -270,6 +303,10 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
         store_record_block(s->store, ts_ms, (int)height, block_hash,
                            worker_name, finder_address,
                            reward_sats, fee_sats);
+    }
+    if (s && s->bcast) {
+        broadcast_block(s->bcast, worker_name, finder_address,
+                        ts_ms, height, block_hash, reward_sats, fee_sats);
     }
     LOG_INFO("BLOCK FOUND: height=%u finder=%s reward=%lld fee=%lld hash=%s",
              height, worker_name ? worker_name : "?",
@@ -303,6 +340,9 @@ static void *tip_watcher(void *arg) {
         uint64_t now_s = (uint64_t)time(NULL);
         store_record_node_tip(s->store, t->height - 1, t->prev_hash_hex,
                               now_s, now_s);
+        if (s->bcast) {
+            broadcast_node_tip(s->bcast, t->height - 1, t->prev_hash_hex, now_s);
+        }
 
         int need_rebuild = 0;
         pthread_mutex_lock(&s->lock);
@@ -424,6 +464,17 @@ int main(int argc, char **argv) {
         return 4;
     }
 
+    /* Broadcast (optional). */
+    broadcast_cfg_t bcfg2 = {0};
+    snprintf(bcfg2.url, sizeof bcfg2.url, "%s", cfg.redis_url);
+    bcfg2.publish_timeout_ms   = cfg.redis_publish_timeout_ms;
+    bcfg2.reconnect_backoff_ms = cfg.redis_reconnect_backoff_ms;
+    broadcast_t *bcast = NULL;
+    if (broadcast_open(&bcfg2, &bcast) < 0) {
+        LOG_WARN("broadcast_open failed; continuing without redis");
+        bcast = NULL;
+    }
+
     /* Initial template + job. */
     bitcoind_template_t *tmpl = NULL;
     if (bitcoind_get_block_template(&btc, &tmpl, err, sizeof err) < 0) {
@@ -448,6 +499,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&sctx.lock, NULL);
     sctx.btc   = &btc;
     sctx.store = store;
+    sctx.bcast = bcast;
     sctx.cfg   = &cfg;
     sctx.last_height = tmpl->height;
     snprintf(sctx.last_prev_hash, sizeof sctx.last_prev_hash, "%s", tmpl->prev_hash_hex);
@@ -459,6 +511,9 @@ int main(int argc, char **argv) {
         uint64_t now_s = (uint64_t)time(NULL);
         store_record_node_tip(store, tmpl->height - 1, tmpl->prev_hash_hex,
                               now_s, now_s);
+        if (bcast) {
+            broadcast_node_tip(bcast, tmpl->height - 1, tmpl->prev_hash_hex, now_s);
+        }
     }
 
     /* Start stratum server. */
@@ -478,6 +533,75 @@ int main(int argc, char **argv) {
     stcfg.vardiff_min        = cfg.vardiff_min;
     stcfg.vardiff_max        = cfg.vardiff_max;
     stcfg.vardiff_window_sec = cfg.vardiff_window_sec;
+    stcfg.idle_timeout_sec   = cfg.idle_timeout_sec;
+
+    /* PPS / Thunder. Both pps and pps-classic modes require Thunder-address
+     * usernames and produce PPS accruals; they differ only in the coinbase
+     * shape (drivechain vs traditional). */
+    static uint8_t pps_payload[80];
+    size_t pps_payload_len = 0;
+    stcfg.pps_enabled         = (strcmp(cfg.pool_mode, "pps")         == 0 ||
+                                 strcmp(cfg.pool_mode, "pps-classic") == 0);
+    stcfg.pps_classic_enabled = (strcmp(cfg.pool_mode, "pps-classic") == 0);
+    stcfg.thunder_sidechain_number = cfg.thunder_sidechain_number;
+    snprintf(stcfg.pool_btc_address, sizeof stcfg.pool_btc_address, "%s",
+             cfg.pool_btc_address);
+
+    if (stcfg.pps_classic_enabled) {
+        /* Fail fast on a misconfigured pool_btc_address so we don't drop
+         * every rendered job at runtime. */
+        uint8_t spk[64];
+        size_t  spk_len = sizeof spk;
+        char    perr[256] = {0};
+        if (coinbase_address_to_script(cfg.pool_btc_address, spk, sizeof spk,
+                                       &spk_len, perr, sizeof perr) < 0) {
+            fprintf(stderr,
+                    "config error: invalid pool_btc_address '%s': %s\n",
+                    cfg.pool_btc_address, perr);
+            return 2;
+        }
+        LOG_INFO("pool_mode=pps-classic: pool_btc_address=%s, pps_sats_per_diff=%.2f",
+                 cfg.pool_btc_address, cfg.pps_sats_per_diff);
+    } else if (stcfg.pps_enabled) {
+        /* pool_mode=pps — precompute the OP_RETURN bytes for the drivechain
+         * coinbase: either the explicit hex from config, or the ASCII of the
+         * pool's base58 Thunder address (matches Thunder's wallet behaviour). */
+        if (cfg.thunder_op_return_hex[0]) {
+            size_t hlen = strlen(cfg.thunder_op_return_hex);
+            if (hlen % 2 != 0 || hlen / 2 > sizeof pps_payload) {
+                fprintf(stderr, "config: invalid thunder_op_return_hex (length)\n");
+                return 9;
+            }
+            for (size_t i = 0; i < hlen / 2; i++) {
+                int hi = hex_nibble(cfg.thunder_op_return_hex[2*i]);
+                int lo = hex_nibble(cfg.thunder_op_return_hex[2*i + 1]);
+                if (hi < 0 || lo < 0) {
+                    fprintf(stderr, "config: invalid thunder_op_return_hex (chars)\n");
+                    return 9;
+                }
+                pps_payload[i] = (uint8_t)((hi << 4) | lo);
+            }
+            pps_payload_len = hlen / 2;
+        } else {
+            size_t alen = strlen(cfg.pool_thunder_reserve_address);
+            if (alen == 0 || alen > sizeof pps_payload) {
+                fprintf(stderr,
+                        "config: pool_thunder_reserve_address empty or too long\n");
+                return 9;
+            }
+            memcpy(pps_payload, cfg.pool_thunder_reserve_address, alen);
+            pps_payload_len = alen;
+        }
+        stcfg.pps_op_return_payload     = pps_payload;
+        stcfg.pps_op_return_payload_len = pps_payload_len;
+        LOG_WARN("pool_mode=pps: coinbase deposits will NOT credit the Thunder "
+                 "Ctip on the LayerTwo-Labs enforcer — this mode strands the "
+                 "block reward. Use pool_mode=pps-classic for real deployments.");
+        LOG_INFO("pool_mode=pps: sidechain=%d, op_return_payload=%zu bytes, "
+                 "pps_sats_per_diff=%.2f",
+                 cfg.thunder_sidechain_number, pps_payload_len,
+                 cfg.pps_sats_per_diff);
+    }
     stcfg.ctx            = &sctx;
     stcfg.on_share       = on_share_cb;
     stcfg.on_reject      = on_reject_cb;
@@ -533,6 +657,19 @@ int main(int argc, char **argv) {
              (unsigned long long)stats.blocks_committed,
              (unsigned long long)stats.pg_errors);
     store_close(store);
+
+    if (bcast) {
+        broadcast_stats_t bs;
+        broadcast_get_stats(bcast, &bs);
+        LOG_INFO("broadcast: published=%llu enqueued=%llu "
+                 "dropped(queue=%llu,redis=%llu) reconnects=%llu",
+                 (unsigned long long)bs.published,
+                 (unsigned long long)bs.enqueued,
+                 (unsigned long long)bs.dropped_queue_full,
+                 (unsigned long long)bs.dropped_redis_down,
+                 (unsigned long long)bs.reconnects);
+        broadcast_close(bcast);
+    }
 
     bitcoind_client_free(&btc);
     pthread_mutex_destroy(&sctx.lock);

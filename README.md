@@ -28,10 +28,31 @@ source: <https://github.com/rsantacroce/simplepool>.
 > verify what they're owed. simplepool aims to address this transparency
 > gap. (Hopefully!)
 
-This repository is the **solo build** — every share lands in the local
-SQLite store, every accepted block is paid directly in its own coinbase,
-and there is no off-chain accounting. The PPS build will be a separate
-service that consumes the same data model; see the roadmap below.
+This repository ships **both modes**, selected by `pool_mode` in
+`proxy.conf`:
+
+- **`pool_mode = solo`** (default) — every share lands in the local
+  SQLite store, every accepted block is paid directly in its own
+  coinbase to the miner who found it, and there is no off-chain
+  accounting. Stratum username is a Bitcoin address.
+- **`pool_mode = pps`** — every accepted block's coinbase is a BIP300
+  drivechain deposit into the pool's Thunder reserve address (sidechain
+  9). The pool never custodies Bitcoin. Each accepted share credits the
+  miner's `pps_credits.accrued_sats` at the configured
+  `pps_sats_per_diff` rate, and a separate payout service (not in this
+  binary) issues Thunder transactions to drain those credits. Stratum
+  username is a Thunder address (plain base58, or the deposit-format
+  wrapper `s9_<base58>_<hex6>`).
+
+In both modes the operator fee stays in BTC, paid to `operator_address`
+out of the same coinbase. See [`proxy.conf.example`](proxy.conf.example)
+for the full set of PPS / Thunder keys.
+
+Optional: set `redis_url` to mirror accepted shares, rejects, blocks,
+tip changes and PPS credits to Redis pub/sub channels (`pool:shares`,
+`pool:rejects`, `pool:blocks`, `pool:tip`, `pool:credits`) for the
+dashboard and any downstream consumers. SQLite remains the source of
+truth; the publish is fire-and-forget.
 
 It is a **solo pool with direct payouts**: every coinbase has two outputs —
 the **miner who found the block gets the reward** (minus a small operator
@@ -295,6 +316,22 @@ sudo systemctl restart  simplepool              # after pulling new code
 To pull edits made directly on a server back into a local checkout (so
 you can commit + push from here), use
 [`scripts/sync-from-server.sh`](scripts/sync-from-server.sh).
+
+### Docker
+
+An alternative to the bare-metal script: containerized builds of the
+three services (stratum proxy, dashboard, payout worker) under
+[`deploy/docker/`](deploy/docker/). One `docker compose up -d --build`
+gets the whole app stack running against a Thunder daemon and Bitcoin
+Core that live on the host (or wherever you point them). Shared bind
+mount on `data/` so the SQLite ledger is portable across restarts /
+image rebuilds. See [`deploy/docker/README.md`](deploy/docker/README.md)
+for the full walkthrough.
+
+Note: the drivechain infrastructure (`bitcoind`, Thunder, the
+`bip300301_enforcer`, `electrs`) is intentionally NOT containerized —
+those daemons have their own lifecycles and typically run bare-metal on
+the same host.
 
 ## Config keys
 

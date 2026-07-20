@@ -1,0 +1,34 @@
+[Unit]
+Description=simplepool Thunder payout worker
+Documentation=https://github.com/rsantacroce/simplepool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=@ROOT@/payout
+# All required env vars must be set here — the worker exits if any is
+# missing. THUNDER_FROM_ADDRESS must equal pool_thunder_reserve_address
+# in proxy.conf so payouts drain from the same Thunder wallet the
+# coinbase is depositing into.
+Environment=PAYOUT_DB_PATH=@ROOT@/data/shares.db
+Environment=THUNDER_RPC_URL=http://127.0.0.1:6009
+# Environment=THUNDER_FROM_ADDRESS=<paste from proxy.conf>
+Environment=PAYOUT_MIN_SATS=10000
+Environment=PAYOUT_INTERVAL_MS=30000
+ExecStart=/usr/bin/node @ROOT@/payout/index.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@ROOT@/data
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,217 @@
+<%
+const fmtN   = (n) => new Intl.NumberFormat('en-US').format(n || 0);
+const fmtF   = (n, d = 4) => (typeof n === 'number' ? n.toFixed(d) : '—');
+const fmtTs  = (t) => t ? new Date(t * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—';
+const ago = (t) => {
+    if (!t) return '—';
+    const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+    return Math.floor(s / 86400) + 'd ago';
+};
+const fmtSats = (sats) => {
+    if (!sats) return '0 sats';
+    const btc = sats / 1e8;
+    if (btc >= 0.01) return fmtN(sats) + ' sats (' + btc.toFixed(8) + ' BTC)';
+    return fmtN(sats) + ' sats';
+};
+/* Precompute a running_accrued column for the recent-shares table.
+ * The rows come newest-first, so we walk in reverse to accumulate. */
+const recentAsc = [...audit.recent].reverse();
+let running = 0;
+const withRunning = recentAsc.map(r => {
+    running += r.credit_sats;
+    return { ...r, running_accrued: running };
+}).reverse();
+const naiveAccrued = Math.floor(audit.totals.sum_difficulty * audit.rate);
+const drift = audit.totals.accrued_computed - naiveAccrued;
+%>
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="30">
+    <title>audit · <%= audit.worker.name %> · simplepool</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header class="top">
+        <a href="/" class="brand">simplepool</a>
+        <span class="tag">worker audit</span>
+        <span style="margin-left:1em"><a href="/admin">← back to admin</a></span>
+    </header>
+    <main class="wrap">
+        <section class="card info">
+            <h2>Why is this balance what it is?</h2>
+            <p class="muted small">
+                Answers a miner's "where does <em>my</em> number come from"
+                question at the byte level. Every accepted share credits
+                <code>FLOOR(difficulty × rate)</code> sats, where <em>rate</em>
+                comes from <code>proxy.conf</code>'s
+                <code>pps_sats_per_diff</code>. Truncation is per-share; that's
+                the authoritative sum shown below.
+            </p>
+        </section>
+
+        <section class="card">
+            <h2><%= audit.worker.name %></h2>
+            <div class="grid">
+                <div><label>Thunder address</label><span class="mono small"><%= audit.worker.thunder_address || '—' %></span></div>
+                <div><label>First seen</label><span title="<%= fmtTs(audit.worker.first_seen) %>"><%= ago(audit.worker.first_seen) %></span></div>
+                <div><label>Last seen</label><span title="<%= fmtTs(audit.worker.last_seen) %>"><%= ago(audit.worker.last_seen) %></span></div>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>Ledger</h2>
+            <div class="grid">
+                <div><label>Owed (needs payout)</label><strong><%= fmtSats(audit.ledger.owed) %></strong></div>
+                <div><label>Accrued (all-time, from pps_credits)</label><strong><%= fmtSats(audit.ledger.accrued) %></strong></div>
+                <div><label>Paid (all-time)</label><strong><%= fmtSats(audit.ledger.paid) %></strong></div>
+                <div><label>Last updated</label><span title="<%= fmtTs(audit.ledger.last_updated) %>"><%= ago(audit.ledger.last_updated) %></span></div>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>Cross-check</h2>
+            <p class="muted small" style="margin-top:0">
+                The pool credits <code>FLOOR(difficulty × <%= fmtN(audit.rate) %>)</code>
+                sats per accepted share. If the numbers below don't match, the
+                DB has drifted from the C proxy's log — worth investigating.
+            </p>
+            <div class="grid">
+                <div><label>Accepted shares</label><strong><%= fmtN(audit.totals.share_count) %></strong></div>
+                <div><label>Blocks found</label><strong><%= fmtN(audit.totals.blocks_found) %></strong></div>
+                <div><label>Σ difficulty</label><strong><%= fmtF(audit.totals.sum_difficulty, 6) %></strong></div>
+                <div><label>Rate (sats × diff)</label><strong><%= fmtN(audit.rate) %></strong></div>
+                <div><label>Σ FLOOR(diff × rate) — authoritative</label><strong><%= fmtSats(audit.totals.accrued_computed) %></strong></div>
+                <div><label>pps_credits.accrued (stored)</label><strong><%= fmtSats(audit.ledger.accrued) %></strong></div>
+            </div>
+            <% if (audit.ledger.accrued === audit.totals.accrued_computed) { %>
+                <p class="muted small" style="margin-top:0.75em;color:#5b8">
+                    ✓ Stored accrued matches the per-share truncated sum.
+                </p>
+            <% } else { %>
+                <p class="muted small" style="margin-top:0.75em;color:#c66">
+                    ⚠ Stored accrued differs by
+                    <%= fmtSats(audit.ledger.accrued - audit.totals.accrued_computed) %>.
+                    This usually means the DB was populated across a rate change,
+                    OR someone edited pps_credits by hand. Look at the C
+                    proxy log for the WARN line at the last mode/rate change.
+                </p>
+            <% } %>
+            <p class="muted small" style="margin-top:0.5em">
+                (Naive sum FLOOR(Σ diff × rate) would be <%= fmtSats(naiveAccrued) %>;
+                per-share truncation costs
+                <%= drift === 0 ? '0 sats' : Math.abs(drift) + ' sats' %>
+                over the window — the difference is the number of shares whose
+                fractional-sat contribution was rounded down.)
+            </p>
+        </section>
+
+        <section class="card">
+            <h2>Daily breakdown</h2>
+            <% if (audit.days.length === 0) { %>
+                <p class="muted">No activity yet.</p>
+            <% } else { %>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Day (UTC)</th>
+                        <th>Shares</th>
+                        <th>Σ difficulty</th>
+                        <th>Accrued this day</th>
+                        <th>Blocks</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <% audit.days.forEach(d => { %>
+                    <tr>
+                        <td class="mono small"><%= d.day %></td>
+                        <td><%= fmtN(d.shares) %></td>
+                        <td><%= fmtF(d.sum_diff, 6) %></td>
+                        <td><strong><%= fmtSats(d.accrued_delta) %></strong></td>
+                        <td><%= d.blocks > 0 ? d.blocks : '' %></td>
+                    </tr>
+                    <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
+
+        <section class="card">
+            <h2>Payouts to this worker</h2>
+            <% if (!audit.payouts || audit.payouts.length === 0) { %>
+                <p class="muted">No payouts yet. Once the payout worker fires a Thunder tx to this address, each one gets a row here with its txid.</p>
+            <% } else { %>
+            <table>
+                <thead>
+                    <tr>
+                        <th>When</th>
+                        <th>Amount</th>
+                        <th>Fee</th>
+                        <th>Thunder txid</th>
+                        <th>Note</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <% audit.payouts.forEach(p => { %>
+                    <tr>
+                        <td class="muted small" title="<%= fmtTs(p.paid_at) %>"><%= ago(p.paid_at) %></td>
+                        <td><strong><%= fmtSats(p.sats) %></strong></td>
+                        <td class="muted small"><%= fmtSats(p.fee_sats) %></td>
+                        <td class="mono small"><%= p.txid %></td>
+                        <td class="muted small"><%= p.note || '' %></td>
+                    </tr>
+                    <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
+
+        <section class="card">
+            <h2>Recent shares (last <%= withRunning.length %>, newest first)</h2>
+            <% if (withRunning.length === 0) { %>
+                <p class="muted">No shares recorded.</p>
+            <% } else { %>
+            <p class="muted small" style="margin-top:0">
+                The <em>credit</em> column is what this share added to your
+                balance. <em>Running accrued</em> is the sum from the oldest
+                visible share up to and including this one.
+            </p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>When</th>
+                        <th>Difficulty</th>
+                        <th>Credit</th>
+                        <th>Block?</th>
+                        <th>Running accrued</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <% withRunning.forEach(r => { %>
+                    <tr<%= r.is_block ? ' style="font-weight:600"' : '' %>>
+                        <td class="mono small"><%= r.id %></td>
+                        <td class="mono small" title="<%= fmtTs(r.ts) %>"><%= ago(r.ts) %></td>
+                        <td><%= fmtF(r.difficulty, 6) %></td>
+                        <td><%= fmtSats(r.credit_sats) %></td>
+                        <td><%= r.is_block ? '✓ ' + (r.block_hash ? r.block_hash.slice(0, 10) + '…' : '') : '' %></td>
+                        <td><%= fmtSats(r.running_accrued) %></td>
+                    </tr>
+                    <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
+    </main>
+    <footer class="foot">
+        <span>read-only · auto-refresh 30s</span>
+        <span class="sep">·</span>
+        <span>worker audit</span>
+    </footer>
+</body>
+</html>

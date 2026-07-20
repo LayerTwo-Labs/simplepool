@@ -1,0 +1,37 @@
+# Compile simplepool and run its unit tests on every push/PR.
+# simplepool is pure C11 (see Makefile); its deps are the same -dev packages
+# the build stage of deploy/docker/Dockerfile.simplepool installs.
+name: Build and test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    # Match build_docker.yaml: CI runs only in the LayerTwo-Labs org repo, so
+    # pushing to a personal repo doesn't spend Actions minutes. Remove this line
+    # if you *do* want build/test CI to run on your own fork too.
+    if: github.repository_owner == 'LayerTwo-Labs'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libsqlite3-dev \
+            libcurl4-openssl-dev \
+            libhiredis-dev
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Test
+        run: make test

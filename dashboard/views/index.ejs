@@ -35,16 +35,45 @@ const ago = (t) => {
         <section class="card info">
             <h2>About the numbers on this page</h2>
             <p class="muted small">
-                This is the <strong>solo build</strong> of simplepool.
-                <strong>Shares</strong> here are accepted Proof-of-Work
-                submissions below your worker target — they are <em>not</em>
-                payout claims and they do not accrue a balance. You only get
-                paid when a share also crosses the network target and becomes
-                a block: in that case the miner's address in the coinbase
-                receives ~99% of the subsidy directly on chain. Shares are
-                kept for hashrate estimation, per-rig accountability, and to
-                seed the same data model that the upcoming PPS pool will
-                bill against.
+                This is the <strong>PPS-classic build</strong> of simplepool,
+                paying out in <strong>Thunder</strong>
+                (BIP300 drivechain sidechain&nbsp;#9). Every accepted share
+                credits your worker a fixed number of sats — currently
+                <strong>1&nbsp;000&nbsp;sats × share difficulty</strong> — whether
+                or not that share becomes a block. Accruals accumulate under
+                your Thunder address in <code>pps_credits</code>.
+            </p>
+            <p class="muted small">
+                When a share becomes a block, the coinbase pays the pool's own
+                Bitcoin wallet (a normal P2WPKH output) for the miner-share of
+                the reward, and the operator address for a small fee (1%). The
+                pool operator then periodically batches accumulated BTC into
+                Thunder via a canonical BIP300 deposit transaction — this is
+                the step that actually moves value onto the sidechain. Once
+                the pool's Thunder reserve is funded, the payout worker sends
+                Thunder transactions to each miner's Thunder address on a
+                cadence to drain their owed balance.
+            </p>
+            <p class="muted small">
+                Why the two-step deposit? The LayerTwo-Labs enforcer only
+                credits deposits that spend real, spendable UTXOs. Coinbases
+                don't qualify; embedding the deposit directly in the coinbase
+                results in a stranded output. Standard drivechain mining
+                pools all route through a pool BTC wallet.
+            </p>
+
+            <h3 style="margin-top:1em;margin-bottom:0.25em">Connect a miner</h3>
+            <pre class="mono small" style="margin:0;padding:0.5em;background:#0002;border-radius:4px;overflow-x:auto"><%= stratumUrl %>
+username:  &lt;your-Thunder-address&gt;[.&lt;rig_label&gt;]
+password:  (ignored — any value)</pre>
+            <p class="muted small" style="margin-top:0.5em">
+                The username must be a valid Thunder address — base58 of a 20-byte
+                hash, e.g. <code>3Z6z1hPySNkFeB7HiKPCgqu4TZez</code>. Generate one
+                with <code>thunder-cli get-new-address</code> on any Thunder node.
+                Using a Bitcoin address is rejected with
+                <em>"invalid thunder address"</em> and no shares accrue.
+                The optional <code>.&lt;rig_label&gt;</code> groups multiple rigs
+                paying the same address as separate rows on the per-worker page.
             </p>
         </section>
 
@@ -114,7 +143,7 @@ const ago = (t) => {
                         <td><%= fmtN(m.rigs) %></td>
                         <td><%= fmtN(m.shares) %></td>
                         <td><%= fmtHashrate(m.hashrate_est) %></td>
-                        <td><%= m.share_of_pool_pct.toFixed(2) %>%</td>
+                        <td><%= fmtPct(m.share_of_pool_pct) %></td>
                         <td title="<%= fmtTs(m.last_seen) %>"><%= ago(m.last_seen) %></td>
                     </tr>
                 <% }) %>
@@ -141,7 +170,7 @@ const ago = (t) => {
                         <td><%= fmtHashrate(w.hashrate_5m) %></td>
                         <td><%= fmtHashrate(w.hashrate_1h) %></td>
                         <td><%= fmtHashrate(w.hashrate_est) %></td>
-                        <td><%= w.share_of_pool_pct.toFixed(2) %>%</td>
+                        <td><%= fmtPct(w.share_of_pool_pct) %></td>
                         <td title="<%= fmtTs(w.last_seen) %>"><%= ago(w.last_seen) %></td>
                     </tr>
                 <% }) %>

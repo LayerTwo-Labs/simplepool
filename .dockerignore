@@ -1,0 +1,30 @@
+# -----------------------------------------------------------------------------
+# Keep the docker build context small. Docker reads this from the context
+# root (the repo root, per docker-compose.yml `context: ../..`).
+# -----------------------------------------------------------------------------
+
+# host-only build outputs — the image builds fresh from source
+build/
+**/node_modules/
+
+# runtime data lives in a bind-mounted volume, never in the image
+data/
+.regtest/
+
+# operator secrets and local notes — never bake into an image
+proxy.conf
+FORKNET_CHEATSHEET.md
+memory.md
+*.pre-reconcile-*
+*.pre-restart-*
+
+# vcs & editor cruft
+.git/
+.gitignore
+.DS_Store
+
+# docs — not needed at runtime
+*.md
+!dashboard/README.md
+!payout/README.md
+!deploy/docker/README.md

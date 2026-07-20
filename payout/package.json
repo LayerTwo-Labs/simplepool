@@ -1,0 +1,15 @@
+{
+  "name": "simplepool-payout",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "dry-run": "PAYOUT_DRY_RUN=1 node index.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0"
+  }
+}

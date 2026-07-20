@@ -52,3 +52,70 @@ CREATE TABLE IF NOT EXISTS node_status (
   tip_observed_at INTEGER,  /* unix seconds — when we first saw this tip */
   updated_at      INTEGER   /* unix seconds — last successful poll */
 );
+
+/* PPS accrual ledger. One row per worker. The C proxy only INCREMENTs
+ * accrued_sats; a separate payout service updates paid_sats after
+ * issuing Thunder transactions for (accrued_sats - paid_sats). Empty in
+ * solo mode. */
+CREATE TABLE IF NOT EXISTS pps_credits (
+  worker_id     INTEGER PRIMARY KEY REFERENCES workers(id),
+  accrued_sats  INTEGER NOT NULL DEFAULT 0,
+  paid_sats     INTEGER NOT NULL DEFAULT 0,
+  last_updated  INTEGER NOT NULL
+);
+
+/* Ledger of operator-triggered mainchain → Thunder deposits, used by
+ * pool_mode=pps-classic. The C proxy does not touch this table; the
+ * admin dashboard + a helper CLI are the writers. */
+CREATE TABLE IF NOT EXISTS deposits (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts                INTEGER NOT NULL,          /* unix seconds */
+  btc_txid          TEXT    NOT NULL,          /* mainchain deposit tx */
+  sats_deposited    INTEGER NOT NULL,
+  fee_sats          INTEGER NOT NULL,
+  thunder_recipient TEXT    NOT NULL,          /* bare base58 Thunder addr */
+  ctip_seq_before   INTEGER,
+  ctip_seq_after    INTEGER,
+  notes             TEXT
+);
+CREATE INDEX IF NOT EXISTS deposits_ts_idx ON deposits(ts);
+
+/* Permanent ledger of successful miner payouts. One row per settled
+ * Thunder transfer — populated by the payout worker inside the same
+ * atomic finalize transaction that increments pps_credits.paid_sats
+ * and drops the payouts_in_flight row. Only append; never mutate
+ * after write (audit trail). Empty in solo mode. */
+CREATE TABLE IF NOT EXISTS payouts (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  worker_id    INTEGER NOT NULL REFERENCES workers(id),
+  sats         INTEGER NOT NULL,
+  fee_sats     INTEGER NOT NULL,
+  txid         TEXT    NOT NULL,        /* Thunder tx id (hex) */
+  paid_at      INTEGER NOT NULL,        /* unix seconds */
+  note         TEXT                     /* 'manual' for hand-driven, else NULL */
+);
+CREATE INDEX IF NOT EXISTS payouts_worker_ts_idx ON payouts(worker_id, paid_at);
+CREATE INDEX IF NOT EXISTS payouts_paid_at_idx   ON payouts(paid_at);
+
+/* In-flight payout ledger. The payout worker INSERTs a row before
+ * broadcasting a Thunder transaction; on successful broadcast it
+ * atomically (in one tx) sets txid, increments pps_credits.paid_sats,
+ * and DELETEs the row. The C proxy does not touch this table.
+ *
+ * Crash semantics:
+ *   - Row exists with txid='' → the broadcast may or may not have
+ *     happened; needs manual reconciliation. listDue skips workers
+ *     that have an in-flight row so we never double-pay.
+ *   - Row exists with txid set → the broadcast went out and we crashed
+ *     before the DELETE finished. The finalize tx is idempotent (its
+ *     paid_sats UPDATE is fenced by the row's existence), so a startup
+ *     sweep can finish it.
+ */
+CREATE TABLE IF NOT EXISTS payouts_in_flight (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  worker_id     INTEGER NOT NULL REFERENCES workers(id),
+  sats          INTEGER NOT NULL,
+  txid          TEXT NOT NULL DEFAULT '',
+  started_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS payouts_in_flight_worker_idx ON payouts_in_flight(worker_id);

@@ -1,0 +1,86 @@
+# -----------------------------------------------------------------------------
+# simplepool — docker-compose orchestration
+# -----------------------------------------------------------------------------
+# Runs the three simplepool services against a Thunder daemon that lives on
+# the host (or wherever THUNDER_RPC_URL points). Bitcoin Core is likewise
+# expected to be reachable from the simplepool container.
+#
+# Directory layout on the operator's box:
+#   deploy/docker/
+#     ├── docker-compose.yml   (this file)
+#     ├── .env                 (copied from .env.example, edited)
+#     └── proxy.conf           (copied from repo root proxy.conf.example)
+#   data/                      (created on first run — holds shares.db)
+#
+# Bring the stack up:
+#   cd deploy/docker
+#   cp .env.example .env && $EDITOR .env
+#   cp ../../proxy.conf.example proxy.conf && $EDITOR proxy.conf
+#   docker compose up -d --build
+#
+# The simplepool container uses host networking so miners can reach :3334
+# without NAT and so it can talk to bitcoind on 127.0.0.1. dashboard and
+# payout use the default bridge and reach Thunder via host.docker.internal.
+# -----------------------------------------------------------------------------
+
+services:
+  simplepool:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.simplepool
+    image: simplepool:latest
+    container_name: simplepool
+    restart: unless-stopped
+    # host mode: miners hit :3334 directly, and bitcoind_url in proxy.conf
+    # can point at 127.0.0.1 exactly like the bare-metal deploy.
+    network_mode: host
+    volumes:
+      - ../../data:/data
+      - ./proxy.conf:/etc/simplepool/proxy.conf:ro
+    stop_grace_period: 15s
+
+  dashboard:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.dashboard
+    image: simplepool-dashboard:latest
+    container_name: simplepool-dashboard
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-8081}:8081"
+    environment:
+      PORT: "8081"
+      PROXY_DB_PATH: /data/shares.db
+      PUBLIC_STRATUM_URL: ${PUBLIC_STRATUM_URL:-stratum+tcp://<pool-host>:3334}
+      THUNDER_RPC_URL: ${THUNDER_RPC_URL:-http://host.docker.internal:6009}
+      POOL_THUNDER_RESERVE_ADDRESS: ${POOL_THUNDER_RESERVE_ADDRESS:-}
+      POOL_PPS_SATS_PER_DIFF: ${POOL_PPS_SATS_PER_DIFF:-1000}
+      ADMIN_USER: ${ADMIN_USER:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    volumes:
+      - ../../data:/data:ro
+    extra_hosts:
+      # Linux: makes host.docker.internal resolve to the host gateway.
+      # No-op on macOS/Windows where docker adds it natively.
+      - "host.docker.internal:host-gateway"
+    stop_grace_period: 10s
+
+  payout:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.payout
+    image: simplepool-payout:latest
+    container_name: simplepool-payout
+    restart: unless-stopped
+    environment:
+      PAYOUT_DB_PATH: /data/shares.db
+      THUNDER_RPC_URL: ${THUNDER_RPC_URL:-http://host.docker.internal:6009}
+      THUNDER_FROM_ADDRESS: ${THUNDER_FROM_ADDRESS:-}
+      PAYOUT_MIN_SATS: ${PAYOUT_MIN_SATS:-10000}
+      PAYOUT_INTERVAL_MS: ${PAYOUT_INTERVAL_MS:-30000}
+      PAYOUT_DRY_RUN: ${PAYOUT_DRY_RUN:-0}
+    volumes:
+      - ../../data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    stop_grace_period: 30s

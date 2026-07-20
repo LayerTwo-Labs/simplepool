@@ -1,6 +1,4 @@
-build/
-data/
-*.o
-*.d
-proxy.conf
-.DS_Store
+/build/
+/data/
+/.regtest/
+/proxy.conf

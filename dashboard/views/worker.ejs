@@ -39,6 +39,14 @@ if (n > 1) {
         <span class="tag">worker</span>
     </header>
     <main class="wrap">
+        <%
+        const fmtSats = (sats) => {
+            if (!sats) return '0 sats';
+            const btc = sats / 1e8;
+            if (btc >= 0.01) return fmtN(sats) + ' sats (' + btc.toFixed(8) + ' BTC)';
+            return fmtN(sats) + ' sats';
+        };
+        %>
         <section class="card">
             <h2><%= worker.name %></h2>
             <% if (worker.payout_address) { %>
@@ -49,9 +57,152 @@ if (n > 1) {
                 <div><label>Shares (24h)</label><strong><%= fmtN(worker.window_shares) %></strong></div>
                 <div><label>First seen</label><strong title="<%= fmtTs(worker.first_seen) %>"><%= ago(worker.first_seen) %></strong></div>
                 <div><label>Last seen</label><strong title="<%= fmtTs(worker.last_seen) %>"><%= ago(worker.last_seen) %></strong></div>
-                <div><label>Balance</label><strong class="muted">N/A</strong></div>
+                <div><label>Owed</label><strong><%= pps_audit ? fmtSats(pps_audit.owed) : 'N/A (solo mode)' %></strong></div>
             </div>
         </section>
+
+        <% if (pps_audit) { %>
+        <section class="card">
+            <h2>PPS balance</h2>
+            <div class="grid">
+                <div><label>Owed (waiting for payout)</label><strong><%= fmtSats(pps_audit.owed) %></strong></div>
+                <div><label>Accrued (all time)</label><strong><%= fmtSats(pps_audit.accrued) %></strong></div>
+                <div><label>Paid (all time)</label><strong><%= fmtSats(pps_audit.paid) %></strong></div>
+                <div><label>Last credited</label><strong title="<%= fmtTs(pps_audit.last_updated) %>"><%= ago(pps_audit.last_updated) %></strong></div>
+            </div>
+            <p class="muted small" style="margin-top:0.75em">
+                Payouts flow to your Thunder address on a cadence once the
+                pool's Thunder reserve is funded. Ask the operator if
+                you've been "Owed" a substantial balance for a long time
+                and it isn't dropping.
+            </p>
+        </section>
+
+        <section class="card">
+            <h2>Audit — why is this number what it is?</h2>
+            <p class="muted small" style="margin-top:0">
+                Every accepted share credits your worker
+                <code>FLOOR(share_difficulty × <%= fmtN(pps_audit.rate) %>)</code>
+                sats. The rate is <code>pps_sats_per_diff</code> from the
+                pool's config; the difficulty is what the pool held you at
+                when the share landed (vardiff adjusts it based on how
+                fast you're finding hashes). Everything below is
+                derivable from the raw <code>shares</code> table — the
+                stored balance is a running total the pool maintains, but
+                you can always recompute it from scratch.
+            </p>
+            <div class="grid">
+                <div><label>Accepted shares</label><strong><%= fmtN(pps_audit.share_count) %></strong></div>
+                <div><label>Σ difficulty</label><strong><%= pps_audit.sum_difficulty.toFixed(6) %></strong></div>
+                <div><label>Rate (sats × diff)</label><strong><%= fmtN(pps_audit.rate) %></strong></div>
+                <div><label>Σ FLOOR(diff × rate)<br><span class="muted small">the authoritative sum</span></label><strong><%= fmtSats(pps_audit.accrued_computed) %></strong></div>
+                <div><label>Stored accrued<br><span class="muted small">from pps_credits</span></label><strong><%= fmtSats(pps_audit.accrued) %></strong></div>
+                <div><label>Match?</label>
+                    <% if (pps_audit.matches) { %>
+                        <strong style="color:#5b8">✓ Yes — every share accounted for</strong>
+                    <% } else { %>
+                        <strong style="color:#c66">⚠ Off by <%= fmtSats(Math.abs(pps_audit.accrued - pps_audit.accrued_computed)) %></strong>
+                    <% } %>
+                </div>
+            </div>
+            <% if (!pps_audit.matches) { %>
+                <p class="muted small" style="color:#c66;margin-top:0.75em">
+                    A ⚠ here usually means the pool's config
+                    (<code>pps_sats_per_diff</code>) changed at some
+                    point after this worker started, so recomputing at
+                    the current rate doesn't reproduce the historical
+                    total. Ask the operator to confirm the rate history.
+                    Your stored balance is authoritative for payouts either
+                    way.
+                </p>
+            <% } %>
+            <p class="muted small" style="margin-top:0.75em">
+                For an even deeper trail (per-share running total, daily
+                breakdown), the operator has an admin-only page at
+                <code>/admin/worker/&lt;id&gt;</code>. Same numbers — just
+                without exposing other miners' data on this public page.
+            </p>
+        </section>
+
+        <section class="card">
+            <h2>Payouts to your Thunder address</h2>
+            <% if (!payouts || payouts.length === 0) { %>
+                <p class="muted">
+                    No payouts recorded yet. Once the operator's Thunder
+                    reserve has enough BTC and the payout worker fires,
+                    each Thunder tx paying you will appear here with its
+                    txid so you can verify it in your own Thunder wallet.
+                </p>
+            <% } else { %>
+            <p class="muted small" style="margin-top:0">
+                Each row is one Thunder transaction the pool sent to your
+                address. Verify by looking the txid up in your own Thunder
+                wallet — the same tx should show as an incoming credit.
+            </p>
+            <table class="lb">
+                <thead><tr>
+                    <th>When</th>
+                    <th>Amount</th>
+                    <th>Fee</th>
+                    <th>Thunder txid <span class="muted small">(click to copy)</span></th>
+                </tr></thead>
+                <tbody>
+                <% payouts.forEach(p => { %>
+                    <tr>
+                        <td title="<%= fmtTs(p.paid_at) %>"><%= ago(p.paid_at) %></td>
+                        <td><strong><%= fmtSats(p.sats) %></strong></td>
+                        <td class="muted small"><%= fmtSats(p.fee_sats) %></td>
+                        <td class="mono small" style="word-break:break-all"><%= p.txid %></td>
+                    </tr>
+                <% }) %>
+                </tbody>
+            </table>
+            <p class="muted small" style="margin-top:0.75em">
+                Total paid to date:
+                <strong><%= fmtSats(payouts.reduce((a, p) => a + p.sats, 0)) %></strong>
+                across <%= payouts.length %> transaction<%= payouts.length === 1 ? '' : 's' %>.
+            </p>
+            <% } %>
+        </section>
+
+        <% if (blocks && blocks.length > 0) { %>
+        <section class="card">
+            <h2>Blocks you found</h2>
+            <p class="muted small" style="margin-top:0">
+                Blocks where <em>your</em> share crossed the network target.
+                Even though PPS pays you the same per share regardless of
+                whether a share becomes a block, blocks are what actually
+                fund the pool BTC wallet that later gets deposited to
+                Thunder to pay you. Look up the coinbase of each block
+                with <code>bitcoin-cli getblock &lt;hash&gt; 2</code>.
+            </p>
+            <table class="lb">
+                <thead><tr>
+                    <th>When</th>
+                    <th>Height</th>
+                    <th>Reward</th>
+                    <th>Fees</th>
+                    <th>Block hash</th>
+                </tr></thead>
+                <tbody>
+                <% blocks.forEach(b => { %>
+                    <tr>
+                        <td title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
+                        <td><%= fmtN(b.height) %></td>
+                        <td><%= fmtSats(b.reward_sats) %></td>
+                        <td class="muted small"><%= fmtSats(b.fee_sats) %></td>
+                        <td class="mono small" style="word-break:break-all"><%= b.hash %></td>
+                    </tr>
+                <% }) %>
+                </tbody>
+            </table>
+            <p class="muted small" style="margin-top:0.75em">
+                <%= blocks.length %> block<%= blocks.length === 1 ? '' : 's' %> found · pool BTC earned:
+                <strong><%= fmtSats(blocks.reduce((a, b) => a + b.reward_sats + b.fee_sats, 0)) %></strong>
+            </p>
+        </section>
+        <% } %>
+        <% } /* end of if (pps_audit) */ %>
 
         <section class="card">
             <h2>Hashrate · 10-min buckets · last 24h</h2>

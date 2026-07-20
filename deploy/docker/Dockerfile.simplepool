@@ -1,0 +1,46 @@
+# -----------------------------------------------------------------------------
+# simplepool — Bitcoin stratum proxy (C11)
+# -----------------------------------------------------------------------------
+# Multi-stage: heavy build tools + -dev headers stay out of the runtime image.
+# Build context expected to be the repo root (see deploy/docker/docker-compose.yml).
+# -----------------------------------------------------------------------------
+
+FROM debian:bookworm-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        libsqlite3-dev \
+        libcurl4-openssl-dev \
+        libhiredis-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Makefile ./
+COPY include/ ./include/
+COPY src/     ./src/
+# The Makefile does `include tests/*.mk` at the top level, so those files
+# must be present for make to parse — we only build the main binary target
+# though, not the tests themselves.
+COPY tests/   ./tests/
+RUN make -j"$(nproc)" build/simplepool
+
+# -----------------------------------------------------------------------------
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libsqlite3-0 \
+        libcurl4 \
+        libhiredis0.14 \
+        ca-certificates \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r -g 1000 simplepool \
+    && useradd -r -u 1000 -g simplepool -m -d /home/simplepool simplepool \
+    && mkdir -p /data && chown simplepool:simplepool /data
+
+COPY --from=build /src/build/simplepool /usr/local/bin/simplepool
+
+USER simplepool
+WORKDIR /home/simplepool
+EXPOSE 3334
+# `tini` reaps zombies and forwards SIGTERM so docker stop is clean.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/simplepool"]
+# Bind-mount proxy.conf to /etc/simplepool/proxy.conf (see docker-compose.yml).
+CMD ["/etc/simplepool/proxy.conf"]

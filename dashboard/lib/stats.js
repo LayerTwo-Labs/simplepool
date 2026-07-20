@@ -242,6 +242,65 @@ export function worker(handle, name, windowSec = 86400) {
         });
     }
 
+    /* Self-service PPS audit — same cross-check the admin view runs,
+     * but scoped to this one worker. Returns null in solo mode (no row
+     * in pps_credits). `rate` is passed in by the caller (from env). */
+    let ppsAudit = null;
+    const credit = d.prepare(`
+        SELECT accrued_sats, paid_sats, last_updated
+          FROM pps_credits WHERE worker_id = ?
+    `).get(w.id);
+    if (credit) {
+        const rate = Number(arguments[3] || 0);
+        const totals = d.prepare(`
+            SELECT COUNT(*)                                          AS share_count,
+                   COALESCE(SUM(difficulty), 0)                      AS sum_difficulty,
+                   COALESCE(SUM(CAST(difficulty * ? AS INTEGER)), 0) AS accrued_computed
+              FROM shares
+             WHERE worker_id = ?
+        `).get(rate, w.id);
+        const accrued = Number(credit.accrued_sats || 0);
+        const paid    = Number(credit.paid_sats    || 0);
+        ppsAudit = {
+            rate,
+            accrued, paid, owed: accrued - paid,
+            last_updated: Number(credit.last_updated || 0),
+            share_count:      Number(totals.share_count),
+            sum_difficulty:   Number(totals.sum_difficulty),
+            accrued_computed: Number(totals.accrued_computed),
+            matches:          Number(totals.accrued_computed) === accrued,
+        };
+    }
+
+    /* Payouts to this worker — same table the admin dashboard reads;
+     * miners can verify their own txids from the public view. */
+    let payouts = [];
+    try {
+        payouts = d.prepare(`
+            SELECT id, sats, fee_sats, txid, paid_at, note
+            FROM   payouts
+            WHERE  worker_id = ?
+            ORDER  BY paid_at DESC, id DESC
+            LIMIT  100
+        `).all(w.id).map(r => ({
+            id: r.id, sats: Number(r.sats), fee_sats: Number(r.fee_sats),
+            txid: r.txid, paid_at: Number(r.paid_at), note: r.note,
+        }));
+    } catch { /* payouts table missing on very old DBs — fine */ }
+
+    /* Blocks found BY this worker specifically. */
+    const workerBlocks = d.prepare(`
+        SELECT id, ts, height, hash, reward_sats, fee_sats
+        FROM   blocks_found
+        WHERE  finder_id = ?
+        ORDER  BY ts DESC, id DESC
+        LIMIT  25
+    `).all(w.id).map(r => ({
+        id: r.id, ts: Number(r.ts), height: Number(r.height), hash: r.hash,
+        reward_sats: Number(r.reward_sats || 0),
+        fee_sats:    Number(r.fee_sats || 0),
+    }));
+
     return {
         worker: {
             name: w.name,
@@ -254,6 +313,9 @@ export function worker(handle, name, windowSec = 86400) {
         shares,
         buckets,
         window_sec: windowSec,
+        pps_audit: ppsAudit,
+        payouts,
+        blocks: workerBlocks,
     };
 }
 
@@ -344,4 +406,25 @@ export function fmtHashrate(hps) {
         i++;
     }
     return `${v.toFixed(2)} ${UNITS[i]}`;
+}
+
+/* Percentage of the pool. A small rig next to a large ASIC is
+ * legitimately a tiny fraction — `toFixed(2)` on 0.000044 renders
+ * "0.00%" and looks like a bug. Adaptive precision so every
+ * contributor sees a non-zero number:
+ *   >= 1%       — 2 decimals   (e.g., "54.32%")
+ *   >= 0.01%    — 3 decimals   (e.g., "0.523%")
+ *   >= 0.0001%  — 4 decimals   (e.g., "0.0523%")
+ *   >  0        — 2 sig figs  (e.g., "4.4e-5%")
+ *   == 0        — "0%"
+ * Kept as a stat-lib export so both the pool-wide and per-worker
+ * pages can share it. */
+export function fmtPct(p) {
+    if (p == null || !isFinite(p)) return '—';
+    if (p === 0) return '0%';
+    const abs = Math.abs(p);
+    if (abs >= 1)      return p.toFixed(2)  + '%';
+    if (abs >= 0.01)   return p.toFixed(3)  + '%';
+    if (abs >= 0.0001) return p.toFixed(4)  + '%';
+    return p.toPrecision(2) + '%';
 }
