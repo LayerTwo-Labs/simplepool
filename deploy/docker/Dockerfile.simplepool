@@ -14,7 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Makefile ./
-COPY include/ ./include/
+# NOTE: include/ is intentionally not copied — it's an empty directory (git
+# can't track empty dirs, so it's absent in a fresh checkout) and no header
+# lives there; all headers are under src/. The Makefile's -Iinclude search
+# path harmlessly tolerates its absence.
 COPY src/     ./src/
 # The Makefile does `include tests/*.mk` at the top level, so those files
 # must be present for make to parse — we only build the main binary target
