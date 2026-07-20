@@ -1,0 +1,87 @@
+# Build the three simplepool container images and push them to the GitHub
+# Container Registry (ghcr.io) — the same registry coinshift-rs publishes to.
+#
+# This job runs only in the canonical LayerTwo-Labs repo (see the `if:` guard
+# on the job), so images land in the org namespace, tagged automatically:
+#   ghcr.io/layertwo-labs/simplepool            (C stratum proxy)
+#   ghcr.io/layertwo-labs/simplepool-dashboard  (Node read-only web UI)
+#   ghcr.io/layertwo-labs/simplepool-payout     (Node Thunder payout worker)
+#
+# Auth uses the built-in GITHUB_TOKEN — no secrets to configure, because the
+# repo lives in the same org that owns the packages (exactly like coinshift).
+# Pull-request runs build the images (to prove the Dockerfiles still work) but
+# do not push; only pushes to main, tags, and manual runs publish.
+name: Build and push Docker images
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  build-push-docker:
+    runs-on: ubuntu-latest
+    # Publish only from the LayerTwo-Labs org repo. On a personal fork/repo
+    # (e.g. rsantacroce/simplepool) this is false, so the whole job is skipped
+    # — nothing is built and nothing is pushed. (String compare is
+    # case-insensitive, so 'LayerTwo-Labs' also matches 'layertwo-labs'.)
+    if: github.repository_owner == 'LayerTwo-Labs'
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: simplepool
+            dockerfile: deploy/docker/Dockerfile.simplepool
+          - image: simplepool-dashboard
+            dockerfile: deploy/docker/Dockerfile.dashboard
+          - image: simplepool-payout
+            dockerfile: deploy/docker/Dockerfile.payout
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=sha,event=push
+            type=ref,event=pr
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        # Skipped on pull_request, where we build-only and don't push.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Per-image GitHub Actions cache so the three legs don't collide.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
