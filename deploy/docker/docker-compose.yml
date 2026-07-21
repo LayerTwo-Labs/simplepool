@@ -57,8 +57,15 @@ services:
       POOL_PPS_SATS_PER_DIFF: ${POOL_PPS_SATS_PER_DIFF:-1000}
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # --- Write-action wiring ---
+      PAYOUT_ADMIN_URL:   ${PAYOUT_ADMIN_URL:-http://host.docker.internal:9080}
+      ENFORCER_GRPC_ADDR: ${ENFORCER_GRPC_ADDR:-host.docker.internal:50051}
+      GRPCURL_BIN:        ${GRPCURL_BIN:-/usr/local/bin/grpcurl}
+      THUNDER_SIDECHAIN_ID: ${THUNDER_SIDECHAIN_ID:-9}
     volumes:
-      - ../../data:/data:ro
+      # Dashboard now writes to the deposits table when the operator
+      # submits a deposit via /admin. Mount RW.
+      - ../../data:/data
     extra_hosts:
       # Linux: makes host.docker.internal resolve to the host gateway.
       # No-op on macOS/Windows where docker adds it natively.
@@ -79,6 +86,15 @@ services:
       PAYOUT_MIN_SATS: ${PAYOUT_MIN_SATS:-10000}
       PAYOUT_INTERVAL_MS: ${PAYOUT_INTERVAL_MS:-30000}
       PAYOUT_DRY_RUN: ${PAYOUT_DRY_RUN:-0}
+      # Admin HTTP surface — dashboard reaches it at PAYOUT_ADMIN_URL.
+      # Bind to 0.0.0.0 (default) so the dashboard container can reach
+      # it via host.docker.internal:PAYOUT_ADMIN_PORT.
+      PAYOUT_ADMIN_BIND: ${PAYOUT_ADMIN_BIND:-0.0.0.0}
+      PAYOUT_ADMIN_PORT: ${PAYOUT_ADMIN_PORT:-9080}
+    ports:
+      # Expose the admin HTTP for the dashboard to hit. Loopback-only
+      # on the host is the sane default.
+      - "127.0.0.1:${PAYOUT_ADMIN_PORT:-9080}:9080"
     volumes:
       - ../../data:/data
     extra_hosts:

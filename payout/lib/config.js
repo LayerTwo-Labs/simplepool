@@ -40,5 +40,9 @@ export function loadConfig() {
         minSats:       BigInt(process.env.PAYOUT_MIN_SATS       || '10000'),
         maxPerTick:    parseInt(process.env.PAYOUT_MAX_PER_TICK || '50',    10),
         dryRun:        process.env.PAYOUT_DRY_RUN === '1',
+        /* Admin HTTP surface — used by the dashboard's "Trigger payout now"
+         * button. Loopback-bound by default; set port=0 to disable. */
+        adminHttpBind: process.env.PAYOUT_ADMIN_BIND || '127.0.0.1',
+        adminHttpPort: parseInt(process.env.PAYOUT_ADMIN_PORT || '9080', 10),
     };
 }

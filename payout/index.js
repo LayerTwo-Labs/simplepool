@@ -20,6 +20,7 @@ import { loadConfig }   from './lib/config.js';
 import { openDb }       from './lib/db.js';
 import { ThunderClient } from './lib/thunder.js';
 import { startLoop, reportStuck } from './lib/payout.js';
+import { startAdminHttp } from './lib/admin-http.js';
 
 const cfg = loadConfig();
 
@@ -50,10 +51,23 @@ reportStuck({ db }, log);
 
 const loop = startLoop({ db, thunder, cfg }, log);
 
+/* Small HTTP admin surface for the dashboard's "Trigger payout now"
+ * button. port=0 disables. Loopback-only unless overridden. */
+let adminHttp = null;
+if (cfg.adminHttpPort > 0) {
+    adminHttp = startAdminHttp({
+        port: cfg.adminHttpPort,
+        bind: cfg.adminHttpBind,
+        ctx:  { db, thunder, cfg },
+        log,
+    });
+}
+
 for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
         log.info(`got ${sig}, stopping`);
         loop.stop();
+        adminHttp?.close();
         db.close();
         process.exit(0);
     });

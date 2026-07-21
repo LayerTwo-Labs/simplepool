@@ -1,5 +1,5 @@
 [Unit]
-Description=simplepool dashboard (read-only web UI)
+Description=simplepool dashboard (operator web UI)
 Documentation=https://github.com/rsantacroce/simplepool
 After=network-online.target
 Wants=network-online.target
@@ -20,6 +20,14 @@ Environment=PROXY_DB_PATH=@ROOT@/data/shares.db
 # operator view (reserve balance, ledger totals, per-worker owed,
 # in-flight payouts). Without both, /admin returns 503 (fail-closed).
 Environment=THUNDER_RPC_URL=http://127.0.0.1:6009
+# --- Write-action wiring (POST buttons on /admin) ---
+# Payout worker admin HTTP endpoint (see simplepool-payout.service).
+Environment=PAYOUT_ADMIN_URL=http://127.0.0.1:9080
+# bip300301_enforcer gRPC address — the deposit action shells out to
+# grpcurl (must be on PATH) to hit CreateDepositTransaction.
+Environment=ENFORCER_GRPC_ADDR=127.0.0.1:50051
+Environment=GRPCURL_BIN=/usr/local/bin/grpcurl
+Environment=THUNDER_SIDECHAIN_ID=9
 # Environment=POOL_THUNDER_RESERVE_ADDRESS=<paste from proxy.conf>
 # Environment=ADMIN_USER=admin
 # Environment=ADMIN_PASSWORD=<generate with `openssl rand -base64 21`>
@@ -36,7 +44,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadOnlyPaths=@ROOT@
+# Dashboard writes to the deposits table when the operator submits a
+# deposit via /admin/action/deposit — the DB dir must be writable.
+ReadWritePaths=@ROOT@/data
 
 [Install]
 WantedBy=multi-user.target

@@ -34,11 +34,108 @@ const fmtSats = (sats) => {
         <section class="card info">
             <h2>Pool operator view</h2>
             <p class="muted small">
-                Read-only. Reserve balance is a live probe of Thunder's
-                JSON-RPC; everything else is the same SQLite the pool
-                writes. Reconciliation is manual — see
-                <code>payout/README.md</code> for the runbook.
+                The <em>read</em> half of this page is a live probe of Thunder
+                plus the pool's SQLite ledger. The <em>Operator actions</em>
+                card below is the write half — every button POSTs to a
+                CSRF-gated route and redirects here with a flash message.
+                See <code>payout/README.md</code> for the runbook when things
+                get weird.
             </p>
+        </section>
+
+        <% if (flash) { %>
+        <section class="card" style="border-left:4px solid <%= flash.ok ? '#5b8' : '#c66' %>">
+            <h2 style="color:<%= flash.ok ? '#5b8' : '#c66' %>">
+                <%= flash.ok ? '✓' : '✗' %> <%= flash.msg %>
+            </h2>
+            <% if (flash.detail) { %>
+                <p class="mono small" style="margin:0;word-break:break-all"><%= flash.detail %></p>
+            <% } %>
+        </section>
+        <% } %>
+
+        <section class="card">
+            <h2>Operator actions</h2>
+            <p class="muted small" style="margin-top:0">
+                CSRF-protected POST forms. Each action returns you here with
+                a green ✓ or red ✗ flash. All four are safe to fire multiple
+                times — Thunder / the payout worker will report the truth if
+                the state hasn't changed.
+            </p>
+
+            <div class="grid" style="align-items:start">
+
+                <!-- Action #4: nudge mine -->
+                <form method="POST" action="/admin/action/nudge-mine"
+                      style="padding:0.5em 0;border-bottom:1px solid #0002">
+                    <input type="hidden" name="csrf" value="<%= csrfToken %>">
+                    <label style="display:block;margin-bottom:0.25em"><strong>Nudge Thunder</strong></label>
+                    <p class="muted small" style="margin:0 0 0.5em 0">
+                        Call <code>mine</code> once. Thunder builds a fresh
+                        BMM commit if it can; harmless if it can't.
+                    </p>
+                    <button type="submit">Nudge mine</button>
+                </form>
+
+                <!-- Action #2: trigger payout -->
+                <form method="POST" action="/admin/action/trigger-payout"
+                      style="padding:0.5em 0;border-bottom:1px solid #0002">
+                    <input type="hidden" name="csrf" value="<%= csrfToken %>">
+                    <label style="display:block;margin-bottom:0.25em"><strong>Trigger payout cycle</strong></label>
+                    <p class="muted small" style="margin:0 0 0.5em 0">
+                        Ask the payout worker to run one cycle now instead
+                        of waiting for its next tick.
+                        <% if (!payoutAdminConfigured) { %>
+                            <br><em style="color:#c66">Not configured — set <code>PAYOUT_ADMIN_URL</code>.</em>
+                        <% } %>
+                    </p>
+                    <button type="submit" <%= payoutAdminConfigured ? '' : 'disabled' %>>Trigger now</button>
+                </form>
+
+                <!-- Action #3: remove from mempool -->
+                <form method="POST" action="/admin/action/remove-from-mempool"
+                      style="padding:0.5em 0;border-bottom:1px solid #0002">
+                    <input type="hidden" name="csrf" value="<%= csrfToken %>">
+                    <label style="display:block;margin-bottom:0.25em"><strong>Remove stale Thunder tx</strong></label>
+                    <p class="muted small" style="margin:0 0 0.5em 0">
+                        Drop a stuck tx from Thunder's mempool. Use when a
+                        payout keeps failing with <code>utxo double spent</code>
+                        because a phantom tx is holding the reserve UTXO.
+                    </p>
+                    <input type="text" name="txid" placeholder="64-char hex txid"
+                           pattern="[0-9a-fA-F]{64}" required
+                           style="width:100%;font-family:monospace;padding:0.35em;margin-bottom:0.5em">
+                    <button type="submit">Remove from mempool</button>
+                </form>
+
+                <!-- Action #1: BTC → Thunder deposit -->
+                <form method="POST" action="/admin/action/deposit"
+                      style="padding:0.5em 0">
+                    <input type="hidden" name="csrf" value="<%= csrfToken %>">
+                    <input type="hidden" name="sidechain_id" value="<%= reserveSidechainId %>">
+                    <label style="display:block;margin-bottom:0.25em"><strong>Deposit BTC → Thunder reserve</strong></label>
+                    <p class="muted small" style="margin:0 0 0.5em 0">
+                        Spend enforcer-wallet BTC into a Thunder deposit
+                        (sidechain #<%= reserveSidechainId %>). Enforcer wallet
+                        must already hold spendable UTXOs — fund it first
+                        with a plain <code>bitcoin-cli sendtoaddress</code>
+                        to an enforcer address.
+                    </p>
+                    <label class="small muted">Recipient (Thunder address)</label>
+                    <input type="text" name="address" value="<%= reserveAddress === '(unset)' ? '' : reserveAddress %>"
+                           required minlength="8" maxlength="128"
+                           style="width:100%;font-family:monospace;padding:0.35em;margin-bottom:0.35em">
+                    <label class="small muted">Value (sats)</label>
+                    <input type="number" name="value_sats" min="1" step="1" required
+                           placeholder="e.g. 100000000 for 1 BTC"
+                           style="width:100%;padding:0.35em;margin-bottom:0.35em">
+                    <label class="small muted">Fee (sats)</label>
+                    <input type="number" name="fee_sats" min="0" step="1" value="100"
+                           style="width:100%;padding:0.35em;margin-bottom:0.5em">
+                    <button type="submit">Submit deposit</button>
+                </form>
+
+            </div>
         </section>
 
         <section class="card">

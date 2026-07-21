@@ -16,8 +16,24 @@ RUN npm ci --omit=dev
 
 # -----------------------------------------------------------------------------
 FROM node:20-bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends tini \
-    && rm -rf /var/lib/apt/lists/*
+# grpcurl is used by the "Deposit BTC → Thunder" admin action — one
+# static Go binary, uses gRPC reflection so no .proto files needed.
+# Fetched from GitHub releases (Debian's apt version lags).
+ARG TARGETARCH
+ARG GRPCURL_VERSION=1.9.1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tini ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "$TARGETARCH" in \
+         amd64) GRPCURL_ARCH=x86_64 ;; \
+         arm64) GRPCURL_ARCH=arm64  ;; \
+         *) echo "unsupported arch: $TARGETARCH"; exit 1 ;; \
+       esac \
+    && curl -fsSL -o /tmp/grpcurl.tgz \
+         "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_${GRPCURL_ARCH}.tar.gz" \
+    && tar -xzf /tmp/grpcurl.tgz -C /usr/local/bin grpcurl \
+    && chmod +x /usr/local/bin/grpcurl \
+    && rm /tmp/grpcurl.tgz
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY dashboard/ ./

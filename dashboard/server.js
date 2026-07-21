@@ -5,6 +5,8 @@ import { renderFile } from 'ejs';
 import { openDb } from './lib/db.js';
 import * as stats from './lib/stats.js';
 import * as admin from './lib/admin.js';        /* PPS ADMIN PATCH */
+import * as actions from './lib/actions.js';    /* admin write-actions */
+import { issueToken, consumeToken } from './lib/csrf.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '8081', 10);
@@ -90,6 +92,12 @@ const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASS = process.env.ADMIN_PASSWORD || '';
 const RESERVE_ADDRESS = process.env.POOL_THUNDER_RESERVE_ADDRESS || '(unset)';
 const THUNDER_RPC_URL = process.env.THUNDER_RPC_URL || 'http://127.0.0.1:6009';
+/* Write-action config. All optional — routes surface a clear error if
+ * the relevant one is unset. */
+const PAYOUT_ADMIN_URL   = process.env.PAYOUT_ADMIN_URL   || '';
+const ENFORCER_GRPC_ADDR = process.env.ENFORCER_GRPC_ADDR || '127.0.0.1:50051';
+const GRPCURL_BIN        = process.env.GRPCURL_BIN        || 'grpcurl';
+const THUNDER_SIDECHAIN_ID = parseInt(process.env.THUNDER_SIDECHAIN_ID || '9', 10);
 /* PPS_SATS_PER_DIFF is declared at the top of the file so both the
  * public /worker/:name view and the admin routes can share it. */
 
@@ -123,14 +131,92 @@ async function adminSummary() {
     };
 }
 
+/* Parse the write-action forms. Confined to POSTs so it never touches
+ * the read-only routes. */
+const parseAdminForm = express.urlencoded({ extended: false, limit: '4kb' });
+
+/* Flash message from a redirect. Query-string based (?flash=…&flashOk=1)
+ * so no cookies / no session store; EJS auto-escapes when rendering. */
+function readFlash(req) {
+    const msg = typeof req.query.flash === 'string' ? req.query.flash : '';
+    if (!msg) return null;
+    return {
+        ok:     req.query.flashOk === '1',
+        msg,
+        detail: typeof req.query.flashDetail === 'string' ? req.query.flashDetail : '',
+    };
+}
+function flashRedirect(res, result) {
+    const q = new URLSearchParams();
+    q.set('flash',   result.msg    || (result.ok ? 'ok' : 'failed'));
+    q.set('flashOk', result.ok ? '1' : '0');
+    if (result.detail) q.set('flashDetail', result.detail);
+    res.redirect(302, '/admin?' + q.toString());
+}
+
 app.get('/admin', requireAdminAuth, async (req, res) => {
     try {
         const data = await adminSummary();
-        res.render('admin', data);
+        res.render('admin', {
+            ...data,
+            csrfToken: issueToken(),
+            flash:     readFlash(req),
+            reserveSidechainId: THUNDER_SIDECHAIN_ID,
+            payoutAdminConfigured: !!PAYOUT_ADMIN_URL,
+        });
     } catch (e) {
         res.status(500).send('admin: ' + e.message);
     }
 });
+
+/* Gate for write actions: valid Basic auth + valid CSRF token. */
+function requireCsrf(req, res, next) {
+    if (consumeToken(req.body?.csrf)) return next();
+    flashRedirect(res, {
+        ok: false,
+        msg: 'CSRF token missing or already used',
+        detail: 'refresh the admin page and retry',
+    });
+}
+
+app.post('/admin/action/nudge-mine',
+    requireAdminAuth, parseAdminForm, requireCsrf,
+    async (_req, res) => {
+        const r = await actions.nudgeMine({ thunderRpcUrl: THUNDER_RPC_URL });
+        flashRedirect(res, r);
+    });
+
+app.post('/admin/action/remove-from-mempool',
+    requireAdminAuth, parseAdminForm, requireCsrf,
+    async (req, res) => {
+        const r = await actions.removeFromMempool({
+            thunderRpcUrl: THUNDER_RPC_URL,
+            txid: (req.body?.txid || '').trim(),
+        });
+        flashRedirect(res, r);
+    });
+
+app.post('/admin/action/trigger-payout',
+    requireAdminAuth, parseAdminForm, requireCsrf,
+    async (_req, res) => {
+        const r = await actions.triggerPayout({ payoutAdminUrl: PAYOUT_ADMIN_URL });
+        flashRedirect(res, r);
+    });
+
+app.post('/admin/action/deposit',
+    requireAdminAuth, parseAdminForm, requireCsrf,
+    async (req, res) => {
+        const r = await actions.createDeposit({
+            grpcurlBin:       GRPCURL_BIN,
+            enforcerGrpcAddr: ENFORCER_GRPC_ADDR,
+            sidechainId:      req.body?.sidechain_id ?? THUNDER_SIDECHAIN_ID,
+            address:          (req.body?.address || '').trim(),
+            valueSats:        req.body?.value_sats,
+            feeSats:          req.body?.fee_sats,
+            db,
+        });
+        flashRedirect(res, r);
+    });
 
 app.get('/api/admin/summary', requireAdminAuth, async (req, res) => {
     try {

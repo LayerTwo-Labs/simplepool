@@ -18,6 +18,10 @@ Environment=THUNDER_RPC_URL=http://127.0.0.1:6009
 # Environment=THUNDER_FROM_ADDRESS=<paste from proxy.conf>
 Environment=PAYOUT_MIN_SATS=10000
 Environment=PAYOUT_INTERVAL_MS=30000
+# Admin HTTP surface — used by the dashboard's "Trigger payout now"
+# button. Loopback-only. Set port=0 to disable.
+Environment=PAYOUT_ADMIN_BIND=127.0.0.1
+Environment=PAYOUT_ADMIN_PORT=9080
 ExecStart=/usr/bin/node @ROOT@/payout/index.js
 Restart=on-failure
 RestartSec=5
