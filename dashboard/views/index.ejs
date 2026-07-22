@@ -1,30 +1,11 @@
-<%
-const fmtN = (n) => new Intl.NumberFormat('en-US').format(n || 0);
-const fmtTs = (t) => t ? new Date(t * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—';
-const ago = (t) => {
-    if (!t) return '—';
-    const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
-    if (s < 60) return s + 's ago';
-    if (s < 3600) return Math.floor(s / 60) + 'm ago';
-    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-    return Math.floor(s / 86400) + 'd ago';
-};
-%>
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="15">
-    <title>overview · simplepool</title>
-    <link rel="stylesheet" href="/static/style.css">
+<%- include('partial/head', { title: 'overview · simplepool', refresh: 15 }) %>
 </head>
 <body>
-    <header class="top">
-        <a href="/" class="brand">simplepool</a>
-        <span class="tag">stratum stats</span>
-    </header>
-    <main class="wrap">
+<%- include('partial/nav-public', { active: 'overview' }) %>
+<main class="wrap">
         <% if (!ov.db_ready) { %>
             <div class="card warn">
                 <h2>no data yet</h2>

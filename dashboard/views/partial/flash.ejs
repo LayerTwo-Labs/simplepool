@@ -1,0 +1,9 @@
+<%# Green/red flash banner. Locals: flash ({ok, msg, detail?}) or null. %>
+<% if (typeof flash !== 'undefined' && flash) { %>
+<section class="card flash <%= flash.ok ? 'flash-ok' : 'flash-err' %>">
+    <h2><%= flash.ok ? '✓' : '✗' %> <%= flash.msg %></h2>
+    <% if (flash.detail) { %>
+        <p class="mono small" style="margin:0;word-break:break-all"><%= flash.detail %></p>
+    <% } %>
+</section>
+<% } %>

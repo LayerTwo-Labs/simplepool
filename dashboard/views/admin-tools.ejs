@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<%- include('partial/head', { title: 'admin · tools · simplepool' }) %>
+</head>
+<body>
+<%- include('partial/nav-admin', { active: 'tools' }) %>
+<main class="wrap">
+    <%- include('partial/flash', { flash }) %>
+
+    <section class="card info">
+        <h2>Tools</h2>
+        <p class="muted small">
+            One-off ops on Thunder. All CSRF-gated; each redirects back
+            here with a green/red banner. None of these move money —
+            payouts and deposits have their own pages.
+        </p>
+    </section>
+
+    <section class="card">
+        <h2>Nudge Thunder mine</h2>
+        <form method="POST" action="/admin/action/nudge-mine">
+            <input type="hidden" name="csrf" value="<%= csrfToken %>">
+            <input type="hidden" name="return_to" value="/admin/tools">
+            <p class="muted small" style="margin:0 0 0.5em 0">
+                Call <code>mine</code> on the Thunder RPC once. Thunder
+                builds a fresh BMM commit if it can; harmless if it
+                can't (the "already exists" error is fine). Complements
+                the systemd <code>thunder-mine.timer</code>.
+            </p>
+            <button type="submit">Nudge mine</button>
+        </form>
+    </section>
+
+    <section class="card">
+        <h2>Remove stale Thunder tx</h2>
+        <form method="POST" action="/admin/action/remove-from-mempool" style="max-width:640px">
+            <input type="hidden" name="csrf" value="<%= csrfToken %>">
+            <input type="hidden" name="return_to" value="/admin/tools">
+            <p class="muted small" style="margin:0 0 0.5em 0">
+                Drop a stuck tx from Thunder's mempool. Use when a payout
+                keeps failing with <code>utxo double spent</code> because
+                a phantom tx is holding the reserve UTXO. Thunder's
+                mempool is persisted, so a daemon restart doesn't clear
+                these — this endpoint does.
+            </p>
+            <label class="small muted">Thunder txid (64 hex chars)</label>
+            <input type="text" name="txid"
+                   placeholder="e.g. 914bb27754339954efec…"
+                   pattern="[0-9a-fA-F]{64}" required
+                   style="width:100%;font-family:monospace;padding:0.35em;margin-bottom:0.5em">
+            <button type="submit">Remove from mempool</button>
+        </form>
+    </section>
+</main>
+<footer class="foot">
+    <span>admin · tools</span>
+</footer>
+</body>
+</html>

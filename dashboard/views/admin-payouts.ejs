@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<%- include('partial/head', { title: 'admin · payouts · simplepool', refresh: 15 }) %>
+</head>
+<body>
+<%- include('partial/nav-admin', { active: 'payouts' }) %>
+<main class="wrap">
+    <%- include('partial/flash', { flash }) %>
+
+    <section class="card info">
+        <h2>Payouts</h2>
+        <p class="muted small">
+            The Thunder payout worker ticks every ~30s and drains any
+            worker whose owed balance ≥ min-payout. Trigger a cycle
+            manually below if you don't want to wait.
+        </p>
+    </section>
+
+    <section class="card">
+        <h2>Trigger cycle now</h2>
+        <form method="POST" action="/admin/action/trigger-payout">
+            <input type="hidden" name="csrf" value="<%= csrfToken %>">
+            <input type="hidden" name="return_to" value="/admin/payouts">
+            <p class="muted small" style="margin:0 0 0.5em 0">
+                Ask the payout worker to run one cycle immediately.
+                Safe to fire multiple times — the worker holds an
+                in-flight row for anything it touched.
+                <% if (!payoutAdminConfigured) { %>
+                    <br><em style="color:#c66">
+                        Not configured — set <code>PAYOUT_ADMIN_URL</code> on the dashboard service.
+                    </em>
+                <% } %>
+            </p>
+            <button type="submit" <%= payoutAdminConfigured ? '' : 'disabled' %>>Trigger now</button>
+        </form>
+    </section>
+
+    <section class="card">
+        <h2>In-flight</h2>
+        <% if (inFlight.length === 0) { %>
+            <p class="muted">Nothing in flight — clean.</p>
+        <% } else { %>
+        <p class="muted small" style="margin-top:0">
+            Rows here need operator attention. Empty <em>txid</em>
+            means the Thunder broadcast may not have gone out; a set
+            <em>txid</em> means the broadcast succeeded but the DB
+            finalize crashed. Never auto-resolved.
+        </p>
+        <table>
+            <thead><tr>
+                <th>#</th><th>Worker</th><th>Amount</th>
+                <th>Age</th><th>txid</th><th>State</th>
+            </tr></thead>
+            <tbody>
+                <% inFlight.forEach(r => { %>
+                <tr>
+                    <td><%= r.id %></td>
+                    <td class="mono small"><%= r.worker_name %></td>
+                    <td><%= fmtSats(r.sats) %></td>
+                    <td class="muted small" title="<%= fmtTs(r.started_at) %>"><%= ago(r.started_at) %></td>
+                    <td class="mono small"><%= r.txid || '—' %></td>
+                    <td><%= r.txid ? 'broadcast, finalize pending' : 'unbroadcast' %></td>
+                </tr>
+                <% }) %>
+            </tbody>
+        </table>
+        <% } %>
+    </section>
+
+    <section class="card">
+        <h2>Recent payouts (Thunder)</h2>
+        <% if (payouts.length === 0) { %>
+            <p class="muted">No successful payouts yet.</p>
+        <% } else { %>
+        <table>
+            <thead><tr>
+                <th>When</th><th>Worker</th><th>Amount</th>
+                <th>Fee</th><th>Thunder txid</th><th>Note</th>
+            </tr></thead>
+            <tbody>
+                <% payouts.forEach(p => { %>
+                <tr>
+                    <td class="muted small" title="<%= fmtTs(p.paid_at) %>"><%= ago(p.paid_at) %></td>
+                    <td class="mono small"><a href="/admin/worker/<%= p.worker_id %>"><%= p.worker_name %></a></td>
+                    <td><strong><%= fmtSats(p.sats) %></strong></td>
+                    <td class="muted small"><%= fmtSats(p.fee_sats) %></td>
+                    <td class="mono small" title="<%= p.txid %>"><%= p.txid.slice(0,16) %>…<%= p.txid.slice(-6) %></td>
+                    <td class="muted small"><%= p.note || '' %></td>
+                </tr>
+                <% }) %>
+            </tbody>
+        </table>
+        <% } %>
+    </section>
+</main>
+<footer class="foot">
+    <span>auto-refresh 15s</span>
+    <span class="sep">·</span>
+    <span>admin · payouts</span>
+</footer>
+</body>
+</html>

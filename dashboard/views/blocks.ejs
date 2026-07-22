@@ -1,32 +1,15 @@
 <%
-const fmtN = (n) => new Intl.NumberFormat('en-US').format(n || 0);
-const fmtTs = (t) => t ? new Date(t * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—';
-const ago = (t) => {
-    if (!t) return '—';
-    const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
-    if (s < 60) return s + 's ago';
-    if (s < 3600) return Math.floor(s / 60) + 'm ago';
-    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-    return Math.floor(s / 86400) + 'd ago';
-};
 const shortHash = (h) => h ? (h.slice(0, 10) + '…' + h.slice(-8)) : '—';
 const shortAddr = (a) => a ? (a.length > 18 ? a.slice(0, 10) + '…' + a.slice(-6) : a) : '—';
 %>
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="60">
-    <title>blocks · simplepool</title>
-    <link rel="stylesheet" href="/static/style.css">
+<%- include('partial/head', { title: 'blocks · simplepool', refresh: 60 }) %>
 </head>
 <body>
-    <header class="top">
-        <a href="/" class="brand">simplepool</a>
-        <span class="tag">blocks found</span>
-    </header>
-    <main class="wrap">
+<%- include('partial/nav-public', { active: 'blocks' }) %>
+<main class="wrap">
         <section class="card">
             <h2>Blocks found by the pool</h2>
             <% if (rows.length === 0) { %>

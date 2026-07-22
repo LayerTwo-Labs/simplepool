@@ -1,0 +1,9 @@
+<%# Shared <head>. Locals: title (required), refresh (optional, seconds). %>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="same-origin">
+<% if (typeof refresh !== 'undefined' && refresh) { %>
+<meta http-equiv="refresh" content="<%= refresh %>">
+<% } %>
+<title><%= (typeof title !== 'undefined' && title) ? title : 'simplepool' %></title>
+<link rel="stylesheet" href="/static/style.css">

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<%- include('partial/head', { title: 'admin · overview · simplepool', refresh: 15 }) %>
+</head>
+<body>
+<%- include('partial/nav-admin', { active: 'overview' }) %>
+<main class="wrap">
+    <%- include('partial/flash', { flash }) %>
+
+    <section class="card info">
+        <h2>Overview</h2>
+        <p class="muted small">
+            Live balances and pool-wide totals. Use the nav above for
+            per-page detail (workers, deposits, payouts) and the tools tab
+            for one-off ops like nudging Thunder or clearing stuck txs.
+        </p>
+    </section>
+
+    <section class="card">
+        <h2>Thunder reserve</h2>
+        <% if (reserve.ok) { %>
+            <div class="grid">
+                <div><label>Available</label><strong><%= fmtSats(reserve.available_sats) %></strong></div>
+                <div><label>Total</label><strong><%= fmtSats(reserve.total_sats) %></strong></div>
+            </div>
+            <p class="mono small muted" style="margin-top:0.5em;word-break:break-all"><%= reserveAddress %></p>
+        <% } else { %>
+            <p class="muted">Thunder RPC unreachable: <em><%= reserve.error %></em></p>
+            <p class="mono small muted" style="margin-top:0.5em;word-break:break-all"><%= reserveAddress %></p>
+        <% } %>
+    </section>
+
+    <section class="card">
+        <h2>Pool BTC (enforcer wallet)</h2>
+        <p class="muted small" style="margin-top:0">
+            Spendable balance the <strong>Deposit BTC → Thunder</strong>
+            action can draw from. Fund it by sending BTC to a fresh
+            enforcer address from your operator wallet.
+        </p>
+        <% if (enforcer.ok) { %>
+            <div class="grid">
+                <div><label>Confirmed (spendable)</label><strong><%= fmtSats(enforcer.confirmed_sats) %></strong></div>
+                <div><label>Pending (in mempool)</label><strong><%= fmtSats(enforcer.pending_sats) %></strong></div>
+                <div><label>Synced?</label><strong><%= enforcer.has_synced ? '✓' : '✗' %></strong></div>
+            </div>
+        <% } else { %>
+            <p class="muted">Enforcer gRPC unreachable: <em><%= enforcer.error %></em></p>
+        <% } %>
+        <p class="muted small" style="margin-top:0.75em">
+            Ready to deposit? Go to <a href="/admin/deposits">Deposits →</a>
+        </p>
+    </section>
+
+    <section class="card">
+        <h2>PPS ledger totals</h2>
+        <div class="grid">
+            <div><label>Owed (needs payout)</label><strong><%= fmtSats(totals.owed) %></strong></div>
+            <div><label>Accrued (all time)</label><strong><%= fmtSats(totals.accrued) %></strong></div>
+            <div><label>Paid (all time)</label><strong><%= fmtSats(totals.paid) %></strong></div>
+            <div><label>Workers with a balance</label><strong><%= fmtN(totals.workers) %></strong></div>
+        </div>
+        <% if (reserve.ok && totals.owed > reserve.available_sats) { %>
+            <p class="muted small" style="margin-top:0.75em;color:#c66">
+                ⚠ Reserve is short by
+                <%= fmtSats(totals.owed - reserve.available_sats) %>.
+                The payout worker will keep skipping ticks until this is closed.
+                Head to <a href="/admin/deposits">Deposits</a> to top up the reserve.
+            </p>
+        <% } %>
+        <p class="muted small" style="margin-top:0.5em">
+            <a href="/admin/workers">Per-worker breakdown →</a>
+        </p>
+    </section>
+
+    <section class="card">
+        <h2>Recent blocks</h2>
+        <% if (blocks.length === 0) { %>
+            <p class="muted">No blocks recorded yet.</p>
+        <% } else { %>
+        <p class="muted small" style="margin-top:0">
+            Every block's coinbase pays the pool's <code>pool_btc_address</code>
+            (pps-classic). Operator batches accumulated BTC into Thunder via the
+            deposits page.
+        </p>
+        <table>
+            <thead><tr>
+                <th>When</th><th>Height</th><th>Block hash</th>
+                <th>Finder</th><th>Reward</th><th>Fee</th>
+            </tr></thead>
+            <tbody>
+                <% blocks.forEach(b => { %>
+                <tr>
+                    <td class="muted small" title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
+                    <td><%= fmtN(b.height) %></td>
+                    <td class="mono small" title="<%= b.hash %>"><%= b.hash.slice(0,16) %>…<%= b.hash.slice(-6) %></td>
+                    <td class="mono small">
+                        <% if (b.finder_id) { %>
+                            <a href="/admin/worker/<%= b.finder_id %>"><%= b.finder_name || b.finder_address || 'unknown' %></a>
+                        <% } else { %>
+                            <span class="muted">(unattributed)</span>
+                        <% } %>
+                    </td>
+                    <td><%= fmtSats(b.reward_sats) %></td>
+                    <td class="muted small"><%= fmtSats(b.fee_sats) %></td>
+                </tr>
+                <% }) %>
+            </tbody>
+        </table>
+        <% } %>
+    </section>
+</main>
+<footer class="foot">
+    <span>auto-refresh 15s</span>
+    <span class="sep">·</span>
+    <span>admin · overview</span>
+</footer>
+</body>
+</html>

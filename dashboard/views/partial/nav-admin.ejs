@@ -1,0 +1,15 @@
+<%# Top nav for /admin/*. Locals: active ('overview'|'workers'|'deposits'|'payouts'|'tools'|'worker'). %>
+<% const _aactive = (typeof active === 'string') ? active : ''; %>
+<% function _acls(name) { return _aactive === name ? 'active' : ''; } %>
+<header class="top top-admin">
+    <a href="/admin" class="brand">simplepool</a>
+    <span class="tag tag-admin">admin</span>
+    <nav class="topnav">
+        <a href="/admin"          class="<%= _acls('overview') %>">Overview</a>
+        <a href="/admin/workers"  class="<%= _acls('workers')  %>">Workers</a>
+        <a href="/admin/deposits" class="<%= _acls('deposits') %>">Deposits</a>
+        <a href="/admin/payouts"  class="<%= _acls('payouts')  %>">Payouts</a>
+        <a href="/admin/tools"    class="<%= _acls('tools')    %>">Tools</a>
+    </nav>
+    <a href="/admin/logout" class="logout" title="Clear cached admin login">Log out</a>
+</header>

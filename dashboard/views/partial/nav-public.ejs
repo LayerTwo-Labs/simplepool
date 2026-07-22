@@ -1,0 +1,19 @@
+<%# Top nav for the public (read-only) dashboard. Locals: active ('overview'|'blocks'|'worker'). %>
+<% const _pactive = (typeof active === 'string') ? active : ''; %>
+<header class="top">
+    <a href="/" class="brand">simplepool</a>
+    <span class="tag">stratum stats</span>
+    <nav class="topnav">
+        <a href="/"       class="<%= _pactive === 'overview' ? 'active' : '' %>">Overview</a>
+        <a href="/blocks" class="<%= _pactive === 'blocks'   ? 'active' : '' %>">Blocks</a>
+    </nav>
+    <form action="/worker-lookup" method="GET" class="topsearch" role="search">
+        <input type="text"
+               name="name"
+               placeholder="worker name…"
+               autocomplete="off"
+               maxlength="200"
+               aria-label="Look up a worker by name">
+        <button type="submit">Look up</button>
+    </form>
+</header>

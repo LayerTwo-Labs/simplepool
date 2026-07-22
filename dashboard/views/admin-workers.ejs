@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<%- include('partial/head', { title: 'admin · workers · simplepool', refresh: 30 }) %>
+</head>
+<body>
+<%- include('partial/nav-admin', { active: 'workers' }) %>
+<main class="wrap">
+    <%- include('partial/flash', { flash }) %>
+
+    <section class="card info">
+        <h2>Per-worker balances</h2>
+        <p class="muted small">
+            Every worker with a non-zero PPS ledger, sorted by
+            outstanding first. Click <em>audit →</em> for the byte-level
+            share breakdown the miner sees on their public page too.
+        </p>
+    </section>
+
+    <section class="card">
+        <% if (workers.length === 0) { %>
+            <p class="muted">No workers have a PPS balance yet.</p>
+        <% } else { %>
+        <table>
+            <thead>
+                <tr>
+                    <th>Worker</th>
+                    <th>Thunder address</th>
+                    <th>Owed</th>
+                    <th>Accrued</th>
+                    <th>Paid</th>
+                    <th>Updated</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                <% workers.forEach(w => { %>
+                <tr>
+                    <td class="mono small"><%= w.worker_name %></td>
+                    <td class="mono small"><%= w.thunder_address %></td>
+                    <td><strong><%= fmtSats(w.owed) %></strong></td>
+                    <td><%= fmtSats(w.accrued) %></td>
+                    <td><%= fmtSats(w.paid) %></td>
+                    <td class="muted small" title="<%= fmtTs(w.last_updated) %>"><%= ago(w.last_updated) %></td>
+                    <td><a href="/admin/worker/<%= w.worker_id %>" class="small">audit →</a></td>
+                </tr>
+                <% }) %>
+            </tbody>
+        </table>
+        <% } %>
+    </section>
+</main>
+<footer class="foot">
+    <span>auto-refresh 30s</span>
+    <span class="sep">·</span>
+    <span>admin · workers</span>
+</footer>
+</body>
+</html>

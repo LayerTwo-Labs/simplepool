@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<%- include('partial/head', { title: 'admin · deposits · simplepool', refresh: 30 }) %>
+</head>
+<body>
+<%- include('partial/nav-admin', { active: 'deposits' }) %>
+<main class="wrap">
+    <%- include('partial/flash', { flash }) %>
+
+    <section class="card info">
+        <h2>Deposits (mainchain → Thunder)</h2>
+        <p class="muted small">
+            The pool operator batches accumulated BTC into Thunder here.
+            Each deposit spends enforcer-wallet UTXOs into a BIP300
+            sidechain-#<%= reserveSidechainId %> tx; the enforcer signs and
+            broadcasts, the mainchain confirms, and Thunder eventually
+            processes the deposit into a spendable UTXO the payout worker
+            can draw from.
+        </p>
+    </section>
+
+    <section class="card">
+        <h2>Fund the reserve</h2>
+        <% if (enforcer.ok) { %>
+            <p class="muted small" style="margin-top:0">
+                <strong>Enforcer wallet spendable:</strong>
+                <%= fmtSats(enforcer.confirmed_sats) %>
+                <% if (enforcer.pending_sats > 0) { %>
+                    &nbsp;(+<%= fmtSats(enforcer.pending_sats) %> pending)
+                <% } %>
+            </p>
+        <% } else { %>
+            <p class="muted small" style="margin-top:0;color:#c66">
+                Enforcer gRPC unreachable: <em><%= enforcer.error %></em>
+            </p>
+        <% } %>
+
+        <form method="POST" action="/admin/action/deposit" style="max-width:640px">
+            <input type="hidden" name="csrf" value="<%= csrfToken %>">
+            <input type="hidden" name="return_to" value="/admin/deposits">
+            <input type="hidden" name="sidechain_id" value="<%= reserveSidechainId %>">
+
+            <label class="small muted">Recipient (Thunder address)</label>
+            <input type="text" name="address"
+                   value="<%= reserveAddress === '(unset)' ? '' : reserveAddress %>"
+                   required minlength="8" maxlength="128"
+                   style="width:100%;font-family:monospace;padding:0.35em;margin-bottom:0.5em">
+
+            <label class="small muted">Value (sats)</label>
+            <input type="number" name="value_sats" min="1" step="1" required
+                   placeholder="e.g. 100000000 for 1 BTC"
+                   style="width:100%;padding:0.35em;margin-bottom:0.5em">
+
+            <label class="small muted">Fee (sats)</label>
+            <input type="number" name="fee_sats" min="0" step="1" value="100"
+                   style="width:100%;padding:0.35em;margin-bottom:0.75em">
+
+            <button type="submit">Submit deposit</button>
+        </form>
+    </section>
+
+    <section class="card">
+        <h2>History</h2>
+        <% if (deposits.length === 0) { %>
+            <p class="muted">No deposits recorded.</p>
+        <% } else { %>
+        <table>
+            <thead><tr>
+                <th>When</th><th>Amount</th><th>Fee</th>
+                <th>Thunder recipient</th><th>Mainchain txid</th><th>Ctip seq</th>
+            </tr></thead>
+            <tbody>
+                <% deposits.forEach(d => { %>
+                <tr>
+                    <td class="muted small" title="<%= fmtTs(d.ts) %>"><%= ago(d.ts) %></td>
+                    <td><strong><%= fmtSats(d.sats_deposited) %></strong></td>
+                    <td class="muted small"><%= fmtSats(d.fee_sats) %></td>
+                    <td class="mono small"><%= d.thunder_recipient %></td>
+                    <td class="mono small" title="<%= d.btc_txid %>"><%= d.btc_txid.slice(0,16) %>…<%= d.btc_txid.slice(-6) %></td>
+                    <td class="muted small"><%= d.ctip_seq_before %> → <%= d.ctip_seq_after %></td>
+                </tr>
+                <% }) %>
+            </tbody>
+        </table>
+        <% } %>
+    </section>
+</main>
+<footer class="foot">
+    <span>auto-refresh 30s</span>
+    <span class="sep">·</span>
+    <span>admin · deposits</span>
+</footer>
+</body>
+</html>

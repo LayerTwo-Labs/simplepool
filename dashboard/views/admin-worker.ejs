@@ -1,21 +1,4 @@
 <%
-const fmtN   = (n) => new Intl.NumberFormat('en-US').format(n || 0);
-const fmtF   = (n, d = 4) => (typeof n === 'number' ? n.toFixed(d) : '—');
-const fmtTs  = (t) => t ? new Date(t * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—';
-const ago = (t) => {
-    if (!t) return '—';
-    const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
-    if (s < 60) return s + 's ago';
-    if (s < 3600) return Math.floor(s / 60) + 'm ago';
-    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-    return Math.floor(s / 86400) + 'd ago';
-};
-const fmtSats = (sats) => {
-    if (!sats) return '0 sats';
-    const btc = sats / 1e8;
-    if (btc >= 0.01) return fmtN(sats) + ' sats (' + btc.toFixed(8) + ' BTC)';
-    return fmtN(sats) + ' sats';
-};
 /* Precompute a running_accrued column for the recent-shares table.
  * The rows come newest-first, so we walk in reverse to accumulate. */
 const recentAsc = [...audit.recent].reverse();
@@ -30,19 +13,11 @@ const drift = audit.totals.accrued_computed - naiveAccrued;
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="30">
-    <title>audit · <%= audit.worker.name %> · simplepool</title>
-    <link rel="stylesheet" href="/static/style.css">
+<%- include('partial/head', { title: `audit · ${audit.worker.name} · simplepool`, refresh: 30 }) %>
 </head>
 <body>
-    <header class="top">
-        <a href="/" class="brand">simplepool</a>
-        <span class="tag">worker audit</span>
-        <span style="margin-left:1em"><a href="/admin">← back to admin</a></span>
-    </header>
-    <main class="wrap">
+<%- include('partial/nav-admin', { active: 'worker' }) %>
+<main class="wrap">
         <section class="card info">
             <h2>Why is this balance what it is?</h2>
             <p class="muted small">
