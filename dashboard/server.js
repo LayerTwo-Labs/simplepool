@@ -8,6 +8,7 @@
  */
 
 import express from 'express';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { renderFile } from 'ejs';
@@ -55,8 +56,43 @@ const PUBLIC_STRATUM_URL = process.env.PUBLIC_STRATUM_URL || 'stratum+tcp://<poo
 const PPS_SATS_PER_DIFF  = parseFloat(process.env.POOL_PPS_SATS_PER_DIFF || '1000');
 
 /* --- admin-side config -------------------------------------------------- */
-const ADMIN_USER           = process.env.ADMIN_USER     || '';
-const ADMIN_PASS           = process.env.ADMIN_PASSWORD || '';
+/* Credentials come from ADMIN_CREDENTIALS_FILE (a "user:password" file —
+ * docker-secret friendly, same shape as the enforcer's RPC cookie) or from
+ * the ADMIN_USER + ADMIN_PASSWORD env vars. The file takes precedence.
+ * A set-but-unreadable/malformed file is a fatal boot error: crashing beats
+ * silently running with admin disabled when the operator asked for it. */
+function loadAdminCredentials() {
+    const file = process.env.ADMIN_CREDENTIALS_FILE || '';
+    let user, pass;
+    if (!file) {
+        user = process.env.ADMIN_USER || '';
+        pass = process.env.ADMIN_PASSWORD || '';
+    } else {
+        let raw;
+        try {
+            raw = fs.readFileSync(file, 'utf8');
+        } catch (e) {
+            throw new Error(`ADMIN_CREDENTIALS_FILE ${file}: ${e.message}`);
+        }
+        /* Strip trailing newlines only — `echo user:pass > file` and
+         * docker secrets end with one. Spaces stay significant. */
+        raw = raw.replace(/[\r\n]+$/, '');
+        const sep = raw.indexOf(':');
+        if (sep < 1 || sep === raw.length - 1) {
+            throw new Error(`ADMIN_CREDENTIALS_FILE ${file}: expected "user:password"`);
+        }
+        user = raw.slice(0, sep);
+        pass = raw.slice(sep + 1);
+    }
+    /* HTTP Basic auth uses ':' as the user/password separator, so a colon
+     * in either would silently truncate at login time. Refuse at boot. */
+    if (user.includes(':') || pass.includes(':')) {
+        throw new Error('admin credentials must not contain ":" ' +
+                        '(HTTP Basic auth uses it as the separator)');
+    }
+    return { user, pass };
+}
+const { user: ADMIN_USER, pass: ADMIN_PASS } = loadAdminCredentials();
 const RESERVE_ADDRESS      = process.env.POOL_THUNDER_RESERVE_ADDRESS || '(unset)';
 const THUNDER_RPC_URL      = process.env.THUNDER_RPC_URL      || 'http://127.0.0.1:6009';
 const PAYOUT_ADMIN_URL     = process.env.PAYOUT_ADMIN_URL     || '';
@@ -66,7 +102,7 @@ const THUNDER_SIDECHAIN_ID = parseInt(process.env.THUNDER_SIDECHAIN_ID || '9', 1
 
 function requireAdminAuth(req, res, next) {
     if (!ADMIN_USER || !ADMIN_PASS) {
-        return res.status(503).send('admin disabled — set ADMIN_USER + ADMIN_PASSWORD');
+        return res.status(503).send('admin disabled — set ADMIN_USER + ADMIN_PASSWORD or ADMIN_CREDENTIALS_FILE');
     }
     const h = req.headers.authorization || '';
     if (h.startsWith('Basic ')) {

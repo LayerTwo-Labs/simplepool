@@ -425,8 +425,13 @@ Subscribers get JSON on channels `pool:shares`, `pool:rejects`,
 
 The dashboard reads the same SQLite the C proxy writes. It's a single
 Node process serving both the public `/` view and the admin `/admin`
-view; the admin routes are only enabled when both `ADMIN_USER` and
-`ADMIN_PASSWORD` are set in the env.
+view; the admin routes are only enabled when credentials are configured:
+either both `ADMIN_USER` and `ADMIN_PASSWORD` in the env, or
+`ADMIN_CREDENTIALS_FILE` pointing at a `user:password` file (handy for
+docker secrets — same shape as the enforcer's RPC cookie). The file
+takes precedence when both are set. A trailing newline in the file is
+ignored; neither the user nor the password may contain `:` (it's the
+HTTP Basic auth separator — the dashboard refuses to boot if one does).
 
 ### Systemd drop-in
 
