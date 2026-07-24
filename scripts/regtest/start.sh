@@ -99,9 +99,9 @@ start_if_dead bip300301_enforcer \
     --node-rpc-addr=127.0.0.1:18443 \
     --node-rpc-user=user \
     --node-rpc-pass=password \
-    --node-zmq-addr-sequence=tcp://127.0.0.1:29000 \
+    --node-zmq-addr-sequence=tcp://127.0.0.1:29010 \
+    --enable-block-template-server \
     --serve-rpc-addr=127.0.0.1:18444 \
-    --serve-json-rpc-addr=127.0.0.1:8123 \
     --serve-grpc-addr=127.0.0.1:50051
 
 wait_for bip300301_enforcer "nc -z 127.0.0.1 18444" 30

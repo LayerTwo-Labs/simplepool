@@ -97,7 +97,6 @@ const RESERVE_ADDRESS      = process.env.POOL_THUNDER_RESERVE_ADDRESS || '(unset
 const THUNDER_RPC_URL      = process.env.THUNDER_RPC_URL      || 'http://127.0.0.1:6009';
 const PAYOUT_ADMIN_URL     = process.env.PAYOUT_ADMIN_URL     || '';
 const ENFORCER_GRPC_ADDR   = process.env.ENFORCER_GRPC_ADDR   || '127.0.0.1:50051';
-const GRPCURL_BIN          = process.env.GRPCURL_BIN          || 'grpcurl';
 const THUNDER_SIDECHAIN_ID = parseInt(process.env.THUNDER_SIDECHAIN_ID || '9', 10);
 
 function requireAdminAuth(req, res, next) {
@@ -185,7 +184,6 @@ app.use('/admin',
         THUNDER_RPC_URL,
         PAYOUT_ADMIN_URL,
         ENFORCER_GRPC_ADDR,
-        GRPCURL_BIN,
         THUNDER_SIDECHAIN_ID,
         RESERVE_ADDRESS,
         PPS_SATS_PER_DIFF,

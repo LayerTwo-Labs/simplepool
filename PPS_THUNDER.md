@@ -122,8 +122,6 @@ BTC address as the username. Same as before.
 ### PPS mode against the regtest BIP300 stack
 
 ```sh
-brew install grpcurl       # one-time, needed by activate-thunder.sh
-
 scripts/regtest/setup.sh   # downloads ~50 MB of prebuilt binaries
 scripts/regtest/start.sh   # starts bitcoind + electrs + enforcer
 scripts/regtest/validate.sh # activates sidechain #9, bootstraps 150 blocks,

@@ -18,7 +18,6 @@ export function createAdminRouter({
     THUNDER_RPC_URL,
     PAYOUT_ADMIN_URL,
     ENFORCER_GRPC_ADDR,
-    GRPCURL_BIN,
     THUNDER_SIDECHAIN_ID,
     RESERVE_ADDRESS,
     PPS_SATS_PER_DIFF,
@@ -31,7 +30,7 @@ export function createAdminRouter({
         const [reserve, enforcer, totals, workers, inFlight, payouts, deposits, blocks] =
             await Promise.all([
                 admin.thunderBalance(THUNDER_RPC_URL),
-                admin.enforcerBalance(GRPCURL_BIN, ENFORCER_GRPC_ADDR),
+                admin.enforcerBalance(ENFORCER_GRPC_ADDR),
                 Promise.resolve(admin.poolTotals(db)),
                 Promise.resolve(admin.perWorkerBalances(db)),
                 Promise.resolve(admin.inFlight(db)),
@@ -158,7 +157,6 @@ export function createAdminRouter({
 
     router.post('/action/deposit', parseAdminForm, requireCsrf, async (req, res) => {
         const r = await actions.createDeposit({
-            grpcurlBin:       GRPCURL_BIN,
             enforcerGrpcAddr: ENFORCER_GRPC_ADDR,
             sidechainId:      req.body?.sidechain_id ?? THUNDER_SIDECHAIN_ID,
             address:          (req.body?.address || '').trim(),

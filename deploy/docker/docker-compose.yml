@@ -60,7 +60,6 @@ services:
       # --- Write-action wiring ---
       PAYOUT_ADMIN_URL:   ${PAYOUT_ADMIN_URL:-http://host.docker.internal:9080}
       ENFORCER_GRPC_ADDR: ${ENFORCER_GRPC_ADDR:-host.docker.internal:50051}
-      GRPCURL_BIN:        ${GRPCURL_BIN:-/usr/local/bin/grpcurl}
       THUNDER_SIDECHAIN_ID: ${THUNDER_SIDECHAIN_ID:-9}
     volumes:
       # Dashboard now writes to the deposits table when the operator

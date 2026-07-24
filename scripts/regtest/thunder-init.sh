@@ -44,8 +44,7 @@ echo ""
 # is NOT recognized by Thunder's OP_RETURN parser — deposits to it are
 # logged as 'Ignoring invalid deposit address' and end up unpayable.
 echo "To send a deposit into this wallet from the mainchain:"
-echo "  grpcurl -plaintext -d '{\"sidechain_id\":9, \"address\":\"$ADDR\","
-echo "    \"value_sats\":100000000, \"fee_sats\":1000}' \\"
-echo "    127.0.0.1:50051 cusf.mainchain.v1.WalletService/CreateDepositTransaction"
-echo "  grpcurl -plaintext -d '{\"blocks\":1}' \\"
-echo "    127.0.0.1:50051 cusf.mainchain.v1.WalletService/GenerateBlocks"
+echo "  scripts/enforcer-rpc.sh cusf.mainchain.v1.WalletService/CreateDepositTransaction \\"
+echo "    '{\"sidechain_id\":9, \"address\":\"$ADDR\", \"value_sats\":100000000, \"fee_sats\":1000}'"
+echo "  scripts/enforcer-rpc.sh --stream cusf.mainchain.v1.WalletService/GenerateBlocks \\"
+echo "    '{\"blocks\":1}'"

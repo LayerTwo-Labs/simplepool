@@ -114,12 +114,18 @@ listen=1
 txindex=1
 rest=1
 fallbackfee=0.0001
+# ZMQ options are global-only: inside the [regtest] section bitcoind
+# parses but silently ignores them (getzmqnotifications returns []),
+# and the enforcer's validator then never advances past startup tip.
+# Port 29010, not the conventional 29000 — a ZMQ bind conflict with
+# another local node is silent, and the enforcer will happily subscribe
+# to whichever process won the port.
+zmqpubrawblock=tcp://127.0.0.1:29010
+zmqpubsequence=tcp://127.0.0.1:29010
 [regtest]
 rpcuser=user
 rpcpassword=password
 rpcport=18443
-zmqpubrawblock=tcp://127.0.0.1:29000
-zmqpubsequence=tcp://127.0.0.1:29000
 EOF
 
 cat > "$DATA/electrs/config.toml" <<EOF
