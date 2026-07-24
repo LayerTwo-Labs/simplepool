@@ -74,13 +74,11 @@ but the deposit flow doesn't work end-to-end anyway.
 - `libhiredis` headers (Redis client — required by the broadcast module,
   even if you don't enable Redis broadcast)
 - `node` v20+ (for the dashboard and payout worker)
-- `grpcurl` (only if you want to drive the enforcer's gRPC by hand —
-  the operator guide relies on it)
 
 ### macOS (Homebrew)
 
 ```sh
-brew install sqlite curl hiredis node grpcurl
+brew install sqlite curl hiredis node
 xcode-select --install    # if `cc` isn't available
 ```
 
@@ -93,9 +91,6 @@ sudo apt install -y build-essential libsqlite3-dev libcurl4-openssl-dev \
 # Node from NodeSource so you get a modern version
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
 sudo apt install -y nodejs
-# grpcurl (via GitHub release) if you plan to run the deposit runbook
-GRPCURL_VER=1.9.3
-curl -fsSL https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VER}/grpcurl_${GRPCURL_VER}_linux_x86_64.tar.gz | sudo tar -xz -C /usr/local/bin grpcurl
 ```
 
 ---

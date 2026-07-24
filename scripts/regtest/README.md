@@ -12,7 +12,7 @@ LayerTwo-Labs enforcer.
                        │              │
               ┌────────┤              ├────────┐
               │  ZMQ   │              │ gRPC   │
-              │ 29000  └──────────────┘ 50051  │
+              │ 29010  └──────────────┘ 50051  │
               ▼              │                 ▼
         ┌──────────┐         │           (events,
         │ bitcoind │◀────────┴───────┐   sidechain CRUD)
@@ -52,7 +52,6 @@ scripts/regtest/stop.sh
 
 `activate-thunder.sh` and `thunder-init.sh` are both idempotent —
 re-running once the state is set up is a no-op.
-Requires `grpcurl` (`brew install grpcurl`).
 
 Everything lives under `.regtest/` (gitignored): binaries in
 `.regtest/bin/`, chain state in `.regtest/data/`, logs in
@@ -146,19 +145,19 @@ with a canonical deposit:
 
 ```
 # Ctip BEFORE a canonical deposit (after the coinbase deposit attempt):
-grpcurl -plaintext -d '{"sidechain_number":9}' 127.0.0.1:50051 \
-  cusf.mainchain.v1.ValidatorService/GetCtip
+scripts/enforcer-rpc.sh cusf.mainchain.v1.ValidatorService/GetCtip \
+  '{"sidechain_number":9}'
 # → {} (no Ctip — coinbase deposit was ignored)
 
 # Issue a canonical deposit:
-grpcurl -plaintext -d '{"sidechain_id":9, "address":"11111111111111111111", "value_sats":100000000, "fee_sats":1000}' \
-  127.0.0.1:50051 cusf.mainchain.v1.WalletService/CreateDepositTransaction
-grpcurl -plaintext -d '{"blocks":1}' 127.0.0.1:50051 \
-  cusf.mainchain.v1.WalletService/GenerateBlocks
+scripts/enforcer-rpc.sh cusf.mainchain.v1.WalletService/CreateDepositTransaction \
+  '{"sidechain_id":9, "address":"11111111111111111111", "value_sats":100000000, "fee_sats":1000}'
+scripts/enforcer-rpc.sh --stream cusf.mainchain.v1.WalletService/GenerateBlocks \
+  '{"blocks":1}'
 
 # Ctip AFTER:
-grpcurl -plaintext -d '{"sidechain_number":9}' 127.0.0.1:50051 \
-  cusf.mainchain.v1.ValidatorService/GetCtip
+scripts/enforcer-rpc.sh cusf.mainchain.v1.ValidatorService/GetCtip \
+  '{"sidechain_number":9}'
 # → {"ctip": {"txid": {...}, "value": "100000000"}}
 ```
 

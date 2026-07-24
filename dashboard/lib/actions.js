@@ -7,13 +7,10 @@
  * External systems these talk to:
  *   - Thunder JSON-RPC       — nudgeMine, removeFromMempool
  *   - payout worker HTTP     — triggerPayout
- *   - bip300301_enforcer     — createDeposit (via grpcurl on the host)
+ *   - bip300301_enforcer     — createDeposit (ConnectRPC over HTTP)
  */
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-
-const execFileAsync = promisify(execFile);
+import { enforcerRpc } from './enforcer.js';
 
 /* ---------- Thunder RPC helper ---------- */
 
@@ -119,22 +116,20 @@ export async function triggerPayout({ payoutAdminUrl }) {
 
 /* ---------- Action #1: BTC → Thunder deposit (via bip300301_enforcer) ---------- */
 
-/* We shell out to `grpcurl` because the enforcer's gRPC on :50051 uses
- * server reflection — no .proto files needed, one static Go binary handles
- * it. The exact call matches ~/scripts/deposit_all_sidechains.sh on the
- * pool host:
+/* The enforcer speaks ConnectRPC on the same port as its gRPC (:50051),
+ * so this is a plain JSON POST:
  *
- *   grpcurl -d '{sidechain_id, address, value_sats, fee_sats}' -plaintext \
- *       ENFORCER_ADDR cusf.mainchain.v1.WalletService/CreateDepositTransaction
+ *   POST http://ENFORCER_ADDR/cusf.mainchain.v1.WalletService/CreateDepositTransaction
+ *   { sidechain_id, address, value_sats, fee_sats }
  *
  * On success the enforcer returns a txid; we insert into the pool DB's
  * `deposits` table so the admin ledger shows the operator action.
  */
 export async function createDeposit({
-    grpcurlBin, enforcerGrpcAddr, sidechainId, address, valueSats, feeSats,
+    enforcerGrpcAddr, sidechainId, address, valueSats, feeSats,
     db,   /* writable handle */
 }) {
-    /* Validate inputs up front — grpcurl errors are less friendly. */
+    /* Validate inputs up front — enforcer errors are less friendly. */
     const sid = Number(sidechainId);
     if (!Number.isInteger(sid) || sid < 0 || sid > 255) {
         return { ok: false, msg: 'invalid sidechain_id (expected 0..255)' };
@@ -147,28 +142,20 @@ export async function createDeposit({
     const fee = BigInt(feeSats || 0);
     if (fee < 0n) return { ok: false, msg: 'fee_sats must be >= 0' };
 
-    const payload = JSON.stringify({
-        sidechain_id: sid,
-        address,
-        value_sats:   Number(val),
-        fee_sats:     Number(fee),
-    });
-    let stdout;
+    let j;
     try {
-        const res = await execFileAsync(grpcurlBin, [
-            '-plaintext',
-            '-d', payload,
-            enforcerGrpcAddr,
-            'cusf.mainchain.v1.WalletService/CreateDepositTransaction',
-        ], { timeout: 60_000, maxBuffer: 1024 * 1024 });
-        stdout = res.stdout;
+        j = await enforcerRpc(enforcerGrpcAddr,
+            'cusf.mainchain.v1.WalletService/CreateDepositTransaction', {
+                sidechain_id: sid,
+                address,
+                value_sats:   Number(val),
+                fee_sats:     Number(fee),
+            }, 60_000);
     } catch (e) {
-        const stderr = (e.stderr || '').toString().slice(0, 500);
-        const stdouterr = (e.stdout || '').toString().slice(0, 300);
         return {
             ok: false,
             msg: 'CreateDepositTransaction failed',
-            detail: stderr || stdouterr || e.message,
+            detail: (e.message || String(e)).slice(0, 500),
         };
     }
 
@@ -176,8 +163,6 @@ export async function createDeposit({
      * depending on version). Parse whatever it gave us; if we can't find
      * a txid, still consider the call a success and echo the raw output
      * so the operator can inspect. */
-    let j = {};
-    try { j = JSON.parse(stdout); } catch { /* ignore */ }
     const txid =
         j.txid?.hex || j.txid?.value?.hex ||
         (typeof j.txid === 'string' ? j.txid : null);
@@ -199,7 +184,7 @@ export async function createDeposit({
             return {
                 ok: true,
                 msg: `deposit tx created (DB log failed: ${e.message})`,
-                detail: txid ? `txid=${txid}` : stdout.slice(0, 300),
+                detail: txid ? `txid=${txid}` : JSON.stringify(j).slice(0, 300),
             };
         }
     }
@@ -207,6 +192,6 @@ export async function createDeposit({
         ok: true,
         msg: `deposit tx submitted`,
         detail: txid ? `txid=${txid}, ${val} sats to ${address}` :
-                       `see raw enforcer response: ${stdout.slice(0, 200)}`,
+                       `see raw enforcer response: ${JSON.stringify(j).slice(0, 200)}`,
     };
 }

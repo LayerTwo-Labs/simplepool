@@ -5,6 +5,8 @@
 // http://127.0.0.1:6009) with a short timeout — we never block a
 // request on a slow / down Thunder node.
 
+import { enforcerRpc } from './enforcer.js';
+
 function unwrap(handle) {
     if (typeof handle?.get === 'function') return handle.get();
     return handle;
@@ -254,21 +256,14 @@ export function recentBlocksFound(handle, limit = 15) {
     }));
 }
 
-/* Probe the enforcer wallet's BTC balance via gRPC (WalletService.GetBalance).
- * Shells out to grpcurl — same binary the deposit action uses. Short
- * timeout so the admin page renders even when the enforcer is slow.
+/* Probe the enforcer wallet's BTC balance (WalletService.GetBalance) via
+ * ConnectRPC — a plain JSON POST, same transport the deposit action uses.
+ * Short timeout so the admin page renders even when the enforcer is slow.
  * Returns { ok, confirmed_sats, pending_sats, has_synced, error? }.  */
-export async function enforcerBalance(grpcurlBin, enforcerGrpcAddr, timeoutMs = 3000) {
-    const { execFile } = await import('node:child_process');
-    const { promisify } = await import('node:util');
-    const execFileAsync = promisify(execFile);
+export async function enforcerBalance(enforcerGrpcAddr, timeoutMs = 3000) {
     try {
-        const { stdout } = await execFileAsync(grpcurlBin, [
-            '-plaintext', '-d', '{}',
-            enforcerGrpcAddr,
-            'cusf.mainchain.v1.WalletService/GetBalance',
-        ], { timeout: timeoutMs, maxBuffer: 256 * 1024 });
-        const j = JSON.parse(stdout);
+        const j = await enforcerRpc(enforcerGrpcAddr,
+            'cusf.mainchain.v1.WalletService/GetBalance', {}, timeoutMs);
         return {
             ok: true,
             confirmed_sats: Number(j.confirmedSats ?? 0),
@@ -276,7 +271,7 @@ export async function enforcerBalance(grpcurlBin, enforcerGrpcAddr, timeoutMs = 
             has_synced:     Boolean(j.hasSynced),
         };
     } catch (e) {
-        const msg = (e.stderr || '').toString().slice(0, 200) || e.message;
+        const msg = (e.message || String(e)).slice(0, 200);
         return { ok: false, error: msg, confirmed_sats: 0, pending_sats: 0, has_synced: false };
     }
 }

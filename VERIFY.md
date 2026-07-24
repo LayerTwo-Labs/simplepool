@@ -16,8 +16,7 @@ behaviour, so `git show <hash>` is a quick way to inspect.
       On Linux/x86 some sections still work (unit tests, payout worker,
       audit, Redis broadcast) — only the regtest stack needs the
       aarch64 binaries.
-- [ ] `brew install hiredis sqlite curl grpcurl` (hiredis for the C
-      build, grpcurl for sidechain activation)
+- [ ] `brew install hiredis sqlite curl` (hiredis for the C build)
 - [ ] `node --version` ≥ 20
 
 ---
@@ -335,12 +334,12 @@ then observe the enforcer's TwoWayPeg event stream:
 
 ```
 DEP='<paste the deposit format from thunder-init.sh>'
-grpcurl -plaintext -d "{\"sidechain_id\":9,\"address\":\"$DEP\",\"value_sats\":100000000,\"fee_sats\":1000}" \
-  127.0.0.1:50051 cusf.mainchain.v1.WalletService/CreateDepositTransaction
-grpcurl -plaintext -d '{"blocks":1}' \
-  127.0.0.1:50051 cusf.mainchain.v1.WalletService/GenerateBlocks
-grpcurl -plaintext -d '{"sidechain_number":9}' \
-  127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetCtip
+scripts/enforcer-rpc.sh cusf.mainchain.v1.WalletService/CreateDepositTransaction \
+  "{\"sidechain_id\":9,\"address\":\"$DEP\",\"value_sats\":100000000,\"fee_sats\":1000}"
+scripts/enforcer-rpc.sh --stream cusf.mainchain.v1.WalletService/GenerateBlocks \
+  '{"blocks":1}'
+scripts/enforcer-rpc.sh cusf.mainchain.v1.ValidatorService/GetCtip \
+  '{"sidechain_number":9}'
 ```
 
 - [ ] Ctip returns non-empty with `value: "100000000"` (or the running
@@ -425,8 +424,8 @@ scripts/regtest/inspect-coinbase.sh
 The critical empirical result. With section 11 finished:
 
 ```
-grpcurl -plaintext -d '{"sidechain_number":9}' 127.0.0.1:50051 \
-  cusf.mainchain.v1.ValidatorService/GetCtip
+scripts/enforcer-rpc.sh cusf.mainchain.v1.ValidatorService/GetCtip \
+  '{"sidechain_number":9}'
 ```
 
 - [ ] Returns `{}`. **The coinbase deposit did NOT credit the Ctip**,
@@ -435,15 +434,15 @@ grpcurl -plaintext -d '{"sidechain_number":9}' 127.0.0.1:50051 \
 Now issue a canonical deposit to confirm the rule difference:
 
 ```
-grpcurl -plaintext -d '{"sidechain_id":9, "address":"11111111111111111111",
-  "value_sats":100000000, "fee_sats":1000}' \
-  127.0.0.1:50051 cusf.mainchain.v1.WalletService/CreateDepositTransaction
+scripts/enforcer-rpc.sh cusf.mainchain.v1.WalletService/CreateDepositTransaction \
+  '{"sidechain_id":9, "address":"11111111111111111111",
+    "value_sats":100000000, "fee_sats":1000}'
 
-grpcurl -plaintext -d '{"blocks":1}' 127.0.0.1:50051 \
-  cusf.mainchain.v1.WalletService/GenerateBlocks
+scripts/enforcer-rpc.sh --stream cusf.mainchain.v1.WalletService/GenerateBlocks \
+  '{"blocks":1}'
 
-grpcurl -plaintext -d '{"sidechain_number":9}' 127.0.0.1:50051 \
-  cusf.mainchain.v1.ValidatorService/GetCtip
+scripts/enforcer-rpc.sh cusf.mainchain.v1.ValidatorService/GetCtip \
+  '{"sidechain_number":9}'
 ```
 
 - [ ] Now returns `{"ctip": {"txid": {...}, "value": "100000000"}}`.

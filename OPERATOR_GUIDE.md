@@ -74,7 +74,7 @@ password](#rotating-the-admin-password) below.
                 │                   │
                 └────────┬──────────┘
                          │ operator triggers deposit
-                         │ (admin dashboard button OR grpcurl)
+                         │ (admin dashboard button OR curl)
                          ▼
                 ┌──────────────────────┐
                 │ BIP300 deposit tx    │
@@ -134,21 +134,23 @@ POOL_ADDR=$(sudo -u forknet $TCLI get-new-address)
 echo "deposit target: $POOL_ADDR"
 
 # 2. Trigger the deposit via the enforcer's wallet. AMOUNT + FEE are yours to pick.
-GRPCURL=/home/forknet/forknet-software/grpcurl
+#    The enforcer speaks ConnectRPC on the gRPC port, so unary calls are
+#    plain JSON POSTs.
+ENFORCER=http://127.0.0.1:50051
 AMOUNT_SATS=1000000     # 0.01 BTC = 1_000_000 sats
 FEE_SATS=1000
-$GRPCURL -plaintext \
+curl -sS -H 'content-type: application/json' \
   -d "{\"sidechain_id\":9,\"address\":\"$POOL_ADDR\",\"value_sats\":$AMOUNT_SATS,\"fee_sats\":$FEE_SATS}" \
-  127.0.0.1:50051 cusf.mainchain.v1.WalletService/CreateDepositTransaction
+  $ENFORCER/cusf.mainchain.v1.WalletService/CreateDepositTransaction
 
-# 3. Wait for a natural mainchain block from your miner (or on regtest,
-#    force one with GenerateBlocks).
-$GRPCURL -plaintext -d '{"blocks":1}' \
-  127.0.0.1:50051 cusf.mainchain.v1.WalletService/GenerateBlocks
+# 3. Wait for a natural mainchain block from your miner. (On regtest you
+#    can force one — GenerateBlocks is a streaming RPC, so use the helper:
+#    scripts/enforcer-rpc.sh --stream \
+#      cusf.mainchain.v1.WalletService/GenerateBlocks '{"blocks":1}' )
 
 # 4. Confirm the Ctip moved
-$GRPCURL -plaintext -d '{"sidechain_number":9}' \
-  127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetCtip
+curl -sS -H 'content-type: application/json' -d '{"sidechain_number":9}' \
+  $ENFORCER/cusf.mainchain.v1.ValidatorService/GetCtip
 
 # 5. Poke Thunder to include the new deposit in a sidechain block.
 #    `mine` may time out on the client side but the block gets produced.
@@ -308,8 +310,8 @@ running. Check with:
 
 ```sh
 # enforcer says the deposit was consensus-accepted?
-grpcurl -plaintext -d '{"sidechain_number":9}' \
-  127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetCtip
+curl -sS -H 'content-type: application/json' -d '{"sidechain_number":9}' \
+  http://127.0.0.1:50051/cusf.mainchain.v1.ValidatorService/GetCtip
 # Thunder wallet sees the balance?
 sudo -u forknet /home/forknet/forknet-software/thunder-rust/target/debug/thunder_app_cli balance
 ```
@@ -387,15 +389,15 @@ new shares landing while you deposit. Read `totals.owed` off
 
 ```sh
 ssh -i <ssh-key> root@<pool-host>
-GRPCURL=/home/forknet/forknet-software/grpcurl
+ENFORCER=http://127.0.0.1:50051
 BCLI="/home/forknet/forknet-software/drivechain-forknet/build/bin/bitcoin-cli \
     -datadir=/home/forknet/.drivechain-forknet \
     -rpcuser=<rpcuser> -rpcpassword=<rpcpassword> \
     -rpcwallet=<wallet-name>"
 
 # Fresh enforcer-owned receive address (one per deposit).
-ENF=$($GRPCURL -plaintext 127.0.0.1:50051 \
-      cusf.mainchain.v1.WalletService/CreateNewAddress \
+ENF=$(curl -sS -H 'content-type: application/json' -d '{}' \
+      $ENFORCER/cusf.mainchain.v1.WalletService/CreateNewAddress \
       | python3 -c "import json,sys; print(json.load(sys.stdin)['address'])")
 echo "enforcer receive: $ENF"
 
@@ -418,24 +420,25 @@ POOL_ADDR=$(sudo -u forknet $TCLI get-new-address)
 echo "deposit target: $POOL_ADDR"
 
 # Capture Ctip before so we can verify it moves.
-CTIP_BEFORE=$($GRPCURL -plaintext -d '{"sidechain_number":9}' \
-    127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetCtip)
+CTIP_BEFORE=$(curl -sS -H 'content-type: application/json' \
+    -d '{"sidechain_number":9}' \
+    $ENFORCER/cusf.mainchain.v1.ValidatorService/GetCtip)
 echo "$CTIP_BEFORE"
 
 # Deposit — value is in sats. E.g. 5 BTC = 500_000_000, 50 BTC = 5_000_000_000.
 DEPOSIT_SATS=<sats>
-$GRPCURL -plaintext \
+curl -sS -H 'content-type: application/json' \
     -d "{\"sidechain_id\":9,\"address\":\"$POOL_ADDR\",\
 \"value_sats\":$DEPOSIT_SATS,\"fee_sats\":1000}" \
-    127.0.0.1:50051 cusf.mainchain.v1.WalletService/CreateDepositTransaction
+    $ENFORCER/cusf.mainchain.v1.WalletService/CreateDepositTransaction
 ```
 
 Wait for a mainchain block, then confirm the Ctip grew by roughly
 `DEPOSIT_SATS`:
 
 ```sh
-$GRPCURL -plaintext -d '{"sidechain_number":9}' \
-    127.0.0.1:50051 cusf.mainchain.v1.ValidatorService/GetCtip
+curl -sS -H 'content-type: application/json' -d '{"sidechain_number":9}' \
+    $ENFORCER/cusf.mainchain.v1.ValidatorService/GetCtip
 ```
 
 **Step 3 — poke Thunder to include the deposit in a sidechain block.**
