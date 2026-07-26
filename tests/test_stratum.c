@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 static int g_pass = 0;
@@ -50,6 +51,14 @@ static cJSON *parse_first_line(char *buf) {
     char *nl = strchr(buf, '\n');
     if (nl) *nl = '\0';
     return cJSON_Parse(buf);
+}
+
+/* usleep is gone from POSIX.1-2008 (which the Makefile requests), so glibc
+ * hides its declaration; nanosleep is the conforming replacement. */
+static void sleep_ms(long ms) {
+    struct timespec ts = { .tv_sec = ms / 1000,
+                           .tv_nsec = (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
 }
 
 /* Helper: count newline-delimited messages. */
@@ -283,6 +292,153 @@ static void test_authorize_address_with_label(void) {
     stratum_server_free(s);
 }
 
+/* A hash that beats the network target but not the share target must be
+ * accepted and submitted as a block, never rejected as low difficulty.
+ * Regression: worker diff 1e12 makes the worker target ~0 so every hash
+ * fails the share check, while an all-ff network target makes every hash
+ * a block. The job is set after authorize so the authorize-time clamp
+ * (no job yet) leaves the huge difficulty in place. */
+static void test_block_wins_over_low_difficulty(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e12,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    int rc = stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(obs.rejects == 0);
+    CHECK(obs.shares == 1);
+    CHECK(obs.blocks == 1);
+    CHECK(obs.last_is_block == 1);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* Vardiff must not raise the share difficulty past the network difficulty.
+ * vardiff_min = 1e12 would floor the retarget at 1e12, but the job's
+ * network target is DIFF1 (difficulty 1), so the emitted set_difficulty
+ * must be clamped to 1. */
+static void test_vardiff_clamped_to_network_diff(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e-12,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 0.001,
+                           .vardiff_min = 1e12,
+                           .vardiff_max = 1e15,
+                           .vardiff_window_sec = 1,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    /* DIFF1 target = difficulty 1.0. */
+    uint8_t net[32] = {0};
+    net[4] = 0xff; net[5] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    /* Let the vardiff window elapse, then submit: the observed rate blows
+     * past target_spm, the retarget floors at vardiff_min, and the network
+     * clamp must pull it back down to 1. */
+    sleep_ms(1100);
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(out != NULL);
+    CHECK(strstr(out, "mining.set_difficulty") != NULL);
+    CHECK(strstr(out, "\"params\":[1]") != NULL);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* After a retarget raises the difficulty, shares mined against the old
+ * difficulty must stay acceptable for the grace period (the miner only
+ * applies set_difficulty on a later job). */
+static void test_vardiff_grace_accepts_old_diff_shares(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e-12,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 0.001,
+                           .vardiff_min = 1e12,
+                           .vardiff_max = 1e15,
+                           .vardiff_window_sec = 1,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    /* All-zero network target: nothing is ever a block, so acceptance can
+     * only come from the share-difficulty path. */
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    /* Share #1 after the window elapses triggers a retarget to 1e12
+     * (no network clamp: the all-zero target has infinite difficulty). */
+    sleep_ms(1100);
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(strstr(out, "mining.set_difficulty") != NULL);
+    CHECK(obs.shares == 1);
+    free(out); out=NULL; olen=0;
+
+    /* Share #2 fails the new 1e12 target but met the old 1e-12 one — the
+     * grace window must accept it. */
+    stratum_handle_message(s, c,
+        "{\"id\":4,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000002\"]}",
+        &out, &olen);
+    CHECK(obs.shares == 2);
+    CHECK(obs.rejects == 0);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 /* Idle-socket reaper: verify the accepted-socket setup path applies
  * SO_RCVTIMEO derived from idle_timeout_sec. We can't cheaply test the
  * "silent client gets dropped" path in a unit test — that would need a
@@ -327,6 +483,9 @@ int main(void) {
     test_submit_share_and_dedupe();
     test_authorize_rejects_non_address();
     test_authorize_address_with_label();
+    test_block_wins_over_low_difficulty();
+    test_vardiff_clamped_to_network_diff();
+    test_vardiff_grace_accepts_old_diff_shares();
     test_socket_setup_applies_rcvtimeo();
     test_socket_setup_disabled();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);

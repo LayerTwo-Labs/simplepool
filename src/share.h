@@ -18,6 +18,10 @@ void nbits_to_target(uint32_t nbits, uint8_t target_be[32]);
  * pool-core::share implementation). */
 void worker_diff_to_target(double diff, uint8_t target_be[32]);
 
+/* 32-byte big-endian target -> difficulty (DIFF1_TARGET / target), from the
+ * top 128 bits in f64. Saturates to HUGE_VAL when those bits are all zero. */
+double target_to_diff(const uint8_t target_be[32]);
+
 /* Fold coinbase txid (LE 32-byte) into a merkle root using branches
  * (each LE 32-byte). Always cur||branch order (Stratum: coinbase at idx 0). */
 void merkle_root_from_branches(const uint8_t leaf_le[32],

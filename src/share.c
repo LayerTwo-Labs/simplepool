@@ -62,6 +62,16 @@ static void u128_to_be16(u128 v, uint8_t out[16]) {
     }
 }
 
+double target_to_diff(const uint8_t target_be[32]) {
+    u128 hi = be16_to_u128(target_be);
+    if (hi == 0) {
+        /* Top 128 bits all zero: harder than any real chain target. Callers
+         * use this for clamping, so saturate rather than divide by zero. */
+        return HUGE_VAL;
+    }
+    return (double)be16_to_u128(DIFF1_TARGET) / (double)hi;
+}
+
 void worker_diff_to_target(double diff, uint8_t target_be[32]) {
     memset(target_be, 0, 32);
     if (!isfinite(diff) || diff <= 0.0) {
