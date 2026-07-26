@@ -9,8 +9,10 @@
 #
 # Auth uses the built-in GITHUB_TOKEN — no secrets to configure, because the
 # repo lives in the same org that owns the packages (exactly like coinshift).
-# Pull-request runs build the images (to prove the Dockerfiles still work) but
-# do not push; only pushes to main, tags, and manual runs publish.
+# Same-repo pull requests push a pullable `pr-<N>` tag so a PR build can be
+# deployed for testing before merge (the same convention as the enforcer's
+# pr-NNN images). Fork PRs only get a read-only GITHUB_TOKEN, so they stay
+# build-only.
 name: Build and push Docker images
 
 on:
@@ -66,8 +68,10 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
-        # Skipped on pull_request, where we build-only and don't push.
-        if: github.event_name != 'pull_request'
+        # Skipped on fork PRs, where the token is read-only and we build-only.
+        if: >-
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -79,7 +83,9 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: >-
+            ${{ github.event_name != 'pull_request' ||
+                github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Per-image GitHub Actions cache so the three legs don't collide.
