@@ -8,9 +8,9 @@
  * "recent jobs" kept alive ~60s for late submits. Connection threads take
  * read locks for notify/submit lookups.
  *
- * Vardiff is intentionally NOT implemented — this proxy is observation
- * only and uses cfg.initial_diff for every connection.
- * TODO: wire in vardiff once the dashboard exposes a control surface.
+ * Vardiff adjusts each connection's difficulty toward cfg.vardiff_target_spm
+ * shares/minute, clamped so the share target never exceeds the network
+ * target (see vardiff_maybe_retarget).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -211,6 +211,14 @@ struct stratum_conn {
      * and `difficulty` is multiplied/divided to converge on the target. */
     uint64_t vd_window_start_ms;
     uint32_t vd_window_shares;
+
+    /* The pre-retarget difficulty, honored for a grace period after a
+     * set_difficulty: the miner applies the new value only on a later job,
+     * so in-flight and old-job shares still arrive at the old difficulty.
+     * A back-to-back retarget overwrites this — only the latest old value
+     * is honored. */
+    double   prev_difficulty;
+    uint64_t diff_changed_ms;
 
     /* Monotonic timestamp of the most recent recv() that got any bytes.
      * The conn thread checks this against cfg.idle_timeout_sec after each
@@ -617,6 +625,23 @@ static void send_set_difficulty(char **buf, size_t *len, double diff) {
     emit_notification(buf, len, "mining.set_difficulty", p);
 }
 
+/* Network difficulty of the current job, or 0 when no job is set. */
+static double current_net_diff(stratum_server_t *s) {
+    double d = 0.0;
+    pthread_rwlock_rdlock(&s->job_lock);
+    if (s->current_job) d = target_to_diff(s->current_job->network_target_be);
+    pthread_rwlock_unlock(&s->job_lock);
+    return d;
+}
+
+/* How long shares at the pre-retarget difficulty stay acceptable. The miner
+ * applies a set_difficulty on a later job notify, which on a slow chain can
+ * lag well past the vardiff window. */
+static uint64_t diff_grace_ms(const stratum_server_t *s) {
+    uint64_t g = (uint64_t)s->cfg.vardiff_window_sec * 2000ULL;
+    return g > 60000 ? g : 60000;
+}
+
 /* Vardiff: every cfg.vardiff_window_sec, look at how many shares the
  * connection submitted in that window and rescale its difficulty so the
  * rate converges on cfg.vardiff_target_spm shares/minute. Called from
@@ -628,7 +653,8 @@ static void send_set_difficulty(char **buf, size_t *len, double diff) {
  *   else                    → new_diff = old_diff * ratio, clamped
  * Always emits a single mining.set_difficulty when diff changes. The
  * client picks it up for the next job notify; we don't force a re-notify
- * because the active job is still valid against the worker target. */
+ * because handle_submit keeps accepting shares at the old difficulty for
+ * a grace period (diff_grace_ms). */
 static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
                                    uint64_t now,
                                    char **buf, size_t *len)
@@ -659,6 +685,15 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
         if (new_diff < old_diff / 4.0) new_diff = old_diff / 4.0;
         if (new_diff < s->cfg.vardiff_min) new_diff = s->cfg.vardiff_min;
         if (new_diff > s->cfg.vardiff_max) new_diff = s->cfg.vardiff_max;
+        /* Never raise the share difficulty above the network difficulty:
+         * the miner discards hashes above the stratum target locally, so a
+         * share target harder than the network target throws away valid
+         * blocks before the pool ever sees them. This clamp wins over
+         * vardiff_min/max — it bites on low-difficulty networks where an
+         * ASIC's vardiff otherwise climbs orders of magnitude past the
+         * chain difficulty. */
+        double net_diff = current_net_diff(s);
+        if (net_diff > 0.0 && new_diff > net_diff) new_diff = net_diff;
     }
 
     /* Reset the window regardless of whether we changed diff. */
@@ -667,6 +702,8 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
 
     if (new_diff != old_diff) {
         c->difficulty = new_diff;
+        c->prev_difficulty = old_diff;
+        c->diff_changed_ms = now;
         LOG_INFO("stratum: vardiff %s: %.0f -> %.0f (%.1f spm observed, %.1f target)",
                  c->worker_name, old_diff, new_diff, observed_spm, target_spm);
         send_set_difficulty(buf, len, new_diff);
@@ -840,6 +877,10 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     sanitize_worker(worker, c->worker_name, sizeof(c->worker_name));
     c->authorized = 1;
     if (c->difficulty <= 0) c->difficulty = s->cfg.initial_diff;
+    /* Same clamp as vardiff: a starting difficulty above the network
+     * difficulty would make the miner discard valid blocks locally. */
+    double net_diff = current_net_diff(s);
+    if (net_diff > 0.0 && c->difficulty > net_diff) c->difficulty = net_diff;
     /* Arm vardiff window for this connection. */
     c->vd_window_start_ms = now_ms();
     c->vd_window_shares = 0;
@@ -1040,9 +1081,29 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
              c->worker_name, sent_hash_hex, worker_target_hex, network_target_hex,
              (uint32_t)job->version, (uint32_t)submit_version, c->version_mask);
 
-    int is_block = 0;
-    char block_hash_hex[65] = {0};
-    if (be32_cmp(hash_be, worker_target) >= 0) {
+    uint64_t ts_now   = now_ms();
+    int is_block      = be32_cmp(hash_be, job->network_target_be) <= 0;
+    int meets_worker  = be32_cmp(hash_be, worker_target) < 0;
+    double share_diff = c->difficulty;
+
+    /* Honor the pre-retarget difficulty for a grace period: the miner only
+     * applies a set_difficulty on a later job, so shares mined against the
+     * old difficulty keep arriving after a retarget. */
+    if (!meets_worker && c->prev_difficulty > 0.0 &&
+        ts_now - c->diff_changed_ms < diff_grace_ms(s)) {
+        uint8_t prev_target[32];
+        worker_diff_to_target(c->prev_difficulty, prev_target);
+        if (be32_cmp(hash_be, prev_target) < 0) {
+            meets_worker = 1;
+            share_diff = c->prev_difficulty;
+        }
+    }
+
+    /* The network-target verdict must win over the share-difficulty reject:
+     * when the share target is harder than the network target (low-difficulty
+     * networks), a hash can be a valid block while failing the share check —
+     * it has to be submitted, never rejected. */
+    if (!is_block && !meets_worker) {
 	LOG_INFO("stratum: reject from worker '%s' - Reason: low difficulty (Sent Hash > Worker Target)", c->worker_name);
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
@@ -1052,10 +1113,16 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         cJSON *err = make_error(23, "low difficulty");
         return emit_response(buf, len, id, NULL, err);
     }
-    uint64_t ts_now = now_ms();
-    if (be32_cmp(hash_be, job->network_target_be) <= 0) {
-        is_block = 1;
+
+    char block_hash_hex[65] = {0};
+    if (is_block) {
         bytes_to_hex(hash_be, 32, block_hash_hex);
+        if (!meets_worker) {
+            /* Credit the share at the difficulty it provably met. */
+            share_diff = target_to_diff(job->network_target_be);
+            LOG_INFO("stratum: hash from '%s' beats the network target but not "
+                     "the share target — submitting block", c->worker_name);
+        }
         char *block_hex = assemble_block_hex(job, cb, cb_len, header);
         if (block_hex) {
             if (s->cfg.on_block) s->cfg.on_block(s->cfg.ctx, block_hex);
@@ -1070,7 +1137,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
          * to gauge how lucky each share was). When is_block, this string
          * also IS the block hash; otherwise it's a 'just-a-share' hash. */
         s->cfg.on_share(s->cfg.ctx, c->worker_name, c->payout_address,
-                        ts_now, c->difficulty, is_block, sent_hash_hex);
+                        ts_now, share_diff, is_block, sent_hash_hex);
     }
     /* Tick vardiff: count this accepted share toward the window. May emit
      * a mining.set_difficulty notification if the window has elapsed. */
