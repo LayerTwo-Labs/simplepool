@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 static int g_pass = 0;
@@ -50,6 +51,14 @@ static cJSON *parse_first_line(char *buf) {
     char *nl = strchr(buf, '\n');
     if (nl) *nl = '\0';
     return cJSON_Parse(buf);
+}
+
+/* usleep is gone from POSIX.1-2008 (which the Makefile requests), so glibc
+ * hides its declaration; nanosleep is the conforming replacement. */
+static void sleep_ms(long ms) {
+    struct timespec ts = { .tv_sec = ms / 1000,
+                           .tv_nsec = (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
 }
 
 /* Helper: count newline-delimited messages. */
@@ -361,7 +370,7 @@ static void test_vardiff_clamped_to_network_diff(void) {
     /* Let the vardiff window elapse, then submit: the observed rate blows
      * past target_spm, the retarget floors at vardiff_min, and the network
      * clamp must pull it back down to 1. */
-    usleep(1100000);
+    sleep_ms(1100);
     stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
         "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
@@ -408,7 +417,7 @@ static void test_vardiff_grace_accepts_old_diff_shares(void) {
 
     /* Share #1 after the window elapses triggers a retarget to 1e12
      * (no network clamp: the all-zero target has infinite difficulty). */
-    usleep(1100000);
+    sleep_ms(1100);
     stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
         "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
