@@ -46,7 +46,8 @@ static const char *SAMPLE_GBT =
 "  \"curtime\": 1700001234,"
 "  \"bits\": \"170abc12\","
 "  \"height\": 800123,"
-"  \"default_witness_commitment\": \"6a24aa21a9ed0000000000000000000000000000000000000000000000000000000000000000\""
+"  \"default_witness_commitment\": \"6a24aa21a9ed0000000000000000000000000000000000000000000000000000000000000000\","
+"  \"longpollid\": \"0000000000000000000a1b2c3d4e5f6789abcdef0123456789abcdef01234567\""
 "}";
 
 static void test_parse_ok(void) {
@@ -69,6 +70,11 @@ static void test_parse_ok(void) {
         CHECK(t->default_witness_commitment != NULL);
         CHECK(t->default_witness_commitment != NULL &&
               strncmp(t->default_witness_commitment, "6a24aa21a9ed", 12) == 0);
+        /* BIP22 long-poll token is optional but must round-trip when sent. */
+        CHECK(t->longpollid != NULL);
+        CHECK(t->longpollid != NULL &&
+              strcmp(t->longpollid,
+                     "0000000000000000000a1b2c3d4e5f6789abcdef0123456789abcdef01234567") == 0);
         CHECK(t->tx_count == 2);
         CHECK(t->txs != NULL);
         if (t->tx_count == 2 && t->txs) {
@@ -129,6 +135,8 @@ static void test_parse_coinbasetxn(void) {
         CHECK(t->coinbasetxn_hex != NULL &&
               strncmp(t->coinbasetxn_hex, "02000000", 8) == 0);
         CHECK(t->bits == 0x170abc12u);
+        /* No longpollid in this fixture: the server doesn't long poll. */
+        CHECK(t->longpollid == NULL);
     }
     bitcoind_template_free(t);
     cJSON_Delete(root);

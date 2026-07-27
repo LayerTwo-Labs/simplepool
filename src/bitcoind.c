@@ -324,6 +324,16 @@ int bitcoind_parse_template(void *result_json,
         }
     }
 
+    cJSON *jlp = cJSON_GetObjectItemCaseSensitive(r, "longpollid");
+    if (cJSON_IsString(jlp) && jlp->valuestring && jlp->valuestring[0]) {
+        t->longpollid = strdup(jlp->valuestring);
+        if (!t->longpollid) {
+            set_err(errbuf, errlen, "oom");
+            bitcoind_template_free(t);
+            return -25;
+        }
+    }
+
     if (jtxs && cJSON_IsArray(jtxs)) {
         int n = cJSON_GetArraySize(jtxs);
         if (n > 0) {
@@ -372,12 +382,25 @@ int bitcoind_get_block_template(bitcoind_client_t *c,
     if (!out) return -1;
     *out = NULL;
 
-    /* params: [{"rules":["segwit"],"capabilities":["coinbasetxn"]}]
+    return bitcoind_get_block_template_lp(c, NULL, out, errbuf, errlen);
+}
+
+int bitcoind_get_block_template_lp(bitcoind_client_t *c,
+                                   const char *longpollid,
+                                   bitcoind_template_t **out,
+                                   char *errbuf, size_t errlen) {
+    if (!out) return -1;
+    *out = NULL;
+
+    /* params: [{"rules":["segwit"],"capabilities":["coinbasetxn","longpoll"]}]
      *
      * Requesting the "coinbasetxn" capability is harmless against Bitcoin Core
      * (it ignores it and still returns "coinbasevalue"), but tells backends
      * that can dictate the coinbase — notably the CUSF enforcer — to hand us a
-     * fully built coinbase carrying the mandatory BIP300/301 commitments. */
+     * fully built coinbase carrying the mandatory BIP300/301 commitments.
+     * "longpoll" declares client-side BIP22 long-poll support (a SHOULD in the
+     * BIP); servers advertise theirs by including "longpollid" in the
+     * template. */
     cJSON *params = cJSON_CreateArray();
     cJSON *obj = cJSON_CreateObject();
     cJSON *rules = cJSON_CreateArray();
@@ -385,7 +408,11 @@ int bitcoind_get_block_template(bitcoind_client_t *c,
     cJSON_AddItemToObject(obj, "rules", rules);
     cJSON *caps = cJSON_CreateArray();
     cJSON_AddItemToArray(caps, cJSON_CreateString("coinbasetxn"));
+    cJSON_AddItemToArray(caps, cJSON_CreateString("longpoll"));
     cJSON_AddItemToObject(obj, "capabilities", caps);
+    if (longpollid && longpollid[0]) {
+        cJSON_AddStringToObject(obj, "longpollid", longpollid);
+    }
     cJSON_AddItemToArray(params, obj);
 
     cJSON *result = NULL;
@@ -430,5 +457,6 @@ void bitcoind_template_free(bitcoind_template_t *t) {
     }
     free(t->default_witness_commitment);
     free(t->coinbasetxn_hex);
+    free(t->longpollid);
     free(t);
 }
