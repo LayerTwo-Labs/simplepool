@@ -1,0 +1,59 @@
+# End-to-end integration test: bitcoind-patched + walletless
+# bip300301_enforcer + simplepool (pps) + a JS CPU miner, driven by
+# tests/test_e2e_regtest.sh.
+#
+# Binary management follows the bip300301_enforcer repo's own CI: the
+# prebuilt zips are the unpinned "latest" builds from
+# releases.drivechain.info, re-downloaded every run (caching them would
+# just pin stale versions — and a run that breaks only because upstream
+# shipped a new "latest" is a signal we want to see).
+name: Integration tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Match check_build.yaml: CI runs only in the LayerTwo-Labs org repo.
+    if: github.repository_owner == 'LayerTwo-Labs'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libsqlite3-dev \
+            libcurl4-openssl-dev \
+            libhiredis-dev \
+            unzip \
+            jq \
+            sqlite3 \
+            netcat-openbsd
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Run end-to-end regtest test
+        run: bash tests/test_e2e_regtest.sh
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs-${{ github.run_id }}
+          path: |
+            .regtest-e2e/logs/
+            /tmp/simplepool-e2e.log
+            /tmp/simplepool-e2e.conf
+            /tmp/simplepool-int.log
+          retention-days: 14
+          if-no-files-found: ignore

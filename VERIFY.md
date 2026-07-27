@@ -336,8 +336,8 @@ then observe the enforcer's TwoWayPeg event stream:
 DEP='<paste the deposit format from thunder-init.sh>'
 scripts/enforcer-rpc.sh cusf.mainchain.v1.WalletService/CreateDepositTransaction \
   "{\"sidechain_id\":9,\"address\":\"$DEP\",\"value_sats\":100000000,\"fee_sats\":1000}"
-scripts/enforcer-rpc.sh --stream cusf.mainchain.v1.WalletService/GenerateBlocks \
-  '{"blocks":1}'
+scripts/enforcer-rpc.sh cusf.mainchain.v1.MiningService/GenerateToAddress \
+  '{"blocks":1, "address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"}'
 scripts/enforcer-rpc.sh cusf.mainchain.v1.ValidatorService/GetCtip \
   '{"sidechain_number":9}'
 ```
@@ -438,8 +438,8 @@ scripts/enforcer-rpc.sh cusf.mainchain.v1.WalletService/CreateDepositTransaction
   '{"sidechain_id":9, "address":"11111111111111111111",
     "value_sats":100000000, "fee_sats":1000}'
 
-scripts/enforcer-rpc.sh --stream cusf.mainchain.v1.WalletService/GenerateBlocks \
-  '{"blocks":1}'
+scripts/enforcer-rpc.sh cusf.mainchain.v1.MiningService/GenerateToAddress \
+  '{"blocks":1, "address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"}'
 
 scripts/enforcer-rpc.sh cusf.mainchain.v1.ValidatorService/GetCtip \
   '{"sidechain_number":9}'

@@ -5,8 +5,8 @@
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-REGTEST="$ROOT/.regtest"
-BIN="$REGTEST/bin"
+REGTEST="${REGTEST_DIR:-$ROOT/.regtest}"
+BIN="${REGTEST_BIN_DIR:-$REGTEST/bin}"
 DATA="$REGTEST/data"
 
 cli() { "$BIN/bitcoin-cli" -datadir="$DATA/bitcoind" -regtest -rpcuser=user -rpcpassword=password "$@"; }

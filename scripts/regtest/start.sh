@@ -1,20 +1,35 @@
 #!/usr/bin/env bash
-# Start the regtest stack: bitcoind-patched, electrs, bip300301_enforcer.
+# Start the regtest stack: bitcoind-patched, bip300301_enforcer, thunder.
 #
 # Each process gets a pidfile under .regtest/run/ and a logfile under
 # .regtest/logs/. Re-running this script is a no-op for processes whose
 # pidfile is alive (idempotent).
+#
+# Env:
+#   REGTEST_DIR           chain state/log location (default: <repo>/.regtest)
+#   REGTEST_BIN_DIR       binary cache (default: $REGTEST_DIR/bin)
+#   REGTEST_SKIP_THUNDER  =1 to not start thunder (CI)
+#   REGTEST_WALLETLESS    =1 to run the enforcer without its wallet.
+#                         Template rewards then go to a fixed regtest
+#                         address and WalletService RPCs (e.g.
+#                         CreateDepositTransaction) are unavailable.
+#                         Mine with MiningService/GenerateToAddress
+#                         (enforcer PR #477).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-REGTEST="$ROOT/.regtest"
-BIN="$REGTEST/bin"
+REGTEST="${REGTEST_DIR:-$ROOT/.regtest}"
+BIN="${REGTEST_BIN_DIR:-$REGTEST/bin}"
 DATA="$REGTEST/data"
 LOGS="$REGTEST/logs"
 RUN="$REGTEST/run"
+SKIP_THUNDER="${REGTEST_SKIP_THUNDER:-0}"
+WALLETLESS="${REGTEST_WALLETLESS:-0}"
 mkdir -p "$RUN"
 
-for b in bitcoind bitcoin-cli bip300301_enforcer electrs thunder thunder-cli; do
+BINARIES=(bitcoind bitcoin-cli bip300301_enforcer)
+[[ "$SKIP_THUNDER" == 1 ]] || BINARIES+=(thunder thunder-cli)
+for b in "${BINARIES[@]}"; do
     if [[ ! -x "$BIN/$b" ]]; then
         echo "missing $BIN/$b — run scripts/regtest/setup.sh first" >&2
         exit 1
@@ -71,31 +86,22 @@ wait_for bitcoind "$BIN/bitcoin-cli -datadir=$DATA/bitcoind -regtest \
        -rpcuser=user -rpcpassword=password loadwallet miner true 2>/dev/null \
     || true
 
-echo "==> starting electrs"
-start_if_dead electrs \
-    "$BIN/electrs" \
-    --network regtest \
-    --daemon-dir "$DATA/bitcoind" \
-    --daemon-rpc-addr 127.0.0.1:18443 \
-    --cookie "user:password" \
-    --db-dir "$DATA/electrs/db" \
-    --electrum-rpc-addr 127.0.0.1:60401 \
-    --jsonrpc-import \
-    --timestamp
-
-# electrs takes a moment to bind its rpc port; probe via netcat-ish curl.
-wait_for electrs "nc -z 127.0.0.1 60401" 20
-
 echo "==> starting bip300301_enforcer"
+# No electrs / electrum sync: with --wallet-sync-source=disabled the wallet
+# is updated purely by incoming blocks, which is complete on a from-genesis
+# regtest chain. Walletless mode drops the wallet entirely; the template
+# server then needs an explicit --coinbase-recipient (any valid regtest
+# address — the pool builds its own coinbase anyway).
+if [[ "$WALLETLESS" == 1 ]]; then
+    WALLET_ARGS=(--coinbase-recipient=bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080)
+else
+    WALLET_ARGS=(--enable-wallet --wallet-auto-create --wallet-sync-source=disabled)
+fi
 start_if_dead bip300301_enforcer \
     "$BIN/bip300301_enforcer" \
     --data-dir="$DATA/enforcer" \
-    --enable-wallet \
     --enable-mempool \
-    --wallet-auto-create \
-    --wallet-sync-source=electrum \
-    --wallet-electrum-host=127.0.0.1 \
-    --wallet-electrum-port=60401 \
+    "${WALLET_ARGS[@]}" \
     --node-rpc-addr=127.0.0.1:18443 \
     --node-rpc-user=user \
     --node-rpc-pass=password \
@@ -109,27 +115,29 @@ wait_for bip300301_enforcer "nc -z 127.0.0.1 18444" 30
 # up before launching it (18444 GBT can come up first).
 wait_for enforcer-grpc "nc -z 127.0.0.1 50051" 15
 
-echo "==> starting thunder (sidechain #9)"
-start_if_dead thunder \
-    "$BIN/thunder" \
-    --headless \
-    --datadir "$DATA/thunder" \
-    --network regtest \
-    --mainchain-grpc-url http://127.0.0.1:50051 \
-    --net-addr 127.0.0.1:4009 \
-    --rpc-addr 127.0.0.1:6009 \
-    --log-level INFO
+if [[ "$SKIP_THUNDER" != 1 ]]; then
+    echo "==> starting thunder (sidechain #9)"
+    start_if_dead thunder \
+        "$BIN/thunder" \
+        --headless \
+        --datadir "$DATA/thunder" \
+        --network regtest \
+        --mainchain-grpc-url http://127.0.0.1:50051 \
+        --net-addr 127.0.0.1:4009 \
+        --rpc-addr 127.0.0.1:6009 \
+        --log-level INFO
 
-wait_for thunder "nc -z 127.0.0.1 6009" 30
+    wait_for thunder "nc -z 127.0.0.1 6009" 30
+fi
 
 echo ""
 echo "stack up. endpoints:"
 echo "  bitcoind RPC:    127.0.0.1:18443  (user/password)"
-echo "  electrs:         127.0.0.1:60401"
 echo "  enforcer GBT:    127.0.0.1:18444  (point simplepool at this)"
-echo "  enforcer JSONRPC: 127.0.0.1:8123"
 echo "  enforcer gRPC:    127.0.0.1:50051"
-echo "  thunder RPC:     127.0.0.1:6009   (point payout worker at this)"
-echo "  thunder P2P:     127.0.0.1:4009"
+if [[ "$SKIP_THUNDER" != 1 ]]; then
+    echo "  thunder RPC:     127.0.0.1:6009   (point payout worker at this)"
+    echo "  thunder P2P:     127.0.0.1:4009"
+fi
 echo ""
 echo "next: scripts/regtest/validate.sh"

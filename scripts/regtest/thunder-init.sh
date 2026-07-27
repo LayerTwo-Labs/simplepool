@@ -10,7 +10,7 @@
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="$ROOT/.regtest/bin"
+BIN="${REGTEST_BIN_DIR:-${REGTEST_DIR:-$ROOT/.regtest}/bin}"
 TCLI="$BIN/thunder-cli"
 
 if [[ ! -x "$TCLI" ]]; then
@@ -46,5 +46,6 @@ echo ""
 echo "To send a deposit into this wallet from the mainchain:"
 echo "  scripts/enforcer-rpc.sh cusf.mainchain.v1.WalletService/CreateDepositTransaction \\"
 echo "    '{\"sidechain_id\":9, \"address\":\"$ADDR\", \"value_sats\":100000000, \"fee_sats\":1000}'"
-echo "  scripts/enforcer-rpc.sh --stream cusf.mainchain.v1.WalletService/GenerateBlocks \\"
-echo "    '{\"blocks\":1}'"
+echo "  # mine it:"
+echo "  scripts/enforcer-rpc.sh cusf.mainchain.v1.MiningService/GenerateToAddress \\"
+echo "    '{\"blocks\":1, \"address\":\"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080\"}'"

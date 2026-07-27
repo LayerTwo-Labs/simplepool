@@ -1,4 +1,6 @@
 /build/
 /data/
 /.regtest/
+/.regtest-e2e/
 /proxy.conf
+/tests/integration.proxy.conf
