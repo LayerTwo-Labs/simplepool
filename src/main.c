@@ -109,6 +109,11 @@ static size_t compute_merkle_branches_for_idx0(const uint8_t (*txids_le)[32],
 
 typedef struct {
     bitcoind_client_t *btc;
+    /* Dedicated client for the tip watcher's (possibly long-polled) GBT
+     * requests. A BIP22 long poll parks the request server-side for tens of
+     * seconds while holding the client's connection lock — on the shared
+     * client that would stall submitblock, so the watcher gets its own. */
+    bitcoind_client_t *btc_lp;
     store_t           *store;
     broadcast_t       *bcast;
     stratum_server_t  *srv;
@@ -318,19 +323,45 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
 
 static void *tip_watcher(void *arg) {
     server_ctx_t *s = (server_ctx_t *)arg;
+    /* BIP22 long-poll token from the previous template. While set, requests
+     * are parked server-side until the template goes stale, so the loop
+     * needs no sleep — the response IS the new-tip notification. Empty means
+     * the server doesn't long poll (e.g. stock bitcoind config without it,
+     * or an older enforcer) and we fall back to interval polling. */
+    char lpid[128] = {0};
+    int consec_errs = 0;
     while (!g_shutdown) {
-        struct timespec ts;
-        ts.tv_sec  = s->cfg->bitcoind_poll_interval_ms / 1000;
-        ts.tv_nsec = (long)(s->cfg->bitcoind_poll_interval_ms % 1000) * 1000000L;
-        nanosleep(&ts, NULL);
+        if (lpid[0] == '\0') {
+            uint64_t delay_ms = (uint64_t)s->cfg->bitcoind_poll_interval_ms;
+            if (consec_errs > 0) {
+                /* BIP22: failed requests SHOULD be retried with exponential
+                 * backoff — retrying with no real delay is explicitly
+                 * forbidden, and matters when the configured poll interval
+                 * is aggressive (e.g. 10ms). 1s doubling to a 32s cap. */
+                int shift = consec_errs - 1 < 5 ? consec_errs - 1 : 5;
+                uint64_t backoff_ms = 1000ULL << shift;
+                if (backoff_ms > delay_ms) delay_ms = backoff_ms;
+            }
+            struct timespec ts;
+            ts.tv_sec  = (time_t)(delay_ms / 1000);
+            ts.tv_nsec = (long)(delay_ms % 1000) * 1000000L;
+            nanosleep(&ts, NULL);
+        }
         if (g_shutdown) break;
 
         char err[512] = {0};
         bitcoind_template_t *t = NULL;
-        if (bitcoind_get_block_template(s->btc, &t, err, sizeof err) < 0) {
-            LOG_WARN("getblocktemplate poll failed: %s", err);
+        if (bitcoind_get_block_template_lp(s->btc_lp, lpid[0] ? lpid : NULL,
+                                           &t, err, sizeof err) < 0) {
+            LOG_WARN("getblocktemplate %s failed: %s",
+                     lpid[0] ? "long poll" : "poll", err);
+            /* Drop to poll mode: the nanosleep above paces the retries, and
+             * a server that stopped long polling is handled gracefully. */
+            lpid[0] = '\0';
+            if (consec_errs < 16) consec_errs++;
             continue;
         }
+        consec_errs = 0;
 
         /* GBT returns the height of the NEXT block to mine and the hash
          * of the current tip in prev_hash_hex. Mirror that into the DB
@@ -372,6 +403,14 @@ static void *tip_watcher(void *arg) {
             pthread_mutex_unlock(&s->lock);
             LOG_INFO("new job: height=%d prev=%.16s... txs=%zu",
                      t->height, t->prev_hash_hex, t->tx_count);
+        }
+        if (t->longpollid) {
+            if (lpid[0] == '\0') {
+                LOG_INFO("getblocktemplate long polling enabled");
+            }
+            snprintf(lpid, sizeof lpid, "%s", t->longpollid);
+        } else {
+            lpid[0] = '\0';
         }
         bitcoind_template_free(t);
     }
@@ -436,6 +475,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "bitcoind_client_init failed\n");
         return 3;
     }
+    /* Second client for the tip watcher (see server_ctx_t.btc_lp). A BIP22
+     * long poll parks server-side — 30s on the CUSF enforcer — so this
+     * client's timeout must comfortably exceed the server's window. */
+    bitcoind_client_t btc_lp = {0};
+    bitcoind_cfg_t bcfg_lp = bcfg;
+    bcfg_lp.timeout_ms = 90000;
+    if (bitcoind_client_init(&btc_lp, &bcfg_lp) < 0) {
+        fprintf(stderr, "bitcoind_client_init (long poll) failed\n");
+        bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
+        return 3;
+    }
     /* The ping is a getblockchaininfo sanity check. Some block-template
      * backends that accept unauthenticated JSON-RPC don't implement it, so
      * skip the ping when no credentials are configured — the initial
@@ -461,6 +512,7 @@ int main(int argc, char **argv) {
     if (store_open(&scfg, &store) < 0) {
         fprintf(stderr, "store_open failed for %s\n", cfg.db_path);
         bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
         return 4;
     }
 
@@ -481,6 +533,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "initial GBT failed: %s\n", err);
         store_close(store);
         bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
         return 5;
     }
 
@@ -490,6 +543,7 @@ int main(int argc, char **argv) {
         bitcoind_template_free(tmpl);
         store_close(store);
         bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
         return 6;
     }
 
@@ -497,8 +551,9 @@ int main(int argc, char **argv) {
     server_ctx_t sctx;
     memset(&sctx, 0, sizeof sctx);
     pthread_mutex_init(&sctx.lock, NULL);
-    sctx.btc   = &btc;
-    sctx.store = store;
+    sctx.btc    = &btc;
+    sctx.btc_lp = &btc_lp;
+    sctx.store  = store;
     sctx.bcast = bcast;
     sctx.cfg   = &cfg;
     sctx.last_height = tmpl->height;
@@ -615,6 +670,7 @@ int main(int argc, char **argv) {
         bitcoind_template_free(tmpl);
         store_close(store);
         bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
         return 7;
     }
     sctx.srv = srv;
@@ -672,6 +728,7 @@ int main(int argc, char **argv) {
     }
 
     bitcoind_client_free(&btc);
+    bitcoind_client_free(&btc_lp);
     pthread_mutex_destroy(&sctx.lock);
 
     LOG_INFO("simplepool exited cleanly");

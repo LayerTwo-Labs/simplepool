@@ -42,6 +42,11 @@ typedef struct {
      * coinbase (mandatory BIP300/301 commitments). When set,
      * coinbase_value_sats is derived from the tx's total output value. */
     char *coinbasetxn_hex;            /* owned, may be NULL */
+    /* BIP22 long-poll token from the server, or NULL when the server does
+     * not support long polling. Echo it via
+     * bitcoind_get_block_template_lp() to have the next request parked
+     * until the template goes stale. */
+    char *longpollid;                 /* owned, may be NULL */
     bitcoind_template_tx_t *txs;       /* owned array */
     size_t tx_count;
 } bitcoind_template_t;
@@ -62,6 +67,18 @@ int bitcoind_ping(bitcoind_client_t *c, char *errbuf, size_t errlen);
 int bitcoind_get_block_template(bitcoind_client_t *c,
                                 bitcoind_template_t **out,
                                 char *errbuf, size_t errlen);
+
+/* Like bitcoind_get_block_template, but passes a BIP22 `longpollid` (from a
+ * previous template's ->longpollid) so a supporting server parks the request
+ * until the template is stale. The request can legitimately take tens of
+ * seconds, so use a dedicated client whose cfg.timeout_ms comfortably
+ * exceeds the server's long-poll window — a parked request holds the
+ * client's connection lock, which would stall submitblock on a shared
+ * client. longpollid == NULL behaves exactly like the plain variant. */
+int bitcoind_get_block_template_lp(bitcoind_client_t *c,
+                                   const char *longpollid,
+                                   bitcoind_template_t **out,
+                                   char *errbuf, size_t errlen);
 
 /* Submit a serialized block (raw hex). Returns 0 if accepted, negative on
  * error. errbuf gets the rejection reason on negative. */
