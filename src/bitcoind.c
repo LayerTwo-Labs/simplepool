@@ -314,6 +314,12 @@ int bitcoind_parse_template(void *result_json,
     t->curtime = (uint32_t)jct->valuedouble;
     t->version = (int32_t)jv->valuedouble;
     t->min_time = cJSON_IsNumber(jmt) ? (int64_t)jmt->valuedouble : 0;
+    /* curtime can sit below the consensus minimum (median-time-past + 1)
+     * when blocks were just mined in a rapid burst, e.g. regtest
+     * generatetoaddress — a block stamped with it is rejected
+     * "time-too-old". mintime is the floor the template gives us. */
+    if (t->min_time > 0 && (int64_t)t->curtime < t->min_time)
+        t->curtime = (uint32_t)t->min_time;
 
     if (cJSON_IsString(jdwc) && jdwc->valuestring) {
         t->default_witness_commitment = strdup(jdwc->valuestring);

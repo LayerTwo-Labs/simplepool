@@ -54,7 +54,9 @@ listen_port = ${PORT}
 bitcoind_url = http://${RPC_HOST}:${RPC_PORT}
 bitcoind_user = ${RPC_USER}
 bitcoind_pass = ${RPC_PASS}
-bitcoind_poll_interval_ms = 30000
+# keep this short: the tip-watcher thread sleeps in poll-interval chunks,
+# so shutdown can take up to one full interval to join it
+bitcoind_poll_interval_ms = 1000
 
 operator_address = ${ADDR}
 fee_bps = 100
@@ -98,30 +100,29 @@ fi
 sleep 1
 kill -INT "$PID" 2>/dev/null || true
 
-# Wait for orderly shutdown (up to 5s).
+# Wait for orderly shutdown (up to 5s), then force-kill so the stratum
+# port is guaranteed free for whatever runs after us.
 for _ in 1 2 3 4 5; do
     if ! kill -0 "$PID" 2>/dev/null; then break; fi
     sleep 1
 done
+kill -9 "$PID" 2>/dev/null || true
 trap - EXIT
 
 if ! command -v sqlite3 >/dev/null 2>&1; then
     skip "sqlite3 cli not installed"
 fi
 
-WORKERS=$(sqlite3 "$DB" "SELECT count(*) FROM workers" 2>/dev/null || echo 0)
+# Workers rows are only created when a share is ACCEPTED (resolve_worker_id
+# runs on share/block/pps events, not on authorize), and our nc client can't
+# mine a real share — so the only DB row this flow produces is the reject
+# for the bogus submit. Worker/share row assertions live in
+# tests/test_e2e_regtest.sh, where cpuminer.js produces an accepted share.
 REJECTS=$(sqlite3 "$DB" "SELECT count(*) FROM rejects" 2>/dev/null || echo 0)
-ADDR_ROWS=$(sqlite3 "$DB" "SELECT count(*) FROM workers WHERE payout_address IS NOT NULL" 2>/dev/null || echo 0)
 
-echo "workers=$WORKERS rejects=$REJECTS payout_addr_rows=$ADDR_ROWS"
-if [ "$WORKERS" -lt 1 ]; then
-    echo "FAIL: expected >= 1 worker"; cat /tmp/simplepool-int.log; exit 1
-fi
+echo "rejects=$REJECTS"
 if [ "$REJECTS" -lt 1 ]; then
     echo "FAIL: expected >= 1 reject"; cat /tmp/simplepool-int.log; exit 1
-fi
-if [ "$ADDR_ROWS" -lt 1 ]; then
-    echo "FAIL: expected workers.payout_address to be set"; cat /tmp/simplepool-int.log; exit 1
 fi
 
 echo "PASS"

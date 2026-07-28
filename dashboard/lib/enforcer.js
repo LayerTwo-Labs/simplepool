@@ -1,8 +1,4 @@
-/* Minimal ConnectRPC client for the bip300301_enforcer.
- *
- * Only unary RPCs — the streaming ones (e.g. GenerateBlocks) are
- * regtest-script territory; see scripts/enforcer-rpc.sh.
- */
+/* Minimal ConnectRPC client for the bip300301_enforcer. Unary RPCs only. */
 
 export async function enforcerRpc(enforcerAddr, rpcPath, body, timeoutMs = 30_000) {
     const base = /^https?:\/\//.test(enforcerAddr) ? enforcerAddr : `http://${enforcerAddr}`;

@@ -144,9 +144,9 @@ curl -sS -H 'content-type: application/json' \
   $ENFORCER/cusf.mainchain.v1.WalletService/CreateDepositTransaction
 
 # 3. Wait for a natural mainchain block from your miner. (On regtest you
-#    can force one — GenerateBlocks is a streaming RPC, so use the helper:
-#    scripts/enforcer-rpc.sh --stream \
-#      cusf.mainchain.v1.WalletService/GenerateBlocks '{"blocks":1}' )
+#    can force one:
+#    scripts/enforcer-rpc.sh cusf.mainchain.v1.MiningService/GenerateToAddress \
+#      '{"blocks":1, "address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"}' )
 
 # 4. Confirm the Ctip moved
 curl -sS -H 'content-type: application/json' -d '{"sidechain_number":9}' \

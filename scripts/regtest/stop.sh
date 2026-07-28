@@ -2,9 +2,9 @@
 # Stop the regtest stack. Sends SIGTERM, waits up to 5s, then SIGKILL.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-RUN="$ROOT/.regtest/run"
+RUN="${REGTEST_DIR:-$ROOT/.regtest}/run"
 
-for name in thunder bip300301_enforcer electrs bitcoind; do
+for name in thunder bip300301_enforcer bitcoind; do
     pidfile="$RUN/$name.pid"
     [[ -f "$pidfile" ]] || continue
     pid="$(cat "$pidfile")"

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-RUN="$ROOT/.regtest/run"
-LOGS="$ROOT/.regtest/logs"
+REGTEST="${REGTEST_DIR:-$ROOT/.regtest}"
+RUN="$REGTEST/run"
+LOGS="$REGTEST/logs"
 
-for name in bitcoind electrs bip300301_enforcer thunder; do
+for name in bitcoind bip300301_enforcer thunder; do
     pidfile="$RUN/$name.pid"
     if [[ -f "$pidfile" ]]; then
         pid="$(cat "$pidfile")"
