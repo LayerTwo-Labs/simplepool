@@ -11,19 +11,19 @@ tracks:
   Thunder node. There's a one-shot deploy script; this doc also
   walks through what it does step by step so you can do it by hand.
 
-The doc is mode-agnostic where possible; where mode matters, the three
+The doc is mode-agnostic where possible; where mode matters, the two
 possibilities are called out clearly:
 
 - **`pool_mode = solo`**    — miners paid direct in the coinbase.
   Simplest. No drivechain, no Thunder, no PPS accrual.
-- **`pool_mode = pps`**     — drivechain deposit in every coinbase.
-  Empirically **does not credit Thunder** on the LayerTwo-Labs
-  enforcer (see [PPS_THUNDER.md](PPS_THUNDER.md)) — kept only as a
-  byte-level shape validator.
 - **`pool_mode = pps-classic`** — traditional coinbase paying a pool
   BTC address, operator-driven Thunder deposits from the admin
-  dashboard. This is the mode you actually want for a Thunder-paying
-  PPS pool. See [CLASSIC_PAYOUTS.md](CLASSIC_PAYOUTS.md).
+  dashboard. This is the mode you want for a Thunder-paying PPS pool.
+  See [CLASSIC_PAYOUTS.md](CLASSIC_PAYOUTS.md).
+
+(A third mode, `pool_mode = pps`, put the drivechain deposit directly in
+the coinbase. The enforcer never credited it, so it has been removed —
+`CLASSIC_PAYOUTS.md` has the evidence.)
 
 For an audit / theory refresher on nonce distribution and share math,
 see [NONCE_AND_SHARES.md](NONCE_AND_SHARES.md). For day-to-day
@@ -133,7 +133,7 @@ scripts/regtest/activate-thunder.sh  # proposes + acks sidechain #9
 scripts/regtest/thunder-init.sh      # generates a Thunder wallet + address
 scripts/regtest/validate.sh          # bootstraps 150 blocks, probes GBT
 node scripts/regtest/cpuminer.js --timeout 60  # actually mine a block
-scripts/regtest/inspect-coinbase.sh
+POOL_BTC_ADDRESS=<pool addr> scripts/regtest/inspect-coinbase.sh
 scripts/regtest/stop.sh
 ```
 
@@ -308,7 +308,7 @@ simplepool talks to. Port `:50051` is the gRPC surface for
 sidechain management (used by the deposit runbook in
 [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md)).
 
-### Thunder (only for `pool_mode=pps` — optional in classic mode)
+### Thunder (needed for `pool_mode=pps-classic` payouts)
 
 Prebuilt: <https://releases.drivechain.info/L2-S9-Thunder-latest-aarch64-apple-darwin.zip>
 (no x86_64 Linux prebuilt as of this doc — build from source at
@@ -370,23 +370,6 @@ log_level = info
 ```
 
 Miner username: `<their BTC address>[.<rig_label>]`. Password ignored.
-
-### PPS mode (byte-shape validation only, does NOT actually pay Thunder)
-
-Only use if you're testing the drivechain coinbase output shape.
-
-```
-# ... same as solo, plus:
-pool_mode = pps
-pool_thunder_reserve_address = <base58 Thunder address>
-thunder_sidechain_number     = 9
-pps_sats_per_diff            = 1000
-# optional: override the OP_RETURN payload bytes
-# thunder_op_return_hex =
-```
-
-Miner username: `<their Thunder address>[.<rig_label>]`. Startup logs
-a WARN — that's intentional.
 
 ### PPS-classic mode
 
@@ -489,7 +472,7 @@ issuing Thunder transactions. Deploy as a systemd service:
 sudo mkdir -p /etc/systemd/system/simplepool-payout.service.d
 sudo tee /etc/systemd/system/simplepool-payout.service.d/local.conf <<'CONF'
 [Service]
-Environment=THUNDER_FROM_ADDRESS=<same as pool_thunder_reserve_address in proxy.conf>
+Environment=THUNDER_FROM_ADDRESS=<same as the dashboard's POOL_THUNDER_RESERVE_ADDRESS>
 # Below have defaults; override if you want:
 # Environment=PAYOUT_MIN_SATS=10000
 # Environment=PAYOUT_INTERVAL_MS=30000
@@ -619,7 +602,7 @@ Install-time trouble usually falls into one of these:
 - Running the pool day-to-day: [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md)
 - Auditing the numbers: [NONCE_AND_SHARES.md](NONCE_AND_SHARES.md)
 - Design rationale for pps-classic vs pps:
-  [CLASSIC_PAYOUTS.md](CLASSIC_PAYOUTS.md), [PPS_THUNDER.md](PPS_THUNDER.md)
+  [CLASSIC_PAYOUTS.md](CLASSIC_PAYOUTS.md)
 - Regtest full walk-through:
   [scripts/regtest/README.md](scripts/regtest/README.md)
 - Branch-level test plan: [VERIFY.md](VERIFY.md)

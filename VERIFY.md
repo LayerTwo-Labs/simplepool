@@ -36,12 +36,11 @@ make test
       test_thunder: ok
       ```
 - [ ] Each suite reports zero failures.
-- [ ] `coinbase` suite shows **12** assertions including:
+- [ ] `coinbase` suite shows **8** assertions including:
       ```
-      ok: drivechain coinbase layout
-      ok: drivechain coinbase no-fee
-      ok: drivechain rejects >80-byte op_return
-      ok: drivechain_from_template (replace spendable, preserve commitments)
+      ok: coinbase split fee math
+      ok: coinbase_build_from_template (redirect + preserve commitments)
+      ok: coinbase_build_from_template fee split
       ```
 - [ ] No spurious WARN lines from `test_broadcast` (silenced in commit
       `76f8753`).
@@ -61,7 +60,7 @@ cp proxy.conf.example /tmp/solo.conf
 ./build/simplepool /tmp/solo.conf
 ```
 
-- [ ] Logs read `pool_mode` is solo by default (no `pool_mode=pps`
+- [ ] Logs read `pool_mode` is solo by default (no `pool_mode=pps-classic`
       line appears).
 - [ ] Process binds `:3334` and waits for bitcoind. Same behaviour as
       pre-branch `main`.
@@ -111,29 +110,25 @@ redis-cli PSUBSCRIBE 'pool:*'
 
 ---
 
-## 5 · Drivechain coinbase byte layout — `f29ea16` + `571dad4`
+## 5 · Classic coinbase byte layout — `f29ea16` + `571dad4`
 
-The byte-level assertions live in `tests/test_coinbase.c`. Spot-check
-the layout produced by the bare builder:
+The byte-level assertions live in `tests/test_coinbase.c`. Both the bare
+builder (`coinbase_build_split`) and the template rewriter
+(`coinbase_build_from_template`) are covered. To *see* a real
+pps-classic coinbase end-to-end, do section 11.
 
-```
-sqlite3 :memory: <<'SQL'
-.read /dev/stdin
-SQL
-```
-
-Or just trust `make test` — but to *see* a real drivechain coinbase
-end-to-end, do section 11.
-
-- [ ] `make test` step 1 passed; drivechain layout is asserted at the
-      byte level (`b4 01 09 51` followed by `OP_RETURN <payload>`,
-      then operator fee, then witness commitment).
+- [ ] `make test` step 1 passed; the classic layout is asserted at the
+      byte level (spendable output, then operator fee, then witness
+      commitment, with any backend commitment outputs preserved in
+      place).
+- [ ] No `drivechain` assertions remain — `pool_mode = pps` and its
+      `coinbase_build_drivechain*` builders were removed.
 
 ---
 
 ## 6 · PPS mode wiring (config + schema) — `8783c0b`
 
-Without running the full regtest stack, you can still verify the new
+Without running the full regtest stack, you can still verify the
 config keys and the schema:
 
 ```
@@ -143,11 +138,15 @@ sqlite3 /tmp/pps-test.db ".schema payouts_in_flight"
 ```
 
 - [ ] Both tables exist and match the columns documented in
-      [PPS_THUNDER.md](PPS_THUNDER.md).
-- [ ] Editing `proxy.conf` to set `pool_mode = pps` without
-      `pool_thunder_reserve_address` makes simplepool refuse to start
-      with `config: 'pool_thunder_reserve_address' is required when
-      pool_mode=pps`.
+      [CLASSIC_PAYOUTS.md](CLASSIC_PAYOUTS.md).
+- [ ] Editing `proxy.conf` to set `pool_mode = pps-classic` without
+      `pool_btc_address` makes simplepool refuse to start with
+      `config: 'pool_btc_address' is required when pool_mode=pps-classic`.
+- [ ] Setting `pool_mode = pps` makes simplepool refuse to start with
+      `config: 'pool_mode = pps' was removed …`.
+- [ ] A leftover `pool_thunder_reserve_address` / `thunder_sidechain_number`
+      / `thunder_op_return_hex` line logs `is obsolete and ignored` and
+      does **not** stop startup.
 
 ---
 
@@ -356,8 +355,9 @@ deposit was consensus-accepted.
 
 ## 11 · End-to-end PPS regtest run — `fedbb8e`
 
-This is the loop-closer: pool emits a drivechain coinbase, the miner
-finds a block, bitcoind-patched accepts it.
+This is the loop-closer: pool emits a pps-classic coinbase, the miner
+finds a block, bitcoind-patched accepts it. `tests/test_e2e_regtest.sh`
+automates this whole section for CI.
 
 After section 10 the stack is up. Run `scripts/regtest/validate.sh` —
 it bootstraps 150 blocks, then prints a `proxy.conf` snippet. Save it:
@@ -370,9 +370,8 @@ bitcoind_url = http://127.0.0.1:18444
 operator_address = bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080
 fee_bps = 100
 coinbase_tag = /simplepool-regtest/
-pool_mode = pps
-pool_thunder_reserve_address = TPoolReserveTestAddr123
-thunder_sidechain_number = 9
+pool_mode = pps-classic
+pool_btc_address = bcrt1qqypqxpq9qcrsszg2pvxq6rs0zqg3yyc5phstwt
 pps_sats_per_diff = 1000
 initial_diff = 0.0000001
 vardiff_enabled = 0
@@ -386,7 +385,8 @@ In terminal A:
 ./build/simplepool /tmp/regtest-proxy.conf
 ```
 
-- [ ] Log shows `pool_mode=pps: sidechain=9, op_return_payload=23 bytes`.
+- [ ] Log shows `pool_mode=pps-classic: pool_btc_address=bcrt1qqypq…,
+      pps_sats_per_diff=1000.00`.
 - [ ] Log shows `stratum listening on 127.0.0.1:13334`.
 
 In terminal B:
@@ -406,16 +406,17 @@ node scripts/regtest/cpuminer.js --timeout 60
 Inspect the coinbase:
 
 ```
-scripts/regtest/inspect-coinbase.sh
+POOL_BTC_ADDRESS=bcrt1qqypqxpq9qcrsszg2pvxq6rs0zqg3yyc5phstwt \
+OPERATOR_ADDRESS=bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080 \
+    scripts/regtest/inspect-coinbase.sh
 ```
 
-- [ ] Output shows `output count: 5`.
-- [ ] Output [1] is `value=49.5 BTC type=drivechain asm=OP_NOP5 9 1`.
-- [ ] Output [2] is `OP_RETURN 54506f6f6c526573657276655465737441646472313233`
-      (ASCII of "TPoolReserveTestAddr123").
-- [ ] Output [3] is the operator fee P2WPKH at 0.5 BTC.
-- [ ] Confirms `>>> OP_DRIVECHAIN found at output [1], sidechain=9`
-      and `>>> OP_RETURN payload immediately follows`.
+- [ ] One output pays the pool wallet 49.5 BTC (`>>> pool output found`).
+- [ ] One output pays the operator fee P2WPKH 0.5 BTC
+      (`>>> operator fee output found`), and it is the smaller of the two.
+- [ ] No `OP_DRIVECHAIN` output is reported — the script exits non-zero
+      if one shows up.
+- [ ] Script prints `==> classic coinbase shape OK`.
 
 ---
 
@@ -450,8 +451,9 @@ scripts/enforcer-rpc.sh cusf.mainchain.v1.ValidatorService/GetCtip \
       deposit source differs. Coinbase-as-deposit doesn't work; deposit
       tx from spendable UTXOs does.
 
-This is the architectural finding that drives the "two-step deposit"
-follow-up in [PPS_THUNDER.md](PPS_THUNDER.md).
+This is the architectural finding that killed `pool_mode = pps` and
+drove the operator-triggered deposit design in
+[CLASSIC_PAYOUTS.md](CLASSIC_PAYOUTS.md).
 
 ---
 
@@ -479,7 +481,6 @@ If every box ticks:
 - the regtest stack reproduces the architectural finding that coinbase
   deposits aren't Ctip-credited by the current LayerTwo-Labs enforcer.
 
-The unfinished business (called out in
-[PPS_THUNDER.md](PPS_THUNDER.md)) is a follow-up "two-step deposit"
-service — the coinbase shape + PPS plumbing are ready to compose with
-it once that lands.
+The two-step deposit that finding forced is the admin dashboard's
+"Deposit to Thunder" action — see
+[CLASSIC_PAYOUTS.md](CLASSIC_PAYOUTS.md).

@@ -2,7 +2,7 @@
 #
 # simplepool installer — run this ON the Linux server you want the pool
 # to live on. Interactive by default: it asks for the install directory,
-# service user, pool mode (solo / pps-classic / pps), bitcoind RPC,
+# service user, pool mode (solo / pps-classic), bitcoind RPC,
 # addresses, dashboard domain, admin password, nginx/TLS and firewall,
 # shows a summary, then does the whole install.
 #
@@ -26,13 +26,14 @@
 #   --root <dir>              install directory        (default /home/simplepool)
 #   --user <name>             service user             (default simplepool)
 #   --repo <url> --branch <b> source to clone/update   (default upstream/main)
-#   --mode solo|pps-classic|pps
+#   --mode solo|pps-classic
 #   --stratum-port <n>        default 3334
 #   --bitcoind-url/-user/-pass
 #   --operator-address <addr> BTC address that takes the fee cut
 #   --fee-bps <n>             default 100 (= 1%)
 #   --pool-btc-address <addr>       pps-classic
-#   --thunder-address <addr>        pps / pps-classic reserve address
+#   --thunder-address <addr>        pps-classic reserve address (dashboard
+#                                   deposits + payout worker source)
 #   --thunder-rpc-url <url>         default http://127.0.0.1:6009
 #   --pps-sats-per-diff <n>         default 1000
 #   --hostname <fqdn>         dashboard domain (nginx vhost + TLS)
@@ -265,9 +266,7 @@ echo
 echo "${BOLD}-- pool mode --${OFF}"
 ask_choice MODE "how does this pool pay miners?" \
     "solo|coinbase pays the miner directly; username = BTC address" \
-    "pps-classic|coinbase pays the pool; miners accrue and are paid in Thunder" \
-    "pps|coinbase carries a BIP300 deposit output — shape validation only"
-[[ "$MODE" == "pps" ]] && warn "pps mode produces effectively unspendable deposits — use pps-classic for real payouts"
+    "pps-classic|coinbase pays the pool; miners accrue and are paid in Thunder"
 
 echo
 echo "${BOLD}-- stratum + bitcoind --${OFF}"
@@ -282,10 +281,6 @@ ask COINBASE_TAG  "coinbase tag"                          "$COINBASE_TAG"
 case "$MODE" in
     pps-classic)
         ask POOL_BTC_ADDRESS  "pool BTC address (coinbase pays here)"        "$POOL_BTC_ADDRESS"
-        ask THUNDER_ADDRESS   "pool Thunder reserve address (base58)"        "$THUNDER_ADDRESS"
-        ask PPS_SATS_PER_DIFF "sats credited per unit of share difficulty"   "$PPS_SATS_PER_DIFF"
-        ;;
-    pps)
         ask THUNDER_ADDRESS   "pool Thunder reserve address (base58)"        "$THUNDER_ADDRESS"
         ask PPS_SATS_PER_DIFF "sats credited per unit of share difficulty"   "$PPS_SATS_PER_DIFF"
         ;;
@@ -363,14 +358,13 @@ fi
 
 # ---------------------------------------------------------------- derived ---
 DB_PATH="$ROOT/data/shares.db"
-[[ "$MODE" =~ ^(solo|pps|pps-classic)$ ]] || die "invalid --mode: $MODE"
+[[ "$MODE" == "pps" ]] && die "--mode pps was removed (the enforcer never credited coinbase deposits) — use pps-classic"
+[[ "$MODE" =~ ^(solo|pps-classic)$ ]] || die "invalid --mode: $MODE"
 [[ "$STRATUM_PORT" =~ ^[0-9]+$ ]] || die "invalid stratum port: $STRATUM_PORT"
 [[ "$DASH_PORT"    =~ ^[0-9]+$ ]] || die "invalid dashboard port: $DASH_PORT"
 [[ "$FEE_BPS" =~ ^[0-9]+$ && "$FEE_BPS" -le 1000 ]] || die "fee_bps must be 0..1000"
 [[ "$MODE" == "pps-classic" && -z "$POOL_BTC_ADDRESS" ]] && \
     warn "pps-classic without pool_btc_address — the proxy will refuse to start"
-[[ "$MODE" == "pps" && -z "$THUNDER_ADDRESS" ]] && \
-    warn "pps without a Thunder reserve address — the proxy will refuse to start"
 
 STEP_TOTAL=10
 [[ "$RUN_TESTS" == "1" ]] && STEP_TOTAL=$((STEP_TOTAL + 1))
@@ -651,21 +645,20 @@ conf_set "$TMP_CONF" coinbase_tag     "$COINBASE_TAG"
 conf_set "$TMP_CONF" pool_mode        "$MODE"
 conf_set "$TMP_CONF" db_path          "$DB_PATH"
 
+# The Thunder reserve address is a dashboard/payout-worker concern, not a
+# proxy one — the coinbase never touches Thunder. Strip the retired keys
+# from any proxy.conf left over from a pool_mode=pps install.
+conf_unset "$TMP_CONF" pool_thunder_reserve_address
+conf_unset "$TMP_CONF" thunder_sidechain_number
+conf_unset "$TMP_CONF" thunder_op_return_hex
+
 case "$MODE" in
     solo)
         conf_unset "$TMP_CONF" pool_btc_address
-        conf_unset "$TMP_CONF" pool_thunder_reserve_address
         ;;
     pps-classic)
-        conf_set "$TMP_CONF" pool_btc_address             "$POOL_BTC_ADDRESS"
-        conf_set "$TMP_CONF" pool_thunder_reserve_address "$THUNDER_ADDRESS"
-        conf_set "$TMP_CONF" pps_sats_per_diff            "$PPS_SATS_PER_DIFF"
-        ;;
-    pps)
-        conf_unset "$TMP_CONF" pool_btc_address
-        conf_set "$TMP_CONF" pool_thunder_reserve_address "$THUNDER_ADDRESS"
-        conf_set "$TMP_CONF" thunder_sidechain_number     "9"
-        conf_set "$TMP_CONF" pps_sats_per_diff            "$PPS_SATS_PER_DIFF"
+        conf_set "$TMP_CONF" pool_btc_address  "$POOL_BTC_ADDRESS"
+        conf_set "$TMP_CONF" pps_sats_per_diff "$PPS_SATS_PER_DIFF"
         ;;
 esac
 
@@ -681,8 +674,8 @@ fi
 if [[ "$MODE" == "pps-classic" && ( -z "$POOL_BTC_ADDRESS" || "$POOL_BTC_ADDRESS" == *REPLACE* ) ]]; then
     warn "pool_btc_address is unset — the proxy will refuse to start"; CONF_OK=0
 fi
-if [[ "$MODE" == "pps" && -z "$THUNDER_ADDRESS" ]]; then
-    warn "pool_thunder_reserve_address is unset — the proxy will refuse to start"; CONF_OK=0
+if [[ "$MODE" == "pps-classic" && -z "$THUNDER_ADDRESS" ]]; then
+    warn "no Thunder reserve address — the dashboard cannot deposit and the payout worker cannot pay"
 fi
 
 # ===================== 9. systemd units + drop-ins ==========================

@@ -471,12 +471,12 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
     coinbase_parts_t parts = {0};
     char err[256] = {0};
     int rc;
-    if (s->cfg.pps_classic_enabled) {
+    if (s->cfg.pps_enabled) {
         /* PPS-classic: every miner's coinbase is identical, paying the
          * pool's BTC wallet for the net-of-fee reward and the operator
-         * address for the fee. No drivechain output; the operator later
-         * moves accumulated BTC into Thunder via the admin dashboard's
-         * deposit action. */
+         * address for the fee. The operator later moves accumulated BTC
+         * into Thunder via the admin dashboard's deposit action; per-miner
+         * accounting happens off-chain via pps_credits. */
         if (job->coinbasetxn_hex) {
             rc = coinbase_build_from_template(job->coinbasetxn_hex,
                                               s->cfg.pool_btc_address,
@@ -491,33 +491,6 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                       job->wc_hex, s->cfg.coinbase_tag,
                                       job->en1_size, job->en2_size,
                                       &parts, NULL, NULL, err, sizeof err);
-        }
-    } else if (s->cfg.pps_enabled) {
-        /* PPS / Thunder: every miner's coinbase is identical — the reward
-         * is deposited to the pool's Thunder reserve via BIP300; per-miner
-         * accounting happens off-chain via pps_credits. NOTE: The BIP300
-         * enforcer does not credit coinbase deposits — this mode produces
-         * a well-formed but effectively unspendable OP_DRIVECHAIN output.
-         * Use pool_mode=pps-classic for real deployments. */
-        if (job->coinbasetxn_hex) {
-            rc = coinbase_build_drivechain_from_template(
-                job->coinbasetxn_hex,
-                s->cfg.thunder_sidechain_number,
-                s->cfg.pps_op_return_payload,
-                s->cfg.pps_op_return_payload_len,
-                s->cfg.operator_address, s->cfg.fee_bps,
-                s->cfg.coinbase_tag,
-                job->en1_size, job->en2_size,
-                &parts, NULL, NULL, NULL, err, sizeof err);
-        } else {
-            rc = coinbase_build_drivechain(job->height, job->value_sats,
-                                           s->cfg.thunder_sidechain_number,
-                                           s->cfg.pps_op_return_payload,
-                                           s->cfg.pps_op_return_payload_len,
-                                           s->cfg.operator_address, s->cfg.fee_bps,
-                                           job->wc_hex, s->cfg.coinbase_tag,
-                                           job->en1_size, job->en2_size,
-                                           &parts, NULL, NULL, err, sizeof err);
         }
     } else if (job->coinbasetxn_hex) {
         /* Backend dictated the coinbase (e.g. CUSF enforcer): build from it,
@@ -837,10 +810,11 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
 
     char    derr[128] = {0};
     if (s->cfg.pps_enabled) {
-        /* Thunder address: 20-byte hash160 in plain base58, or the
-         * 's<n>_<base58>_<hex6>' deposit-format wrapper. We don't need the
-         * decoded bytes here — the coinbase pays the pool reserve, not the
-         * miner — but we validate so a typo'd username can't accrue PPS. */
+        /* Thunder address: 20-byte hash160 in plain base58. The
+         * 's<n>_<base58>_<hex6>' deposit-format wrapper is rejected (see
+         * thunder.c). We don't need the decoded bytes here — the coinbase
+         * pays the pool's BTC wallet, not the miner — but we validate so a
+         * typo'd username can't accrue unpayable PPS. */
         uint8_t th[20];
         if (thunder_address_decode(c->payout_address, th, derr, sizeof derr) < 0) {
             if (s->cfg.on_reject) {

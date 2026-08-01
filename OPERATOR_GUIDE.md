@@ -1,8 +1,8 @@
-# Pool operator guide (pps-thunder-classic)
+# Pool operator guide (pps-classic)
 
 Everything you need to run this pool day-to-day. Assumes the branch
-already deployed (see `PPS_THUNDER.md` and `CLASSIC_PAYOUTS.md` for
-background on why the design looks like this).
+already deployed (see `CLASSIC_PAYOUTS.md` for background on why the
+design looks like this).
 
 ---
 
@@ -34,7 +34,7 @@ password](#rotating-the-admin-password) below.
 ## Where things live on the box
 
 - **Root**: `/home/forknet/pps-thunder-test/`
-  - `simplepool/` — this repo, checked out at `pps-thunder-classic`
+  - `simplepool/` — this repo, checked out at `main`
   - `data/shares.db` — pool state (SQLite, WAL mode)
   - `data/archive/` — old DB snapshots from mode switches
   - `logs/` — pool + payout + Thunder logs (plus stashed Thunder mnemonic)

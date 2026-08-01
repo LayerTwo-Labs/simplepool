@@ -1,5 +1,5 @@
 # End-to-end integration test: bitcoind-patched + walletless
-# bip300301_enforcer + simplepool (pps) + a JS CPU miner, driven by
+# bip300301_enforcer + simplepool (pps-classic) + a JS CPU miner, driven by
 # tests/test_e2e_regtest.sh.
 #
 # Binary management follows the bip300301_enforcer repo's own CI: the

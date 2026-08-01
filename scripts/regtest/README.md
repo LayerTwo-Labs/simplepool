@@ -1,14 +1,14 @@
 # BIP300 regtest validation stack
 
-Local stack for validating that simplepool's `pool_mode=pps` coinbase
-shape is accepted as a valid drivechain deposit by the canonical
-LayerTwo-Labs enforcer.
+Local stack for validating simplepool's coinbase shape against the
+canonical LayerTwo-Labs enforcer, and for reproducing the finding that
+killed the coinbase-as-deposit design (see below).
 
 ## Stack
 
 ```
                        ┌──────────────┐  GBT 18444
-                       │  enforcer    │◀────── simplepool (pps mode)
+                       │  enforcer    │◀────── simplepool (pps-classic)
                        │              │
               ┌────────┤              ├────────┐
               │  ZMQ   │              │ gRPC   │
@@ -80,12 +80,17 @@ on the enforcer, and prints the next-step runbook.
 ## End-to-end validation status
 
 **All infra steps verified.** A tiny CPU stratum miner
-([`cpuminer.js`](cpuminer.js)) connects to a `pool_mode=pps` simplepool
-running against the enforcer, finds a regtest block in seconds, and
-submits it. The block is accepted into the regtest chain by bitcoind-
-patched and the enforcer; bitcoind classifies the coinbase output as
-`"type": "drivechain"`; the OP_RETURN destination immediately follows;
-`inspect-coinbase.sh` confirms the 5-output layout.
+([`cpuminer.js`](cpuminer.js)) connects to simplepool running against
+the enforcer, finds a regtest block in seconds, and submits it. The
+block is accepted into the regtest chain by bitcoind-patched and the
+enforcer, and `inspect-coinbase.sh` confirms the coinbase layout.
+
+When this stack was first built the pool ran a `pool_mode=pps` build
+that put an `OP_DRIVECHAIN(9)` output straight in the coinbase.
+bitcoind classified the output as `"type": "drivechain"` and the
+OP_RETURN destination immediately followed — the shape was right, but
+see the finding below. That mode has since been removed; the pool now
+runs `pool_mode=pps-classic` here.
 
 **Critical finding from running the loop:** the enforcer DOES NOT
 credit coinbase outputs as drivechain deposits. A side-by-side test:
@@ -107,23 +112,21 @@ answer is **no**, at least against the current LayerTwo-Labs enforcer.
 
 ### Architectural impact
 
-The PPS design's working assumption — "every block's coinbase deposits
-directly to Thunder, so the pool never custodies BTC" — needs revision.
-Options for the follow-up:
+The original PPS design's working assumption — "every block's coinbase
+deposits directly to Thunder, so the pool never custodies BTC" — does
+not hold. `pool_mode = pps` and its `coinbase_build_drivechain*`
+builders were removed as a result; a well-formed coinbase that never
+credits the Ctip only strands the block reward.
 
-1. **Two-step deposit.** Coinbase pays the pool's BTC P2WPKH; a separate
-   service spends accumulated coinbase UTXOs into a proper
-   `CreateDepositTransaction` periodically. Pool DOES custody BTC,
-   briefly. Lowest implementation cost.
-2. **Per-block deposit tx.** Pool builds and broadcasts a deposit tx
-   in the same block as the coinbase. Higher coordination cost.
-3. **Re-examine the enforcer's deposit rule for a path that does work**
-   (e.g. is there a flag, or did the rule change in a recent release?).
+What replaced it is the **two-step deposit**: the coinbase pays the
+pool's BTC P2WPKH (`pool_mode = pps-classic`), and the operator spends
+accumulated coinbase UTXOs into a proper `CreateDepositTransaction`
+from the admin dashboard. The pool DOES custody BTC, briefly. Full
+design in [CLASSIC_PAYOUTS.md](../../CLASSIC_PAYOUTS.md).
 
-The drivechain coinbase builders we landed are still useful — they
-produce a well-formed (if not Ctip-crediting) coinbase shape, and the
-parsing/structural assertions stand. The shape becomes useful again
-if option 3 turns up a way to make the rule permit it.
+If a future enforcer release ever permits coinbase-source deposits, the
+builders are recoverable from git history — but nothing in the tree
+depends on them now.
 
 ### Running it
 
@@ -138,13 +141,14 @@ scripts/regtest/validate.sh      # activates sidechain #9, bootstraps,
 node scripts/regtest/cpuminer.js --timeout 60
 
 # after a block lands, parse its coinbase:
-scripts/regtest/inspect-coinbase.sh
+POOL_BTC_ADDRESS=<pool_btc_address from the config> \
+OPERATOR_ADDRESS=<operator_address from the config> \
+    scripts/regtest/inspect-coinbase.sh
 
 # expect:
-#   output count: 5
-#   [N]   value=49.5  type=drivechain  asm=OP_NOP5 9 1
-#   [N+1] value=0     type=nulldata    asm=OP_RETURN <payload>
-#   [N+2] value=0.5   type=witness_v0_keyhash
+#   [N]   value=49.5  type=witness_v0_keyhash  addr=<pool_btc_address>
+#   [N+1] value=0.5   type=witness_v0_keyhash  addr=<operator_address>
+#   >>> classic coinbase shape OK
 ```
 
 To verify the deposit-recognition finding for yourself, side-by-side
