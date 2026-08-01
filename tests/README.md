@@ -12,14 +12,16 @@ in `.github/workflows/check_build.yaml`.
   running regtest bitcoind (subscribe/authorize/bogus-submit via nc,
   then asserts the reject landed in SQLite). Best-effort: skips cleanly
   when bitcoind/nc/sqlite3 are unavailable.
-- `test_e2e_regtest.sh` — the full drivechain mining path, one-shot:
-  downloads bitcoind-patched + bip300301_enforcer (walletless), starts
-  the minimal regtest stack, runs the smoke test above, activates
-  sidechain #9 (`SetAckAllProposals` + the walletless
-  `MiningService/GenerateToAddress`, enforcer PR #477), then runs
-  simplepool in `pool_mode=pps` and mines a real block through stratum
-  with `scripts/regtest/cpuminer.js`. Asserts the drivechain coinbase
-  shape and the pool DB rows (worker, share, block, pps credit).
+- `test_e2e_regtest.sh` — the full mining path, one-shot: downloads
+  bitcoind-patched + bip300301_enforcer (walletless), starts the minimal
+  regtest stack, runs the smoke test above, activates sidechain #9
+  (`SetAckAllProposals` + the walletless
+  `MiningService/GenerateToAddress`, enforcer PR #477) so the GBT
+  template carries BIP301 commitments, then runs simplepool in
+  `pool_mode=pps-classic` and mines a real block through stratum with
+  `scripts/regtest/cpuminer.js`. Asserts the classic coinbase shape
+  (pool wallet output + operator fee, no OP_DRIVECHAIN) and the pool DB
+  rows (worker, share, block, pps credit).
 
   Deterministic by construction: chain state lives in its own
   `.regtest-e2e/` dir and is wiped at the start of every run, while

@@ -34,7 +34,7 @@ PAYOUT_DRY_RUN=1 PAYOUT_DB_PATH=../data/shares.db \
 | --- | --- | --- | --- |
 | `PAYOUT_DB_PATH` | yes | — | path to `data/shares.db` (writable) |
 | `THUNDER_RPC_URL` | yes | — | Thunder JSON-RPC endpoint, e.g. `http://127.0.0.1:6009` |
-| `THUNDER_FROM_ADDRESS` | yes | — | pool reserve address; must equal `pool_thunder_reserve_address` in `proxy.conf` |
+| `THUNDER_FROM_ADDRESS` | yes | — | pool reserve address; must equal the dashboard's `POOL_THUNDER_RESERVE_ADDRESS` |
 | `THUNDER_RPC_USER` / `THUNDER_RPC_PASS` | no | — | basic-auth if your Thunder node has it (default Thunder build has none) |
 | `PAYOUT_INTERVAL_MS` | no | 30000 | how often to scan |
 | `PAYOUT_MIN_SATS` | no | 10000 | skip workers below this owed balance |

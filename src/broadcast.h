@@ -75,7 +75,7 @@ void broadcast_node_tip(broadcast_t *b,
                         uint64_t observed_at_s);
 
 /* PPS credit event — accrued sats added to a worker after an accepted
- * share. Only fires when pool_mode = pps. */
+ * share. Only fires when pool_mode = pps-classic. */
 void broadcast_credit(broadcast_t *b,
                       const char *worker_name,
                       uint64_t ts_ms,

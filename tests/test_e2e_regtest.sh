@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end test of the drivechain (pps) mining path, one-shot for CI:
+# End-to-end test of the pps-classic mining path, one-shot for CI:
 #
 #   bitcoind-patched  <-ZMQ/RPC-  bip300301_enforcer (walletless)
 #          ^                              | GBT 18444
 #          | submitblock                  v
-#          +----------------------- simplepool (pps)
+#          +----------------------- simplepool (pps-classic)
 #                                         ^ stratum 13334
 #                                         |
 #                                  cpuminer.js
@@ -15,11 +15,15 @@
 #      enforcer wallet play no part in the coinbase-shape e2e)
 #   2. basic stratum smoke test against bitcoind directly
 #      (tests/test_integration.sh: subscribe/authorize/reject + sqlite)
-#   3. activate sidechain #9 by mining enforcer-template blocks
-#   4. run simplepool in pool_mode=pps against the enforcer GBT
+#   3. activate sidechain #9 by mining enforcer-template blocks. The pool
+#      no longer emits drivechain coinbases, but keeping the sidechain
+#      active means the enforcer's GBT template still carries the BIP301
+#      commitment outputs the coinbase builder has to preserve.
+#   4. run simplepool in pool_mode=pps-classic against the enforcer GBT
 #   5. mine ONE block through the real stratum path with cpuminer.js
-#   6. assert the mined tip's coinbase has the drivechain deposit shape
-#      (inspect-coinbase.sh: OP_DRIVECHAIN output + OP_RETURN after it)
+#   6. assert the mined tip's coinbase has the classic shape
+#      (inspect-coinbase.sh: pool wallet output + operator fee output,
+#      and no OP_DRIVECHAIN)
 #
 # Deterministic by construction: every run starts from a completely
 # fresh data dir (chain state, enforcer DB, logs are wiped), while the
@@ -47,6 +51,10 @@ POOL_LOG="/tmp/simplepool-e2e.log"
 POOL_DB="/tmp/simplepool-e2e.db"
 POOL_PORT=13334
 OPERATOR_ADDR="bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+# The pool's own BTC wallet — where pps-classic sends the net-of-fee
+# reward. Must differ from OPERATOR_ADDR so the assertion below can tell
+# the two coinbase outputs apart.
+POOL_BTC_ADDR="bcrt1qqypqxpq9qcrsszg2pvxq6rs0zqg3yyc5phstwt"
 POOL_PID=""
 
 cli() { "$BIN/bitcoin-cli" -datadir="$REGTEST_DIR/data/bitcoind" -regtest \
@@ -105,7 +113,7 @@ PATH="$BIN:$PATH" BITCOIND_USER=user BITCOIND_PASS=password \
 stage "activate sidechain #9 via enforcer-template mining"
 "$ROOT/scripts/regtest/activate-thunder.sh"
 
-stage "start simplepool in pps mode against enforcer GBT"
+stage "start simplepool in pps-classic mode against enforcer GBT"
 rm -f "$POOL_DB"
 cat > "$POOL_CONF" <<EOF
 listen_addr = 127.0.0.1
@@ -118,9 +126,8 @@ operator_address = ${OPERATOR_ADDR}
 fee_bps = 100
 coinbase_tag = /simplepool-e2e/
 
-pool_mode = pps
-pool_thunder_reserve_address = 11111111111111111111
-thunder_sidechain_number = 9
+pool_mode = pps-classic
+pool_btc_address = ${POOL_BTC_ADDR}
 # The share difficulty is clamped to the network difficulty, which on
 # regtest is ~4.66e-10 — so the rate must be huge for a share to accrue
 # whole sats (credit = trunc(difficulty * pps_sats_per_diff), 0 is
@@ -153,8 +160,9 @@ if [ "$TIP_AFTER" -le "$TIP_BEFORE" ]; then
     exit 1
 fi
 
-stage "assert drivechain coinbase shape on the new tip"
-"$ROOT/scripts/regtest/inspect-coinbase.sh"
+stage "assert pps-classic coinbase shape on the new tip"
+POOL_BTC_ADDRESS="$POOL_BTC_ADDR" OPERATOR_ADDRESS="$OPERATOR_ADDR" \
+    "$ROOT/scripts/regtest/inspect-coinbase.sh"
 
 stage "assert pool DB recorded the accepted share"
 # give the batched writer a moment, then stop the pool cleanly to flush

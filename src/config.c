@@ -56,9 +56,6 @@ void proxy_config_defaults(proxy_config_t *cfg) {
 
     snprintf(cfg->pool_mode, sizeof cfg->pool_mode, "%s", "solo");
     cfg->pool_btc_address[0] = '\0';
-    cfg->pool_thunder_reserve_address[0] = '\0';
-    cfg->thunder_sidechain_number = 9;
-    cfg->thunder_op_return_hex[0] = '\0';
     cfg->pps_sats_per_diff = 0.0;
 }
 
@@ -159,10 +156,17 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "redis_reconnect_backoff_ms")== 0) cfg->redis_reconnect_backoff_ms = atoi(v);
         else if (strcmp(k, "pool_mode")                 == 0) copy_str(cfg->pool_mode, sizeof cfg->pool_mode, v);
         else if (strcmp(k, "pool_btc_address")          == 0) copy_str(cfg->pool_btc_address, sizeof cfg->pool_btc_address, v);
-        else if (strcmp(k, "pool_thunder_reserve_address") == 0) copy_str(cfg->pool_thunder_reserve_address, sizeof cfg->pool_thunder_reserve_address, v);
-        else if (strcmp(k, "thunder_sidechain_number")  == 0) cfg->thunder_sidechain_number = atoi(v);
-        else if (strcmp(k, "thunder_op_return_hex")     == 0) copy_str(cfg->thunder_op_return_hex, sizeof cfg->thunder_op_return_hex, v);
         else if (strcmp(k, "pps_sats_per_diff")         == 0) cfg->pps_sats_per_diff = atof(v);
+        /* Retired with pool_mode=pps (the drivechain-in-coinbase build).
+         * Accepted and ignored so an existing proxy.conf keeps loading;
+         * the Thunder reserve address now lives only on the dashboard,
+         * which owns the deposit flow. */
+        else if (strcmp(k, "pool_thunder_reserve_address") == 0 ||
+                 strcmp(k, "thunder_sidechain_number")     == 0 ||
+                 strcmp(k, "thunder_op_return_hex")        == 0) {
+            LOG_WARN("config: line %d: '%s' is obsolete and ignored "
+                     "(pool_mode=pps was removed)", lineno, k);
+        }
         else if (strcmp(k, "log_level")                 == 0) {
             int lv = parse_log_level(v);
             if (lv < 0) {
@@ -188,38 +192,26 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                 cfg->fee_bps);
         return -4;
     }
+    if (strcmp(cfg->pool_mode, "pps") == 0) {
+        set_err(errbuf, errlen,
+                "config: 'pool_mode = pps' was removed — the BIP300 enforcer "
+                "does not credit coinbase outputs as drivechain deposits, so "
+                "that mode stranded the block reward. Use 'pps-classic'.");
+        return -5;
+    }
     if (strcmp(cfg->pool_mode, "solo")        != 0 &&
-        strcmp(cfg->pool_mode, "pps")         != 0 &&
         strcmp(cfg->pool_mode, "pps-classic") != 0) {
         set_err(errbuf, errlen,
-                "config: 'pool_mode' must be 'solo', 'pps' or 'pps-classic', got '%s'",
+                "config: 'pool_mode' must be 'solo' or 'pps-classic', got '%s'",
                 cfg->pool_mode);
         return -5;
     }
-    int is_pps         = (strcmp(cfg->pool_mode, "pps")         == 0);
-    int is_pps_classic = (strcmp(cfg->pool_mode, "pps-classic") == 0);
-    if (is_pps || is_pps_classic) {
+    if (strcmp(cfg->pool_mode, "pps-classic") == 0) {
         if (cfg->pps_sats_per_diff <= 0.0) {
             set_err(errbuf, errlen,
-                    "config: 'pps_sats_per_diff' must be > 0 when pool_mode=%s",
-                    cfg->pool_mode);
+                    "config: 'pps_sats_per_diff' must be > 0 when pool_mode=pps-classic");
             return -8;
         }
-    }
-    if (is_pps) {
-        if (cfg->pool_thunder_reserve_address[0] == '\0') {
-            set_err(errbuf, errlen,
-                    "config: 'pool_thunder_reserve_address' is required when pool_mode=pps");
-            return -6;
-        }
-        if (cfg->thunder_sidechain_number < 0 || cfg->thunder_sidechain_number > 255) {
-            set_err(errbuf, errlen,
-                    "config: 'thunder_sidechain_number' must be in [0, 255], got %d",
-                    cfg->thunder_sidechain_number);
-            return -7;
-        }
-    }
-    if (is_pps_classic) {
         if (cfg->pool_btc_address[0] == '\0') {
             set_err(errbuf, errlen,
                     "config: 'pool_btc_address' is required when pool_mode=pps-classic");

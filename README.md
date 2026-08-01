@@ -35,14 +35,24 @@ This repository ships **both modes**, selected by `pool_mode` in
   SQLite store, every accepted block is paid directly in its own
   coinbase to the miner who found it, and there is no off-chain
   accounting. Stratum username is a Bitcoin address.
-- **`pool_mode = pps`** — every accepted block's coinbase is a BIP300
-  drivechain deposit into the pool's Thunder reserve address (sidechain
-  9). The pool never custodies Bitcoin. Each accepted share credits the
-  miner's `pps_credits.accrued_sats` at the configured
-  `pps_sats_per_diff` rate, and a separate payout service (not in this
-  binary) issues Thunder transactions to drain those credits. Stratum
-  username is a Thunder address (plain base58, or the deposit-format
-  wrapper `s9_<base58>_<hex6>`).
+- **`pool_mode = pps-classic`** — every accepted block's coinbase pays a
+  single pool-owned BTC wallet (`pool_btc_address`) as a normal output.
+  Each accepted share credits the miner's `pps_credits.accrued_sats` at
+  the configured `pps_sats_per_diff` rate; the operator batches the
+  accumulated BTC into the pool's Thunder reserve from the admin
+  dashboard, and a separate payout service (not in this binary) issues
+  Thunder transactions to drain those credits to miners. Stratum
+  username is a bare base58 Thunder address — the deposit-format wrapper
+  `s9_<base58>_<hex6>` is rejected, since Thunder itself doesn't
+  recognize it at the byte level.
+
+  > An earlier `pool_mode = pps` put a BIP300 drivechain deposit
+  > directly in each coinbase, so the pool would never custody BTC.
+  > Regtest and forknet both showed the enforcer does *not* credit
+  > coinbase outputs as deposits — the block confirms but the sidechain
+  > Ctip never moves, stranding the reward. That mode has been removed;
+  > see [`CLASSIC_PAYOUTS.md`](CLASSIC_PAYOUTS.md) for the evidence and
+  > the design that replaced it.
 
 In both modes the operator fee stays in BTC, paid to `operator_address`
 out of the same coinbase. See [`proxy.conf.example`](proxy.conf.example)

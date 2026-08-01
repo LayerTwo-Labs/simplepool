@@ -16,8 +16,8 @@
  *   THUNDER_RPC_USER       optional basic-auth user
  *   THUNDER_RPC_PASS       optional basic-auth pass
  *   THUNDER_FROM_ADDRESS   pool reserve address to send from (must match
- *                          pool_thunder_reserve_address in proxy.conf so
- *                          it matches what the C proxy deposits to)
+ *                          the dashboard's POOL_THUNDER_RESERVE_ADDRESS —
+ *                          the wallet the operator deposits mined BTC into)
  */
 
 function require_env(name) {
