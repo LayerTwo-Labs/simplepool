@@ -60,9 +60,12 @@ middle can't double-pay:
 1. `INSERT INTO payouts_in_flight (worker_id, sats, txid='')` — reserve
    the slot before Thunder is touched. `listDue()` skips any worker
    with an in-flight row.
-2. `thunder.transfer(addr, sats, fee)` — broadcast. On clean failure
-   (RPC error before a txid is returned), the row is DELETEd and the
-   worker is eligible next tick.
+2. `thunder.transfer(addr, sats, fee)` — broadcast. Since thunder
+   v0.17.0 this is three RPCs under the hood (`create_transfer` →
+   `sign_transaction` → `submit_transaction`); only the last one can
+   put a tx on the network. On clean failure (RPC error before a txid
+   is returned), the row is DELETEd and the worker is eligible next
+   tick.
 3. In ONE SQLite transaction: write the txid onto the in-flight row,
    `paid_sats += sats`, DELETE the in-flight row.
 
