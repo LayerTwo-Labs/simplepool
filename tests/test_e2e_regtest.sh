@@ -2,12 +2,15 @@
 # End-to-end test of the pps-classic mining path, one-shot for CI:
 #
 #   bitcoind-patched  <-ZMQ/RPC-  bip300301_enforcer (walletless)
-#          ^                              | GBT 18444
+#          ^                              | GBT
 #          | submitblock                  v
 #          +----------------------- simplepool (pps-classic)
-#                                         ^ stratum 13334
+#                                         ^ stratum
 #                                         |
 #                                  cpuminer.js
+#
+# Ports are allocated per run (pick_port), so this coexists with a dev
+# stack in .regtest/ and with the payout e2e.
 #
 # Stages:
 #   1. download + start bitcoind-patched and a walletless enforcer
@@ -49,7 +52,22 @@ POOL_BIN="$ROOT/build/simplepool"
 POOL_CONF="/tmp/simplepool-e2e.conf"
 POOL_LOG="/tmp/simplepool-e2e.log"
 POOL_DB="/tmp/simplepool-e2e.db"
-POOL_PORT=13334
+
+# Pick a free port and assign it to the named variable. Not $()-command
+# substitution: PICKED must accumulate across calls so two picks can't
+# return the same not-yet-bound port.
+PICKED=""
+pick_port() {
+    local p
+    while :; do
+        p=$(( (RANDOM % 20000) + 20001 ))
+        [[ " $PICKED " == *" $p "* ]] && continue
+        nc -z 127.0.0.1 "$p" 2>/dev/null && continue
+        PICKED="$PICKED $p"
+        printf -v "$1" '%s' "$p"
+        return
+    done
+}
 OPERATOR_ADDR="bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
 # The pool's own BTC wallet — where pps-classic sends the net-of-fee
 # reward. Must differ from OPERATOR_ADDR so the assertion below can tell
@@ -77,19 +95,21 @@ cleanup() {
 }
 trap 'code=$?; [ "$code" -ne 0 ] && dump_logs; cleanup; exit $code' EXIT
 
-stage "check stack ports are free"
-# The stack uses fixed ports, so REGTEST_DIR isolation is not enough: if
-# another regtest stack is already running, the wait_for probes in
-# start.sh would silently cross-wire this test into it (and mine blocks
-# on its chain). Refuse to run instead.
-for p in 18443 18444 50051 "$POOL_PORT"; do
-    if nc -z 127.0.0.1 "$p" 2>/dev/null; then
-        echo "FAIL: port $p is already in use — is another regtest stack" >&2
-        echo "running? (scripts/regtest/stop.sh)" >&2
-        trap - EXIT
-        exit 1
-    fi
-done
+stage "allocate stack ports"
+# Dynamic per-run ports: this test can run alongside a dev stack (or
+# the payout e2e) without cross-wiring or refusing to start.
+pick_port REGTEST_BITCOIND_RPC_PORT
+pick_port REGTEST_BITCOIND_ZMQ_PORT
+pick_port REGTEST_ENFORCER_RPC_PORT
+pick_port REGTEST_ENFORCER_GRPC_PORT
+pick_port POOL_PORT
+pick_port INT_POOL_PORT
+export REGTEST_BITCOIND_RPC_PORT REGTEST_BITCOIND_ZMQ_PORT \
+       REGTEST_ENFORCER_RPC_PORT REGTEST_ENFORCER_GRPC_PORT
+export ENFORCER_URL="http://127.0.0.1:$REGTEST_ENFORCER_GRPC_PORT"
+echo "  bitcoind=$REGTEST_BITCOIND_RPC_PORT zmq=$REGTEST_BITCOIND_ZMQ_PORT" \
+     "enforcer=$REGTEST_ENFORCER_RPC_PORT/$REGTEST_ENFORCER_GRPC_PORT" \
+     "pool=$POOL_PORT smoke-pool=$INT_POOL_PORT"
 
 stage "wipe e2e data dir (fresh chain every run)"
 # Chain state must not leak between runs: a pre-activated sidechain or
@@ -108,6 +128,7 @@ stage "start bitcoind-patched + walletless enforcer"
 
 stage "basic stratum smoke test (solo mode, direct bitcoind)"
 PATH="$BIN:$PATH" BITCOIND_USER=user BITCOIND_PASS=password \
+    PORT="$INT_POOL_PORT" RPC_PORT="$REGTEST_BITCOIND_RPC_PORT" \
     bash "$HERE/test_integration.sh"
 
 stage "activate sidechain #9 via enforcer-template mining"
@@ -119,7 +140,7 @@ cat > "$POOL_CONF" <<EOF
 listen_addr = 127.0.0.1
 listen_port = ${POOL_PORT}
 
-bitcoind_url = http://127.0.0.1:18444
+bitcoind_url = http://127.0.0.1:${REGTEST_ENFORCER_RPC_PORT}
 bitcoind_poll_interval_ms = 500
 
 operator_address = ${OPERATOR_ADDR}

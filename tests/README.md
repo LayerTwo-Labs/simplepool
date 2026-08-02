@@ -50,6 +50,9 @@ the version last validated against.
 
       bash tests/test_payout_regtest.sh
 
-CI runs both one-shot tests in
-`.github/workflows/integration_tests.yaml` (separate jobs — the stacks
-use fixed ports) on every PR and push to main.
+Both one-shot tests allocate their stack ports dynamically per run, so
+they can run concurrently — with each other and with a dev stack from
+`scripts/regtest/start.sh` (which keeps the traditional fixed ports;
+override via the `REGTEST_*_PORT` env vars). CI runs them as separate
+jobs in `.github/workflows/integration_tests.yaml` on every PR and
+push to main.

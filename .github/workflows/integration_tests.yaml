@@ -62,8 +62,8 @@ jobs:
 
   # The payout path the coinbase e2e skips: wallet-enabled enforcer +
   # thunder, a real deposit, and one payout tick broadcasting a Thunder
-  # transaction (tests/test_payout_regtest.sh). Separate job so the two
-  # fixed-port stacks never share a runner.
+  # transaction (tests/test_payout_regtest.sh). Separate job purely for
+  # wall-clock parallelism — the stacks allocate ports dynamically.
   payout-test:
     runs-on: ubuntu-latest
     timeout-minutes: 20

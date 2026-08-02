@@ -171,12 +171,12 @@ fallbackfee=0.0001
 # Port 29010, not the conventional 29000 — a ZMQ bind conflict with
 # another local node is silent, and the enforcer will happily subscribe
 # to whichever process won the port.
-zmqpubrawblock=tcp://127.0.0.1:29010
-zmqpubsequence=tcp://127.0.0.1:29010
+zmqpubrawblock=tcp://127.0.0.1:${REGTEST_BITCOIND_ZMQ_PORT:-29010}
+zmqpubsequence=tcp://127.0.0.1:${REGTEST_BITCOIND_ZMQ_PORT:-29010}
 [regtest]
 rpcuser=user
 rpcpassword=password
-rpcport=18443
+rpcport=${REGTEST_BITCOIND_RPC_PORT:-18443}
 EOF
 
 echo "==> done. Next:"

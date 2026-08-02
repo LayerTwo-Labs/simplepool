@@ -2,12 +2,15 @@
 # End-to-end test of the Thunder payout path, one-shot for CI:
 #
 #   bitcoind-patched  <-ZMQ/RPC-  bip300301_enforcer (wallet ENABLED)
-#          ^                              | gRPC 50051
+#          ^                              | gRPC
 #          |                              v
 #          |                          thunder (sidechain #9)
-#          |                              ^ JSON-RPC 6009
+#          |                              ^ JSON-RPC
 #          |                              |
 #          +--- deposit tx          payout/run-once.mjs
+#
+# Ports are allocated per run (pick_port), so this coexists with a dev
+# stack in .regtest/ and with the coinbase e2e.
 #
 # This is the coverage the coinbase-shape e2e deliberately skips: the
 # payout worker actually broadcasting a Thunder transaction. Stages:
@@ -47,7 +50,23 @@ JUNK_ADDR="bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
 OWED_SATS=250000
 DEPOSIT_SATS=100000000
 
-tcli()  { "$BIN/thunder-cli" "$@"; }
+# Pick a free port and assign it to the named variable. Not $()-command
+# substitution: PICKED must accumulate across calls so two picks can't
+# return the same not-yet-bound port.
+PICKED=""
+pick_port() {
+    local p
+    while :; do
+        p=$(( (RANDOM % 20000) + 20001 ))
+        [[ " $PICKED " == *" $p "* ]] && continue
+        nc -z 127.0.0.1 "$p" 2>/dev/null && continue
+        PICKED="$PICKED $p"
+        printf -v "$1" '%s' "$p"
+        return
+    done
+}
+
+tcli()  { "$BIN/thunder-cli" --rpc-url="$THUNDER_RPC_URL" "$@"; }
 stage() { echo; echo "=== payout-e2e: $1"; }
 
 dump_logs() {
@@ -62,17 +81,23 @@ dump_logs() {
 cleanup() { "$ROOT/scripts/regtest/stop.sh" || true; }
 trap 'code=$?; [ "$code" -ne 0 ] && dump_logs; cleanup; exit $code' EXIT
 
-stage "check stack ports are free"
-# Fixed ports mean REGTEST_DIR isolation is not enough — refuse to run
-# into someone else's stack rather than silently cross-wiring.
-for p in 18443 18444 50051 6009 4009; do
-    if nc -z 127.0.0.1 "$p" 2>/dev/null; then
-        echo "FAIL: port $p is already in use — is another regtest stack" >&2
-        echo "running? (scripts/regtest/stop.sh)" >&2
-        trap - EXIT
-        exit 1
-    fi
-done
+stage "allocate stack ports"
+# Dynamic per-run ports: this test can run alongside a dev stack (or
+# the coinbase e2e) without cross-wiring or refusing to start.
+pick_port REGTEST_BITCOIND_RPC_PORT
+pick_port REGTEST_BITCOIND_ZMQ_PORT
+pick_port REGTEST_ENFORCER_RPC_PORT
+pick_port REGTEST_ENFORCER_GRPC_PORT
+pick_port REGTEST_THUNDER_RPC_PORT
+pick_port REGTEST_THUNDER_P2P_PORT
+export REGTEST_BITCOIND_RPC_PORT REGTEST_BITCOIND_ZMQ_PORT \
+       REGTEST_ENFORCER_RPC_PORT REGTEST_ENFORCER_GRPC_PORT \
+       REGTEST_THUNDER_RPC_PORT REGTEST_THUNDER_P2P_PORT
+export ENFORCER_URL="http://127.0.0.1:$REGTEST_ENFORCER_GRPC_PORT"
+THUNDER_RPC_URL="http://127.0.0.1:$REGTEST_THUNDER_RPC_PORT"
+echo "  bitcoind=$REGTEST_BITCOIND_RPC_PORT zmq=$REGTEST_BITCOIND_ZMQ_PORT" \
+     "enforcer=$REGTEST_ENFORCER_RPC_PORT/$REGTEST_ENFORCER_GRPC_PORT" \
+     "thunder=$REGTEST_THUNDER_RPC_PORT/$REGTEST_THUNDER_P2P_PORT"
 
 stage "wipe payout-e2e data dir (fresh chain every run)"
 rm -rf "$REGTEST_DIR/data" "$REGTEST_DIR/logs" "$REGTEST_DIR/run"
@@ -159,7 +184,7 @@ sqlite3 "$PAYOUT_DB" "
 stage "run one payout tick"
 RESULT="$(
     PAYOUT_DB_PATH="$PAYOUT_DB" \
-    THUNDER_RPC_URL="http://127.0.0.1:6009" \
+    THUNDER_RPC_URL="$THUNDER_RPC_URL" \
     THUNDER_FROM_ADDRESS="$RESERVE_ADDR" \
     PAYOUT_MIN_SATS=10000 \
     node "$ROOT/payout/run-once.mjs"
@@ -180,7 +205,7 @@ echo "  txid=$TXID paid_sats=$PAID in_flight=$INFLIGHT"
 stage "assert thunder knows the tx"
 curl -sS -H 'Content-Type: application/json' \
     -d '{"jsonrpc":"2.0","id":1,"method":"get_transaction","params":["'"$TXID"'"]}' \
-    http://127.0.0.1:6009 | jq -e '.result != null' > /dev/null || {
+    "$THUNDER_RPC_URL" | jq -e '.result != null' > /dev/null || {
     echo "FAIL: thunder get_transaction($TXID) returned null" >&2; exit 1; }
 
 stage "confirm the payout in a thunder block, check the worker's UTXO"
