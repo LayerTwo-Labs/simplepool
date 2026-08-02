@@ -22,6 +22,23 @@ void worker_diff_to_target(double diff, uint8_t target_be[32]);
  * top 128 bits in f64. Saturates to HUGE_VAL when those bits are all zero. */
 double target_to_diff(const uint8_t target_be[32]);
 
+/* Fair PPS rate for a block template: sats to credit per unit of share
+ * difficulty, net of the operator fee.
+ *
+ *   gross = value_sats / net_diff
+ *   net   = gross * (1 - fee_bps/10000)
+ *
+ * A share of difficulty D represents D * 2^32 expected hashes, and the chain
+ * pays `value_sats` per `net_diff` * 2^32 hashes, so D * gross is exactly what
+ * that share is worth in expectation. Deriving this per template is what keeps
+ * the fee honest as difficulty moves — a hand-set rate goes stale, and can
+ * invert into paying miners more than each share earns.
+ *
+ * Returns 0.0 for a template it cannot price (non-positive value or
+ * difficulty, non-finite difficulty, or a fee that consumes the whole
+ * reward), so callers disable accrual rather than credit a guess. */
+double pps_rate_from_template(int64_t value_sats, double net_diff, int fee_bps);
+
 /* Fold coinbase txid (LE 32-byte) into a merkle root using branches
  * (each LE 32-byte). Always cur||branch order (Stratum: coinbase at idx 0). */
 void merkle_root_from_branches(const uint8_t leaf_le[32],

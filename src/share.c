@@ -72,6 +72,16 @@ double target_to_diff(const uint8_t target_be[32]) {
     return (double)be16_to_u128(DIFF1_TARGET) / (double)hi;
 }
 
+double pps_rate_from_template(int64_t value_sats, double net_diff, int fee_bps) {
+    if (value_sats <= 0) return 0.0;
+    if (!isfinite(net_diff) || net_diff <= 0.0) return 0.0;
+    if (fee_bps < 0 || fee_bps >= 10000) return 0.0;
+    double gross = (double)value_sats / net_diff;
+    if (!isfinite(gross)) return 0.0;
+    double net = gross * (1.0 - (double)fee_bps / 10000.0);
+    return net > 0.0 ? net : 0.0;
+}
+
 void worker_diff_to_target(double diff, uint8_t target_be[32]) {
     memset(target_be, 0, 32);
     if (!isfinite(diff) || diff <= 0.0) {

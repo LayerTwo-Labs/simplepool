@@ -45,11 +45,17 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
 
 /* Record an accepted share with the miner's payout_address so the worker
  * row can be tagged. payout_address may be NULL (legacy/tests). The
- * share_hash semantics match store_record_share() above. */
+ * share_hash semantics match store_record_share() above.
+ *
+ * credited_sats is what this share was credited at the rate in force when
+ * it was accepted, stored on the row so audits report history instead of
+ * recomputing it against whatever rate is current. Pass 0 in solo mode or
+ * when no accrual applies. */
 int store_record_share_addr(store_t *s, const char *worker_name,
                             const char *payout_address,
                             uint64_t ts_ms, double difficulty,
-                            int is_block, const char *share_hash_or_null);
+                            int is_block, const char *share_hash_or_null,
+                            int64_t credited_sats);
 
 /* PPS credit: add delta_sats to the worker's accrued_sats in pps_credits.
  * Async (writer thread). delta_sats must be > 0. payout_address (the
@@ -57,6 +63,23 @@ int store_record_share_addr(store_t *s, const char *worker_name,
 int store_record_credit(store_t *s, const char *worker_name,
                         const char *payout_address,
                         uint64_t ts_ms, int64_t delta_sats);
+
+/* Publish what this proxy is actually paying, so the dashboard reads the
+ * effective rate from the running process instead of keeping its own copy
+ * of the config. Single-row upsert on id=1, synchronous (called at most
+ * once per template change, not per share).
+ *
+ * rate_source is "derived" or "override". gross is fair value before the
+ * fee; rate is net of it. effective_fee_bps is what the pair actually
+ * implies, which under an override need not equal fee_bps. */
+int store_record_pool_meta(store_t *s, const char *pool_mode, int fee_bps,
+                           const char *rate_source,
+                           double rate_sats_per_diff,
+                           double gross_sats_per_diff,
+                           double effective_fee_bps,
+                           double network_difficulty,
+                           int64_t block_value_sats,
+                           uint64_t updated_ts_s);
 
 /* Record / refresh the upstream bitcoind tip the proxy is mining on.
  * Single-row upsert keyed on id=1. tip_observed_at is preserved when

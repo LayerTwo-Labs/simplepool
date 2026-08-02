@@ -248,6 +248,87 @@ static void test_drop(void) {
            (unsigned long long)st.shares_dropped);
 }
 
+/* credited_sats must be stored per share exactly as passed, and pool_meta
+ * must be readable back.
+ *
+ * The audit sums shares.credited_sats instead of recomputing it from a rate,
+ * because the rate is derived per template and moves with difficulty. That
+ * only works if the column faithfully records what was credited — including
+ * 0, which is what solo mode writes since it never accrues. */
+static void test_credited_sats(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* pps-classic-style: each share carries the sats it was credited. */
+    int64_t expected = 0;
+    for (int i = 1; i <= 50; ++i) {
+        int64_t credited = (int64_t)i * 7;
+        expected += credited;
+        assert(store_record_share_addr(s, "payer", "addr1",
+                                       1000ULL + (uint64_t)i, (double)i,
+                                       0, NULL, credited) == 0);
+    }
+    /* solo-style: no accrual, so the column must record 0 — not be left
+     * to a later recompute that would invent a credit. */
+    for (int i = 0; i < 25; ++i) {
+        assert(store_record_share_addr(s, "solo", "addr2",
+                                       9000ULL + (uint64_t)i, 3.0,
+                                       0, NULL, 0) == 0);
+    }
+    /* The legacy 6-arg helper must still work and store 0. */
+    assert(store_record_share(s, "legacy", 9500, 2.0, 0, NULL) == 0);
+
+    assert(store_record_pool_meta(s, "pps-classic", 100, "derived",
+                                  2783.22, 2811.33, 100.4,
+                                  111157.455, 312500000, 1700000000ULL) == 0);
+    assert(store_flush(s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+
+    int64_t total = scalar_i64(db,
+        "SELECT sum(credited_sats) FROM shares "
+        "WHERE worker_id = (SELECT id FROM workers WHERE name='payer')");
+    assert(total == expected);
+
+    int64_t solo = scalar_i64(db,
+        "SELECT sum(credited_sats) FROM shares "
+        "WHERE worker_id = (SELECT id FROM workers WHERE name='solo')");
+    assert(solo == 0);
+
+    int64_t legacy = scalar_i64(db,
+        "SELECT sum(credited_sats) FROM shares "
+        "WHERE worker_id = (SELECT id FROM workers WHERE name='legacy')");
+    assert(legacy == 0);
+
+    /* pool_meta: single row, values round-tripped. */
+    assert(scalar_i64(db, "SELECT count(*) FROM pool_meta") == 1);
+    assert(scalar_i64(db, "SELECT fee_bps FROM pool_meta") == 100);
+    double rate = scalar_dbl(db, "SELECT rate_sats_per_diff FROM pool_meta");
+    assert(rate > 2783.0 && rate < 2783.5);
+
+    /* credited_from is stamped once and must survive later updates, so an
+     * audit can tell where credited_sats became trustworthy. */
+    int64_t from1 = scalar_i64(db, "SELECT credited_from FROM pool_meta");
+    assert(from1 == 1700000000);
+    assert(store_record_pool_meta(s, "pps-classic", 200, "override",
+                                  1000.0, 2811.33, 6443.0,
+                                  111157.455, 312500000, 1700009999ULL) == 0);
+    int64_t from2 = scalar_i64(db, "SELECT credited_from FROM pool_meta");
+    assert(from2 == 1700000000);
+    assert(scalar_i64(db, "SELECT fee_bps FROM pool_meta") == 200);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_credited_sats\n");
+}
+
 int main(void) {
     log_init(2 /* WARN */);
     printf("running test_store...\n");
@@ -255,6 +336,7 @@ int main(void) {
     test_rejects();
     test_concurrent();
     test_drop();
+    test_credited_sats();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;

@@ -54,7 +54,6 @@ services:
       PUBLIC_STRATUM_URL: ${PUBLIC_STRATUM_URL:-stratum+tcp://<pool-host>:3334}
       THUNDER_RPC_URL: ${THUNDER_RPC_URL:-http://host.docker.internal:6009}
       POOL_THUNDER_RESERVE_ADDRESS: ${POOL_THUNDER_RESERVE_ADDRESS:-}
-      POOL_PPS_SATS_PER_DIFF: ${POOL_PPS_SATS_PER_DIFF:-1000}
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       # --- Write-action wiring ---

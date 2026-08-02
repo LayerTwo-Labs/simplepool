@@ -53,7 +53,17 @@ const dbRw = openAdminDb(path.resolve(__dirname, DB_PATH));
 
 /* --- public-side config ------------------------------------------------- */
 const PUBLIC_STRATUM_URL = process.env.PUBLIC_STRATUM_URL || 'stratum+tcp://<pool-host>:3334';
-const PPS_SATS_PER_DIFF  = parseFloat(process.env.POOL_PPS_SATS_PER_DIFF || '1000');
+
+/* The PPS rate is NOT configured here. It is read from pool_meta, which the
+ * proxy writes on every template change, so the dashboard always reports the
+ * rate that was actually applied rather than a second copy of the config
+ * that can silently disagree with it. POOL_PPS_SATS_PER_DIFF is accepted
+ * only to warn that it is now ignored. */
+if (process.env.POOL_PPS_SATS_PER_DIFF) {
+    console.warn('[warn] POOL_PPS_SATS_PER_DIFF is ignored — the rate is read ' +
+                 'from the pool_meta table written by the proxy. Remove it ' +
+                 'from the environment.');
+}
 
 /* --- admin-side config -------------------------------------------------- */
 /* Credentials come from ADMIN_CREDENTIALS_FILE (a "user:password" file —
@@ -129,7 +139,7 @@ app.get('/', (_req, res) => {
 });
 
 app.get('/worker/:name', (req, res) => {
-    const w = stats.worker(db, req.params.name, 86400, PPS_SATS_PER_DIFF);
+    const w = stats.worker(db, req.params.name, 86400);
     if (!w.worker) return res.status(404).render('404', { what: 'worker' });
     res.render('worker', {
         ...w, name: req.params.name,
@@ -186,7 +196,6 @@ app.use('/admin',
         ENFORCER_GRPC_ADDR,
         THUNDER_SIDECHAIN_ID,
         RESERVE_ADDRESS,
-        PPS_SATS_PER_DIFF,
     }));
 
 /* ================================ 404 =================================== */

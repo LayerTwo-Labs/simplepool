@@ -8,8 +8,10 @@
 #include "store.h"
 #include "stratum.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -123,7 +125,25 @@ typedef struct {
     int             last_height;
     char            last_prev_hash[65];
     uint64_t        last_built_ms;
+
+    /* Live PPS rate, refreshed whenever a new template arrives. Read on the
+     * share path, so it is an atomic double rather than taking `lock` —
+     * a share crediting against the previous template's rate for a few
+     * microseconds during a swap is immaterial, whereas contending the job
+     * lock per share would not be. Zero means "no accrual" (solo, or a
+     * template we could not derive a rate from). */
+    _Atomic double  pps_rate;
 } server_ctx_t;
+
+/* The rate this proxy will credit at: the operator's override verbatim if
+ * set, otherwise fair value derived from the template. See the
+ * pps_sats_per_diff commentary in config.h for why an override bypasses
+ * fee_bps rather than stacking with it. */
+static double effective_pps_rate(const proxy_config_t *cfg,
+                                 int64_t value_sats, double net_diff) {
+    if (cfg->pps_sats_per_diff > 0.0) return cfg->pps_sats_per_diff;
+    return pps_rate_from_template(value_sats, net_diff, cfg->fee_bps);
+}
 
 /* Build a job from a freshly fetched template. The coinbase is rendered
  * per-connection inside stratum.c (each miner pays their own address),
@@ -233,6 +253,66 @@ static stratum_job_t *build_job_from_template(const proxy_config_t *cfg,
     return job;
 }
 
+/* Recompute the PPS rate from a new template and publish it, so the
+ * dashboard reads what is actually being paid instead of keeping a second
+ * copy of the config. Cheap and called once per template change.
+ *
+ * Warns when an override implies a materially different fee from fee_bps —
+ * that mismatch is invisible otherwise, and a stale override is how the fee
+ * silently drifts to zero (or negative) as difficulty moves. */
+static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
+    if (!s || !s->cfg || !t) return;
+
+    uint8_t target_be[32] = {0};
+    if (t->target_hex[0] != '\0' && strlen(t->target_hex) == 64) {
+        if (hex_to_bytes_display(t->target_hex, target_be, 32) < 0)
+            nbits_to_target(t->bits, target_be);
+    } else {
+        nbits_to_target(t->bits, target_be);
+    }
+    double net_diff = target_to_diff(target_be);
+    int64_t value   = t->coinbase_value_sats;
+
+    int overridden  = s->cfg->pps_sats_per_diff > 0.0;
+    double rate     = effective_pps_rate(s->cfg, value, net_diff);
+    double gross    = (value > 0 && isfinite(net_diff) && net_diff > 0.0)
+                    ? (double)value / net_diff : 0.0;
+    /* What the numbers actually imply, which under an override is whatever
+     * the operator's arithmetic produced rather than fee_bps. */
+    double eff_fee_bps = (gross > 0.0) ? (1.0 - rate / gross) * 10000.0 : 0.0;
+
+    int accrues = strcmp(s->cfg->pool_mode, "pps-classic") == 0;
+    atomic_store_explicit(&s->pps_rate, accrues ? rate : 0.0,
+                          memory_order_relaxed);
+
+    if (accrues && overridden && gross > 0.0) {
+        double drift = eff_fee_bps - (double)s->cfg->fee_bps;
+        if (drift < -25.0 || drift > 25.0) {
+            LOG_WARN("pps rate override %.4f implies a %.2f%% fee, but "
+                     "fee_bps=%d says %.2f%% (network difficulty %.2f, "
+                     "block value %lld sats). Fair value is %.4f sats/diff. "
+                     "Omit pps_sats_per_diff to derive it automatically.",
+                     s->cfg->pps_sats_per_diff, eff_fee_bps / 100.0,
+                     s->cfg->fee_bps, s->cfg->fee_bps / 100.0,
+                     net_diff, (long long)value,
+                     gross * (1.0 - (double)s->cfg->fee_bps / 10000.0));
+        }
+        if (eff_fee_bps < 0.0) {
+            LOG_WARN("pps rate override %.4f EXCEEDS fair value %.4f — the "
+                     "pool is paying out more than each share earns.",
+                     s->cfg->pps_sats_per_diff, gross);
+        }
+    }
+
+    if (s->store) {
+        store_record_pool_meta(s->store, s->cfg->pool_mode, s->cfg->fee_bps,
+                               overridden ? "override" : "derived",
+                               accrues ? rate : 0.0, gross,
+                               accrues ? eff_fee_bps : 0.0,
+                               net_diff, value, (uint64_t)time(NULL));
+    }
+}
+
 /* ---------- observer hooks ---------- */
 
 static void on_share_cb(void *ctx, const char *worker_name,
@@ -240,36 +320,48 @@ static void on_share_cb(void *ctx, const char *worker_name,
                         double difficulty, int is_block,
                         const char *block_hash_or_null) {
     server_ctx_t *s = (server_ctx_t *)ctx;
+
+    /* PPS accrual. Credit the worker proportional to share difficulty at the
+     * rate derived from the current template (or the operator's override).
+     * Truncates to whole sats; sub-sat dust accumulates per-share so over
+     * many shares the rounding error is bounded by 1 sat per row.
+     *
+     * Only pool_mode=pps-classic accrues. Solo pays each miner directly from
+     * their own coinbase, so there is nothing to credit and delta stays 0 —
+     * which is also what gets stored on the share row.
+     *
+     * Computed before the share is recorded so the amount can be written
+     * onto the share itself; an audit then reports what was paid rather than
+     * recomputing it against a rate that may since have moved. */
+    int64_t delta = 0;
+    if (s && s->cfg && strcmp(s->cfg->pool_mode, "pps-classic") == 0) {
+        double rate = atomic_load_explicit(&s->pps_rate, memory_order_relaxed);
+        if (rate > 0.0) {
+            double d = difficulty * rate;
+            if (d > 0.0 && d < (double)INT64_MAX) delta = (int64_t)d;
+        }
+    }
+
     if (s && s->store) {
         store_record_share_addr(s->store, worker_name, payout_address,
                                 ts_ms, difficulty, is_block,
-                                block_hash_or_null);
+                                block_hash_or_null, delta);
     }
     if (s && s->bcast) {
         broadcast_share(s->bcast, worker_name, payout_address,
                         ts_ms, difficulty, is_block, block_hash_or_null);
     }
-    /* PPS accrual. Credit the worker proportional to share difficulty.
-     * Truncates to whole sats; sub-sat dust accumulates per-share so
-     * over many shares the rounding error is bounded by 1 sat per row.
-     * Fires in pool_mode=pps-classic (traditional coinbase, operator-driven
-     * deposits into Thunder). */
-    if (s && s->cfg &&
-        strcmp(s->cfg->pool_mode, "pps-classic") == 0 &&
-        s->cfg->pps_sats_per_diff > 0.0) {
-        int64_t delta = (int64_t)(difficulty * s->cfg->pps_sats_per_diff);
-        if (delta > 0) {
-            if (s->store) {
-                store_record_credit(s->store, worker_name, payout_address,
-                                    ts_ms, delta);
-            }
-            if (s->bcast) {
-                /* accrued_total is the running balance after this credit.
-                 * Since the writer thread is async we don't know it
-                 * exactly; pass 0 and let consumers query SQLite for the
-                 * authoritative number. */
-                broadcast_credit(s->bcast, worker_name, ts_ms, delta, 0);
-            }
+    if (delta > 0) {
+        if (s->store) {
+            store_record_credit(s->store, worker_name, payout_address,
+                                ts_ms, delta);
+        }
+        if (s->bcast) {
+            /* accrued_total is the running balance after this credit.
+             * Since the writer thread is async we don't know it
+             * exactly; pass 0 and let consumers query SQLite for the
+             * authoritative number. */
+            broadcast_credit(s->bcast, worker_name, ts_ms, delta, 0);
         }
     }
 }
@@ -394,6 +486,9 @@ static void *tip_watcher(void *arg) {
                 continue;
             }
             stratum_server_set_job(s->srv, job);
+            /* Difficulty and block value move with the template, so the
+             * rate has to move with it too. */
+            refresh_pps_rate(s, t);
             pthread_mutex_lock(&s->lock);
             s->last_height = t->height;
             snprintf(s->last_prev_hash, sizeof s->last_prev_hash, "%s",
@@ -569,6 +664,10 @@ int main(int argc, char **argv) {
             broadcast_node_tip(bcast, tmpl->height - 1, tmpl->prev_hash_hex, now_s);
         }
     }
+
+    /* Seed the rate before any share can arrive — a share credited at 0
+     * would be silently unpaid. */
+    refresh_pps_rate(&sctx, tmpl);
 
     /* Start stratum server. */
     stratum_cfg_t stcfg;

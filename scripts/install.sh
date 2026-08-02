@@ -96,7 +96,7 @@ COINBASE_TAG="/simplepool/"
 POOL_BTC_ADDRESS=""
 THUNDER_ADDRESS=""
 THUNDER_RPC_URL="http://127.0.0.1:6009"
-PPS_SATS_PER_DIFF="1000"
+PPS_SATS_PER_DIFF=""   # empty = derive from the block template (recommended)
 FQDN=""
 DASH_PORT="8081"
 PUBLIC_STRATUM_URL=""
@@ -282,7 +282,11 @@ case "$MODE" in
     pps-classic)
         ask POOL_BTC_ADDRESS  "pool BTC address (coinbase pays here)"        "$POOL_BTC_ADDRESS"
         ask THUNDER_ADDRESS   "pool Thunder reserve address (base58)"        "$THUNDER_ADDRESS"
-        ask PPS_SATS_PER_DIFF "sats credited per unit of share difficulty"   "$PPS_SATS_PER_DIFF"
+        # Blank means the proxy derives the rate per template from
+        # coinbasevalue, network difficulty and fee_bps. A fixed value goes
+        # stale as difficulty moves and bypasses fee_bps entirely, so the
+        # default is deliberately empty.
+        ask PPS_SATS_PER_DIFF "sats/diff override (blank = derive from template, recommended)" "$PPS_SATS_PER_DIFF"
         ;;
 esac
 
@@ -658,7 +662,11 @@ case "$MODE" in
         ;;
     pps-classic)
         conf_set "$TMP_CONF" pool_btc_address  "$POOL_BTC_ADDRESS"
-        conf_set "$TMP_CONF" pps_sats_per_diff "$PPS_SATS_PER_DIFF"
+        if [[ -n "$PPS_SATS_PER_DIFF" ]]; then
+            conf_set   "$TMP_CONF" pps_sats_per_diff "$PPS_SATS_PER_DIFF"
+        else
+            conf_unset "$TMP_CONF" pps_sats_per_diff
+        fi
         ;;
 esac
 
@@ -716,7 +724,9 @@ if [[ "$DO_DASH" == "1" ]]; then
             echo "Environment=ADMIN_USER=${ADMIN_USER}"
             echo "Environment=ADMIN_PASSWORD=${ADMIN_PASSWORD}"
         fi
-        echo "Environment=POOL_PPS_SATS_PER_DIFF=${PPS_SATS_PER_DIFF}"
+        # No POOL_PPS_SATS_PER_DIFF: the dashboard reads the effective rate
+        # from pool_meta, which the proxy writes, so the audit cannot drift
+        # from the ledger it checks.
         [[ -n "$THUNDER_ADDRESS" ]] && echo "Environment=POOL_THUNDER_RESERVE_ADDRESS=${THUNDER_ADDRESS}"
         echo "Environment=THUNDER_RPC_URL=${THUNDER_RPC_URL}"
         if [[ "$DO_PAYOUT" == "1" ]]; then

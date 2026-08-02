@@ -2,6 +2,7 @@
 #include "../src/sha256.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -133,6 +134,50 @@ static void test_genesis(void) {
     CHECK(be32_cmp(hash_be, target) < 0);
 }
 
+/* The PPS rate must be fair value net of fee, and must track difficulty.
+ *
+ * Regression guard for the bug where the fee lived only in a hand-computed
+ * pps_sats_per_diff: fee_bps had no effect on what miners were credited, and
+ * the rate went stale as difficulty moved. */
+static void test_pps_rate(void) {
+    const int64_t subsidy = 312500000;      /* 3.125 BTC */
+
+    /* gross = 312500000 / 111157.455 = 2811.33...; 1% fee -> 2783.2... */
+    double r = pps_rate_from_template(subsidy, 111157.455354832, 100);
+    CHECK(r > 2783.0 && r < 2783.5);
+
+    /* fee_bps must actually move the payout. */
+    double gross = pps_rate_from_template(subsidy, 111157.455354832, 0);
+    CHECK(gross > 2811.0 && gross < 2811.7);
+    CHECK(r < gross);
+    /* 1% off gross, to within float noise. */
+    double implied_fee = 1.0 - r / gross;
+    CHECK(implied_fee > 0.0099 && implied_fee < 0.0101);
+
+    /* A 3% fee must pay strictly less than a 1% fee. */
+    double r3 = pps_rate_from_template(subsidy, 111157.455354832, 300);
+    CHECK(r3 < r);
+    CHECK(r3 > 2726.0 && r3 < 2728.0);
+
+    /* Rate tracks difficulty: double the difficulty, halve the rate. This is
+     * what a static configured rate could not do. */
+    double easy = pps_rate_from_template(subsidy, 100000.0, 100);
+    double hard = pps_rate_from_template(subsidy, 200000.0, 100);
+    CHECK(hard > 0.0);
+    CHECK(easy / hard > 1.999 && easy / hard < 2.001);
+
+    /* Unpriceable templates disable accrual rather than guess. */
+    CHECK(pps_rate_from_template(0,       111157.0, 100) == 0.0);
+    CHECK(pps_rate_from_template(-1,      111157.0, 100) == 0.0);
+    CHECK(pps_rate_from_template(subsidy, 0.0,      100) == 0.0);
+    CHECK(pps_rate_from_template(subsidy, -5.0,     100) == 0.0);
+    CHECK(pps_rate_from_template(subsidy, HUGE_VAL, 100) == 0.0);
+    /* A fee of 100% or more would credit nothing; reject rather than
+     * silently pay zero. */
+    CHECK(pps_rate_from_template(subsidy, 111157.0, 10000) == 0.0);
+    CHECK(pps_rate_from_template(subsidy, 111157.0, -1)    == 0.0);
+}
+
 int main(void) {
     test_dsha256();
     test_nbits();
@@ -140,6 +185,7 @@ int main(void) {
     test_merkle();
     test_be_cmp();
     test_genesis();
+    test_pps_rate();
     printf("test_share: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

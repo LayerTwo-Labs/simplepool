@@ -242,27 +242,33 @@ export function worker(handle, name, windowSec = 86400) {
         });
     }
 
-    /* Self-service PPS audit — same cross-check the admin view runs,
-     * but scoped to this one worker. Returns null in solo mode (no row
-     * in pps_credits). `rate` is passed in by the caller (from env). */
+    /* Self-service PPS audit — same cross-check the admin view runs, scoped
+     * to this one worker. Null in solo mode (no pps_credits row).
+     *
+     * The cross-check sums shares.credited_sats, which is what each share was
+     * actually credited when it was accepted. It is NOT recomputed from a
+     * current rate: the rate is derived per-template and moves with network
+     * difficulty, so re-deriving history would report a mismatch on every
+     * difficulty change. Rate metadata comes from pool_meta for display only. */
     let ppsAudit = null;
     const credit = d.prepare(`
         SELECT accrued_sats, paid_sats, last_updated
           FROM pps_credits WHERE worker_id = ?
     `).get(w.id);
     if (credit) {
-        const rate = Number(arguments[3] || 0);
+        const meta = poolMeta(d);
         const totals = d.prepare(`
-            SELECT COUNT(*)                                          AS share_count,
-                   COALESCE(SUM(difficulty), 0)                      AS sum_difficulty,
-                   COALESCE(SUM(CAST(difficulty * ? AS INTEGER)), 0) AS accrued_computed
+            SELECT COUNT(*)                            AS share_count,
+                   COALESCE(SUM(difficulty), 0)        AS sum_difficulty,
+                   COALESCE(SUM(credited_sats), 0)     AS accrued_computed
               FROM shares
              WHERE worker_id = ?
-        `).get(rate, w.id);
+        `).get(w.id);
         const accrued = Number(credit.accrued_sats || 0);
         const paid    = Number(credit.paid_sats    || 0);
         ppsAudit = {
-            rate,
+            rate: meta ? meta.rate_sats_per_diff : null,
+            meta,
             accrued, paid, owed: accrued - paid,
             last_updated: Number(credit.last_updated || 0),
             share_count:      Number(totals.share_count),
@@ -321,6 +327,47 @@ export function worker(handle, name, windowSec = 86400) {
 
 /* Latest tip the C proxy is mining on, mirrored from getblocktemplate.
  * Returns null if the proxy hasn't recorded a tip yet (fresh DB). */
+/* What the proxy is actually paying, straight from the row it writes on
+ * every template change. This is the ONLY place the dashboard should learn
+ * the rate — never from its own config, or the audit can disagree with the
+ * ledger it exists to check.
+ *
+ * Returns null on a DB predating pool_meta, in which case callers should
+ * present the rate as unknown rather than substituting a guess. */
+export function poolMeta(handle) {
+    const d = unwrap(handle);
+    if (!d) return null;
+    try {
+        const r = d.prepare(`
+            SELECT pool_mode, fee_bps, rate_source, rate_sats_per_diff,
+                   gross_sats_per_diff, effective_fee_bps, network_difficulty,
+                   block_value_sats, credited_from, updated_at
+              FROM pool_meta WHERE id = 1
+        `).get();
+        if (!r) return null;
+        const gross = Number(r.gross_sats_per_diff || 0);
+        const rate  = Number(r.rate_sats_per_diff  || 0);
+        return {
+            pool_mode:           r.pool_mode || 'solo',
+            fee_bps:             Number(r.fee_bps || 0),
+            rate_source:         r.rate_source || 'derived',
+            rate_sats_per_diff:  rate,
+            gross_sats_per_diff: gross,
+            effective_fee_bps:   Number(r.effective_fee_bps || 0),
+            network_difficulty:  Number(r.network_difficulty || 0),
+            block_value_sats:    Number(r.block_value_sats || 0),
+            credited_from:       Number(r.credited_from || 0),
+            updated_at:          Number(r.updated_at || 0),
+            /* An override whose implied fee has drifted from fee_bps is the
+             * failure this table exists to expose. */
+            fee_drift_bps: Number(r.effective_fee_bps || 0) - Number(r.fee_bps || 0),
+            accrues: (r.pool_mode || 'solo') === 'pps-classic',
+        };
+    } catch {
+        return null;   /* pre-pool_meta DB */
+    }
+}
+
 export function nodeStatus(handle) {
     const d = db(handle);
     if (!d) return null;
