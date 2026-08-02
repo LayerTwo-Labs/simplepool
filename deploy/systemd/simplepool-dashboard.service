@@ -30,9 +30,9 @@ Environment=THUNDER_SIDECHAIN_ID=9
 # Environment=POOL_THUNDER_RESERVE_ADDRESS=<paste from proxy.conf>
 # Environment=ADMIN_USER=admin
 # Environment=ADMIN_PASSWORD=<generate with `openssl rand -base64 21`>
-# Must equal proxy.conf's pps_sats_per_diff — used by the per-worker
-# audit view to cross-check the C proxy's accrual math.
-Environment=POOL_PPS_SATS_PER_DIFF=1000
+# The PPS rate is deliberately NOT configured here. The dashboard reads it
+# from the pool_meta table, which the proxy writes on every template change,
+# so the audit can never disagree with the process that did the crediting.
 ExecStart=/usr/bin/node @ROOT@/dashboard/server.js
 Restart=on-failure
 RestartSec=3

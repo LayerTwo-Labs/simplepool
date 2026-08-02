@@ -58,8 +58,20 @@ typedef struct {
      * the net-of-fee reward. Required when pool_mode = pps-classic;
      * ignored otherwise. */
     char pool_btc_address[128];
-    /* PPS rate — sats credited per unit of share difficulty. Used by the
-     * payout worker downstream; the C proxy only computes accrued credits. */
+    /* PPS rate override — sats credited per unit of share difficulty.
+     *
+     * Leave unset (0) and the proxy derives the rate from each block
+     * template as (coinbasevalue / network_difficulty) * (1 - fee_bps/1e4).
+     * That is the recommended configuration: fee_bps becomes the single
+     * knob controlling the fee, and the rate tracks difficulty instead of
+     * going stale.
+     *
+     * Set it and the value is used verbatim and taken to be ALREADY NET of
+     * fee — fee_bps is not applied on top, because historically operators
+     * baked the fee into this number by hand. The proxy logs the fee that
+     * choice actually implies and warns when it disagrees with fee_bps.
+     * A static value silently drifts as difficulty moves, and can invert
+     * into paying miners more than the pool earns, so prefer derived. */
     double pps_sats_per_diff;
 
     /* logging */

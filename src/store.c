@@ -34,13 +34,20 @@ static const char *SCHEMA_SQL =
     "  last_seen       INTEGER NOT NULL,"
     "  payout_address  TEXT"
     ");"
+    /* credited_sats is what this share was ACTUALLY credited at the time it
+     * was accepted — not something to be recomputed later from a rate read
+     * from config. The rate is derived per-template and moves with network
+     * difficulty, so recomputing historical shares against a current rate
+     * silently misreports them. Audits must sum this column. 0 in solo mode,
+     * where no PPS accrual happens. */
     "CREATE TABLE IF NOT EXISTS shares ("
-    "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
-    "  worker_id   INTEGER NOT NULL REFERENCES workers(id),"
-    "  ts          INTEGER NOT NULL,"
-    "  difficulty  REAL NOT NULL,"
-    "  is_block    INTEGER NOT NULL DEFAULT 0,"
-    "  block_hash  TEXT"
+    "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  worker_id     INTEGER NOT NULL REFERENCES workers(id),"
+    "  ts            INTEGER NOT NULL,"
+    "  difficulty    REAL NOT NULL,"
+    "  is_block      INTEGER NOT NULL DEFAULT 0,"
+    "  block_hash    TEXT,"
+    "  credited_sats INTEGER NOT NULL DEFAULT 0"
     ");"
     "CREATE INDEX IF NOT EXISTS shares_ts_idx ON shares(ts);"
     "CREATE INDEX IF NOT EXISTS shares_worker_ts_idx ON shares(worker_id, ts);"
@@ -71,6 +78,30 @@ static const char *SCHEMA_SQL =
     "  tip_hash        TEXT,"
     "  tip_observed_at INTEGER,"
     "  updated_at      INTEGER"
+    ");"
+    /* Single source of truth for what the running proxy is actually paying.
+     *
+     * The dashboard MUST read the rate from here rather than from its own
+     * config or environment. Holding the same number in two places is how
+     * the audit ends up disagreeing with the ledger it is meant to check.
+     *
+     * rate_source is 'derived' (rate computed from the live template and
+     * fee_bps — the default) or 'override' (operator pinned
+     * pps_sats_per_diff, which is taken NET of fee and bypasses fee_bps).
+     * effective_fee_bps is what the numbers actually imply, which under an
+     * override can differ from the configured fee_bps. */
+    "CREATE TABLE IF NOT EXISTS pool_meta ("
+    "  id                  INTEGER PRIMARY KEY CHECK (id = 1),"
+    "  pool_mode           TEXT,"
+    "  fee_bps             INTEGER,"
+    "  rate_source         TEXT,"
+    "  rate_sats_per_diff  REAL,"     /* effective, net of fee */
+    "  gross_sats_per_diff REAL,"     /* fair value before fee */
+    "  effective_fee_bps   REAL,"
+    "  network_difficulty  REAL,"
+    "  block_value_sats    INTEGER,"
+    "  credited_from       INTEGER,"  /* first ts with credited_sats populated */
+    "  updated_at          INTEGER"
     ");"
     /* PPS accrual ledger. One row per worker; the C proxy only INCREMENTS
      * accrued_sats. paid_sats is updated by a downstream payout service
@@ -126,6 +157,12 @@ static const char *MIGRATIONS_SQL[] = {
     "ALTER TABLE blocks_found ADD COLUMN finder_address TEXT",
     "ALTER TABLE blocks_found ADD COLUMN reward_sats    INTEGER",
     "ALTER TABLE blocks_found ADD COLUMN fee_sats       INTEGER",
+    /* Rows written before this column existed keep 0. They are not
+     * retroactively creditable — the rate in force when they were accepted
+     * is not recoverable — so an audit spanning the upgrade must fall back
+     * to pps_credits for the earlier period. pool_meta.credited_from marks
+     * the boundary. */
+    "ALTER TABLE shares       ADD COLUMN credited_sats  INTEGER NOT NULL DEFAULT 0",
 };
 
 #define EV_SHARE   1
@@ -316,6 +353,9 @@ static void process_event(store_t *s, const event_t *ev) {
             sqlite3_bind_text(s->st_insert_share, 5, ev->hash, -1, SQLITE_TRANSIENT);
         else
             sqlite3_bind_null(s->st_insert_share, 5);
+        /* What this share was credited, at the rate in force when it was
+         * accepted. 0 in solo mode. See the shares schema comment. */
+        sqlite3_bind_int64(s->st_insert_share, 6, ev->delta_sats);
         if (sqlite3_step(s->st_insert_share) != SQLITE_DONE) {
             atomic_fetch_add(&s->pg_errors, 1);
         } else {
@@ -541,8 +581,8 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         "  payout_address = COALESCE(workers.payout_address, excluded.payout_address) "
         "RETURNING id";
     static const char *Q_INS_SHARE =
-        "INSERT INTO shares (worker_id, ts, difficulty, is_block, block_hash) "
-        "VALUES (?, ?, ?, ?, ?)";
+        "INSERT INTO shares (worker_id, ts, difficulty, is_block, block_hash, credited_sats) "
+        "VALUES (?, ?, ?, ?, ?, ?)";
     static const char *Q_INS_REJECT =
         "INSERT INTO rejects (worker_name, ts, reason) VALUES (?, ?, ?)";
     static const char *Q_INS_BLOCK =
@@ -633,13 +673,14 @@ int store_record_share(store_t *s, const char *worker_name,
                        int is_block, const char *share_hash_or_null)
 {
     return store_record_share_addr(s, worker_name, NULL, ts_ms, difficulty,
-                                   is_block, share_hash_or_null);
+                                   is_block, share_hash_or_null, 0);
 }
 
 int store_record_share_addr(store_t *s, const char *worker_name,
                             const char *payout_address,
                             uint64_t ts_ms, double difficulty,
-                            int is_block, const char *share_hash_or_null)
+                            int is_block, const char *share_hash_or_null,
+                            int64_t credited_sats)
 {
     if (!s || !worker_name) return -1;
     event_t ev;
@@ -648,6 +689,7 @@ int store_record_share_addr(store_t *s, const char *worker_name,
     ev.ts_ms = ts_ms;
     ev.difficulty = difficulty;
     ev.is_block = is_block;
+    ev.delta_sats = credited_sats;
     strncpy(ev.worker_name, worker_name, WORKER_NAME_MAX - 1);
     if (payout_address)
         strncpy(ev.payout_address, payout_address, ADDR_MAX - 1);
@@ -763,6 +805,65 @@ int store_record_node_tip(store_t *s, int height, const char *hash,
     int rc = sqlite3_step(s->st_upsert_node_tip);
     sqlite3_reset(s->st_upsert_node_tip);
     pthread_mutex_unlock(&s->node_tip_mu);
+    if (rc != SQLITE_DONE) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    return 0;
+}
+
+int store_record_pool_meta(store_t *s, const char *pool_mode, int fee_bps,
+                           const char *rate_source,
+                           double rate_sats_per_diff,
+                           double gross_sats_per_diff,
+                           double effective_fee_bps,
+                           double network_difficulty,
+                           int64_t block_value_sats,
+                           uint64_t updated_ts_s)
+{
+    if (!s) return -1;
+    /* Prepared ad-hoc rather than cached: this runs once per template
+     * change, so the prepare cost is irrelevant and it keeps the hot
+     * writer-thread statement set untouched.
+     *
+     * credited_from is stamped on first write and never overwritten. It
+     * marks where shares.credited_sats becomes trustworthy, so an audit
+     * spanning the upgrade can tell which period it may sum directly. */
+    static const char *Q =
+        "INSERT INTO pool_meta (id, pool_mode, fee_bps, rate_source,"
+        "  rate_sats_per_diff, gross_sats_per_diff, effective_fee_bps,"
+        "  network_difficulty, block_value_sats, credited_from, updated_at) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "  pool_mode = excluded.pool_mode,"
+        "  fee_bps = excluded.fee_bps,"
+        "  rate_source = excluded.rate_source,"
+        "  rate_sats_per_diff = excluded.rate_sats_per_diff,"
+        "  gross_sats_per_diff = excluded.gross_sats_per_diff,"
+        "  effective_fee_bps = excluded.effective_fee_bps,"
+        "  network_difficulty = excluded.network_difficulty,"
+        "  block_value_sats = excluded.block_value_sats,"
+        "  credited_from = COALESCE(pool_meta.credited_from, excluded.credited_from),"
+        "  updated_at = excluded.updated_at";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    pthread_mutex_lock(&s->node_tip_mu);
+    sqlite3_bind_text  (st, 1, pool_mode   ? pool_mode   : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int   (st, 2, fee_bps);
+    sqlite3_bind_text  (st, 3, rate_source ? rate_source : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(st, 4, rate_sats_per_diff);
+    sqlite3_bind_double(st, 5, gross_sats_per_diff);
+    sqlite3_bind_double(st, 6, effective_fee_bps);
+    sqlite3_bind_double(st, 7, network_difficulty);
+    sqlite3_bind_int64 (st, 8, (sqlite3_int64)block_value_sats);
+    sqlite3_bind_int64 (st, 9, (sqlite3_int64)updated_ts_s);
+    sqlite3_bind_int64 (st, 10, (sqlite3_int64)updated_ts_s);
+    int rc = sqlite3_step(st);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;

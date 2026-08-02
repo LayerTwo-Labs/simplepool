@@ -6,6 +6,7 @@
 // request on a slow / down Thunder node.
 
 import { enforcerRpc } from './enforcer.js';
+import { poolMeta } from './stats.js';
 
 function unwrap(handle) {
     if (typeof handle?.get === 'function') return handle.get();
@@ -80,14 +81,19 @@ export function inFlight(handle) {
 }
 
 /* Per-worker audit — "why is my accrued balance N sats?" answered with
- * the formula, a cross-check, per-day rollup, and the last N shares.
+ * the stored credits, a cross-check, per-day rollup, and the last N shares.
  *
- * The C proxy credits each accepted share `FLOOR(difficulty * rate)`
- * sats where `rate` is proxy.conf's pps_sats_per_diff. Truncation is
- * per-share, not once at the end, so `Σ FLOOR(diff × rate)` is the
- * authoritative cross-check — NOT `FLOOR(Σ diff × rate)`. Both are
- * shown so operators can spot a config drift immediately. */
-export function workerAudit(handle, workerId, { rate, recentLimit = 100, dayLimit = 30 } = {}) {
+ * The C proxy credits each accepted share FLOOR(difficulty * rate) and
+ * writes that amount to shares.credited_sats. The audit sums that column
+ * rather than recomputing it: the rate is derived per template and moves
+ * with network difficulty, so re-deriving history against a current rate
+ * would show a false mismatch after every difficulty change. Truncation is
+ * also per-share, so only the stored per-row values reconstruct the ledger
+ * exactly.
+ *
+ * Rate metadata is read from pool_meta — written by the proxy itself — so
+ * this view can never disagree with the process that did the crediting. */
+export function workerAudit(handle, workerId, { recentLimit = 100, dayLimit = 30 } = {}) {
     const db = unwrap(handle);
     if (!db) return null;
     const worker = db.prepare(`
@@ -99,16 +105,19 @@ export function workerAudit(handle, workerId, { rate, recentLimit = 100, dayLimi
     `).get(workerId);
     if (!worker) return null;
 
+    /* Rate provenance from the proxy itself — never from dashboard config. */
+    const meta = poolMeta(db);
+
     const totals = db.prepare(`
-        SELECT COUNT(*)                                       AS share_count,
-               COALESCE(SUM(difficulty), 0)                   AS sum_difficulty,
-               COALESCE(SUM(CAST(difficulty * ? AS INTEGER)), 0) AS accrued_computed,
-               MIN(ts)                                        AS first_ts,
-               MAX(ts)                                        AS last_ts,
-               COUNT(*) FILTER (WHERE is_block = 1)           AS blocks_found
+        SELECT COUNT(*)                              AS share_count,
+               COALESCE(SUM(difficulty), 0)          AS sum_difficulty,
+               COALESCE(SUM(credited_sats), 0)       AS accrued_computed,
+               MIN(ts)                               AS first_ts,
+               MAX(ts)                               AS last_ts,
+               COUNT(*) FILTER (WHERE is_block = 1)  AS blocks_found
         FROM   shares
         WHERE  worker_id = ? AND is_block IS NOT NULL
-    `).get(rate, workerId);
+    `).get(workerId);
 
     /* Day-level rollup: (day, shares, sum_diff, sats_credited). Only
      * days with activity, most-recent first. */
@@ -116,24 +125,24 @@ export function workerAudit(handle, workerId, { rate, recentLimit = 100, dayLimi
         SELECT DATE(ts, 'unixepoch') AS day,
                COUNT(*)              AS shares,
                SUM(difficulty)       AS sum_diff,
-               SUM(CAST(difficulty * ? AS INTEGER)) AS accrued_delta,
+               SUM(credited_sats)    AS accrued_delta,
                COUNT(*) FILTER (WHERE is_block = 1) AS blocks
         FROM   shares
         WHERE  worker_id = ?
         GROUP  BY day
         ORDER  BY day DESC
         LIMIT  ?
-    `).all(rate, workerId, dayLimit);
+    `).all(workerId, dayLimit);
 
     /* Most-recent shares, cheapest to derive running_accrued client-side. */
     const recent = db.prepare(`
         SELECT id, ts, difficulty, is_block, block_hash,
-               CAST(difficulty * ? AS INTEGER) AS credit_sats
+               credited_sats AS credit_sats
         FROM   shares
         WHERE  worker_id = ?
         ORDER  BY ts DESC
         LIMIT  ?
-    `).all(rate, workerId, recentLimit);
+    `).all(workerId, recentLimit);
 
     return {
         worker: {
@@ -143,7 +152,8 @@ export function workerAudit(handle, workerId, { rate, recentLimit = 100, dayLimi
             first_seen: Number(worker.first_seen),
             last_seen:  Number(worker.last_seen),
         },
-        rate,
+        rate: meta ? meta.rate_sats_per_diff : null,
+        meta,
         ledger: {
             accrued: Number(worker.accrued_sats || 0),
             paid:    Number(worker.paid_sats    || 0),

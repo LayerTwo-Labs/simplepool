@@ -7,8 +7,19 @@ const withRunning = recentAsc.map(r => {
     running += r.credit_sats;
     return { ...r, running_accrued: running };
 }).reverse();
-const naiveAccrued = Math.floor(audit.totals.sum_difficulty * audit.rate);
-const drift = audit.totals.accrued_computed - naiveAccrued;
+/* The ledger cross-check: sum of what was actually credited per share
+ * versus the pps_credits running total. These must agree exactly — both
+ * are written by the proxy from the same per-share amount.
+ *
+ * Deliberately NOT compared against sum_difficulty x current_rate: the
+ * rate is derived per template and moves with network difficulty, so that
+ * comparison reports a false mismatch after every retarget. */
+const meta   = audit.meta || null;
+const drift  = audit.totals.accrued_computed - audit.ledger.accrued;
+/* Shown only for context — what today's rate would imply for this much
+ * work. Divergence here is difficulty movement, not an error. */
+const atCurrentRate = meta && meta.rate_sats_per_diff
+    ? Math.floor(audit.totals.sum_difficulty * meta.rate_sats_per_diff) : null;
 %>
 <!doctype html>
 <html lang="en">
@@ -22,12 +33,58 @@ const drift = audit.totals.accrued_computed - naiveAccrued;
             <h2>Why is this balance what it is?</h2>
             <p class="muted small">
                 Answers a miner's "where does <em>my</em> number come from"
-                question at the byte level. Every accepted share credits
-                <code>FLOOR(difficulty × rate)</code> sats, where <em>rate</em>
-                comes from <code>proxy.conf</code>'s
-                <code>pps_sats_per_diff</code>. Truncation is per-share; that's
-                the authoritative sum shown below.
+                question at the byte level. Every accepted share is credited
+                <code>FLOOR(difficulty × rate)</code> sats, and that amount is
+                stored on the share row as <code>credited_sats</code>. The
+                totals below <strong>sum those stored values</strong> — they
+                are not recomputed from today's rate, because the rate moves
+                with network difficulty and re-deriving history would misreport
+                every share mined under a different one.
             </p>
+        </section>
+
+        <section class="card">
+            <h2>Rate &amp; fee</h2>
+            <% if (!meta) { %>
+                <p class="muted small">
+                    No <code>pool_meta</code> row yet — this database predates
+                    rate publishing, or the proxy has not seen a template since
+                    upgrading. Stored per-share credits are still authoritative.
+                </p>
+            <% } else { %>
+            <div class="grid">
+                <div><label>Source</label><span>
+                    <%= meta.rate_source %>
+                    <% if (meta.rate_source === 'derived') { %>
+                        <span class="muted small">— from the live block template</span>
+                    <% } else { %>
+                        <span class="muted small">— pinned via <code>pps_sats_per_diff</code></span>
+                    <% } %>
+                </span></div>
+                <div><label>Effective rate</label><span class="mono"><%= meta.rate_sats_per_diff.toFixed(4) %> sats/diff</span></div>
+                <div><label>Fair value (gross)</label><span class="mono"><%= meta.gross_sats_per_diff.toFixed(4) %> sats/diff</span></div>
+                <div><label>Configured fee</label><span class="mono"><%= (meta.fee_bps / 100).toFixed(2) %>%</span></div>
+                <div><label>Effective fee</label><span class="mono"><%= (meta.effective_fee_bps / 100).toFixed(4) %>%</span></div>
+                <div><label>Network difficulty</label><span class="mono"><%= meta.network_difficulty.toLocaleString() %></span></div>
+                <div><label>Block value</label><span class="mono"><%= meta.block_value_sats.toLocaleString() %> sats</span></div>
+                <div><label>Rate updated</label><span title="<%= fmtTs(meta.updated_at) %>"><%= ago(meta.updated_at) %></span></div>
+            </div>
+            <% if (Math.abs(meta.fee_drift_bps) > 25) { %>
+                <p class="warn small">
+                    ⚠ The effective fee (<%= (meta.effective_fee_bps / 100).toFixed(2) %>%)
+                    disagrees with the configured <code>fee_bps</code>
+                    (<%= (meta.fee_bps / 100).toFixed(2) %>%). The pinned
+                    <code>pps_sats_per_diff</code> has drifted from fair value as
+                    difficulty moved. Remove it to derive the rate automatically.
+                </p>
+            <% } %>
+            <% if (meta.effective_fee_bps < 0) { %>
+                <p class="warn small">
+                    ⚠ The rate <strong>exceeds</strong> fair value — the pool is
+                    paying out more per share than each share earns.
+                </p>
+            <% } %>
+            <% } %>
         </section>
 
         <section class="card">
@@ -52,38 +109,43 @@ const drift = audit.totals.accrued_computed - naiveAccrued;
         <section class="card">
             <h2>Cross-check</h2>
             <p class="muted small" style="margin-top:0">
-                The pool credits <code>FLOOR(difficulty × <%= fmtN(audit.rate) %>)</code>
-                sats per accepted share. If the numbers below don't match, the
-                DB has drifted from the C proxy's log — worth investigating.
+                Every accepted share stores the sats it was credited. Summing
+                that column must equal the running total in
+                <code>pps_credits</code> — both are written by the proxy from
+                the same number. A mismatch means the ledger was edited outside
+                the proxy, or rows were written before
+                <code>credited_sats</code> existed.
             </p>
             <div class="grid">
                 <div><label>Accepted shares</label><strong><%= fmtN(audit.totals.share_count) %></strong></div>
                 <div><label>Blocks found</label><strong><%= fmtN(audit.totals.blocks_found) %></strong></div>
                 <div><label>Σ difficulty</label><strong><%= fmtF(audit.totals.sum_difficulty, 6) %></strong></div>
-                <div><label>Rate (sats × diff)</label><strong><%= fmtN(audit.rate) %></strong></div>
-                <div><label>Σ FLOOR(diff × rate) — authoritative</label><strong><%= fmtSats(audit.totals.accrued_computed) %></strong></div>
+                <div><label>Σ credited_sats — authoritative</label><strong><%= fmtSats(audit.totals.accrued_computed) %></strong></div>
                 <div><label>pps_credits.accrued (stored)</label><strong><%= fmtSats(audit.ledger.accrued) %></strong></div>
             </div>
-            <% if (audit.ledger.accrued === audit.totals.accrued_computed) { %>
+            <% if (drift === 0) { %>
                 <p class="muted small" style="margin-top:0.75em;color:#5b8">
-                    ✓ Stored accrued matches the per-share truncated sum.
+                    ✓ Per-share credits sum exactly to the stored ledger.
                 </p>
             <% } else { %>
                 <p class="muted small" style="margin-top:0.75em;color:#c66">
-                    ⚠ Stored accrued differs by
-                    <%= fmtSats(audit.ledger.accrued - audit.totals.accrued_computed) %>.
-                    This usually means the DB was populated across a rate change,
-                    OR someone edited pps_credits by hand. Look at the C
-                    proxy log for the WARN line at the last mode/rate change.
+                    ⚠ Differs by <%= fmtSats(drift) %>. Shares accepted before
+                    this build stored <code>credited_sats = 0</code> and cannot
+                    be reconstructed — check
+                    <code>pool_meta.credited_from</code> for where the column
+                    became trustworthy. Otherwise <code>pps_credits</code> was
+                    modified outside the proxy.
                 </p>
             <% } %>
+            <% if (atCurrentRate !== null) { %>
             <p class="muted small" style="margin-top:0.5em">
-                (Naive sum FLOOR(Σ diff × rate) would be <%= fmtSats(naiveAccrued) %>;
-                per-share truncation costs
-                <%= drift === 0 ? '0 sats' : Math.abs(drift) + ' sats' %>
-                over the window — the difference is the number of shares whose
-                fractional-sat contribution was rounded down.)
+                For reference, this much work at the <em>current</em> rate
+                (<%= meta.rate_sats_per_diff.toFixed(4) %> sats/diff) would be
+                <%= fmtSats(atCurrentRate) %>. A difference is normal — it just
+                means difficulty moved during the window, and each share was
+                correctly credited at the rate in force at the time.
             </p>
+            <% } %>
         </section>
 
         <section class="card">

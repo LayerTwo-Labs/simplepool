@@ -10,13 +10,20 @@ CREATE TABLE IF NOT EXISTS workers (
   payout_address  TEXT
 );
 
+-- credited_sats is what the share was ACTUALLY credited when it was
+-- accepted. The PPS rate is derived per-template and moves with network
+-- difficulty, so recomputing historical shares against a current rate
+-- misreports them. Audits must sum this column, not re-derive it.
+-- 0 in solo mode, and 0 on rows written before the column existed
+-- (see pool_meta.credited_from for where it becomes trustworthy).
 CREATE TABLE IF NOT EXISTS shares (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  worker_id   INTEGER NOT NULL REFERENCES workers(id),
-  ts          INTEGER NOT NULL,
-  difficulty  REAL NOT NULL,
-  is_block    INTEGER NOT NULL DEFAULT 0,
-  block_hash  TEXT
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  worker_id     INTEGER NOT NULL REFERENCES workers(id),
+  ts            INTEGER NOT NULL,
+  difficulty    REAL NOT NULL,
+  is_block      INTEGER NOT NULL DEFAULT 0,
+  block_hash    TEXT,
+  credited_sats INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS shares_ts_idx ON shares(ts);
 CREATE INDEX IF NOT EXISTS shares_worker_ts_idx ON shares(worker_id, ts);
@@ -51,6 +58,34 @@ CREATE TABLE IF NOT EXISTS node_status (
   tip_hash        TEXT,
   tip_observed_at INTEGER,  /* unix seconds — when we first saw this tip */
   updated_at      INTEGER   /* unix seconds — last successful poll */
+);
+
+/* Single source of truth for what the running proxy is actually paying.
+ *
+ * The dashboard MUST read the rate from here rather than from its own
+ * config or environment — holding the same number in two places is how an
+ * audit ends up disagreeing with the ledger it exists to check.
+ *
+ * rate_source is 'derived' (computed from the live template and fee_bps —
+ * the default and recommended setup) or 'override' (operator pinned
+ * pps_sats_per_diff, which is taken NET of fee and bypasses fee_bps).
+ * effective_fee_bps is what the numbers actually imply, which under an
+ * override can differ from the configured fee_bps.
+ *
+ * credited_from is stamped once, on first write, and marks the point from
+ * which shares.credited_sats is populated. */
+CREATE TABLE IF NOT EXISTS pool_meta (
+  id                  INTEGER PRIMARY KEY CHECK (id = 1),
+  pool_mode           TEXT,
+  fee_bps             INTEGER,
+  rate_source         TEXT,     /* 'derived' | 'override' */
+  rate_sats_per_diff  REAL,     /* effective, net of fee; 0 in solo */
+  gross_sats_per_diff REAL,     /* fair value before fee */
+  effective_fee_bps   REAL,
+  network_difficulty  REAL,
+  block_value_sats    INTEGER,
+  credited_from       INTEGER,  /* unix seconds */
+  updated_at          INTEGER   /* unix seconds */
 );
 
 /* PPS accrual ledger. One row per worker. The C proxy only INCREMENTs

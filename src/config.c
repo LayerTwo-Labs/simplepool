@@ -207,9 +207,13 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         return -5;
     }
     if (strcmp(cfg->pool_mode, "pps-classic") == 0) {
-        if (cfg->pps_sats_per_diff <= 0.0) {
+        /* pps_sats_per_diff is no longer required: unset means the rate is
+         * derived per-template from coinbasevalue, network difficulty and
+         * fee_bps. A negative value is still a typo worth rejecting. */
+        if (cfg->pps_sats_per_diff < 0.0) {
             set_err(errbuf, errlen,
-                    "config: 'pps_sats_per_diff' must be > 0 when pool_mode=pps-classic");
+                    "config: 'pps_sats_per_diff' must be > 0 when set "
+                    "(omit it to derive the rate from the block template)");
             return -8;
         }
         if (cfg->pool_btc_address[0] == '\0') {

@@ -54,7 +54,17 @@ pool_mode = solo
 # pps-classic — required
 # pool_btc_address = REPLACE_WITH_POOL_BTC_ADDRESS
 
-# pps-classic — required, sats credited per unit of share difficulty
+# pps-classic — OPTIONAL rate override, sats credited per unit of share
+# difficulty. Leave it commented out and the proxy derives the rate from each
+# block template as (coinbasevalue / network_difficulty) * (1 - fee_bps/1e4).
+# That is the recommended setup: fee_bps becomes the single knob controlling
+# the fee, and the rate follows difficulty instead of going stale.
+#
+# If you do set it, the value is used verbatim and treated as ALREADY NET of
+# fee — fee_bps is NOT applied on top. A fixed rate drifts as difficulty
+# moves and can invert into paying miners more than each share earns, so the
+# proxy logs the fee your value actually implies and warns when it disagrees
+# with fee_bps. Prefer leaving it unset.
 # pps_sats_per_diff = 1000
 
 log_level = info

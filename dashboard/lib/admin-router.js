@@ -20,7 +20,6 @@ export function createAdminRouter({
     ENFORCER_GRPC_ADDR,
     THUNDER_SIDECHAIN_ID,
     RESERVE_ADDRESS,
-    PPS_SATS_PER_DIFF,
 } = {}) {
     const router = express.Router();
     const parseAdminForm = express.urlencoded({ extended: false, limit: '4kb' });
@@ -106,7 +105,7 @@ export function createAdminRouter({
 
     /* --- Per-worker audit (unchanged surface, uses admin.workerAudit) --- */
     function workerAuditFor(workerId) {
-        const audit = admin.workerAudit(db, workerId, { rate: PPS_SATS_PER_DIFF });
+        const audit = admin.workerAudit(db, workerId);
         if (!audit) return null;
         audit.payouts = admin.payoutsForWorker(db, workerId, 100);
         return audit;
