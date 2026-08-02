@@ -92,8 +92,28 @@ dump_logs() {
 cleanup() {
     [ -n "$POOL_PID" ] && kill "$POOL_PID" 2>/dev/null || true
     "$ROOT/scripts/regtest/stop.sh" || true
+    rm -rf "$LOCK"
 }
+
+# One run per data dir: two runs of the SAME suite share REGTEST_DIR
+# (pidfiles + chain state), so the second run's wipe pulls the rug from
+# under the first, and the first's cleanup then kills the second's
+# freshly started daemons via the recreated pidfiles. Different suites
+# coexist fine (own dirs, dynamic ports); same-suite runs are excluded
+# here. Take the lock BEFORE installing traps — a refused run must not
+# stop the owner's stack on its way out.
+LOCK="$REGTEST_DIR.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "FAIL: $LOCK exists — another run of this suite is active." >&2
+    echo "If it crashed and left the lock behind, clear it with:" >&2
+    echo "  REGTEST_DIR=$REGTEST_DIR scripts/regtest/stop.sh && rm -rf $LOCK" >&2
+    exit 1
+fi
+
 trap 'code=$?; [ "$code" -ne 0 ] && dump_logs; cleanup; exit $code' EXIT
+# Chain INT/TERM into the EXIT trap — bash skips EXIT traps when killed
+# by an unhandled signal, which is how Ctrl-C used to orphan the stack.
+trap 'exit 130' INT TERM
 
 stage "allocate stack ports"
 # Dynamic per-run ports: this test can run alongside a dev stack (or
