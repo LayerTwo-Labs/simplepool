@@ -2,5 +2,6 @@
 /data/
 /.regtest/
 /.regtest-e2e/
+/.regtest-payout/
 /proxy.conf
 /tests/integration.proxy.conf
