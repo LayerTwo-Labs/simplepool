@@ -335,7 +335,11 @@ export function worker(handle, name, windowSec = 86400) {
  * Returns null on a DB predating pool_meta, in which case callers should
  * present the rate as unknown rather than substituting a guess. */
 export function poolMeta(handle) {
-    const d = unwrap(handle);
+    /* Called from stats.js with a lazy handle and from admin.js with an
+     * already-resolved better-sqlite3 Database, so accept either rather
+     * than making callers remember which. */
+    const d = !handle ? null
+            : (typeof handle.get === 'function' ? handle.get() : handle);
     if (!d) return null;
     try {
         const r = d.prepare(`
