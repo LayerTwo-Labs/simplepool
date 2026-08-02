@@ -41,6 +41,9 @@
 
 #define MAX_LINE_BYTES 16384
 #define DEDUPE_RING    1024
+/* Server-wide ring, so it has to cover every live connection's recent
+ * submissions rather than just one's. */
+#define SHARE_DEDUPE_RING 16384
 #define RECENT_JOBS    8
 #define RECENT_JOB_TTL_MS 60000
 
@@ -161,7 +164,21 @@ struct stratum_server {
     int  listen_fd;
     atomic_int  stop;
     atomic_int  conn_count;
+    /* Seeded from the clock at startup (so values differ across restarts)
+     * and incremented per subscribe, which is what makes each connection's
+     * extranonce1 distinct. Do not mix it with the clock again at use. */
     atomic_uint extranonce1_seq;
+
+    /* Server-wide share dedupe, keyed on the resulting block-header hash.
+     * The per-connection ring in stratum_conn cannot catch a duplicate that
+     * arrives on a *different* connection, and two connections handed the
+     * same extranonce1 render identical coinbases — so the same nonce
+     * yields the same hash on both, and PPS would credit it twice. Keying
+     * on the final hash makes the check independent of how the submission
+     * was framed (job id, extranonce2, version rolling). */
+    pthread_mutex_t share_dedupe_lock;
+    uint64_t        share_dedupe[SHARE_DEDUPE_RING];
+    size_t          share_dedupe_head;
 
     pthread_t   listener_thr;
     int         listener_started;
@@ -326,6 +343,15 @@ static uint64_t fnv1a(const char *s) {
     uint64_t h = 1469598103934665603ULL;
     for (; *s; ++s) {
         h ^= (uint8_t)*s;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t fnv1a_bytes(const uint8_t *p, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
         h *= 1099511628211ULL;
     }
     return h;
@@ -700,9 +726,20 @@ static void send_current_notify(stratum_server_t *s, stratum_conn_t *c,
 
 static int handle_subscribe(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                             char **buf, size_t *len) {
-    /* Allocate extranonce1 from server counter ^ time. */
+    /* Take extranonce1 straight from the server counter, which is seeded
+     * from the clock at startup and incremented once per subscribe.
+     *
+     * It must be unique across every live connection: identical extranonce1
+     * means identical coinbases, so two connections mine the same header and
+     * find the same hash from the same nonce — wasting half their hashrate
+     * and double-crediting the share. XOR-ing the counter with the clock
+     * again here (the previous approach) destroyed that guarantee: it
+     * collides whenever the delta in the clock equals the delta in the
+     * counter, e.g. an even seq at an even millisecond and the next seq one
+     * millisecond later both yield the same value. A miner opening several
+     * connections at once hits that case routinely. */
     unsigned seq = atomic_fetch_add(&s->extranonce1_seq, 1);
-    uint32_t mix = seq ^ (uint32_t)now_ms();
+    uint32_t mix = (uint32_t)seq;
     c->extranonce1[0] = (uint8_t)(mix >> 24);
     c->extranonce1[1] = (uint8_t)(mix >> 16);
     c->extranonce1[2] = (uint8_t)(mix >> 8);
@@ -884,6 +921,28 @@ static int dedupe_check_and_add(stratum_conn_t *c, const char *jid,
     return 0;
 }
 
+/* Server-wide dedupe on the assembled header hash. Returns 1 if this exact
+ * hash has already been credited on any connection, else records it and
+ * returns 0. Called after the header is built, so it catches duplicates the
+ * per-connection ring structurally cannot: a resubmission on a reconnected
+ * or parallel connection, or the same work reframed under a different job
+ * id. Two identical hashes represent one solution and must be paid once. */
+static int share_dedupe_check_and_add(stratum_server_t *s,
+                                      const uint8_t hash_be[32]) {
+    uint64_t h = fnv1a_bytes(hash_be, 32);
+    int dup = 0;
+    pthread_mutex_lock(&s->share_dedupe_lock);
+    for (size_t i = 0; i < SHARE_DEDUPE_RING; ++i) {
+        if (s->share_dedupe[i] == h) { dup = 1; break; }
+    }
+    if (!dup) {
+        s->share_dedupe[s->share_dedupe_head] = h;
+        s->share_dedupe_head = (s->share_dedupe_head + 1) % SHARE_DEDUPE_RING;
+    }
+    pthread_mutex_unlock(&s->share_dedupe_lock);
+    return dup;
+}
+
 /* Build full block hex from job + coinbase + nonce/ntime. Returns malloc'd
  * NUL-terminated string, or NULL on OOM. */
 static char *assemble_block_hex(const stratum_job_t *j,
@@ -1034,6 +1093,20 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
 
     uint8_t hash_be[32];
     hash_header(header, hash_be);
+
+    /* Reject before any crediting: this hash is one solution regardless of
+     * which connection produced it or how the submission was framed. */
+    if (share_dedupe_check_and_add(s, hash_be)) {
+        free(cb);
+        LOG_INFO("stratum: reject from worker '%s' - Reason: duplicate share "
+                 "(hash already credited)", c->worker_name);
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "duplicate share");
+        }
+        cJSON *err = make_error(22, "duplicate share");
+        return emit_response(buf, len, id, NULL, err);
+    }
 
     uint8_t worker_target[32];
     worker_diff_to_target(c->difficulty, worker_target);
@@ -1389,6 +1462,7 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     pthread_rwlock_init(&s->job_lock, NULL);
     pthread_mutex_init(&s->recent_lock, NULL);
     pthread_mutex_init(&s->conns_lock, NULL);
+    pthread_mutex_init(&s->share_dedupe_lock, NULL);
     atomic_init(&s->stop, 0);
     atomic_init(&s->conn_count, 0);
     atomic_init(&s->extranonce1_seq, (unsigned)now_ms());
@@ -1472,5 +1546,6 @@ void stratum_server_free(stratum_server_t *s) {
     pthread_rwlock_destroy(&s->job_lock);
     pthread_mutex_destroy(&s->recent_lock);
     pthread_mutex_destroy(&s->conns_lock);
+    pthread_mutex_destroy(&s->share_dedupe_lock);
     free(s);
 }

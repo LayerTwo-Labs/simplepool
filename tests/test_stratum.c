@@ -476,6 +476,112 @@ static void test_socket_setup_disabled(void) {
     close(sp[1]);
 }
 
+/* Every connection must get a distinct extranonce1. Two connections sharing
+ * one render identical coinbases, so they mine the same header and submit the
+ * same hash — half the hashrate is wasted and PPS credits the share twice.
+ *
+ * The old allocator was `seq ^ now_ms()`, which collides whenever the delta in
+ * the clock equals the delta in the counter: an even seq at an even
+ * millisecond and the next seq a millisecond later produce the same value.
+ * Subscribing in a tight loop, as a miner opening several connections at once
+ * does, reproduces it. */
+static void test_extranonce1_unique_across_connections(void) {
+    enum { N = 64 };
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = N, .initial_diff = 1.0 };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+
+    char seen[N][9];
+    stratum_conn_t *conns[N];
+    int collected = 0;
+
+    for (int i = 0; i < N; ++i) {
+        conns[i] = stratum_conn_new_for_test(s);
+        char *out = NULL; size_t olen = 0;
+        stratum_handle_message(s, conns[i],
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+            &out, &olen);
+        if (out) {
+            cJSON *resp = parse_first_line(out);
+            if (resp) {
+                cJSON *ex1 = cJSON_GetArrayItem(
+                    cJSON_GetObjectItem(resp, "result"), 1);
+                if (cJSON_IsString(ex1)) {
+                    snprintf(seen[collected], sizeof(seen[0]), "%s",
+                             ex1->valuestring);
+                    collected++;
+                }
+                cJSON_Delete(resp);
+            }
+            free(out);
+        }
+        /* Straddle millisecond boundaries so the old clock-XOR allocator is
+         * actually given the chance to collide. */
+        if (i % 8 == 0) sleep_ms(1);
+    }
+    CHECK(collected == N);
+
+    int dupes = 0;
+    for (int i = 0; i < collected; ++i)
+        for (int j = i + 1; j < collected; ++j)
+            if (strcmp(seen[i], seen[j]) == 0) dupes++;
+    CHECK(dupes == 0);
+
+    for (int i = 0; i < N; ++i) stratum_conn_free_for_test(conns[i]);
+    stratum_server_free(s);
+}
+
+/* The per-connection ring keys on (job_id|en2|ntime|nonce|version), so the
+ * same solution resubmitted under a *different* job id slips past it. When
+ * both jobs carry the same template the header — and therefore the hash — is
+ * identical, and it must still be credited only once. The server-wide ring
+ * keys on the hash itself, which is what makes this hold. */
+static void test_dedupe_same_hash_across_job_ids(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-12,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(obs.shares == 1);
+    free(out); out=NULL; olen=0;
+
+    /* Same template, new id. Identical header -> identical hash. */
+    stratum_server_set_job(s, make_test_job("J2", net));
+    stratum_handle_message(s, c,
+        "{\"id\":4,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J2\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(obs.shares == 1);  /* still one */
+    CHECK(obs.rejects >= 1);
+    CHECK(strstr(obs.last_reason, "duplicate") != NULL);
+    free(out);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -488,6 +594,8 @@ int main(void) {
     test_vardiff_grace_accepts_old_diff_shares();
     test_socket_setup_applies_rcvtimeo();
     test_socket_setup_disabled();
+    test_extranonce1_unique_across_connections();
+    test_dedupe_same_hash_across_job_ids();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
