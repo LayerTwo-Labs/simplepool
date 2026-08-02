@@ -2,11 +2,13 @@
 # bip300301_enforcer + simplepool (pps-classic) + a JS CPU miner, driven by
 # tests/test_e2e_regtest.sh.
 #
-# Binary management follows the bip300301_enforcer repo's own CI: the
-# prebuilt zips are the unpinned "latest" builds from
-# releases.drivechain.info, re-downloaded every run (caching them would
-# just pin stale versions — and a run that breaks only because upstream
-# shipped a new "latest" is a signal we want to see).
+# Binary versions are pinned in scripts/regtest/setup.sh (the
+# pinned-versions block) so a red run maps to our code or to a
+# deliberate version bump — not to upstream silently shipping a new
+# "latest". The one exception is the enforcer, which publishes no
+# versioned artifacts; setup.sh prints a WARNING when the latest zip
+# drifts from the version we last validated against, so an
+# enforcer-caused breakage is at least attributable from the logs.
 name: Integration tests
 
 on:
@@ -55,5 +57,38 @@ jobs:
             /tmp/simplepool-e2e.log
             /tmp/simplepool-e2e.conf
             /tmp/simplepool-int.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # The payout path the coinbase e2e skips: wallet-enabled enforcer +
+  # thunder, a real deposit, and one payout tick broadcasting a Thunder
+  # transaction (tests/test_payout_regtest.sh). Separate job purely for
+  # wall-clock parallelism — the stacks allocate ports dynamically.
+  payout-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.repository_owner == 'LayerTwo-Labs'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            unzip \
+            jq \
+            sqlite3 \
+            netcat-openbsd
+
+      - name: Run payout regtest test
+        run: bash tests/test_payout_regtest.sh
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: payout-logs-${{ github.run_id }}
+          path: .regtest-payout/logs/
           retention-days: 14
           if-no-files-found: ignore

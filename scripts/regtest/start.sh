@@ -27,6 +27,17 @@ SKIP_THUNDER="${REGTEST_SKIP_THUNDER:-0}"
 WALLETLESS="${REGTEST_WALLETLESS:-0}"
 mkdir -p "$RUN"
 
+# Stack ports. Env-overridable so several stacks can coexist — the
+# integration tests allocate free ports per run; these defaults are the
+# traditional dev-stack ports. Must match what setup.sh wrote into
+# bitcoin.conf, so export the same REGTEST_* vars to both scripts.
+BITCOIND_RPC_PORT="${REGTEST_BITCOIND_RPC_PORT:-18443}"
+BITCOIND_ZMQ_PORT="${REGTEST_BITCOIND_ZMQ_PORT:-29010}"
+ENFORCER_RPC_PORT="${REGTEST_ENFORCER_RPC_PORT:-18444}"
+ENFORCER_GRPC_PORT="${REGTEST_ENFORCER_GRPC_PORT:-50051}"
+THUNDER_RPC_PORT="${REGTEST_THUNDER_RPC_PORT:-6009}"
+THUNDER_P2P_PORT="${REGTEST_THUNDER_P2P_PORT:-4009}"
+
 BINARIES=(bitcoind bitcoin-cli bip300301_enforcer)
 [[ "$SKIP_THUNDER" == 1 ]] || BINARIES+=(thunder thunder-cli)
 for b in "${BINARIES[@]}"; do
@@ -102,18 +113,18 @@ start_if_dead bip300301_enforcer \
     --data-dir="$DATA/enforcer" \
     --enable-mempool \
     "${WALLET_ARGS[@]}" \
-    --node-rpc-addr=127.0.0.1:18443 \
+    --node-rpc-addr=127.0.0.1:$BITCOIND_RPC_PORT \
     --node-rpc-user=user \
     --node-rpc-pass=password \
-    --node-zmq-addr-sequence=tcp://127.0.0.1:29010 \
+    --node-zmq-addr-sequence=tcp://127.0.0.1:$BITCOIND_ZMQ_PORT \
     --enable-block-template-server \
-    --serve-rpc-addr=127.0.0.1:18444 \
-    --serve-grpc-addr=127.0.0.1:50051
+    --serve-rpc-addr=127.0.0.1:$ENFORCER_RPC_PORT \
+    --serve-grpc-addr=127.0.0.1:$ENFORCER_GRPC_PORT
 
-wait_for bip300301_enforcer "nc -z 127.0.0.1 18444" 30
+wait_for bip300301_enforcer "nc -z 127.0.0.1 $ENFORCER_RPC_PORT" 30
 # Thunder connects to the enforcer's gRPC — make sure that's actually
-# up before launching it (18444 GBT can come up first).
-wait_for enforcer-grpc "nc -z 127.0.0.1 50051" 15
+# up before launching it (the GBT port can come up first).
+wait_for enforcer-grpc "nc -z 127.0.0.1 $ENFORCER_GRPC_PORT" 15
 
 if [[ "$SKIP_THUNDER" != 1 ]]; then
     echo "==> starting thunder (sidechain #9)"
@@ -122,22 +133,22 @@ if [[ "$SKIP_THUNDER" != 1 ]]; then
         --headless \
         --datadir "$DATA/thunder" \
         --network regtest \
-        --mainchain-grpc-url http://127.0.0.1:50051 \
-        --net-addr 127.0.0.1:4009 \
-        --rpc-addr 127.0.0.1:6009 \
+        --mainchain-grpc-url http://127.0.0.1:$ENFORCER_GRPC_PORT \
+        --net-addr 127.0.0.1:$THUNDER_P2P_PORT \
+        --rpc-addr 127.0.0.1:$THUNDER_RPC_PORT \
         --log-level INFO
 
-    wait_for thunder "nc -z 127.0.0.1 6009" 30
+    wait_for thunder "nc -z 127.0.0.1 $THUNDER_RPC_PORT" 30
 fi
 
 echo ""
 echo "stack up. endpoints:"
-echo "  bitcoind RPC:    127.0.0.1:18443  (user/password)"
-echo "  enforcer GBT:    127.0.0.1:18444  (point simplepool at this)"
-echo "  enforcer gRPC:    127.0.0.1:50051"
+echo "  bitcoind RPC:    127.0.0.1:$BITCOIND_RPC_PORT  (user/password)"
+echo "  enforcer GBT:    127.0.0.1:$ENFORCER_RPC_PORT  (point simplepool at this)"
+echo "  enforcer gRPC:    127.0.0.1:$ENFORCER_GRPC_PORT"
 if [[ "$SKIP_THUNDER" != 1 ]]; then
-    echo "  thunder RPC:     127.0.0.1:6009   (point payout worker at this)"
-    echo "  thunder P2P:     127.0.0.1:4009"
+    echo "  thunder RPC:     127.0.0.1:$THUNDER_RPC_PORT   (point payout worker at this)"
+    echo "  thunder P2P:     127.0.0.1:$THUNDER_P2P_PORT"
 fi
 echo ""
 echo "next: scripts/regtest/validate.sh"

@@ -18,7 +18,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RPC="$ROOT/scripts/enforcer-rpc.sh"
-export ENFORCER_URL="${ENFORCER_URL:-http://127.0.0.1:50051}"
+export ENFORCER_URL="${ENFORCER_URL:-http://127.0.0.1:${REGTEST_ENFORCER_GRPC_PORT:-50051}}"
 SIDECHAIN_ID=9
 # Reward address for GenerateToAddress; any valid regtest address works.
 MINE_ADDR="${REGTEST_MINE_ADDR:-bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080}"

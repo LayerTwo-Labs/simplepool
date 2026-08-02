@@ -8,6 +8,13 @@ in `.github/workflows/check_build.yaml`.
 
 ## Integration tests
 
+Upstream binary versions are pinned in the pinned-versions block of
+`scripts/regtest/setup.sh` (thunder by GitHub release tag, the L1 node
+by versioned zip). Bump them there — deliberately, with a revalidating
+run — when moving to a new upstream. The enforcer is the exception
+(latest-only artifacts upstream); setup.sh warns when it drifts from
+the version last validated against.
+
 - `test_integration.sh` — smoke test of the stratum surface against a
   running regtest bitcoind (subscribe/authorize/bogus-submit via nc,
   then asserts the reject landed in SQLite). Best-effort: skips cleanly
@@ -31,5 +38,21 @@ in `.github/workflows/check_build.yaml`.
 
       bash tests/test_e2e_regtest.sh
 
-CI runs the e2e in `.github/workflows/integration_tests.yaml` on every
-PR and push to main.
+- `test_payout_regtest.sh` — the Thunder payout path the coinbase e2e
+  skips: wallet-ENABLED enforcer + thunder, sidechain #9 activated, a
+  real `CreateDepositTransaction` moving 1 BTC into thunder (BMM-mining
+  a thunder block to credit it), then one payout tick via
+  `payout/run-once.mjs`. Asserts the at-most-once ledger settled
+  (payouts row with txid, `paid_sats` bumped, no in-flight rows),
+  thunder's `get_transaction` knows the txid, and the reserve balance
+  math is exact. Needs node ≥ 20. Same isolation model, own
+  `.regtest-payout/` dir:
+
+      bash tests/test_payout_regtest.sh
+
+Both one-shot tests allocate their stack ports dynamically per run, so
+they can run concurrently — with each other and with a dev stack from
+`scripts/regtest/start.sh` (which keeps the traditional fixed ports;
+override via the `REGTEST_*_PORT` env vars). CI runs them as separate
+jobs in `.github/workflows/integration_tests.yaml` on every PR and
+push to main.
