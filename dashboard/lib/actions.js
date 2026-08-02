@@ -12,6 +12,81 @@
 
 import { enforcerRpc } from './enforcer.js';
 
+/* ---------- transaction attempt log ---------- */
+
+/* Record every broadcast attempt, successful or not, into tx_attempts.
+ *
+ * A failed broadcast used to leave nothing behind but a flash message that
+ * vanished on the next page load — and the raw transaction, which is what
+ * you actually need to diagnose a rejection, was never surfaced anywhere.
+ *
+ * Best-effort by design: a logging failure must never change the outcome of
+ * the action that was attempted, so this swallows its own errors and returns
+ * the row id (or null). Callers pass the fullest error text they have; the
+ * column is deliberately untruncated. */
+export function recordTxAttempt(db, {
+    kind, status, stage = null, txid = null, rawTx = null,
+    amountSats = null, feeSats = null, destination = null,
+    workerId = null, error = null, detail = null,
+}) {
+    if (!db || typeof db.prepare !== 'function') return null;
+    try {
+        const info = db.prepare(`
+            INSERT INTO tx_attempts
+                (ts, kind, status, stage, txid, raw_tx, amount_sats, fee_sats,
+                 destination, worker_id, error, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(Math.floor(Date.now() / 1000), kind, status, stage, txid, rawTx,
+               amountSats === null ? null : Number(amountSats),
+               feeSats    === null ? null : Number(feeSats),
+               destination, workerId, error,
+               detail === null ? null
+                   : (typeof detail === 'string' ? detail : JSON.stringify(detail)));
+        return info.lastInsertRowid;
+    } catch {
+        return null;   /* never let logging break the action */
+    }
+}
+
+/* After a deposit broadcast fails, the enforcer has still built and SIGNED
+ * the transaction — it only failed to hand it to bitcoind. That signed tx is
+ * in the enforcer's wallet, so it can be recovered and shown to the operator.
+ *
+ * Matches on amount + sidechain rather than txid, because a failed
+ * CreateDepositTransaction returns no txid at all. Returns the newest
+ * plausible match, or null. Never throws: this runs on an error path and
+ * must not mask the original failure. */
+async function recoverDepositTx(enforcerGrpcAddr, sidechainId, valueSats) {
+    try {
+        const j = await enforcerRpc(enforcerGrpcAddr,
+            'cusf.mainchain.v1.WalletService/ListSidechainDepositTransactions',
+            {}, 15_000);
+        const rows = j?.transactions || [];
+        const want = Number(valueSats);
+        /* Newest first — the enforcer returns oldest-first in practice, and
+         * the attempt we just made is by definition the most recent. */
+        for (let i = rows.length - 1; i >= 0; i--) {
+            const r  = rows[i];
+            const sn = r?.sidechainNumber?.value ?? r?.sidechain_number?.value
+                     ?? r?.sidechainNumber ?? r?.sidechain_number;
+            if (sn !== undefined && Number(sn) !== Number(sidechainId)) continue;
+            const tx = r?.tx || r?.transaction;
+            if (!tx) continue;
+            /* Unconfirmed only: a confirmed tx cannot be the one that just
+             * failed to broadcast. */
+            if (tx.confirmationInfo || tx.confirmation_info) continue;
+            const sent = Number(tx.sentSats ?? tx.sent_sats ?? 0);
+            if (want && sent && Math.abs(sent - want) > Number(tx.feeSats ?? tx.fee_sats ?? 0) + 1000) continue;
+            return {
+                txid:  tx.txid?.hex  ?? (typeof tx.txid === 'string' ? tx.txid : null),
+                rawTx: tx.rawTransaction?.hex ?? tx.raw_transaction?.hex
+                       ?? (typeof tx.rawTransaction === 'string' ? tx.rawTransaction : null),
+            };
+        }
+    } catch { /* recovery is a bonus, not a requirement */ }
+    return null;
+}
+
 /* ---------- Thunder RPC helper ---------- */
 
 async function thunderRpc(rpcUrl, method, params) {
@@ -142,56 +217,78 @@ export async function createDeposit({
     const fee = BigInt(feeSats || 0);
     if (fee < 0n) return { ok: false, msg: 'fee_sats must be >= 0' };
 
+    const params = { sidechain_id: sid, address, value_sats: Number(val), fee_sats: Number(fee) };
+
     let j;
     try {
         j = await enforcerRpc(enforcerGrpcAddr,
-            'cusf.mainchain.v1.WalletService/CreateDepositTransaction', {
-                sidechain_id: sid,
-                address,
-                value_sats:   Number(val),
-                fee_sats:     Number(fee),
-            }, 60_000);
+            'cusf.mainchain.v1.WalletService/CreateDepositTransaction',
+            params, 60_000);
     } catch (e) {
+        /* Broadcast failed. The enforcer still SIGNED the transaction, so
+         * recover it and show the operator what was actually built — that is
+         * the only way to diagnose a node-side rejection such as
+         * `-26 scriptpubkey`. The full error is stored untruncated. */
+        const full = e.message || String(e);
+        const rec  = await recoverDepositTx(enforcerGrpcAddr, sid, val);
+        recordTxAttempt(db, {
+            kind: 'deposit', status: 'failed', stage: 'broadcast',
+            txid: rec?.txid || null, rawTx: rec?.rawTx || null,
+            amountSats: val, feeSats: fee, destination: address,
+            error: full, detail: params,
+        });
         return {
             ok: false,
             msg: 'CreateDepositTransaction failed',
-            detail: (e.message || String(e)).slice(0, 500),
+            detail: full,
+            txid:  rec?.txid  || null,
+            rawTx: rec?.rawTx || null,
         };
     }
 
     /* Enforcer returns JSON with a `txid` field (bytes as base64 or hex
-     * depending on version). Parse whatever it gave us; if we can't find
-     * a txid, still consider the call a success and echo the raw output
-     * so the operator can inspect. */
+     * depending on version). */
     const txid =
         j.txid?.hex || j.txid?.value?.hex ||
         (typeof j.txid === 'string' ? j.txid : null);
 
-    /* Log to deposits so /admin history shows it. Best-effort — never fail
-     * the whole action just because the DB write hiccuped. `db` may be
-     * null if the writable handle couldn't open (e.g. file missing) —
-     * still consider the deposit successful. */
+    /* Fetch the raw hex so a successful deposit is just as inspectable as a
+     * failed one. */
+    const rec = await recoverDepositTx(enforcerGrpcAddr, sid, val);
+
+    recordTxAttempt(db, {
+        kind: 'deposit', status: 'broadcast', stage: 'broadcast',
+        txid: txid || rec?.txid || null, rawTx: rec?.rawTx || null,
+        amountSats: val, feeSats: fee, destination: address,
+        detail: params,
+    });
+
+    /* Permanent deposit ledger. Column names must match schema.sql — they
+     * previously did not (ctip_before/ctip_after/note vs
+     * ctip_seq_before/ctip_seq_after/notes), so every INSERT threw and no
+     * deposit was ever recorded, successful or otherwise. */
+    let dbNote = '';
     if (db && typeof db.prepare === 'function') {
         try {
-            const nowSec = Math.floor(Date.now() / 1000);
             db.prepare(`
                 INSERT INTO deposits
-                    (ts, btc_txid, sats_deposited, fee_sats, thunder_recipient, ctip_before, ctip_after, note)
+                    (ts, btc_txid, sats_deposited, fee_sats, thunder_recipient,
+                     ctip_seq_before, ctip_seq_after, notes)
                 VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)
-            `).run(nowSec, txid || '(pending)', Number(val), Number(fee),
-                   address, `via admin dashboard, sidechain_id=${sid}`);
+            `).run(Math.floor(Date.now() / 1000), txid || '(pending)',
+                   Number(val), Number(fee), address,
+                   `via admin dashboard, sidechain_id=${sid}`);
         } catch (e) {
-            return {
-                ok: true,
-                msg: `deposit tx created (DB log failed: ${e.message})`,
-                detail: txid ? `txid=${txid}` : JSON.stringify(j).slice(0, 300),
-            };
+            dbNote = ` (deposit-ledger write failed: ${e.message})`;
         }
     }
+
     return {
         ok: true,
-        msg: `deposit tx submitted`,
+        msg: `deposit tx submitted${dbNote}`,
         detail: txid ? `txid=${txid}, ${val} sats to ${address}` :
                        `see raw enforcer response: ${JSON.stringify(j).slice(0, 200)}`,
+        txid:  txid || rec?.txid || null,
+        rawTx: rec?.rawTx || null,
     };
 }

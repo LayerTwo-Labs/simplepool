@@ -37,12 +37,15 @@ export function createAdminRouter({
                 Promise.resolve(admin.recentDeposits(db, 25)),
                 Promise.resolve(admin.recentBlocksFound(db, 15)),
             ]);
+        /* Broadcast attempts, both kinds, successes and failures. Cheap
+         * enough to include on every admin render. */
+        const txAttempts = admin.recentTxAttempts(db, { limit: 40 });
         return {
             reserve, enforcer,
             reserveAddress:        RESERVE_ADDRESS,
             reserveSidechainId:    THUNDER_SIDECHAIN_ID,
             payoutAdminConfigured: !!PAYOUT_ADMIN_URL,
-            totals, workers, inFlight, payouts, deposits, blocks,
+            totals, workers, inFlight, payouts, deposits, blocks, txAttempts,
         };
     }
 

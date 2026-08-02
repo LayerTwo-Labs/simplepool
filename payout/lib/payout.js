@@ -25,7 +25,8 @@
  * Failure isolation: per-worker payouts are NOT batched into one tx —
  * a bad address or transient RPC error must not block other miners. */
 
-import { listDue, listStuck, beginPayout, finalizePayout, abortPayout } from './db.js';
+import { listDue, listStuck, beginPayout, finalizePayout, abortPayout,
+         recordTxAttempt, asRawTx } from './db.js';
 
 /* Fee model: flat per-tx fee, configurable later. Thunder is a sidechain
  * with relatively low fees; 100 sats covers a one-input one-output tx
@@ -73,13 +74,33 @@ export async function runOnce(ctx, log) {
         const rowId = beginPayout(db, r.worker_id, r.owed_sats, now_s);
         let txid;
         try {
-            txid = await thunder.transfer(
+            const res = await thunder.transferDetailed(
                 r.thunder_address, r.owed_sats, TX_FEE_SATS);
+            txid = res.txid;
+            /* Record the successful attempt with its transaction so the
+             * dashboard can show it alongside the failures. */
+            recordTxAttempt(db, {
+                kind: 'payout', status: 'broadcast', stage: 'submit',
+                txid, rawTx: asRawTx(res.signed),
+                amountSats: r.owed_sats, feeSats: TX_FEE_SATS,
+                destination: r.thunder_address, workerId: r.worker_id,
+            });
         } catch (e) {
-            /* Broadcast failed cleanly — no txid was issued. Drop the
-             * in-flight row so the worker is eligible next tick. */
+            /* Drop the in-flight row so the worker is eligible next tick.
+             * Safe for create/sign, which are local and cannot have
+             * broadcast; a submit failure keeps the usual ambiguity and is
+             * caught by the stuck-row sweep. */
             abortPayout(db, rowId);
-            log.warn(`payout: ${r.worker_name} broadcast failed: ${e.message}`);
+            /* Keep the transaction. It is the whole point of a failure
+             * report — without it there is nothing to inspect. */
+            recordTxAttempt(db, {
+                kind: 'payout', status: 'failed', stage: e.stage || 'unknown',
+                rawTx: asRawTx(e.signed || e.unsigned),
+                amountSats: r.owed_sats, feeSats: TX_FEE_SATS,
+                destination: r.thunder_address, workerId: r.worker_id,
+                error: e.message || String(e),
+            });
+            log.warn(`payout: ${r.worker_name} ${e.stage || 'transfer'} failed: ${e.message}`);
             failed++;
             continue;
         }

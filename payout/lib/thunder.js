@@ -69,10 +69,41 @@ export class ThunderClient {
      * the old one-shot transfer had, and payout.js already treats it
      * that way (abort + retry next tick, stuck-row sweep as backstop). */
     async transfer(dest, valueSats, feeSats) {
-        const unsigned = await this._call('create_transfer',
-            [dest, Number(valueSats), Number(feeSats)]);
-        const signed = await this._call('sign_transaction', [unsigned, false]);
-        return this._call('submit_transaction', [signed]);
+        return (await this.transferDetailed(dest, valueSats, feeSats)).txid;
+    }
+
+    /* Same three RPCs, but keeps hold of the intermediate transactions and
+     * reports which step failed.
+     *
+     * The transaction is what an operator needs to diagnose a rejection, and
+     * previously it was discarded — a failure surfaced as a bare message with
+     * no way to inspect what had been built. On error this throws with
+     * `.stage` ('create' | 'sign' | 'submit') and whatever transactions had
+     * been produced by then attached, so the caller can record them.
+     *
+     * The stage also disambiguates the broadcast question: create and sign
+     * are local, so a throw from either is a clean abort that definitely put
+     * nothing on the network. Only a throw from `submit` carries the usual
+     * did-it-or-didn't-it ambiguity. */
+    async transferDetailed(dest, valueSats, feeSats) {
+        let unsigned = null, signed = null;
+        const fail = (stage, err) => {
+            err.stage    = stage;
+            err.unsigned = unsigned;
+            err.signed   = signed;
+            return err;
+        };
+        try {
+            unsigned = await this._call('create_transfer',
+                [dest, Number(valueSats), Number(feeSats)]);
+        } catch (e) { throw fail('create', e); }
+        try {
+            signed = await this._call('sign_transaction', [unsigned, false]);
+        } catch (e) { throw fail('sign', e); }
+        try {
+            const txid = await this._call('submit_transaction', [signed]);
+            return { txid, unsigned, signed };
+        } catch (e) { throw fail('submit', e); }
     }
 
     async getWalletAddresses() {
