@@ -51,7 +51,7 @@ esac
 # releases.drivechain.info hosts only -latest- zips, so it CANNOT be
 # URL-pinned. We record the version we validated against and warn (not
 # fail) on drift; when the warning fires, revalidate and bump.
-THUNDER_VERSION=0.16.1
+THUNDER_VERSION=0.17.0
 BITCOIN_PATCHED_VERSION=v30.2
 ENFORCER_VALIDATED_VERSION=v0.3.4
 
