@@ -60,12 +60,12 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
-  # Dashboard audit surface. Compiling the EJS templates is not enough — a
+  # Node-side unit tests (dashboard audit surface + payout worker). Compiling the EJS templates is not enough — a
   # template can compile and still throw at render time, and a lib function
   # can be valid while calling a helper that is not in scope. Both shipped
   # once, so these drive the real query + render path against a real DB.
   # Cheap (no chain, no build) so it runs on every push.
-  dashboard-test:
+  node-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -83,6 +83,14 @@ jobs:
 
       - name: Run dashboard tests
         working-directory: dashboard
+        run: npm test
+
+      - name: Install payout dependencies
+        working-directory: payout
+        run: npm ci || npm install
+
+      - name: Run payout worker tests
+        working-directory: payout
         run: npm test
 
   # The payout path the coinbase e2e skips: wallet-enabled enforcer +

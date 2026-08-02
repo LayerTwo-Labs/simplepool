@@ -93,6 +93,10 @@
         </table>
         <% } %>
     </section>
+    <%- include('partial/tx-attempts', {
+            attempts: txAttempts.filter(a => a.kind === 'payout'),
+            kindLabel: 'Payout broadcast attempts' }) %>
+
 </main>
 <footer class="foot">
     <span>auto-refresh 15s</span>

@@ -115,3 +115,45 @@ export function listStuck(db, staleAfterSec, nowSec) {
         ORDER BY p.started_at ASC
     `).all(nowSec - staleAfterSec);
 }
+
+/* Record a broadcast attempt, successful or not, into tx_attempts.
+ *
+ * A failed payout previously left only a log line: the transaction that was
+ * built — the thing you actually need to diagnose a rejection — was
+ * discarded. This keeps it.
+ *
+ * Best-effort: logging must never change the outcome of the payout it is
+ * describing, so this swallows its own errors. In particular it must not
+ * throw on a database that predates the tx_attempts table. */
+export function recordTxAttempt(db, {
+    kind, status, stage = null, txid = null, rawTx = null,
+    amountSats = null, feeSats = null, destination = null,
+    workerId = null, error = null, detail = null,
+}) {
+    if (!db || typeof db.prepare !== 'function') return null;
+    try {
+        const info = db.prepare(`
+            INSERT INTO tx_attempts
+                (ts, kind, status, stage, txid, raw_tx, amount_sats, fee_sats,
+                 destination, worker_id, error, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(Math.floor(Date.now() / 1000), kind, status, stage, txid, rawTx,
+               amountSats === null ? null : Number(amountSats),
+               feeSats    === null ? null : Number(feeSats),
+               destination, workerId, error,
+               detail === null ? null
+                   : (typeof detail === 'string' ? detail : JSON.stringify(detail)));
+        return info.lastInsertRowid;
+    } catch {
+        return null;
+    }
+}
+
+/* Thunder's RPCs return transactions as JSON objects, not hex. Store a
+ * canonical JSON rendering so the operator has the exact bytes that were
+ * signed; fall back to a string as-is if a future version returns hex. */
+export function asRawTx(tx) {
+    if (tx == null) return null;
+    if (typeof tx === 'string') return tx;
+    try { return JSON.stringify(tx); } catch { return null; }
+}

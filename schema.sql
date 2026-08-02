@@ -154,3 +154,33 @@ CREATE TABLE IF NOT EXISTS payouts_in_flight (
   started_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS payouts_in_flight_worker_idx ON payouts_in_flight(worker_id);
+
+/* Every attempt to broadcast a transaction, successful or not. Owned by the
+ * dashboard and the payout worker; the C proxy never writes here.
+ *
+ * `deposits` and `payouts` record what actually happened. A failed broadcast
+ * is neither, but it is the thing an operator most needs to see — so it
+ * lands here instead, with the raw transaction whenever it can be recovered.
+ * Without this a failure left nothing behind but a truncated flash message.
+ *
+ * raw_tx is the full hex when obtainable. For a deposit that failed at
+ * broadcast the enforcer has still signed and stored the tx, so it can be
+ * recovered afterwards via ListSidechainDepositTransactions; `stage` records
+ * how far the attempt got. */
+CREATE TABLE IF NOT EXISTS tx_attempts (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts          INTEGER NOT NULL,   /* unix seconds */
+  kind        TEXT    NOT NULL,   /* 'deposit' | 'payout' */
+  status      TEXT    NOT NULL,   /* 'broadcast' | 'failed' */
+  stage       TEXT,               /* step reached when it failed */
+  txid        TEXT,
+  raw_tx      TEXT,               /* full hex, when recoverable */
+  amount_sats INTEGER,
+  fee_sats    INTEGER,
+  destination TEXT,
+  worker_id   INTEGER,            /* payouts only */
+  error       TEXT,               /* full, never truncated */
+  detail      TEXT                /* JSON: request params */
+);
+CREATE INDEX IF NOT EXISTS tx_attempts_ts_idx   ON tx_attempts(ts);
+CREATE INDEX IF NOT EXISTS tx_attempts_kind_idx ON tx_attempts(kind, ts);

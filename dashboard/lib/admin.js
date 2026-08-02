@@ -310,3 +310,52 @@ export async function thunderBalance(rpcUrl, timeoutMs = 1500) {
         clearTimeout(t);
     }
 }
+
+/* Broadcast attempts — successes and failures — newest first.
+ *
+ * `deposits` and `payouts` hold what succeeded. This holds what was *tried*,
+ * with the transaction attached, which is what an operator needs when the
+ * node rejects something. Filter by kind ('deposit' | 'payout') or pass null
+ * for both.
+ *
+ * Tolerates a database predating the table: returns [] rather than throwing,
+ * so an older DB degrades to "no history" instead of a 500. */
+export function recentTxAttempts(handle, { kind = null, limit = 25, failedOnly = false } = {}) {
+    const db = unwrap(handle);
+    if (!db) return [];
+    try {
+        const where = [];
+        const args  = [];
+        if (kind)       { where.push('a.kind = ?');       args.push(kind); }
+        if (failedOnly) { where.push("a.status = 'failed'"); }
+        const sql = `
+            SELECT a.id, a.ts, a.kind, a.status, a.stage, a.txid, a.raw_tx,
+                   a.amount_sats, a.fee_sats, a.destination, a.worker_id,
+                   a.error, a.detail, w.name AS worker_name
+              FROM tx_attempts a
+              LEFT JOIN workers w ON w.id = a.worker_id
+             ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+             ORDER BY a.ts DESC, a.id DESC
+             LIMIT ?`;
+        args.push(limit);
+        return db.prepare(sql).all(...args).map(r => ({
+            id:          Number(r.id),
+            ts:          Number(r.ts),
+            kind:        r.kind,
+            status:      r.status,
+            stage:       r.stage,
+            txid:        r.txid,
+            raw_tx:      r.raw_tx,
+            amount_sats: r.amount_sats === null ? null : Number(r.amount_sats),
+            fee_sats:    r.fee_sats    === null ? null : Number(r.fee_sats),
+            destination: r.destination,
+            worker_id:   r.worker_id === null ? null : Number(r.worker_id),
+            worker_name: r.worker_name,
+            error:       r.error,
+            detail:      r.detail,
+            ok:          r.status === 'broadcast',
+        }));
+    } catch {
+        return [];   /* pre-tx_attempts DB */
+    }
+}

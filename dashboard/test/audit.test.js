@@ -160,3 +160,134 @@ test('solo-style DB (no credits) does not produce a pps audit', () => {
     const w = stats.worker(handle, '3RobWZetukZUXY9kk763AtMyoJtJ.rig1', 86400);
     assert.equal(w.pps_audit, null);
 });
+
+/* ---------------- transaction visibility ---------------- */
+
+import { recordTxAttempt } from '../lib/actions.js';
+
+function attemptsDb() {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sp-tx-')), 'shares.db');
+    const db = new Database(file);
+    db.exec(fs.readFileSync(SCHEMA, 'utf8'));
+    db.prepare(`INSERT INTO workers (id, name, first_seen, last_seen, payout_address)
+                VALUES (1, 'rig1', 1000, 2000, '3RobWZetukZUXY9kk763AtMyoJtJ')`).run();
+    return { db, handle: { get: () => db } };
+}
+
+test('a failed attempt is persisted with its raw transaction and full error', () => {
+    const { db, handle } = attemptsDb();
+    /* The real drynet3 failure: enforcer signs, bitcoind rejects the
+     * OP_DRIVECHAIN output as nonstandard. */
+    const err = 'failed to broadcast tx: ErrorObject { code: ServerError(-26), '
+              + 'message: "scriptpubkey", data: None }';
+    recordTxAttempt(db, {
+        kind: 'deposit', status: 'failed', stage: 'broadcast',
+        txid: '5d30eee0c5226e2e0a849c87c17dbc99ac2619878ef456af697af8f7539492dd',
+        rawTx: '0200000001abcd', amountSats: 100000, feeSats: 1000,
+        destination: '3MA4uE5RsmQmJuSNYwGC125NVnVJ',
+        error: err, detail: { sidechain_id: 9 },
+    });
+    const rows = admin.recentTxAttempts(handle, { kind: 'deposit' });
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].ok, false);
+    assert.equal(rows[0].stage, 'broadcast');
+    assert.equal(rows[0].raw_tx, '0200000001abcd');
+    /* Untruncated — the reject reason is at the end of the string. */
+    assert.equal(rows[0].error, err);
+    assert.match(rows[0].error, /scriptpubkey/);
+    assert.match(rows[0].detail, /sidechain_id/);
+});
+
+test('successful attempts are recorded too, and kinds are separable', () => {
+    const { db, handle } = attemptsDb();
+    recordTxAttempt(db, { kind: 'deposit', status: 'broadcast', txid: 'aa', amountSats: 5 });
+    recordTxAttempt(db, { kind: 'payout',  status: 'broadcast', txid: 'bb', amountSats: 6, workerId: 1 });
+    recordTxAttempt(db, { kind: 'payout',  status: 'failed', stage: 'submit', error: 'boom', workerId: 1 });
+
+    assert.equal(admin.recentTxAttempts(handle).length, 3);
+    assert.equal(admin.recentTxAttempts(handle, { kind: 'deposit' }).length, 1);
+    assert.equal(admin.recentTxAttempts(handle, { kind: 'payout' }).length, 2);
+    assert.equal(admin.recentTxAttempts(handle, { failedOnly: true }).length, 1);
+    /* Payout rows resolve the worker name for display. */
+    const p = admin.recentTxAttempts(handle, { kind: 'payout' }).find(r => !r.ok);
+    assert.equal(p.worker_name, 'rig1');
+    assert.equal(p.stage, 'submit');
+});
+
+test('recording never throws on a DB predating tx_attempts', () => {
+    const { db, handle } = attemptsDb();
+    db.exec('DROP TABLE tx_attempts');
+    assert.equal(recordTxAttempt(db, { kind: 'deposit', status: 'failed' }), null);
+    assert.deepEqual(admin.recentTxAttempts(handle), []);
+});
+
+test('the deposits ledger INSERT matches the schema', () => {
+    /* Regression: the INSERT used ctip_before/ctip_after/note while the
+     * schema has ctip_seq_before/ctip_seq_after/notes, so every write threw
+     * and no deposit was ever recorded — success or failure. */
+    const { db } = attemptsDb();
+    db.prepare(`
+        INSERT INTO deposits
+            (ts, btc_txid, sats_deposited, fee_sats, thunder_recipient,
+             ctip_seq_before, ctip_seq_after, notes)
+        VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)
+    `).run(1, 'txid', 100, 1, 'addr', 'note');
+    assert.equal(db.prepare('SELECT count(*) n FROM deposits').get().n, 1);
+});
+
+test('deposits and payouts pages render with attempts', async () => {
+    const { db, handle } = attemptsDb();
+    recordTxAttempt(db, {
+        kind: 'deposit', status: 'failed', stage: 'broadcast',
+        rawTx: 'deadbeef', amountSats: 100000, destination: 'addr',
+        error: 'message: "scriptpubkey"',
+    });
+    recordTxAttempt(db, {
+        kind: 'payout', status: 'broadcast', txid: 'cc',
+        rawTx: '{"tx":1}', amountSats: 7, workerId: 1, destination: 'addr2',
+    });
+    const txAttempts = admin.recentTxAttempts(handle);
+    const html = await render('partial/tx-attempts.ejs',
+                              { attempts: txAttempts, kindLabel: 'All attempts' });
+    assert.match(html, /scriptpubkey/);       /* the error is visible */
+    assert.match(html, /deadbeef/);           /* the raw tx is visible */
+    assert.match(html, /failed/);
+});
+
+test('FULL admin-deposits and admin-payouts pages render', async () => {
+    /* Rendering the partial in isolation is not enough — the 500 that shipped
+     * in #21 compiled fine and only threw when the real page was assembled.
+     * These render the whole view with the locals the router supplies. */
+    const { db, handle } = attemptsDb();
+    recordTxAttempt(db, {
+        kind: 'deposit', status: 'failed', stage: 'broadcast',
+        rawTx: 'deadbeef', amountSats: 1, destination: 'a', error: 'scriptpubkey',
+    });
+    recordTxAttempt(db, {
+        kind: 'payout', status: 'broadcast', txid: 'cc',
+        amountSats: 2, workerId: 1, destination: 'b',
+    });
+
+    const locals = {
+        reserve:  { ok: true, balance_sats: 0, available_sats: 0 },
+        enforcer: { ok: true, confirmed_sats: 1000, pending_sats: 0 },
+        totals:   { accrued: 0, paid: 0, owed: 0, workers: 1 },
+        workers:  [],
+        inFlight: [],
+        payouts:  admin.recentPayouts(handle, 25),
+        deposits: admin.recentDeposits(handle, 25),
+        blocks:   [],
+        txAttempts:            admin.recentTxAttempts(handle),
+        reserveAddress:        '3MA4uE5RsmQmJuSNYwGC125NVnVJ',
+        reserveSidechainId:    9,
+        payoutAdminConfigured: true,
+        csrfToken: 'test-token',
+        flash:     null,
+    };
+
+    for (const view of ['admin-deposits.ejs', 'admin-payouts.ejs']) {
+        const html = await render(view, locals);
+        assert.ok(html.length > 0, `${view} rendered empty`);
+        assert.match(html, /broadcast attempts/i, `${view} missing the attempts table`);
+    }
+});

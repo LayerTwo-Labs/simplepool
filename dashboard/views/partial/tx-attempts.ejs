@@ -1,0 +1,104 @@
+<%
+/* Broadcast attempts — successes AND failures — with the transaction.
+ *
+ * The point of this table is the failure rows. `deposits` and `payouts`
+ * already show what worked; a rejected broadcast used to leave nothing
+ * behind but a flash message, so there was no way to see what had been
+ * built or why the node refused it.
+ *
+ * Expects: attempts (array), and optionally kindLabel for the heading.
+ */
+const rows = (typeof attempts !== 'undefined' && attempts) ? attempts : [];
+const label = (typeof kindLabel !== 'undefined' && kindLabel) ? kindLabel : 'Broadcast attempts';
+const failures = rows.filter(r => !r.ok).length;
+%>
+<section class="card">
+    <h2><%= label %>
+        <% if (failures > 0) { %>
+            <span class="tag" style="background:#5a2a2a;color:#f3c6c6"><%= failures %> failed</span>
+        <% } %>
+    </h2>
+
+    <% if (rows.length === 0) { %>
+        <p class="muted">
+            No attempts recorded yet. Every deposit and payout broadcast lands
+            here, successful or not, with its transaction attached.
+        </p>
+    <% } else { %>
+    <p class="muted small" style="margin-top:0">
+        Newest first. A failed row keeps the transaction that was built — for a
+        deposit the enforcer signs before broadcasting, so the tx exists even
+        when the node rejects it. Copy the hex into
+        <code>bitcoin-cli decoderawtransaction</code> or
+        <code>testmempoolaccept</code> to inspect.
+    </p>
+    <table>
+        <thead>
+            <tr>
+                <th>When</th>
+                <th>Kind</th>
+                <th>Result</th>
+                <th>Amount</th>
+                <th>Destination</th>
+                <th>Transaction</th>
+            </tr>
+        </thead>
+        <tbody>
+        <% for (const r of rows) { %>
+            <tr>
+                <td class="mono small" title="<%= fmtTs(r.ts) %>"><%= ago(r.ts) %></td>
+                <td><%= r.kind %><% if (r.worker_name) { %><br><span class="muted small"><%= r.worker_name %></span><% } %></td>
+                <td>
+                    <% if (r.ok) { %>
+                        <span style="color:#5b8">✓ broadcast</span>
+                    <% } else { %>
+                        <span style="color:#c66">✗ failed</span>
+                        <% if (r.stage) { %><br><span class="muted small">at <%= r.stage %></span><% } %>
+                    <% } %>
+                </td>
+                <td class="mono small">
+                    <%= r.amount_sats === null ? '—' : fmtSats(r.amount_sats) %>
+                    <% if (r.fee_sats) { %><br><span class="muted small">fee <%= r.fee_sats %></span><% } %>
+                </td>
+                <td class="mono small" style="word-break:break-all;max-width:16em"><%= r.destination || '—' %></td>
+                <td style="max-width:32em">
+                    <% if (r.txid) { %>
+                        <div class="mono small" style="word-break:break-all">txid <%= r.txid %></div>
+                    <% } else if (!r.ok) { %>
+                        <div class="muted small">no txid — rejected before the node accepted it</div>
+                    <% } %>
+
+                    <% if (r.raw_tx) { %>
+                        <details>
+                            <summary class="small">raw transaction (<%= r.raw_tx.length %> chars)</summary>
+                            <textarea readonly rows="4"
+                                      style="width:100%;font-family:monospace;font-size:11px;word-break:break-all"
+                                      onclick="this.select()"><%= r.raw_tx %></textarea>
+                        </details>
+                    <% } else if (!r.ok) { %>
+                        <div class="muted small">
+                            transaction not recoverable — the attempt failed before one was built,
+                            or the enforcer had not retained it
+                        </div>
+                    <% } %>
+
+                    <% if (r.error) { %>
+                        <details open>
+                            <summary class="small" style="color:#c66">error</summary>
+                            <pre class="small" style="white-space:pre-wrap;word-break:break-word;margin:0.3em 0 0"><%= r.error %></pre>
+                        </details>
+                    <% } %>
+
+                    <% if (r.detail) { %>
+                        <details>
+                            <summary class="small">request</summary>
+                            <pre class="small" style="white-space:pre-wrap;word-break:break-word;margin:0.3em 0 0"><%= r.detail %></pre>
+                        </details>
+                    <% } %>
+                </td>
+            </tr>
+        <% } %>
+        </tbody>
+    </table>
+    <% } %>
+</section>
