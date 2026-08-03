@@ -32,7 +32,10 @@ const GROSS = 2811.32740041998;
  * around, because different call sites use different ones — which is exactly
  * what broke before. */
 function makeDb({ rateSource = 'derived', rate = RATE, feeBps = 100,
-                  effectiveFeeBps = 100, shares = 40 } = {}) {
+                  effectiveFeeBps = 100, shares = 40,
+                  /* legacy: emulate a DB written before rate_used existed, so
+                   * the credits are present but nothing can be recomputed. */
+                  legacy = false, logRate = true } = {}) {
     const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sp-audit-')), 'shares.db');
     const db = new Database(file);
     db.exec(fs.readFileSync(SCHEMA, 'utf8'));
@@ -40,14 +43,23 @@ function makeDb({ rateSource = 'derived', rate = RATE, feeBps = 100,
     db.prepare(`INSERT INTO workers (id, name, first_seen, last_seen, payout_address)
                 VALUES (1, '3RobWZetukZUXY9kk763AtMyoJtJ.rig1', 1000, 2000, '3RobWZetukZUXY9kk763AtMyoJtJ')`).run();
 
-    const ins = db.prepare(`INSERT INTO shares (worker_id, ts, difficulty, is_block, block_hash, credited_sats)
-                            VALUES (1, ?, ?, ?, ?, ?)`);
+    /* The proxy appends here on every rate change; a share's rate_used must
+     * be findable in it. */
+    if (logRate) {
+        db.prepare(`INSERT INTO rate_history (ts, rate_sats_per_diff, gross_sats_per_diff,
+                        fee_bps, network_difficulty, block_value_sats, rate_source)
+                    VALUES (900, ?, ?, ?, 111157.455354832, 312500000, ?)`)
+          .run(rate, GROSS, feeBps, rateSource);
+    }
+
+    const ins = db.prepare(`INSERT INTO shares (worker_id, ts, difficulty, is_block, block_hash, credited_sats, rate_used)
+                            VALUES (1, ?, ?, ?, ?, ?, ?)`);
     let accrued = 0;
     for (let i = 0; i < shares; i++) {
         const diff = 1 + (i % 5);
         const credited = Math.floor(diff * rate);   /* per-share truncation, as the proxy does */
         accrued += credited;
-        ins.run(1000 + i, diff, i === 7 ? 1 : 0, 'hash' + i, credited);
+        ins.run(1000 + i, diff, i === 7 ? 1 : 0, 'hash' + i, credited, legacy ? 0 : rate);
     }
     db.prepare(`INSERT INTO pps_credits (worker_id, accrued_sats, paid_sats, last_updated)
                 VALUES (1, ?, 0, 2000)`).run(accrued);
@@ -289,5 +301,132 @@ test('FULL admin-deposits and admin-payouts pages render', async () => {
         const html = await render(view, locals);
         assert.ok(html.length > 0, `${view} rendered empty`);
         assert.match(html, /broadcast attempts/i, `${view} missing the attempts table`);
+    }
+});
+
+/* ---------- verification: the checks, and the failures they must catch ----
+ *
+ * A verifier that only ever passes is indistinguishable from no verifier, so
+ * each of the three checks gets a test that deliberately breaks it. */
+
+test('verification re-derives every credited share from its own stored rate', () => {
+    const { db } = makeDb();
+    const v = stats.rateVerification(db);
+    assert.equal(v.ok, true);
+    assert.equal(v.mismatched, 0);
+    assert.equal(v.orphaned, 0);
+    assert.equal(v.rates_inconsistent, 0);
+    assert.equal(v.verifiable, 40);
+    assert.equal(v.coverage_pct, 100);
+});
+
+test('verification catches a credit that does not match its own rate', () => {
+    const { db } = makeDb();
+    /* Exactly the tamper the audit exists to detect: the ledger says one
+     * thing, the arithmetic says another. */
+    db.prepare('UPDATE shares SET credited_sats = credited_sats + 1 WHERE id = 3').run();
+    const v = stats.rateVerification(db);
+    assert.equal(v.ok, false);
+    assert.equal(v.mismatched, 1);
+});
+
+test('verification catches a rate that does not follow from its inputs', () => {
+    const { db } = makeDb();
+    /* Rate applied consistently to every share, but derived wrongly — the
+     * per-share check alone cannot see this. */
+    db.prepare('UPDATE rate_history SET block_value_sats = 999999999').run();
+    const v = stats.rateVerification(db);
+    assert.equal(v.ok, false);
+    assert.equal(v.rates_inconsistent, 1);
+    assert.equal(v.mismatched, 0, 'per-share arithmetic is still self-consistent');
+});
+
+test('verification catches shares paid at a rate the pool never published', () => {
+    const { db } = makeDb();
+    db.prepare('UPDATE rate_history SET rate_sats_per_diff = rate_sats_per_diff * 2').run();
+    const v = stats.rateVerification(db);
+    assert.equal(v.ok, false);
+    assert.equal(v.orphaned, 40);
+});
+
+test('an empty rate log does not make every share an orphan', () => {
+    /* A pool that has not published a rate yet must report "nothing logged",
+     * not "everything is unaccounted for". */
+    const { db } = makeDb({ logRate: false });
+    const v = stats.rateVerification(db);
+    assert.equal(v.rate_rows, 0);
+    assert.equal(v.orphaned, 0);
+    assert.equal(v.ok, true);
+});
+
+test('legacy rows are reported as unverifiable, not as failures', () => {
+    const { db } = makeDb({ legacy: true });
+    const v = stats.rateVerification(db);
+    assert.equal(v.mismatched, 0);
+    assert.equal(v.unverifiable, 40);
+    assert.equal(v.verifiable, 0);
+    assert.equal(v.coverage_pct, 0);
+});
+
+test('verification returns null on a DB predating rate_used', () => {
+    const { db } = makeDb();
+    /* better-sqlite3 has no DROP COLUMN on old SQLite; rebuild without it. */
+    db.exec(`
+        CREATE TABLE shares_old (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, worker_id INTEGER NOT NULL,
+          ts INTEGER NOT NULL, difficulty REAL NOT NULL,
+          is_block INTEGER NOT NULL DEFAULT 0, block_hash TEXT,
+          credited_sats INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO shares_old (id, worker_id, ts, difficulty, is_block, block_hash, credited_sats)
+          SELECT id, worker_id, ts, difficulty, is_block, block_hash, credited_sats FROM shares;
+        DROP TABLE shares;
+        ALTER TABLE shares_old RENAME TO shares;
+    `);
+    assert.equal(stats.rateVerification(db), null);
+});
+
+test('verification scopes to one worker', () => {
+    const { db } = makeDb();
+    db.prepare(`INSERT INTO workers (id, name, first_seen, last_seen, payout_address)
+                VALUES (2, 'other.rig', 1000, 2000, 'addr2')`).run();
+    db.prepare(`INSERT INTO shares (worker_id, ts, difficulty, is_block, block_hash, credited_sats, rate_used)
+                VALUES (2, 1500, 4.0, 0, 'h', 999999, ?)`).run(RATE);   /* wrong on purpose */
+
+    const all = stats.rateVerification(db);
+    assert.equal(all.mismatched, 1);
+
+    const mine = stats.rateVerification(db, 1);
+    assert.equal(mine.mismatched, 0, 'worker 1 must not inherit worker 2 breakage');
+    assert.equal(stats.rateVerification(db, 2).mismatched, 1);
+});
+
+test('admin-worker renders the verification section, passing and failing', async () => {
+    for (const broken of [false, true]) {
+        const { db, handle } = makeDb();
+        if (broken) db.prepare('UPDATE shares SET credited_sats = 1 WHERE id = 2').run();
+        const audit = admin.workerAudit(handle, 1);
+        assert.ok(audit.verification, 'workerAudit must carry the verification');
+        const html = await render('admin-worker.ejs', {
+            audit, meta: audit.meta, worker: audit.worker,
+        });
+        assert.match(html, /Verification/);
+        assert.match(html, broken ? /Verification failed/ : /re-derives exactly/);
+    }
+});
+
+test('the public miner page shows the independent check, passing and failing', async () => {
+    /* Miners see the same re-derivation the operator does — an audit only the
+     * pool can run is not much of an audit. */
+    for (const broken of [false, true]) {
+        const { db, handle } = makeDb();
+        if (broken) db.prepare('UPDATE shares SET credited_sats = 7 WHERE id = 5').run();
+        const w = stats.worker(handle, '3RobWZetukZUXY9kk763AtMyoJtJ.rig1', 86400);
+        assert.ok(w.pps_audit.verification, 'verification missing from the public audit');
+        assert.equal(w.pps_audit.verification.ok, !broken);
+        const html = await render('worker.ejs', { ...w, name: w.worker.name,
+                                                  fmtHashrate: stats.fmtHashrate });
+        assert.match(html, /Independent check/);
+        assert.match(html, broken ? /do not match their own stored rate/
+                                  : /re-derive exactly/);
     }
 });

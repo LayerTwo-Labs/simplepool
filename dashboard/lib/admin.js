@@ -6,7 +6,7 @@
 // request on a slow / down Thunder node.
 
 import { enforcerRpc } from './enforcer.js';
-import { poolMeta } from './stats.js';
+import { poolMeta, rateVerification } from './stats.js';
 
 function unwrap(handle) {
     if (typeof handle?.get === 'function') return handle.get();
@@ -107,6 +107,8 @@ export function workerAudit(handle, workerId, { recentLimit = 100, dayLimit = 30
 
     /* Rate provenance from the proxy itself — never from dashboard config. */
     const meta = poolMeta(db);
+    /* The one part of this page that checks rather than reports. */
+    const verification = rateVerification(db, workerId);
 
     const totals = db.prepare(`
         SELECT COUNT(*)                              AS share_count,
@@ -154,6 +156,7 @@ export function workerAudit(handle, workerId, { recentLimit = 100, dayLimit = 30
         },
         rate: meta ? meta.rate_sats_per_diff : null,
         meta,
+        verification,
         ledger: {
             accrued: Number(worker.accrued_sats || 0),
             paid:    Number(worker.paid_sats    || 0),

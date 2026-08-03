@@ -22,8 +22,14 @@
 #include <sys/time.h>
 #include <time.h>
 
-/* Keep in sync with schema.sql */
-static const char *SCHEMA_SQL =
+/* Keep in sync with schema.sql.
+ *
+ * Split into parts only because one concatenated literal now exceeds the
+ * 4095 characters ISO C99 requires a compiler to support, which -Wpedantic
+ * flags as an error here. The parts are applied in order and the split point
+ * carries no meaning — when adding tables, start a new part rather than
+ * growing one past the limit. */
+static const char *SCHEMA_SQL_PARTS[] = {
     "PRAGMA journal_mode = WAL;\n"
     "PRAGMA synchronous = NORMAL;\n"
     "PRAGMA foreign_keys = ON;\n"
@@ -39,7 +45,13 @@ static const char *SCHEMA_SQL =
      * from config. The rate is derived per-template and moves with network
      * difficulty, so recomputing historical shares against a current rate
      * silently misreports them. Audits must sum this column. 0 in solo mode,
-     * where no PPS accrual happens. */
+     * where no PPS accrual happens.
+     *
+     * rate_used is the exact rate that produced credited_sats. Recording the
+     * multiplicand next to the product is what turns the credit from
+     * self-attested into checkable: CAST(difficulty * rate_used AS INTEGER)
+     * must equal credited_sats for every row, and that holds no matter how
+     * far the rate has since moved. */
     "CREATE TABLE IF NOT EXISTS shares ("
     "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  worker_id     INTEGER NOT NULL REFERENCES workers(id),"
@@ -47,7 +59,8 @@ static const char *SCHEMA_SQL =
     "  difficulty    REAL NOT NULL,"
     "  is_block      INTEGER NOT NULL DEFAULT 0,"
     "  block_hash    TEXT,"
-    "  credited_sats INTEGER NOT NULL DEFAULT 0"
+    "  credited_sats INTEGER NOT NULL DEFAULT 0,"
+    "  rate_used     REAL NOT NULL DEFAULT 0"
     ");"
     "CREATE INDEX IF NOT EXISTS shares_ts_idx ON shares(ts);"
     "CREATE INDEX IF NOT EXISTS shares_worker_ts_idx ON shares(worker_id, ts);"
@@ -103,6 +116,26 @@ static const char *SCHEMA_SQL =
     "  credited_from       INTEGER,"  /* first ts with credited_sats populated */
     "  updated_at          INTEGER"
     ");"
+    /* Append-only log of every distinct rate the proxy has paid at. pool_meta
+     * is overwritten on every template, so without this the rate a share was
+     * credited at is unrecoverable after the fact. Appended only when the
+     * tuple changes. Prunable: shares.rate_used carries per-share
+     * verification on its own; this table exists to show the rate itself was
+     * derived fairly from the template. */
+    "CREATE TABLE IF NOT EXISTS rate_history ("
+    "  id                  INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  ts                  INTEGER NOT NULL,"
+    "  rate_sats_per_diff  REAL    NOT NULL,"
+    "  gross_sats_per_diff REAL    NOT NULL,"
+    "  fee_bps             INTEGER NOT NULL,"
+    "  network_difficulty  REAL    NOT NULL,"
+    "  block_value_sats    INTEGER NOT NULL,"
+    "  rate_source         TEXT    NOT NULL"
+    ");"
+    "CREATE INDEX IF NOT EXISTS rate_history_ts_idx   ON rate_history(ts);"
+    "CREATE INDEX IF NOT EXISTS rate_history_rate_idx ON rate_history(rate_sats_per_diff);",
+
+    /* ---- part 2 ---- */
     /* PPS accrual ledger. One row per worker; the C proxy only INCREMENTS
      * accrued_sats. paid_sats is updated by a downstream payout service
      * that issues Thunder transactions to drain accrued - paid. */
@@ -178,7 +211,8 @@ static const char *SCHEMA_SQL =
     "  note         TEXT"
     ");"
     "CREATE INDEX IF NOT EXISTS payouts_worker_ts_idx ON payouts(worker_id, paid_at);"
-    "CREATE INDEX IF NOT EXISTS payouts_paid_at_idx   ON payouts(paid_at);";
+    "CREATE INDEX IF NOT EXISTS payouts_paid_at_idx   ON payouts(paid_at);",
+};
 
 /* Forward-compat: ALTER existing DBs to add columns that didn't exist in
  * earlier schemas. Duplicate-column errors are silently ignored. */
@@ -193,6 +227,12 @@ static const char *MIGRATIONS_SQL[] = {
      * to pps_credits for the earlier period. pool_meta.credited_from marks
      * the boundary. */
     "ALTER TABLE shares       ADD COLUMN credited_sats  INTEGER NOT NULL DEFAULT 0",
+    /* Rows predating this column keep 0, which the audit reports as
+     * "unverifiable" rather than "wrong": their credited_sats is still the
+     * authoritative amount, there is simply no stored multiplicand to check
+     * it against. rate_history (created by SCHEMA_SQL above) likewise only
+     * covers rates published after the upgrade. */
+    "ALTER TABLE shares       ADD COLUMN rate_used      REAL NOT NULL DEFAULT 0",
 };
 
 #define EV_SHARE   1
@@ -216,6 +256,7 @@ typedef struct {
     int64_t  reward_sats;       /* EV_BLOCK only */
     int64_t  fee_sats;          /* EV_BLOCK only */
     int64_t  delta_sats;        /* EV_CREDIT only */
+    double   rate_used;         /* EV_SHARE only: multiplicand for delta_sats */
     char     worker_name[WORKER_NAME_MAX];
     char     payout_address[ADDR_MAX];   /* EV_SHARE, EV_BLOCK, EV_CREDIT: may be empty */
     char     hash[HASH_STR_MAX];
@@ -384,8 +425,11 @@ static void process_event(store_t *s, const event_t *ev) {
         else
             sqlite3_bind_null(s->st_insert_share, 5);
         /* What this share was credited, at the rate in force when it was
-         * accepted. 0 in solo mode. See the shares schema comment. */
-        sqlite3_bind_int64(s->st_insert_share, 6, ev->delta_sats);
+         * accepted, and the rate itself. 0 in solo mode. Both come from the
+         * same computation in the caller, so the pair is always internally
+         * consistent — see the shares schema comment. */
+        sqlite3_bind_int64 (s->st_insert_share, 6, ev->delta_sats);
+        sqlite3_bind_double(s->st_insert_share, 7, ev->rate_used);
         if (sqlite3_step(s->st_insert_share) != SQLITE_DONE) {
             atomic_fetch_add(&s->pg_errors, 1);
         } else {
@@ -580,12 +624,17 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
     }
 
     char *err = NULL;
-    if (sqlite3_exec(s->db, SCHEMA_SQL, NULL, NULL, &err) != SQLITE_OK) {
-        LOG_ERROR("store: schema apply failed: %s", err ? err : "?");
+    for (size_t i = 0; i < sizeof(SCHEMA_SQL_PARTS) / sizeof(SCHEMA_SQL_PARTS[0]); ++i) {
+        err = NULL;
+        if (sqlite3_exec(s->db, SCHEMA_SQL_PARTS[i], NULL, NULL, &err) != SQLITE_OK) {
+            LOG_ERROR("store: schema apply (part %zu) failed: %s",
+                      i + 1, err ? err : "?");
+            sqlite3_free(err);
+            sqlite3_close(s->db);
+            free(s->ring); free(s);
+            return -3;
+        }
         sqlite3_free(err);
-        sqlite3_close(s->db);
-        free(s->ring); free(s);
-        return -3;
     }
     /* Best-effort migrations for DBs created by an older simplepool. Each
      * ALTER returns "duplicate column" on already-migrated DBs, which is
@@ -611,8 +660,9 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         "  payout_address = COALESCE(workers.payout_address, excluded.payout_address) "
         "RETURNING id";
     static const char *Q_INS_SHARE =
-        "INSERT INTO shares (worker_id, ts, difficulty, is_block, block_hash, credited_sats) "
-        "VALUES (?, ?, ?, ?, ?, ?)";
+        "INSERT INTO shares "
+        "  (worker_id, ts, difficulty, is_block, block_hash, credited_sats, rate_used) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)";
     static const char *Q_INS_REJECT =
         "INSERT INTO rejects (worker_name, ts, reason) VALUES (?, ?, ?)";
     static const char *Q_INS_BLOCK =
@@ -703,14 +753,14 @@ int store_record_share(store_t *s, const char *worker_name,
                        int is_block, const char *share_hash_or_null)
 {
     return store_record_share_addr(s, worker_name, NULL, ts_ms, difficulty,
-                                   is_block, share_hash_or_null, 0);
+                                   is_block, share_hash_or_null, 0, 0.0);
 }
 
 int store_record_share_addr(store_t *s, const char *worker_name,
                             const char *payout_address,
                             uint64_t ts_ms, double difficulty,
                             int is_block, const char *share_hash_or_null,
-                            int64_t credited_sats)
+                            int64_t credited_sats, double rate_used)
 {
     if (!s || !worker_name) return -1;
     event_t ev;
@@ -720,6 +770,7 @@ int store_record_share_addr(store_t *s, const char *worker_name,
     ev.difficulty = difficulty;
     ev.is_block = is_block;
     ev.delta_sats = credited_sats;
+    ev.rate_used = rate_used;
     strncpy(ev.worker_name, worker_name, WORKER_NAME_MAX - 1);
     if (payout_address)
         strncpy(ev.payout_address, payout_address, ADDR_MAX - 1);
@@ -891,6 +942,74 @@ int store_record_pool_meta(store_t *s, const char *pool_mode, int fee_bps,
     sqlite3_bind_int64 (st, 8, (sqlite3_int64)block_value_sats);
     sqlite3_bind_int64 (st, 9, (sqlite3_int64)updated_ts_s);
     sqlite3_bind_int64 (st, 10, (sqlite3_int64)updated_ts_s);
+    int rc = sqlite3_step(st);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    return 0;
+}
+
+int store_record_rate(store_t *s, const char *rate_source,
+                      double rate_sats_per_diff,
+                      double gross_sats_per_diff,
+                      int fee_bps,
+                      double network_difficulty,
+                      int64_t block_value_sats,
+                      uint64_t ts_s)
+{
+    if (!s) return -1;
+
+    /* Append only when something actually moved. Compared bitwise against
+     * the newest row rather than with a tolerance: rate_used on the share
+     * rows is the same double, so an exact match is what makes the
+     * "every rate a share used appears in this log" check work. On a chain
+     * with a busy mempool the block value shifts every template and this
+     * appends about that often; on a quiet one it barely grows. */
+    static const char *Q_LAST =
+        "SELECT rate_sats_per_diff, gross_sats_per_diff, fee_bps,"
+        "       network_difficulty, block_value_sats, rate_source"
+        "  FROM rate_history ORDER BY id DESC LIMIT 1";
+    sqlite3_stmt *last = NULL;
+    int unchanged = 0;
+    pthread_mutex_lock(&s->node_tip_mu);
+    if (sqlite3_prepare_v2(s->db, Q_LAST, -1, &last, NULL) == SQLITE_OK &&
+        sqlite3_step(last) == SQLITE_ROW)
+    {
+        const unsigned char *src = sqlite3_column_text(last, 5);
+        unchanged =
+            sqlite3_column_double(last, 0) == rate_sats_per_diff  &&
+            sqlite3_column_double(last, 1) == gross_sats_per_diff &&
+            sqlite3_column_int   (last, 2) == fee_bps             &&
+            sqlite3_column_double(last, 3) == network_difficulty  &&
+            sqlite3_column_int64 (last, 4) == (sqlite3_int64)block_value_sats &&
+            src && rate_source && strcmp((const char *)src, rate_source) == 0;
+    }
+    sqlite3_finalize(last);
+    if (unchanged) {
+        pthread_mutex_unlock(&s->node_tip_mu);
+        return 0;
+    }
+
+    static const char *Q_INS =
+        "INSERT INTO rate_history (ts, rate_sats_per_diff, gross_sats_per_diff,"
+        "  fee_bps, network_difficulty, block_value_sats, rate_source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q_INS, -1, &st, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->node_tip_mu);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    sqlite3_bind_int64 (st, 1, (sqlite3_int64)ts_s);
+    sqlite3_bind_double(st, 2, rate_sats_per_diff);
+    sqlite3_bind_double(st, 3, gross_sats_per_diff);
+    sqlite3_bind_int   (st, 4, fee_bps);
+    sqlite3_bind_double(st, 5, network_difficulty);
+    sqlite3_bind_int64 (st, 6, (sqlite3_int64)block_value_sats);
+    sqlite3_bind_text  (st, 7, rate_source ? rate_source : "", -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(st);
     pthread_mutex_unlock(&s->node_tip_mu);
     sqlite3_finalize(st);

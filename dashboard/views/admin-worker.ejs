@@ -148,6 +148,77 @@ const atCurrentRate = meta && meta.rate_sats_per_diff
             <% } %>
         </section>
 
+        <% const v = audit.verification; %>
+        <section class="card">
+            <h2>Verification</h2>
+            <p class="muted small" style="margin-top:0">
+                The cross-check above compares two numbers the proxy wrote.
+                This one recomputes them. Each share stores both the rate it
+                was credited at and the resulting sats, so
+                <code>floor(difficulty × rate_used)</code> must reproduce
+                <code>credited_sats</code> exactly — without consulting any
+                current rate. <code>rate_history</code> then shows each rate
+                followed from the block value and difficulty of the template
+                it came from.
+            </p>
+            <% if (!v) { %>
+                <p class="muted small" style="color:#c66">
+                    ⚠ This database predates <code>shares.rate_used</code>, so
+                    the ledger cannot be independently verified. The stored
+                    credits remain authoritative; there is simply nothing to
+                    check them against.
+                </p>
+            <% } else { %>
+                <div class="grid">
+                    <div><label>Credited shares</label><strong><%= fmtN(v.credited) %></strong></div>
+                    <div><label>Verifiable</label><strong><%= fmtN(v.verifiable) %> (<%= v.coverage_pct.toFixed(1) %>%)</strong></div>
+                    <div><label>Arithmetic mismatches</label><strong><%= fmtN(v.mismatched) %></strong></div>
+                    <div><label>Rates not in the log</label><strong><%= fmtN(v.orphaned) %></strong></div>
+                    <div><label>Rate log entries</label><strong><%= fmtN(v.rate_rows) %></strong></div>
+                    <div><label>Rates inconsistent with their inputs</label><strong><%= fmtN(v.rates_inconsistent) %></strong></div>
+                </div>
+                <% if (v.ok && v.coverage_pct >= 100) { %>
+                    <p class="muted small" style="margin-top:0.75em;color:#5b8">
+                        ✓ Every credited share re-derives exactly, and every
+                        rate used follows from the template it came from.
+                    </p>
+                <% } else if (v.ok) { %>
+                    <p class="muted small" style="margin-top:0.75em;color:#5b8">
+                        ✓ No failures among the <%= fmtN(v.verifiable) %> share(s)
+                        that carry a stored rate. The remainder is not checked
+                        — see below.
+                    </p>
+                <% } else { %>
+                    <p class="muted small" style="margin-top:0.75em;color:#c66">
+                        ⚠ Verification failed.
+                        <% if (v.mismatched > 0) { %>
+                            <%= fmtN(v.mismatched) %> share(s) do not match
+                            their own stored rate — the credit was not produced
+                            by the rate recorded beside it.
+                        <% } %>
+                        <% if (v.rates_inconsistent > 0) { %>
+                            <%= fmtN(v.rates_inconsistent) %> logged rate(s) do
+                            not follow from their recorded block value,
+                            difficulty and fee.
+                        <% } %>
+                        <% if (v.orphaned > 0) { %>
+                            <%= fmtN(v.orphaned) %> share(s) were credited at a
+                            rate that never appears in <code>rate_history</code>.
+                        <% } %>
+                        This is the check that should never fail; treat it as a
+                        ledger integrity problem, not a display issue.
+                    </p>
+                <% } %>
+                <% if (v.unverifiable > 0) { %>
+                    <p class="muted small" style="margin-top:0.5em">
+                        <%= fmtN(v.unverifiable) %> credited share(s) predate
+                        <code>rate_used</code> and are excluded from the checks
+                        above — their credits stand, but cannot be recomputed.
+                    </p>
+                <% } %>
+            <% } %>
+        </section>
+
         <section class="card">
             <h2>Daily breakdown</h2>
             <% if (audit.days.length === 0) { %>

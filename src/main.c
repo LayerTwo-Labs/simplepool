@@ -305,11 +305,21 @@ static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
     }
 
     if (s->store) {
+        uint64_t now_s = (uint64_t)time(NULL);
         store_record_pool_meta(s->store, s->cfg->pool_mode, s->cfg->fee_bps,
                                overridden ? "override" : "derived",
                                accrues ? rate : 0.0, gross,
                                accrues ? eff_fee_bps : 0.0,
-                               net_diff, value, (uint64_t)time(NULL));
+                               net_diff, value, now_s);
+        /* Append to the rate log so the rate a share was credited at stays
+         * recoverable after pool_meta has been overwritten. Only meaningful
+         * while accruing — in solo mode the effective rate is 0 and there is
+         * nothing to audit. */
+        if (accrues) {
+            store_record_rate(s->store, overridden ? "override" : "derived",
+                              rate, gross, s->cfg->fee_bps,
+                              net_diff, value, now_s);
+        }
     }
 }
 
@@ -334,18 +344,26 @@ static void on_share_cb(void *ctx, const char *worker_name,
      * onto the share itself; an audit then reports what was paid rather than
      * recomputing it against a rate that may since have moved. */
     int64_t delta = 0;
+    double  rate_used = 0.0;
     if (s && s->cfg && strcmp(s->cfg->pool_mode, "pps-classic") == 0) {
         double rate = atomic_load_explicit(&s->pps_rate, memory_order_relaxed);
         if (rate > 0.0) {
             double d = difficulty * rate;
-            if (d > 0.0 && d < (double)INT64_MAX) delta = (int64_t)d;
+            /* rate_used is stored only when it is the number that actually
+             * produced delta. On the overflow guard below the two would not
+             * reconcile, so it stays 0 and the audit reports the row as
+             * unverifiable instead of as a mismatch. */
+            if (d > 0.0 && d < (double)INT64_MAX) {
+                delta = (int64_t)d;
+                rate_used = rate;
+            }
         }
     }
 
     if (s && s->store) {
         store_record_share_addr(s->store, worker_name, payout_address,
                                 ts_ms, difficulty, is_block,
-                                block_hash_or_null, delta);
+                                block_hash_or_null, delta, rate_used);
     }
     if (s && s->bcast) {
         broadcast_share(s->bcast, worker_name, payout_address,

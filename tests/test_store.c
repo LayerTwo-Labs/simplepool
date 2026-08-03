@@ -265,21 +265,23 @@ static void test_credited_sats(void) {
     store_t *s = NULL;
     assert(store_open(&cfg, &s) == 0);
 
-    /* pps-classic-style: each share carries the sats it was credited. */
+    /* pps-classic-style: each share carries the sats it was credited and
+     * the rate that produced them. difficulty=i at rate 7.0 gives i*7. */
     int64_t expected = 0;
     for (int i = 1; i <= 50; ++i) {
         int64_t credited = (int64_t)i * 7;
         expected += credited;
         assert(store_record_share_addr(s, "payer", "addr1",
                                        1000ULL + (uint64_t)i, (double)i,
-                                       0, NULL, credited) == 0);
+                                       0, NULL, credited, 7.0) == 0);
     }
     /* solo-style: no accrual, so the column must record 0 — not be left
-     * to a later recompute that would invent a credit. */
+     * to a later recompute that would invent a credit. rate_used stays 0
+     * too, which is what marks the row as "nothing to verify". */
     for (int i = 0; i < 25; ++i) {
         assert(store_record_share_addr(s, "solo", "addr2",
                                        9000ULL + (uint64_t)i, 3.0,
-                                       0, NULL, 0) == 0);
+                                       0, NULL, 0, 0.0) == 0);
     }
     /* The legacy 6-arg helper must still work and store 0. */
     assert(store_record_share(s, "legacy", 9500, 2.0, 0, NULL) == 0);
@@ -307,6 +309,19 @@ static void test_credited_sats(void) {
         "WHERE worker_id = (SELECT id FROM workers WHERE name='legacy')");
     assert(legacy == 0);
 
+    /* The audit invariant. Every credited share must re-derive exactly from
+     * the pair stored on its own row, with no reference to any current rate.
+     * This is the property that makes the ledger checkable rather than
+     * merely recorded, so it is asserted as equality, not as a tolerance. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM shares WHERE rate_used > 0 "
+        "  AND credited_sats <> CAST(difficulty * rate_used AS INTEGER)") == 0);
+    /* Non-accruing rows carry no multiplicand to check against. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM shares WHERE rate_used != 0 "
+        "  AND worker_id IN (SELECT id FROM workers "
+        "                     WHERE name IN ('solo','legacy'))") == 0);
+
     /* pool_meta: single row, values round-tripped. */
     assert(scalar_i64(db, "SELECT count(*) FROM pool_meta") == 1);
     assert(scalar_i64(db, "SELECT fee_bps FROM pool_meta") == 100);
@@ -329,6 +344,76 @@ static void test_credited_sats(void) {
     printf("  ok test_credited_sats\n");
 }
 
+/* rate_history is the provenance half of the audit: it must append when the
+ * rate moves, stay quiet when it doesn't, and hold rows that re-derive from
+ * their own inputs. */
+static void test_rate_history(void) {
+    const char *path = fresh_db_path();
+
+    store_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    const double  net_diff = 111157.455354832;
+    const int64_t value    = 312500000;
+    const int     fee_bps  = 100;
+    double gross = (double)value / net_diff;
+    double rate  = gross * (1.0 - (double)fee_bps / 10000.0);
+
+    assert(store_record_rate(s, "derived", rate, gross, fee_bps,
+                             net_diff, value, 1700000000ULL) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT count(*) FROM rate_history") == 1);
+
+    /* Re-publishing an unchanged rate must not append — otherwise the table
+     * grows once per template poll rather than once per actual change. */
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_rate(s, "derived", rate, gross, fee_bps,
+                                 net_diff, value, 1700000100ULL + (uint64_t)i) == 0);
+    }
+    assert(scalar_i64(db, "SELECT count(*) FROM rate_history") == 1);
+
+    /* A moved block value is a new rate and must append. */
+    int64_t value2 = 312500141;
+    double  gross2 = (double)value2 / net_diff;
+    double  rate2  = gross2 * (1.0 - (double)fee_bps / 10000.0);
+    assert(store_record_rate(s, "derived", rate2, gross2, fee_bps,
+                             net_diff, value2, 1700000200ULL) == 0);
+    assert(scalar_i64(db, "SELECT count(*) FROM rate_history") == 2);
+
+    /* So is a changed source at an otherwise identical rate. */
+    assert(store_record_rate(s, "override", rate2, gross2, fee_bps,
+                             net_diff, value2, 1700000300ULL) == 0);
+    assert(scalar_i64(db, "SELECT count(*) FROM rate_history") == 3);
+
+    /* Every logged rate must follow from its own recorded inputs. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM rate_history WHERE ABS(rate_sats_per_diff"
+        "  - (block_value_sats*1.0/network_difficulty)"
+        "    *(1-fee_bps/10000.0)) > 1e-9") == 0);
+
+    /* And a share credited at one of those rates must be traceable to it —
+     * exact equality, because it is the same double on both sides. */
+    assert(store_record_share_addr(s, "w", "addr", 1700000400000ULL, 2.0,
+                                   0, NULL, (int64_t)(2.0 * rate2), rate2) == 0);
+    assert(store_flush(s) == 0);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM shares s WHERE s.rate_used > 0 AND NOT EXISTS ("
+        "  SELECT 1 FROM rate_history r"
+        "   WHERE r.rate_sats_per_diff = s.rate_used)") == 0);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_rate_history\n");
+}
+
 int main(void) {
     log_init(2 /* WARN */);
     printf("running test_store...\n");
@@ -337,6 +422,7 @@ int main(void) {
     test_concurrent();
     test_drop();
     test_credited_sats();
+    test_rate_history();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;
