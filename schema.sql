@@ -16,6 +16,12 @@ CREATE TABLE IF NOT EXISTS workers (
 -- misreports them. Audits must sum this column, not re-derive it.
 -- 0 in solo mode, and 0 on rows written before the column existed
 -- (see pool_meta.credited_from for where it becomes trustworthy).
+-- rate_used is the exact rate the proxy multiplied by to get credited_sats.
+-- Storing it alongside the result is what makes the credit *verifiable*
+-- rather than merely recorded: an auditor can recompute
+-- CAST(difficulty * rate_used AS INTEGER) and must get credited_sats back,
+-- with no need to know what the rate happened to be at that moment.
+-- 0 in solo mode and on rows written before the column existed.
 CREATE TABLE IF NOT EXISTS shares (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   worker_id     INTEGER NOT NULL REFERENCES workers(id),
@@ -23,7 +29,8 @@ CREATE TABLE IF NOT EXISTS shares (
   difficulty    REAL NOT NULL,
   is_block      INTEGER NOT NULL DEFAULT 0,
   block_hash    TEXT,
-  credited_sats INTEGER NOT NULL DEFAULT 0
+  credited_sats INTEGER NOT NULL DEFAULT 0,
+  rate_used     REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS shares_ts_idx ON shares(ts);
 CREATE INDEX IF NOT EXISTS shares_worker_ts_idx ON shares(worker_id, ts);
@@ -87,6 +94,31 @@ CREATE TABLE IF NOT EXISTS pool_meta (
   credited_from       INTEGER,  /* unix seconds */
   updated_at          INTEGER   /* unix seconds */
 );
+
+/* Append-only log of every distinct PPS rate the proxy has paid at.
+ *
+ * pool_meta holds one row and is overwritten on every template, so the rate
+ * a share was credited at is not recoverable from it after the fact. This
+ * table keeps the provenance: what the rate was, and the inputs it was
+ * derived from, so an auditor can check the rate itself was fair — not just
+ * that the arithmetic was applied consistently (which shares.rate_used
+ * already proves on its own).
+ *
+ * A row is appended only when the tuple actually changes, so on a chain with
+ * a quiet mempool this stays small; on a busy one it approaches one row per
+ * template. Safe to prune: per-share verification does not depend on it. */
+CREATE TABLE IF NOT EXISTS rate_history (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts                  INTEGER NOT NULL,  /* unix seconds, when it took effect */
+  rate_sats_per_diff  REAL    NOT NULL,  /* net of fee — matches shares.rate_used */
+  gross_sats_per_diff REAL    NOT NULL,  /* fair value before fee */
+  fee_bps             INTEGER NOT NULL,
+  network_difficulty  REAL    NOT NULL,
+  block_value_sats    INTEGER NOT NULL,
+  rate_source         TEXT    NOT NULL   /* 'derived' | 'override' */
+);
+CREATE INDEX IF NOT EXISTS rate_history_ts_idx   ON rate_history(ts);
+CREATE INDEX IF NOT EXISTS rate_history_rate_idx ON rate_history(rate_sats_per_diff);
 
 /* PPS accrual ledger. One row per worker. The C proxy only INCREMENTs
  * accrued_sats; a separate payout service updates paid_sats after

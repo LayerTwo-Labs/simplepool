@@ -269,6 +269,9 @@ export function worker(handle, name, windowSec = 86400) {
         ppsAudit = {
             rate: meta ? meta.rate_sats_per_diff : null,
             meta,
+            /* Miners get the same re-derivation the operator sees — an audit
+             * only the pool can run is not much of an audit. */
+            verification: rateVerification(d, w.id),
             accrued, paid, owed: accrued - paid,
             last_updated: Number(credit.last_updated || 0),
             share_count:      Number(totals.share_count),
@@ -369,6 +372,98 @@ export function poolMeta(handle) {
         };
     } catch {
         return null;   /* pre-pool_meta DB */
+    }
+}
+
+/* Independently re-derive the PPS ledger instead of reporting it.
+ *
+ * Every other figure on the audit page is a number the proxy wrote and this
+ * page repeats. These three are checks:
+ *
+ *   1. arithmetic — every credited share must satisfy
+ *      credited_sats == floor(difficulty * rate_used), where both operands
+ *      live on the share's own row. Holds no matter how far the rate has
+ *      since moved, because nothing current is consulted. Exact equality is
+ *      the right test: the proxy compiles without -ffast-math, so the same
+ *      IEEE-754 multiply and truncation reproduce bit-for-bit here.
+ *
+ *   2. provenance — every rate in the log must follow from the template
+ *      inputs recorded beside it and the configured fee. Catches a rate that
+ *      was applied consistently but derived wrongly, which check 1 cannot
+ *      see.
+ *
+ *   3. linkage — every rate a share was credited at must appear in the log,
+ *      so no share was paid at a rate the pool never published. Scoped to
+ *      shares newer than the first logged rate; older ones predate the log
+ *      and are counted as unverifiable, not as failures.
+ *
+ * Returns null on a DB predating these columns, in which case the caller
+ * should say the ledger cannot be verified rather than imply it passed.
+ * Pass a workerId to scope checks 1 and 3 to one miner. */
+export function rateVerification(handle, workerId = null) {
+    const d = !handle ? null
+            : (typeof handle.get === 'function' ? handle.get() : handle);
+    if (!d) return null;
+    const scoped = workerId !== null && workerId !== undefined;
+    /* Two spellings because the orphan query aliases the table. */
+    const where   = scoped ? 'AND worker_id = ?'   : '';
+    const whereS  = scoped ? 'AND s.worker_id = ?' : '';
+    const run     = (sql) => scoped ? d.prepare(sql).get(workerId)
+                                    : d.prepare(sql).get();
+    try {
+        const shares = run(`
+            SELECT COUNT(*)                                              AS total,
+                   COUNT(*) FILTER (WHERE credited_sats > 0)             AS credited,
+                   COUNT(*) FILTER (WHERE rate_used > 0)                 AS verifiable,
+                   COUNT(*) FILTER (WHERE rate_used > 0
+                       AND credited_sats <> CAST(difficulty * rate_used AS INTEGER))
+                                                                         AS mismatched,
+                   COUNT(*) FILTER (WHERE rate_used = 0 AND credited_sats > 0)
+                                                                         AS unverifiable
+              FROM shares
+             WHERE 1 = 1 ${where}
+        `);
+        const rates = d.prepare(`
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE ABS(rate_sats_per_diff
+                       - (block_value_sats * 1.0 / network_difficulty)
+                         * (1 - fee_bps / 10000.0)) > 1e-9)  AS inconsistent,
+                   MIN(ts) AS first_ts
+              FROM rate_history
+        `).get();
+        /* NULL-safe by construction: with an empty log MIN(ts) is NULL, the
+         * ts comparison yields NULL, and nothing is counted — so a pool that
+         * has not published a rate yet reports 0 orphans, not "everything is
+         * an orphan". */
+        const orphans = run(`
+            SELECT COUNT(*) AS n
+              FROM shares s
+             WHERE s.rate_used > 0
+               AND s.ts >= (SELECT MIN(ts) FROM rate_history)
+               AND NOT EXISTS (SELECT 1 FROM rate_history r
+                                WHERE r.rate_sats_per_diff = s.rate_used)
+               ${whereS}
+        `);
+        const mismatched   = Number(shares.mismatched   || 0);
+        const inconsistent = Number(rates.inconsistent  || 0);
+        const orphaned     = Number(orphans.n           || 0);
+        const credited     = Number(shares.credited     || 0);
+        const verifiable   = Number(shares.verifiable   || 0);
+        return {
+            ok: mismatched === 0 && inconsistent === 0 && orphaned === 0,
+            share_count:  Number(shares.total || 0),
+            credited, verifiable,
+            unverifiable: Number(shares.unverifiable || 0),
+            mismatched, orphaned,
+            /* What share of the credited ledger these checks actually cover.
+             * 100% on a DB written entirely by this build or later. */
+            coverage_pct: credited > 0 ? (verifiable / credited) * 100 : 100,
+            rate_rows:         Number(rates.total || 0),
+            rates_inconsistent: inconsistent,
+            rate_log_from:     Number(rates.first_ts || 0),
+        };
+    } catch {
+        return null;   /* DB predates rate_used / rate_history */
     }
 }
 

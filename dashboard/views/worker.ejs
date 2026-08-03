@@ -90,6 +90,37 @@ if (n > 1) {
                     way.
                 </p>
             <% } %>
+            <% const v = pps_audit.verification; if (v) { %>
+                <p class="muted small" style="margin-top:0.75em">
+                    <strong>Independent check.</strong> The comparison above
+                    weighs two numbers the pool wrote. Separately, every share
+                    stores the rate it was credited at, so
+                    <code>FLOOR(difficulty × rate_used)</code> must reproduce
+                    its credit without reference to any current rate — and
+                    every rate used must appear in the pool's published rate
+                    log, derived from the block value and difficulty of the
+                    template it came from.
+                    <% if (v.ok && v.coverage_pct >= 100) { %>
+                        <strong style="color:#5b8">✓ All
+                        <%= fmtN(v.verifiable) %> of your credited shares
+                        re-derive exactly</strong>, against
+                        <%= fmtN(v.rate_rows) %> logged rate(s).
+                    <% } else if (v.ok) { %>
+                        <strong style="color:#5b8">✓ No failures</strong> among
+                        the <%= fmtN(v.verifiable) %> share(s) carrying a stored
+                        rate. The other <%= fmtN(v.unverifiable) %> predate this
+                        feature and cannot be recomputed — their credits still
+                        stand.
+                    <% } else { %>
+                        <strong style="color:#c66">⚠ <%= fmtN(v.mismatched) %>
+                        share(s) do not match their own stored rate</strong>
+                        <% if (v.orphaned > 0) { %>
+                            and <%= fmtN(v.orphaned) %> were credited at an
+                            unpublished rate<% } %>. Raise this with the
+                        operator — it should never happen.
+                    <% } %>
+                </p>
+            <% } %>
             <p class="muted small" style="margin-top:0.75em">
                 For an even deeper trail (per-share running total, daily
                 breakdown), the operator has an admin-only page at

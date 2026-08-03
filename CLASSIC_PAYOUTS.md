@@ -47,7 +47,20 @@ would accrue unpayable PPS balance. Validated in
 [src/thunder.c](src/thunder.c).
 
 Each accepted share credits the worker's `pps_credits.accrued_sats` at
-`pps_sats_per_diff * difficulty`, truncated to whole sats.
+`rate * difficulty`, truncated to whole sats, where the rate is **derived
+from the live template** rather than configured:
+
+```
+gross = coinbasevalue / network_difficulty      # fair value of one diff-1 share
+rate  = gross * (1 - fee_bps / 10000)           # what the pool actually pays
+```
+
+It is recomputed on every template change, so it tracks difficulty and block
+value automatically. `fee_bps` is the only fee knob.
+
+Both numbers are written onto the share row — `credited_sats` and
+`rate_used` — so the credit can be re-derived later without knowing what the
+rate happened to be at the time. See [Verifying the ledger](#verifying-the-ledger).
 
 ## Config
 
@@ -58,11 +71,33 @@ pool_mode = pps-classic
 # and that has enough age/maturity for later deposit-tx use.
 pool_btc_address = bc1q...
 
-# Sats credited per unit of share difficulty.
-pps_sats_per_diff = 1000
-
 # operator_address and fee_bps behave exactly as in solo mode.
 ```
+
+Do **not** set `pps_sats_per_diff`. It pins the rate to a constant that
+cannot track difficulty, is taken net of fee (so it silently bypasses
+`fee_bps`), and drifts toward paying more than each share earns as
+difficulty moves. It exists only as an escape hatch; the proxy logs a
+warning when a pinned rate implies a fee more than 25 bps from `fee_bps`.
+
+### Where the fee lands
+
+`fee_bps` is applied in two independent places, and whether that is one
+deduction or two depends on your addresses:
+
+- **The coinbase** splits `fee_bps` of the block to `operator_address` and
+  the rest to `pool_btc_address`.
+- **The PPS rate** is reduced by `fee_bps` before miners are credited.
+
+When `operator_address == pool_btc_address` the split is a no-op — the pool
+receives the whole block — and the fee is collected once, via the rate. The
+pool then runs with a `fee_bps` margin over its expected payout, which is
+the buffer that absorbs bad luck.
+
+When they differ, the operator takes the cut on-chain per block and the pool
+entity runs at **break-even in expectation** with no buffer, while still
+bearing full PPS variance. Both arrangements are coherent; pick deliberately,
+because the second one turns a run of bad luck into a shortfall.
 
 The pool's Thunder reserve address is **not** a proxy config key — the
 coinbase never touches Thunder. It is set on the dashboard
@@ -150,3 +185,58 @@ writing.
   automatically — we can't safely tell "broadcast didn't happen" from
   "broadcast happened, finalize crashed" without a Thunder-side
   mempool/chain lookup.
+
+## Verifying the ledger
+
+The audit page reports what the pool credited. These four queries **check**
+it, and can be run by anyone with a copy of `shares.db` — no trust in the
+dashboard required:
+
+```sql
+-- 1. Arithmetic. Every credited share must re-derive from the pair stored on
+--    its own row. Nothing current is consulted, so this holds no matter how
+--    far the rate has since moved.
+SELECT COUNT(*) FROM shares
+ WHERE rate_used > 0
+   AND credited_sats <> CAST(difficulty * rate_used AS INTEGER);
+
+-- 2. Provenance. Every rate the pool published must follow from the template
+--    inputs recorded beside it. Catches a rate applied consistently but
+--    derived wrongly — which (1) cannot see.
+SELECT COUNT(*) FROM rate_history
+ WHERE ABS(rate_sats_per_diff
+       - (block_value_sats * 1.0 / network_difficulty)
+         * (1 - fee_bps / 10000.0)) > 1e-9;
+
+-- 3. Linkage. No share may be credited at a rate the pool never published.
+SELECT COUNT(*) FROM shares s
+ WHERE s.rate_used > 0
+   AND s.ts >= (SELECT MIN(ts) FROM rate_history)
+   AND NOT EXISTS (SELECT 1 FROM rate_history r
+                    WHERE r.rate_sats_per_diff = s.rate_used);
+
+-- 4. Solvency. What the pool mined must cover what it owes. The margin
+--    decomposes into the fee plus luck; a negative result means the pool
+--    cannot pay out of what it has earned.
+SELECT (SELECT SUM(reward_sats) + SUM(fee_sats) FROM blocks_found)
+     - (SELECT SUM(credited_sats) FROM shares) AS margin_sats;
+```
+
+The first three must all return **0**. Query 4 should be positive and close
+to `Σ difficulty × gross × fee_bps/10000` once luck is accounted for:
+
+```sql
+SELECT ROUND((SELECT SUM(difficulty) FROM shares)
+             / (SELECT network_difficulty FROM pool_meta)) AS expected_blocks,
+       (SELECT COUNT(*) FROM blocks_found)                 AS actual_blocks;
+```
+
+Exact equality in (1) is the right test rather than a tolerance: the proxy
+builds without `-ffast-math`, so SQLite reproduces the same IEEE-754 multiply
+and truncation bit-for-bit.
+
+Shares accepted before `rate_used` existed carry 0 and are excluded from (1)
+and (3). Their `credited_sats` is still authoritative — there is simply no
+stored multiplicand to check it against — and the audit page reports them as
+*unverifiable* rather than as failures. `rate_history` is safe to prune:
+check (1) does not depend on it.
