@@ -60,29 +60,99 @@
         </form>
     </section>
 
+    <%
+    /* depositStatus is only populated on this page; fall back to the plain
+     * ledger if the probe was skipped entirely. */
+    const ds       = typeof depositStatus !== 'undefined' ? depositStatus : null;
+    const rows     = ds ? ds.rows : deposits.map(d => ({ ...d, status: null }));
+    const reserve_ = ds ? ds.reserve : null;
+    /* The state worth shouting about: money irreversibly on the mainchain
+     * that Thunder has not turned into anything spendable. */
+    const settled  = rows.filter(r => r.status && r.status.ok).length;
+    const stranded = settled > 0 && reserve_ && reserve_.ok && reserve_.total === 0;
+    %>
+
     <section class="card">
         <h2>History</h2>
-        <% if (deposits.length === 0) { %>
+
+        <form method="POST" action="/admin/action/check-deposits" style="margin:0 0 0.75em">
+            <input type="hidden" name="csrf" value="<%= csrfToken %>">
+            <input type="hidden" name="return_to" value="/admin/deposits">
+            <button type="submit">Check deposit status now</button>
+            <span class="muted small" style="margin-left:0.6em">
+                Re-reads the enforcer and Thunder. The table below already
+                refreshes every 30s; this answers in words.
+            </span>
+        </form>
+
+        <% if (ds && ds.errors && ds.errors.length) { %>
+            <p class="muted small" style="color:#c66;margin-top:0">
+                ⚠ Status probe incomplete: <%= ds.errors.join('; ') %>.
+                Amounts and txids below are from the pool's own ledger and
+                are unaffected.
+            </p>
+        <% } %>
+
+        <% if (stranded) { %>
+            <p class="small" style="color:#c66;margin-top:0">
+                ⚠ <strong><%= settled %> deposit(s) are confirmed on the mainchain,
+                but the Thunder reserve is 0.</strong>
+                A deposit only becomes spendable when the sidechain advances a
+                block and ingests it. Thunder is not producing blocks, so these
+                funds are irreversibly committed and not yet usable — payouts
+                stay blocked until it does. Use <em>Nudge Thunder to mine</em>
+                on the Tools page, or wait for a BMM miner.
+            </p>
+        <% } %>
+
+        <% if (rows.length === 0) { %>
             <p class="muted">No deposits recorded.</p>
         <% } else { %>
         <table>
             <thead><tr>
                 <th>When</th><th>Amount</th><th>Fee</th>
-                <th>Thunder recipient</th><th>Mainchain txid</th><th>Ctip seq</th>
+                <th>Status</th>
+                <th>Thunder recipient</th><th>Mainchain txid</th>
             </tr></thead>
             <tbody>
-                <% deposits.forEach(d => { %>
+                <% rows.forEach(d => { const s = d.status; %>
                 <tr>
                     <td class="muted small" title="<%= fmtTs(d.ts) %>"><%= ago(d.ts) %></td>
                     <td><strong><%= fmtSats(d.sats_deposited) %></strong></td>
                     <td class="muted small"><%= fmtSats(d.fee_sats) %></td>
+                    <td class="small">
+                        <% if (!s) { %>
+                            <span class="muted">unknown</span>
+                        <% } else { %>
+                            <span style="color:<%= s.ok ? '#5b8' : '#c66' %>">
+                                <%= s.ok ? '✓' : '○' %> <%= s.label %>
+                            </span>
+                            <% if (s.height) { %>
+                                <br><span class="muted">block <%= fmtN(s.height) %></span>
+                            <% } %>
+                            <br><span class="muted" title="<%= s.detail %>"><%= s.detail %></span>
+                        <% } %>
+                    </td>
                     <td class="mono small"><%= d.thunder_recipient %></td>
                     <td class="mono small" title="<%= d.btc_txid %>"><%= d.btc_txid.slice(0,16) %>…<%= d.btc_txid.slice(-6) %></td>
-                    <td class="muted small"><%= d.ctip_seq_before %> → <%= d.ctip_seq_after %></td>
                 </tr>
                 <% }) %>
             </tbody>
         </table>
+
+        <p class="muted small" style="margin-top:0.75em">
+            A deposit passes through four stages:
+            <strong>broadcast</strong> → <strong>confirmed</strong> on the
+            mainchain → recognised as the sidechain's <strong>Ctip</strong> →
+            <strong>credited</strong> on Thunder. Only the last one makes the
+            funds spendable by the payout worker, and it needs the sidechain to
+            advance a block.
+            <% if (ds) { %>
+                Mainchain tip <strong><%= fmtN(ds.tipHeight) %></strong>;
+                Thunder reserve
+                <strong><%= reserve_ && reserve_.ok ? fmtSats(reserve_.total) : 'unreachable' %></strong>.
+            <% } %>
+        </p>
         <% } %>
     </section>
     <%- include('partial/tx-attempts', {

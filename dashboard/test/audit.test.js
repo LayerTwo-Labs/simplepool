@@ -430,3 +430,155 @@ test('the public miner page shows the independent check, passing and failing', a
                                   : /re-derive exactly/);
     }
 });
+
+/* ---------- deposit status ---------------------------------------------
+ *
+ * The stages are stubbed at the HTTP boundary rather than at the module
+ * boundary, so the real enforcerRpc / field-name handling is exercised —
+ * that is where the camelCase-vs-snake_case bugs live. */
+
+import * as depstat from '../lib/deposit-status.js';
+
+function withStubbedFetch(handlers, fn) {
+    const real = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+        const u = String(url);
+        for (const [match, body] of Object.entries(handlers)) {
+            if (u.includes(match)) {
+                if (body === 'ERROR') return { ok: false, status: 500, text: async () => '{"code":"unavailable"}' };
+                return { ok: true, status: 200, text: async () => JSON.stringify(body),
+                         json: async () => body };
+            }
+        }
+        throw new Error(`unstubbed fetch: ${u}`);
+    };
+    return fn().finally(() => { globalThis.fetch = real; });
+}
+
+const TXID = '67c64353b8ee524e761ef06c49e854353693c6ad15255d4491a81b7a17c52bed';
+
+const stubs = ({ confirmed = true, isCtip = true, reserveSats = 0 } = {}) => ({
+    'ListSidechainDepositTransactions': {
+        transactions: [{
+            sidechainNumber: 9,
+            tx: {
+                txid: { hex: TXID },
+                sentSats: '1000000000', feeSats: '100',
+                ...(confirmed ? { confirmationInfo: {
+                    height: 977589,
+                    blockHash: { hex: '00000000000054c40add36402ba525c9b95859647863878a071b2175fb8ea213' },
+                } } : {}),
+            },
+        }],
+    },
+    'GetChainTip': { blockHeaderInfo: { height: 977600 } },
+    'GetCtip':     isCtip ? { ctip: { txid: { hex: TXID }, value: '1000000000' } } : { ctip: null },
+    '6009':        { jsonrpc: '2.0', id: 1, result: { total_sats: reserveSats, available_sats: reserveSats } },
+});
+
+const DEPOSIT = { id: 1, ts: 1785774125, btc_txid: TXID, sats_deposited: 1000000000,
+                  fee_sats: 100, thunder_recipient: '3MA4uE5RsmQmJuSNYwGC125NVnVJ' };
+
+const OPTS = { enforcerGrpcAddr: '127.0.0.1:50051',
+               thunderRpcUrl: 'http://127.0.0.1:6009', sidechainId: 9 };
+
+test('a confirmed deposit that is the current Ctip reports stage ctip', async () => {
+    await withStubbedFetch(stubs(), async () => {
+        const st = await depstat.depositStatuses([DEPOSIT], OPTS);
+        assert.equal(st.rows[0].status.stage, 'ctip');
+        assert.equal(st.rows[0].status.ok, true);
+        assert.equal(st.rows[0].status.confirmations, 12);   /* 977600-977589+1 */
+        assert.equal(st.rows[0].status.isCtip, true);
+        assert.equal(st.errors.length, 0);
+    });
+});
+
+test('confirmed-but-not-credited is called out, not reported as done', async () => {
+    /* The failure mode this panel exists for: irreversibly on the mainchain,
+     * worth nothing on Thunder. */
+    await withStubbedFetch(stubs({ reserveSats: 0 }), async () => {
+        const st = await depstat.depositStatuses([DEPOSIT], OPTS);
+        assert.equal(st.rows[0].status.ok, true);
+        assert.equal(st.reserve.total, 0);
+        assert.match(depstat.summarise(st), /NOT yet credited on Thunder/);
+    });
+});
+
+test('a credited reserve does not trigger the stranded warning', async () => {
+    await withStubbedFetch(stubs({ reserveSats: 1000000000 }), async () => {
+        const st = await depstat.depositStatuses([DEPOSIT], OPTS);
+        assert.doesNotMatch(depstat.summarise(st), /NOT yet credited/);
+    });
+});
+
+test('an unconfirmed deposit reports mempool, not confirmed', async () => {
+    await withStubbedFetch(stubs({ confirmed: false }), async () => {
+        const st = await depstat.depositStatuses([DEPOSIT], OPTS);
+        assert.equal(st.rows[0].status.stage, 'broadcast');
+        assert.equal(st.rows[0].status.ok, false);
+    });
+});
+
+test('a superseded deposit is confirmed but not the Ctip', async () => {
+    await withStubbedFetch(stubs({ isCtip: false }), async () => {
+        const st = await depstat.depositStatuses([DEPOSIT], OPTS);
+        assert.equal(st.rows[0].status.stage, 'confirmed');
+        assert.equal(st.rows[0].status.ok, true, 'superseded is normal, not a failure');
+        assert.equal(st.rows[0].status.isCtip, false);
+    });
+});
+
+test('a row with no txid is reported as such, not as unconfirmed', async () => {
+    await withStubbedFetch(stubs(), async () => {
+        const st = await depstat.depositStatuses(
+            [{ ...DEPOSIT, btc_txid: '(pending)' }], OPTS);
+        assert.equal(st.rows[0].status.stage, 'no-txid');
+    });
+});
+
+test('enforcer snake_case field names are handled too', async () => {
+    const s = stubs();
+    s['ListSidechainDepositTransactions'].transactions[0].tx = {
+        txid: { hex: TXID }, sent_sats: '1000000000',
+        confirmation_info: { height: 977589, block_hash: { hex: 'ab'.repeat(32) } },
+    };
+    await withStubbedFetch(s, async () => {
+        const st = await depstat.depositStatuses([DEPOSIT], OPTS);
+        assert.equal(st.rows[0].status.stage, 'ctip');
+        assert.equal(st.rows[0].status.confirmations, 12);
+    });
+});
+
+test('an enforcer outage degrades to unknown rather than throwing', async () => {
+    await withStubbedFetch({ 'ListSidechainDepositTransactions': 'ERROR',
+                             'GetChainTip': 'ERROR', 'GetCtip': 'ERROR',
+                             '6009': 'ERROR' }, async () => {
+        const st = await depstat.depositStatuses([DEPOSIT], OPTS);
+        assert.equal(st.rows[0].status.stage, 'unknown');
+        assert.ok(st.errors.length > 0, 'errors must be surfaced, not swallowed');
+    });
+});
+
+test('admin-deposits renders the status column and the stranded warning', async () => {
+    const { db } = makeDb();
+    db.prepare(`INSERT INTO deposits (ts, btc_txid, sats_deposited, fee_sats,
+                    thunder_recipient, notes)
+                VALUES (?, ?, ?, ?, ?, '')`)
+      .run(DEPOSIT.ts, TXID, DEPOSIT.sats_deposited, DEPOSIT.fee_sats, DEPOSIT.thunder_recipient);
+
+    await withStubbedFetch(stubs({ reserveSats: 0 }), async () => {
+        const depositStatus = await depstat.depositStatuses([DEPOSIT], OPTS);
+        const html = await render('admin-deposits.ejs', {
+            deposits: [DEPOSIT], depositStatus,
+            txAttempts: [], reserveAddress: '3MA4uE5RsmQmJuSNYwGC125NVnVJ',
+            reserveSidechainId: 9, csrfToken: 'tok', flash: null,
+            enforcer: { ok: true, confirmed_sats: 145314677739, pending_sats: 0 },
+        });
+        assert.match(html, /Check deposit status now/);
+        assert.match(html, /current Ctip/);
+        assert.match(html.replace(/\s+/g, ' '),
+                     /confirmed on the mainchain, but the Thunder reserve is 0/);
+        assert.match(html, /block 977,589/);
+        assert.match(html.replace(/\s+/g, ' '), /Mainchain tip <strong>977,600<\/strong>/);
+    });
+});
