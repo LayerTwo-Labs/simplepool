@@ -60,6 +60,31 @@ export class ThunderClient {
         return this._call('balance', []);
     }
 
+    /* Where a broadcast transaction currently stands.
+     *
+     *   { known: false }                    node has never seen this txid
+     *   { known: true, confirmed: false }   in the mempool, holding its inputs
+     *   { known: true, confirmed: true }    mined, inputs released
+     *
+     * `get_transaction` returns `{ tx, block_hash }`, with both null for an
+     * unknown txid and `block_hash` null while a known tx is unconfirmed —
+     * so the two fields have to be read together. This distinction is what
+     * lets the payout loop tell "still settling" from "gone", which decide
+     * opposite things: wait, or stop waiting.
+     *
+     * Never throws: an unreachable node returns { known: false, error }, and
+     * callers must treat that as "cannot tell" rather than "not pending". */
+    async getTransaction(txid) {
+        try {
+            const r = await this._call('get_transaction', [txid]);
+            const tx = r?.tx ?? null;
+            const blockHash = r?.block_hash ?? r?.blockHash ?? null;
+            return { known: tx !== null, confirmed: blockHash !== null, blockHash };
+        } catch (e) {
+            return { known: false, confirmed: false, blockHash: null, error: e.message };
+        }
+    }
+
     /* Build, sign, broadcast a Thunder tx from the node's wallet to `dest`.
      * Returns the txid (hex). Throws on insufficient funds, bad address, etc.
      *
