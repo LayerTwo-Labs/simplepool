@@ -417,6 +417,64 @@ static void test_build_from_template_fee_split(void) {
     printf("ok: coinbase_build_from_template fee split\n");
 }
 
+
+/* coinbase_count_outputs: the OP_RETURN count is what tells an observer
+ * whether these blocks can have a sidechain merge-mined into them. One
+ * OP_RETURN is a bare witness commitment (a coinbase we built ourselves);
+ * more means BIP300/301 commitments came down with the template.
+ *
+ * Counted against the real fixtures above rather than hand-written hex — a
+ * miscounted length byte in a literal silently desyncs the parse and the
+ * assertion that catches it tells you nothing about which byte was wrong. */
+static void test_count_outputs(void) {
+    int spend = -1, opret = -1;
+
+    /* Server-provided coinbase: BIP301 commitment + reward + witness
+     * commitment, and segwit-serialized, so the marker/flag and the trailing
+     * witness must both be stepped over correctly. */
+    assert(coinbase_count_outputs(ENF_COINBASE_HEX, &spend, &opret) == 0);
+    assert(spend == 1);
+    assert(opret == 2);
+
+    /* A coinbase we built: reward + operator fee + witness commitment only.
+     * One OP_RETURN means no sidechain commitments — the state that left
+     * Thunder unable to advance. */
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+    assert(coinbase_build_split(800000, 5000000000LL, ENF_ADDR, ENF_ADDR, 100,
+                                /* witness_commitment_hex */
+                                "6a24aa21a9ed2222222222222222222222222222"
+                                "222222222222222222222222222222222222",
+                                /* coinbase_tag */ NULL,
+                                4, 4, &parts, NULL, NULL, err, sizeof err) == 0);
+    /* cb1 + extranonce1 + extranonce2 + cb2 is the coinbase a miner submits. */
+    size_t n = parts.cb1_len * 2 + 16 + parts.cb2_len * 2 + 1;
+    char *hex = (char *)malloc(n);
+    assert(hex);
+    size_t o = 0;
+    for (size_t i = 0; i < parts.cb1_len; i++) o += (size_t)sprintf(hex + o, "%02x", parts.cb1[i]);
+    o += (size_t)sprintf(hex + o, "%s", "0011223344556677");   /* en1 + en2 */
+    for (size_t i = 0; i < parts.cb2_len; i++) o += (size_t)sprintf(hex + o, "%02x", parts.cb2[i]);
+    hex[o] = '\0';
+
+    spend = -1; opret = -1;
+    assert(coinbase_count_outputs(hex, &spend, &opret) == 0);
+    assert(spend == 2);      /* miner + operator */
+    assert(opret == 1);      /* witness commitment only */
+    free(hex);
+    coinbase_parts_free(&parts);
+
+    /* Malformed input must fail rather than report a plausible count. */
+    assert(coinbase_count_outputs("00", &spend, &opret) < 0);
+    assert(coinbase_count_outputs("abc", &spend, &opret) < 0);   /* odd length */
+    assert(coinbase_count_outputs(NULL, &spend, &opret) < 0);
+
+    /* Out-params are optional. */
+    assert(coinbase_count_outputs(ENF_COINBASE_HEX, NULL, NULL) == 0);
+
+    printf("ok: coinbase_count_outputs\n");
+}
+
 int main(void) {
     test_p2pkh_address();
     test_p2wpkh_address();
@@ -426,6 +484,7 @@ int main(void) {
     test_bip34_small_height_uses_opn();
     test_build_from_template();
     test_build_from_template_fee_split();
+    test_count_outputs();
     printf("test_coinbase: all tests passed\n");
     return 0;
 }

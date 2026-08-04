@@ -467,6 +467,70 @@ export function rateVerification(handle, workerId = null) {
     }
 }
 
+/* What the pool is mining right now, and what it mined before.
+ *
+ * The row is appended by the proxy on each material template change, so the
+ * newest row is the current job and the rest is history. `source` is the
+ * field worth reading: 'bitcoind' means the pool built its own coinbase and
+ * the block carries no BIP300/301 commitments, so no sidechain can be
+ * merge-mined into it — a condition invisible from every other page.
+ *
+ * Returns null on a DB predating the table. */
+export function templates(handle, { limit = 50 } = {}) {
+    const d = !handle ? null
+            : (typeof handle.get === 'function' ? handle.get() : handle);
+    if (!d) return null;
+    try {
+        const rows = d.prepare(`
+            SELECT id, ts, height, prev_hash, bits, network_difficulty,
+                   coinbase_value_sats, tx_count, tx_fees_sats, source,
+                   cb_spendable, cb_op_returns, longpoll, rate_sats_per_diff
+              FROM templates
+             ORDER BY id DESC
+             LIMIT ?
+        `).all(Math.max(1, Math.min(500, Number(limit) || 50)));
+        if (rows.length === 0) {
+            return { current: null, history: [], total: 0, commitments_ok: null };
+        }
+        const norm = r => ({
+            id:        Number(r.id),
+            ts:        Number(r.ts),
+            height:    Number(r.height),
+            prev_hash: r.prev_hash,
+            bits:      r.bits,
+            network_difficulty:  Number(r.network_difficulty),
+            coinbase_value_sats: Number(r.coinbase_value_sats),
+            tx_count:      Number(r.tx_count),
+            tx_fees_sats:  Number(r.tx_fees_sats),
+            source:        r.source,
+            cb_spendable:  Number(r.cb_spendable),
+            cb_op_returns: Number(r.cb_op_returns),
+            longpoll:      !!r.longpoll,
+            rate_sats_per_diff: Number(r.rate_sats_per_diff),
+            /* The subsidy is whatever is left once fees are removed. Derived
+             * rather than stored: it is a property of the chain's schedule,
+             * not of the template. */
+            subsidy_sats: Number(r.coinbase_value_sats) - Number(r.tx_fees_sats),
+            /* A server-dictated coinbase carries the sidechain commitments
+             * alongside the witness commitment, so more than one OP_RETURN
+             * is the observable signature of a mergeable block. */
+            has_commitments: r.source === 'enforcer' && Number(r.cb_op_returns) > 1,
+        });
+        const total = d.prepare('SELECT COUNT(*) AS n FROM templates').get().n;
+        const all   = rows.map(norm);
+        return {
+            current: all[0],
+            history: all.slice(1),
+            total:   Number(total),
+            /* Whether the pool is currently producing blocks a sidechain can
+             * be merge-mined into. */
+            commitments_ok: all[0].has_commitments,
+        };
+    } catch {
+        return null;   /* DB predates the templates table */
+    }
+}
+
 export function nodeStatus(handle) {
     const d = db(handle);
     if (!d) return null;

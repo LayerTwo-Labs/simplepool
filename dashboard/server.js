@@ -167,6 +167,18 @@ app.get('/blocks', (req, res) => {
     });
 });
 
+/* Public view of the work the pool is handing miners. Read-only and
+ * unauthenticated: what a pool is mining, and whether its blocks can carry
+ * sidechain commitments, is exactly the sort of thing miners should be able
+ * to check without asking the operator. */
+app.get('/templates', (req, res) => {
+    const limit = req.query.limit ? Number(req.query.limit) : 50;
+    res.render('templates', {
+        templates: stats.templates(db, { limit }),
+        fmtBtc: stats.fmtBtc,
+    });
+});
+
 /* --- JSON API (unchanged) ---------------------------------------------- */
 app.get('/api/overview',              (_req, res) => res.json(stats.overview(db)));
 app.get('/api/node',                  (_req, res) => res.json(stats.nodeStatus(db) || {}));
@@ -177,6 +189,11 @@ app.get('/api/worker/:name', (req, res) => {
     if (!w.worker) return res.status(404).json({ error: 'unknown worker' });
     res.json(w);
 });
+app.get('/api/templates', (req, res) => {
+    const limit = req.query.limit ? Number(req.query.limit) : 50;
+    res.json(stats.templates(db, { limit }) || { current: null, history: [], total: 0 });
+});
+
 app.get('/api/blocks', (req, res) => {
     const beforeTs = req.query.before ? Number(req.query.before) : null;
     const limit = req.query.limit ? Number(req.query.limit) : 50;

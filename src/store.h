@@ -103,6 +103,32 @@ int store_record_rate(store_t *s, const char *rate_source,
                       int64_t block_value_sats,
                       uint64_t ts_s);
 
+/* One block template, as the pool received it. */
+typedef struct {
+    uint64_t    ts_s;
+    int         height;
+    const char *prev_hash;
+    const char *bits;                /* nbits as hex */
+    double      network_difficulty;
+    int64_t     coinbase_value_sats; /* subsidy + fees */
+    int         tx_count;
+    int64_t     tx_fees_sats;
+    /* "enforcer" when the backend dictated the coinbase (BIP22 coinbasetxn),
+     * "bitcoind" when we built our own. Only the former carries BIP300/301
+     * commitments, so only the former lets a sidechain be merge-mined. */
+    const char *source;
+    int         cb_spendable;        /* server coinbase outputs; 0 when we build it */
+    int         cb_op_returns;
+    int         longpoll;            /* server supports BIP22 long polling */
+    double      rate_sats_per_diff;  /* PPS rate derived from this template */
+} store_template_t;
+
+/* Append one row to the template history, unless the newest row already
+ * describes the same work. Synchronous; called at most once per template
+ * change. Deduped on tip / value / tx set / bits / source — curtime alone
+ * must not append, or the table grows once per poll forever. */
+int store_record_template(store_t *s, const store_template_t *t);
+
 /* Record / refresh the upstream bitcoind tip the proxy is mining on.
  * Single-row upsert keyed on id=1. tip_observed_at is preserved when
  * (height, hash) match the existing row, so 'time since last tip change'

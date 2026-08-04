@@ -84,6 +84,15 @@ int coinbase_build_from_template(const char *coinbase_tx_hex,
 
 void coinbase_parts_free(coinbase_parts_t *p);
 
+/* Count a serialized coinbase's outputs, split into spendable and OP_RETURN.
+ * Either out-param may be NULL. The OP_RETURN count distinguishes a coinbase
+ * we built (one output: the witness commitment) from one dictated by the CUSF
+ * enforcer (plus the mandatory BIP300/301 commitments), which is what tells an
+ * observer whether a sidechain can be merge-mined into these blocks.
+ * Returns 0 ok, negative on malformed input. */
+int coinbase_count_outputs(const char *tx_hex, int *spendable_out,
+                           int *op_return_out);
+
 /* Internal helpers exposed for tests. */
 int coinbase_address_to_script(const char *addr,
                                uint8_t *out, size_t cap, size_t *out_len,
