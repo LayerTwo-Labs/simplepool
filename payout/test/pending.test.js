@@ -66,10 +66,12 @@ function thunderStub({ txState = {}, balance = 10n ** 12n, onTransfer } = {}) {
             calls.getTx++;
             return txState[txid] ?? { known: false, confirmed: false, blockHash: null };
         },
-        async transferDetailed(dest, sats) {
+        async transferBatchDetailed(recipients) {
             calls.transfers++;
+            calls.lastBatch = recipients;
             if (onTransfer) onTransfer(calls.transfers);
-            return { txid: `tx${calls.transfers}`, unsigned: {}, signed: {} };
+            return { txid: `tx${calls.transfers}`, unsigned: {}, signed: {},
+                     recipients: recipients.length };
         },
     };
 }
@@ -135,37 +137,54 @@ test('no prior payout at all does not block a first payout', async () => {
     assert.equal(thunder.calls.getTx, 0, 'nothing to check when no payout was ever made');
 });
 
-test('at most one payout is broadcast per tick', async () => {
-    /* The in-tick version of the same conflict: worker 2 would select the
-     * inputs worker 1 just spent. Four due workers used to mean one success
-     * and three double-spend failures. */
+test('every due worker is paid by ONE transaction', async () => {
+    /* The whole point of batching: four workers, one broadcast, one
+     * sidechain block. One tx per worker would need four. */
     const db = makeDb({ owed: { rig1: 5_000_000, rig2: 6_000_000, rig3: 7_000_000, rig4: 8_000_000 } });
     const thunder = thunderStub();
 
     const r = await runOnce({ db, thunder, cfg }, quietLog);
     assert.equal(thunder.calls.transfers, 1, 'exactly one broadcast');
-    assert.equal(r.paid, 1);
-    assert.equal(r.failed, 0, 'the deferred workers are not failures');
+    assert.equal(thunder.calls.lastBatch.length, 4, 'all four in the same tx');
+    assert.equal(r.paid, 4);
+    assert.equal(r.failed, 0);
 
-    /* Only the paid worker is debited; the rest keep their full balance. */
-    const paid = db.prepare('SELECT worker_id, paid_sats FROM pps_credits WHERE paid_sats > 0').all();
-    assert.equal(paid.length, 1);
-    /* And no in-flight rows are left behind to strand them. */
+    /* All four credited, none left in flight. */
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM pps_credits WHERE paid_sats > 0').get().n, 4);
     assert.equal(db.prepare('SELECT COUNT(*) n FROM payouts_in_flight').get().n, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM payouts').get().n, 4);
+    /* All ledger rows share the batch's txid. */
+    assert.equal(db.prepare('SELECT COUNT(DISTINCT txid) n FROM payouts').get().n, 1);
 });
 
-test('successive ticks drain the queue one worker at a time', async () => {
+test('the whole queue settles in a single tick', async () => {
     const db = makeDb({ owed: { rig1: 5_000_000, rig2: 6_000_000, rig3: 7_000_000 } });
-    const confirmed = {};
-    const thunder = thunderStub({ txState: confirmed });
-
-    for (let i = 1; i <= 3; i++) {
-        const r = await runOnce({ db, thunder, cfg }, quietLog);
-        assert.equal(r.paid, 1, `tick ${i} should pay exactly one`);
-        confirmed[`tx${i}`] = { known: true, confirmed: true };   /* mined between ticks */
-    }
-    assert.equal(db.prepare('SELECT COUNT(*) n FROM payouts').get().n, 3);
+    const thunder = thunderStub();
+    const r = await runOnce({ db, thunder, cfg }, quietLog);
+    assert.equal(r.paid, 3);
     assert.equal(db.prepare('SELECT COUNT(*) n FROM pps_credits WHERE accrued_sats > paid_sats').get().n, 0);
+});
+
+test('the batch fee sums to exactly one transaction fee', async () => {
+    /* Divided across the ledger rows, so SUM(fee_sats) is what was actually
+     * spent — a per-row copy of the full fee would triple-count it. */
+    const db = makeDb({ owed: { rig1: 5_000_000, rig2: 6_000_000, rig3: 7_000_000 } });
+    await runOnce({ db, thunder: thunderStub(), cfg }, quietLog);
+    assert.equal(db.prepare('SELECT SUM(fee_sats) f FROM payouts').get().f, 100);
+});
+
+test('a failed batch credits nobody and strands nobody', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000, rig2: 6_000_000, rig3: 7_000_000 } });
+    const thunder = thunderStub();
+    thunder.transferBatchDetailed = async () => {
+        const e = new Error('boom'); e.stage = 'submit'; throw e;
+    };
+    const r = await runOnce({ db, thunder, cfg }, quietLog);
+    assert.equal(r.paid, 0);
+    assert.equal(r.failed, 3);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM pps_credits WHERE paid_sats > 0').get().n, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM payouts_in_flight').get().n, 0,
+                 'in-flight rows must be released or the workers are stuck forever');
 });
 
 test('lastBroadcastPayout ignores rows with no txid and picks the newest', async () => {

@@ -85,6 +85,87 @@ export class ThunderClient {
         }
     }
 
+    /* Pay many recipients in a single Thunder transaction.
+     *
+     * Thunder's create_transfer builds a one-recipient tx, and its wallet
+     * cannot spend the change of an unconfirmed transaction — so paying N
+     * workers as N transactions means N sidechain blocks, and Thunder only
+     * advances when a mainchain block commits to it. Batching removes that
+     * ceiling entirely: the whole queue settles in one block.
+     *
+     * Rather than construct a transaction from scratch — the kind of thing
+     * that loses money when one field is wrong — this asks Thunder to build a
+     * transfer for the TOTAL and then splits that one output into one per
+     * recipient. Inputs, the utreexo proof and the change output are whatever
+     * Thunder chose and are never touched. The proof commits to inputs
+     * (`targets`/`hashes`), not outputs, so it stays valid.
+     *
+     * Value conservation is structural — the outputs we insert sum to exactly
+     * the one we removed — and asserted anyway before signing, because the
+     * failure mode is silently burning the difference as fee.
+     *
+     * `recipients` is [{ address, sats }]. One flat fee covers the whole
+     * transaction, not one per recipient. */
+    async transferBatchDetailed(recipients, feeSats) {
+        if (!Array.isArray(recipients) || recipients.length === 0) {
+            throw new Error('transferBatch: no recipients');
+        }
+        const amounts = recipients.map(r => BigInt(r.sats));
+        if (amounts.some(v => v <= 0n)) throw new Error('transferBatch: non-positive amount');
+        const total = amounts.reduce((a, b) => a + b, 0n);
+        /* Sat amounts stay well inside 2^53 (all of Bitcoin is ~2.1e15), but
+         * the JSON layer is numbers, so refuse rather than round silently. */
+        if (total > BigInt(Number.MAX_SAFE_INTEGER)) {
+            throw new Error(`transferBatch: total ${total} exceeds safe integer range`);
+        }
+
+        let unsigned = null, signed = null;
+        const fail = (stage, err) => { err.stage = stage; err.unsigned = unsigned; err.signed = signed; return err; };
+
+        try {
+            unsigned = await this._call('create_transfer',
+                [recipients[0].address, Number(total), Number(feeSats)]);
+        } catch (e) { throw fail('create', e); }
+
+        const outs = unsigned?.outputs;
+        if (!Array.isArray(outs) || outs.length === 0) {
+            throw fail('create', new Error('create_transfer returned no outputs'));
+        }
+        const valueOf = o => BigInt(o?.content?.Value ?? o?.content?.value ?? 0);
+        const sum = a => a.reduce((acc, o) => acc + valueOf(o), 0n);
+        const before = sum(outs);
+
+        /* Match on address AND amount: the change output could coincidentally
+         * carry the same value, and splitting the change instead of the
+         * payment would send the entire wallet to one worker. Ambiguity is a
+         * hard error, never a guess. */
+        const hits = outs.reduce((acc, o, i) =>
+            (o.address === recipients[0].address && valueOf(o) === total) ? acc.concat(i) : acc, []);
+        if (hits.length !== 1) {
+            throw fail('create', new Error(
+                `transferBatch: expected exactly one output of ${total} to ` +
+                `${recipients[0].address}, found ${hits.length}`));
+        }
+
+        outs.splice(hits[0], 1, ...recipients.map((r, i) => ({
+            address: r.address,
+            content: { Value: Number(amounts[i]) },
+        })));
+
+        const after = sum(outs);
+        if (after !== before) {
+            throw fail('create', new Error(
+                `transferBatch: value not conserved (${before} -> ${after}); refusing to sign`));
+        }
+
+        try { signed = await this._call('sign_transaction', [unsigned, false]); }
+        catch (e) { throw fail('sign', e); }
+        try {
+            const txid = await this._call('submit_transaction', [signed]);
+            return { txid, unsigned, signed, recipients: recipients.length, total };
+        } catch (e) { throw fail('submit', e); }
+    }
+
     /* Build, sign, broadcast a Thunder tx from the node's wallet to `dest`.
      * Returns the txid (hex). Throws on insufficient funds, bad address, etc.
      *
