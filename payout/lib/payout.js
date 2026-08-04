@@ -1,32 +1,44 @@
 /* Payout loop.
  *
  * Each tick:
- *   1. SELECT workers from pps_credits where (accrued - paid) >= minSats
+ *   1. If the previous payout transaction has not confirmed, stop. Thunder
+ *      cannot spend the change of an unconfirmed transaction, so there is
+ *      nothing to pay from until it is mined (see blockingPayout).
+ *   2. SELECT workers from pps_credits where (accrued - paid) >= minSats
  *      AND no in-flight payout row exists for them.
- *   2. Check the Thunder reserve has enough balance to cover the sum
- *      + a fee budget. If not, log and skip the tick.
- *   3. For each due worker, run a three-step at-most-once protocol:
- *        a. beginPayout()      — INSERT in payouts_in_flight (txid='')
- *        b. thunder.transfer() — broadcast; on failure abortPayout() and
- *                                move on (paid_sats untouched, safe to retry)
- *        c. finalizePayout()   — atomic UPDATE(txid) + paid_sats +=
- *                                + DELETE in one SQLite tx
+ *   3. Check the Thunder reserve covers the total plus one fee.
+ *   4. Pay them ALL in a single transaction:
+ *        a. beginBatch()                — INSERT one in-flight row per worker
+ *        b. thunder.transferBatchDetailed() — one broadcast for the batch; on
+ *                                         failure abortBatch() and retry next
+ *                                         tick with paid_sats untouched
+ *        c. finalizeBatch()             — atomic, across every worker: txid +
+ *                                         paid_sats += + ledger row + DELETE
+ *
+ * Why one transaction rather than one per worker: Thunder only advances when
+ * a mainchain block commits to it, and its wallet cannot spend unconfirmed
+ * change — so N transactions cost N sidechain blocks, and the queue drains
+ * slower than it fills as soon as the pool has more than a handful of miners.
+ * Batching makes throughput independent of miner count.
+ *
+ * The cost is failure isolation: one bad address fails the whole batch rather
+ * than just that worker. That is the right trade here — every recipient is a
+ * Thunder address the proxy already validated at authorize time, and a batch
+ * that fails leaves nobody credited and nobody stranded, so the next tick
+ * simply retries. A persistently bad address surfaces as a repeating failure
+ * in tx_attempts with the transaction attached.
  *
  * Crash semantics:
- *   - Crash between (a) and (b): row stays with txid=''. listDue skips
- *     this worker forever until an operator inspects it and either
- *     reconciles the broadcast (was it sent? if yes finalize manually,
- *     if no delete the row).
- *   - Crash between (b) and (c): same — row exists, broadcast went out,
- *     but paid_sats not yet incremented. listStuck() surfaces it.
- *   - Crash mid-(c): the SQLite tx atomically commits or rolls back.
- *     No partial state.
- *
- * Failure isolation: per-worker payouts are NOT batched into one tx —
- * a bad address or transient RPC error must not block other miners. */
+ *   - Crash between (a) and (b): rows stay with txid=''. listDue skips those
+ *     workers until an operator reconciles (was it broadcast? if yes finalize
+ *     manually, if no delete the rows).
+ *   - Crash between (b) and (c): same — rows exist, broadcast went out, but
+ *     paid_sats not yet incremented. listStuck() surfaces them.
+ *   - Crash mid-(c): the SQLite transaction commits or rolls back as a whole,
+ *     across every worker in the batch. No partial credit. */
 
-import { listDue, listStuck, beginPayout, finalizePayout, abortPayout,
-         recordTxAttempt, asRawTx, lastBroadcastPayout } from './db.js';
+import { listDue, listStuck, abortPayout, recordTxAttempt, asRawTx,
+         lastBroadcastPayout, beginBatch, finalizeBatch, abortBatch } from './db.js';
 
 /* Fee model: flat per-tx fee, configurable later. Thunder is a sidechain
  * with relatively low fees; 100 sats covers a one-input one-output tx
@@ -93,8 +105,9 @@ export async function runOnce(ctx, log) {
     }
 
     const totalOwed = due.reduce((a, r) => a + r.owed_sats, 0n);
-    const totalFees = BigInt(due.length) * TX_FEE_SATS;
-    log.info(`payout: ${due.length} due, total owed=${totalOwed} sats, fees~${totalFees}`);
+    /* One transaction, one fee — not one per recipient. */
+    const totalFees = TX_FEE_SATS;
+    log.info(`payout: ${due.length} due, total owed=${totalOwed} sats, fee=${totalFees}`);
 
     if (!cfg.dryRun) {
         let bal;
@@ -115,70 +128,64 @@ export async function runOnce(ctx, log) {
     }
 
     const now_s = Math.floor(Date.now() / 1000);
-    let paid = 0, failed = 0;
-    for (const r of due) {
-        if (cfg.dryRun) {
+
+    if (cfg.dryRun) {
+        for (const r of due) {
             log.info(`payout: DRY ${r.worker_name} -> ${r.thunder_address} ${r.owed_sats} sats`);
-            continue;
         }
-        const rowId = beginPayout(db, r.worker_id, r.owed_sats, now_s);
-        let txid;
-        try {
-            const res = await thunder.transferDetailed(
-                r.thunder_address, r.owed_sats, TX_FEE_SATS);
-            txid = res.txid;
-            /* Record the successful attempt with its transaction so the
-             * dashboard can show it alongside the failures. */
-            recordTxAttempt(db, {
-                kind: 'payout', status: 'broadcast', stage: 'submit',
-                txid, rawTx: asRawTx(res.signed),
-                amountSats: r.owed_sats, feeSats: TX_FEE_SATS,
-                destination: r.thunder_address, workerId: r.worker_id,
-            });
-        } catch (e) {
-            /* Drop the in-flight row so the worker is eligible next tick.
-             * Safe for create/sign, which are local and cannot have
-             * broadcast; a submit failure keeps the usual ambiguity and is
-             * caught by the stuck-row sweep. */
-            abortPayout(db, rowId);
-            /* Keep the transaction. It is the whole point of a failure
-             * report — without it there is nothing to inspect. */
-            recordTxAttempt(db, {
-                kind: 'payout', status: 'failed', stage: e.stage || 'unknown',
-                rawTx: asRawTx(e.signed || e.unsigned),
-                amountSats: r.owed_sats, feeSats: TX_FEE_SATS,
-                destination: r.thunder_address, workerId: r.worker_id,
-                error: e.message || String(e),
-            });
-            log.warn(`payout: ${r.worker_name} ${e.stage || 'transfer'} failed: ${e.message}`);
-            failed++;
-            continue;
-        }
-        try {
-            finalizePayout(db, rowId, r.worker_id, r.owed_sats, TX_FEE_SATS, txid, now_s);
-            log.info(`payout: ${r.worker_name} -> ${r.thunder_address} ` +
-                     `${r.owed_sats} sats txid=${txid}`);
-            paid++;
-            /* Stop here. This transfer has just consumed every wallet UTXO
-             * and its change is unconfirmed, so paying the next worker in the
-             * same tick would select the very inputs it spends and be
-             * rejected as a double spend. The remaining workers keep their
-             * in-flight rows clear and are picked up once this confirms. */
-            if (due.length > 1) {
-                log.info(`payout: ${due.length - 1} worker(s) deferred until ` +
-                         `${txid.slice(0, 16)}… confirms`);
-            }
-            break;
-        } catch (e) {
-            /* DB error after a successful broadcast. The row now has
-             * txid set; listStuck() will surface it on next startup. */
-            log.error(`payout: ${r.worker_name} FINALIZE FAILED after ` +
-                      `broadcast txid=${txid}: ${e.message}; ` +
-                      `paid_sats NOT updated — manual reconciliation required`);
-            failed++;
-        }
+        return { attempted: due.length, paid: 0, failed: 0 };
     }
-    return { attempted: due.length, paid, failed };
+
+    /* Everyone due goes out in ONE transaction. Paying them one at a time
+     * would cost one sidechain block each, and Thunder only advances when a
+     * mainchain block commits to it — so the queue would drain slower than it
+     * fills as soon as the pool has more than a handful of miners. */
+    const batch = due.map(r => ({
+        worker_id: r.worker_id, worker_name: r.worker_name,
+        address: r.thunder_address, sats: r.owed_sats,
+    }));
+    const rowIds = beginBatch(db, batch, now_s);
+
+    let res;
+    try {
+        res = await thunder.transferBatchDetailed(
+            batch.map(b => ({ address: b.address, sats: b.sats })), TX_FEE_SATS);
+    } catch (e) {
+        /* The whole batch fails together, which is the point: no worker is
+         * credited for a transaction that did not go out. */
+        abortBatch(db, rowIds);
+        recordTxAttempt(db, {
+            kind: 'payout', status: 'failed', stage: e.stage || 'unknown',
+            rawTx: asRawTx(e.signed || e.unsigned),
+            amountSats: totalOwed, feeSats: TX_FEE_SATS,
+            destination: batch.length === 1 ? batch[0].address : `${batch.length} recipients`,
+            workerId: batch.length === 1 ? batch[0].worker_id : null,
+            error: e.message || String(e),
+        });
+        log.warn(`payout: batch of ${batch.length} ${e.stage || 'transfer'} failed: ${e.message}`);
+        return { attempted: due.length, paid: 0, failed: due.length };
+    }
+
+    recordTxAttempt(db, {
+        kind: 'payout', status: 'broadcast', stage: 'submit',
+        txid: res.txid, rawTx: asRawTx(res.signed),
+        amountSats: totalOwed, feeSats: TX_FEE_SATS,
+        destination: batch.length === 1 ? batch[0].address : `${batch.length} recipients`,
+        workerId: batch.length === 1 ? batch[0].worker_id : null,
+    });
+
+    try {
+        finalizeBatch(db, batch.map((b, i) => ({ ...b, rowId: rowIds[i] })),
+                      TX_FEE_SATS, res.txid, now_s);
+        log.info(`payout: ${batch.length} worker(s), ${totalOwed} sats, txid=${res.txid}`);
+        for (const b of batch) log.info(`  ${b.worker_name} -> ${b.address} ${b.sats} sats`);
+        return { attempted: due.length, paid: batch.length, failed: 0, txid: res.txid };
+    } catch (e) {
+        log.error(`payout: FINALIZE FAILED after broadcast txid=${res.txid}: ${e.message}; ` +
+                  `paid_sats NOT updated for ${batch.length} worker(s) — ` +
+                  'manual reconciliation required');
+        return { attempted: due.length, paid: 0, failed: batch.length };
+    }
 }
 
 /* Called once at startup. Doesn't auto-resolve; logs anything older

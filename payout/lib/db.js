@@ -95,9 +95,6 @@ export function finalizePayout(db, rowId, workerId, sats, feeSats, txid, nowSec)
     })();
 }
 
-/* Drop an in-flight row that we failed to broadcast — the Thunder RPC
- * threw before any txid was returned, so paid_sats was untouched and
- * the worker is safe to retry next tick. */
 /* The most recently broadcast payout, or null if none.
  *
  * Used to answer "is a payout still settling?" before starting another.
@@ -115,8 +112,66 @@ export function lastBroadcastPayout(db) {
     `).get() || null;
 }
 
+/* Drop an in-flight row that we failed to broadcast — the Thunder RPC threw
+ * before any txid was returned, so paid_sats was untouched and the worker is
+ * safe to retry next tick. */
 export function abortPayout(db, rowId) {
     db.prepare(`DELETE FROM payouts_in_flight WHERE id = ?`).run(rowId);
+}
+
+/* ---------- batched payouts ------------------------------------------------
+ *
+ * One Thunder transaction pays many workers, so the in-flight rows for the
+ * whole batch have to appear and settle together. A per-worker finalize would
+ * leave a window where some workers are credited for a transaction the others
+ * are still "waiting" on — and a crash inside that window is unreconcilable,
+ * because the txid is the same for all of them. */
+
+export function beginBatch(db, items, nowSec) {
+    const ins = db.prepare(`
+        INSERT INTO payouts_in_flight (worker_id, sats, txid, started_at)
+        VALUES (?, ?, '', ?)
+    `);
+    return db.transaction(() =>
+        items.map(i => ins.run(i.worker_id, Number(i.sats), nowSec).lastInsertRowid)
+    )();
+}
+
+/* Credit every worker in the batch, atomically, against one txid.
+ *
+ * The transaction pays a single fee covering all recipients. It is divided
+ * evenly across the ledger rows with the remainder on the first, so
+ * SUM(payouts.fee_sats) equals what was actually spent — which is what any
+ * accounting query over that column assumes. */
+export function finalizeBatch(db, rows, totalFeeSats, txid, nowSec) {
+    const n = BigInt(rows.length);
+    const fee = BigInt(totalFeeSats);
+    const share = n > 0n ? fee / n : 0n;
+    const remainder = n > 0n ? fee - share * n : 0n;
+
+    db.transaction(() => {
+        rows.forEach((r, i) => {
+            const rowFee = share + (i === 0 ? remainder : 0n);
+            db.prepare('UPDATE payouts_in_flight SET txid = ? WHERE id = ?')
+              .run(txid, r.rowId);
+            db.prepare(`
+                UPDATE pps_credits
+                   SET paid_sats = paid_sats + ?, last_updated = ?
+                 WHERE worker_id = ?
+            `).run(Number(r.sats), nowSec, r.worker_id);
+            db.prepare(`
+                INSERT INTO payouts (worker_id, sats, fee_sats, txid, paid_at, note)
+                VALUES (?, ?, ?, ?, ?, ?)
+            `).run(r.worker_id, Number(r.sats), Number(rowFee), txid, nowSec,
+                   rows.length > 1 ? `batch of ${rows.length}` : null);
+            db.prepare('DELETE FROM payouts_in_flight WHERE id = ?').run(r.rowId);
+        });
+    })();
+}
+
+export function abortBatch(db, rowIds) {
+    const del = db.prepare('DELETE FROM payouts_in_flight WHERE id = ?');
+    db.transaction(() => { for (const id of rowIds) del.run(id); })();
 }
 
 /* Stuck in-flight rows older than `staleAfterSec`. Used at startup to
