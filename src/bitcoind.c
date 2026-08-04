@@ -222,12 +222,64 @@ static int rpc_call(bitcoind_client_t *c,
     return 0;
 }
 
+/* params: [{"rules":["segwit"],"capabilities":["coinbasetxn","longpoll"]}]
+ *
+ * Requesting the "coinbasetxn" capability is harmless against Bitcoin Core
+ * (it ignores it and still returns "coinbasevalue"), but tells backends that
+ * can dictate the coinbase — notably the CUSF enforcer — to hand us a fully
+ * built coinbase carrying the mandatory BIP300/301 commitments. "longpoll"
+ * declares client-side BIP22 long-poll support (a SHOULD in the BIP); servers
+ * advertise theirs by including "longpollid" in the template.
+ *
+ * Returns NULL on allocation failure. */
+static cJSON *gbt_params(const char *longpollid) {
+    cJSON *params = cJSON_CreateArray();
+    cJSON *obj    = cJSON_CreateObject();
+    cJSON *rules  = cJSON_CreateArray();
+    cJSON *caps   = cJSON_CreateArray();
+    if (!params || !obj || !rules || !caps) {
+        cJSON_Delete(params); cJSON_Delete(obj);
+        cJSON_Delete(rules);  cJSON_Delete(caps);
+        return NULL;
+    }
+    cJSON_AddItemToArray(rules, cJSON_CreateString("segwit"));
+    cJSON_AddItemToObject(obj, "rules", rules);
+    cJSON_AddItemToArray(caps, cJSON_CreateString("coinbasetxn"));
+    cJSON_AddItemToArray(caps, cJSON_CreateString("longpoll"));
+    cJSON_AddItemToObject(obj, "capabilities", caps);
+    if (longpollid && longpollid[0]) {
+        cJSON_AddStringToObject(obj, "longpollid", longpollid);
+    }
+    cJSON_AddItemToArray(params, obj);
+    return params;
+}
+
+/* Startup liveness probe.
+ *
+ * Tries getblockchaininfo first, which is what a full node answers. A
+ * template server is not a full node: the CUSF enforcer serves exactly
+ * getblocktemplate and submitblock and replies "Method not found" to
+ * everything else, so requiring getblockchaininfo would refuse to start
+ * against the very backend that supplies BIP300/301 commitments.
+ *
+ * So fall back to getblocktemplate. That is the better probe anyway — the
+ * question at startup is not "are you a full node?" but "can you hand me
+ * work?", and getblocktemplate is the call the proxy actually depends on.
+ * When both fail, errbuf keeps the getblocktemplate error, because that names
+ * the capability we need. */
 int bitcoind_ping(bitcoind_client_t *c, char *errbuf, size_t errlen) {
     cJSON *result = NULL;
-    int rc = rpc_call(c, "getblockchaininfo", NULL, &result, errbuf, errlen);
-    if (rc != 0) return rc;
+    if (rpc_call(c, "getblockchaininfo", NULL, &result, errbuf, errlen) == 0) {
+        if (result) cJSON_Delete(result);
+        return 0;
+    }
+
+    cJSON *params = gbt_params(NULL);
+    if (!params) { set_err(errbuf, errlen, "oom"); return -20; }
+    result = NULL;
+    int rc = rpc_call(c, "getblocktemplate", params, &result, errbuf, errlen);
     if (result) cJSON_Delete(result);
-    return 0;
+    return rc;
 }
 
 static int hex_to_u32(const char *hex, uint32_t *out) {
@@ -398,28 +450,8 @@ int bitcoind_get_block_template_lp(bitcoind_client_t *c,
     if (!out) return -1;
     *out = NULL;
 
-    /* params: [{"rules":["segwit"],"capabilities":["coinbasetxn","longpoll"]}]
-     *
-     * Requesting the "coinbasetxn" capability is harmless against Bitcoin Core
-     * (it ignores it and still returns "coinbasevalue"), but tells backends
-     * that can dictate the coinbase — notably the CUSF enforcer — to hand us a
-     * fully built coinbase carrying the mandatory BIP300/301 commitments.
-     * "longpoll" declares client-side BIP22 long-poll support (a SHOULD in the
-     * BIP); servers advertise theirs by including "longpollid" in the
-     * template. */
-    cJSON *params = cJSON_CreateArray();
-    cJSON *obj = cJSON_CreateObject();
-    cJSON *rules = cJSON_CreateArray();
-    cJSON_AddItemToArray(rules, cJSON_CreateString("segwit"));
-    cJSON_AddItemToObject(obj, "rules", rules);
-    cJSON *caps = cJSON_CreateArray();
-    cJSON_AddItemToArray(caps, cJSON_CreateString("coinbasetxn"));
-    cJSON_AddItemToArray(caps, cJSON_CreateString("longpoll"));
-    cJSON_AddItemToObject(obj, "capabilities", caps);
-    if (longpollid && longpollid[0]) {
-        cJSON_AddStringToObject(obj, "longpollid", longpollid);
-    }
-    cJSON_AddItemToArray(params, obj);
+    cJSON *params = gbt_params(longpollid);
+    if (!params) { set_err(errbuf, errlen, "oom"); return -20; }
 
     cJSON *result = NULL;
     int rc = rpc_call(c, "getblocktemplate", params, &result, errbuf, errlen);
