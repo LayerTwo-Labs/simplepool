@@ -120,6 +120,38 @@ CREATE TABLE IF NOT EXISTS rate_history (
 CREATE INDEX IF NOT EXISTS rate_history_ts_idx   ON rate_history(ts);
 CREATE INDEX IF NOT EXISTS rate_history_rate_idx ON rate_history(rate_sats_per_diff);
 
+/* What the pool is actually mining, and what it mined before.
+ *
+ * A row is appended whenever the template materially changes — new tip, new
+ * block value, different transaction set. Repeated polls of an unchanged
+ * template do not append.
+ *
+ * `source` records where the template came from. 'enforcer' means the backend
+ * dictated the coinbase (BIP22 "coinbasetxn"), which is how the mandatory
+ * BIP300/301 commitments reach the block; 'bitcoind' means the pool built its
+ * own coinbase and the block carries none. `cb_op_returns` makes that concrete:
+ * one is a bare witness commitment, more means sidechain commitments are
+ * present. A pool mining 'bitcoind' templates cannot have any sidechain
+ * merge-mined into its blocks, which is invisible from every other view. */
+CREATE TABLE IF NOT EXISTS templates (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts                  INTEGER NOT NULL,  /* unix seconds, first seen */
+  height              INTEGER NOT NULL,  /* height this template builds */
+  prev_hash           TEXT    NOT NULL,
+  bits                TEXT    NOT NULL,  /* nbits, hex */
+  network_difficulty  REAL    NOT NULL,
+  coinbase_value_sats INTEGER NOT NULL,  /* subsidy + fees */
+  tx_count            INTEGER NOT NULL,
+  tx_fees_sats        INTEGER NOT NULL,
+  source              TEXT    NOT NULL,  /* 'enforcer' | 'bitcoind' */
+  cb_spendable        INTEGER NOT NULL,  /* coinbase outputs, 0 when we build it */
+  cb_op_returns       INTEGER NOT NULL,
+  longpoll            INTEGER NOT NULL,  /* 1 when the server long-polls */
+  rate_sats_per_diff  REAL    NOT NULL   /* PPS rate derived from this template */
+);
+CREATE INDEX IF NOT EXISTS templates_ts_idx     ON templates(ts);
+CREATE INDEX IF NOT EXISTS templates_height_idx ON templates(height);
+
 /* PPS accrual ledger. One row per worker. The C proxy only INCREMENTs
  * accrued_sats; a separate payout service updates paid_sats after
  * issuing Thunder transactions for (accrued_sats - paid_sats). Empty in

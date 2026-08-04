@@ -1,0 +1,149 @@
+<%# Public view of the work the pool is mining. Locals: templates (from
+    stats.templates), fmtBtc. %>
+<!doctype html>
+<html lang="en">
+<head>
+<%- include('partial/head', { title: 'templates · simplepool', refresh: 20 }) %>
+</head>
+<body>
+<%- include('partial/nav-public', { active: 'templates' }) %>
+<main class="wrap">
+
+    <% if (!templates) { %>
+        <section class="card">
+            <h2>Block templates</h2>
+            <p class="muted">
+                This pool has not recorded any templates yet. The history
+                starts once the proxy has fetched its first block template.
+            </p>
+        </section>
+    <% } else {
+         const cur = templates.current;
+         const age = cur ? Math.max(0, Math.floor(Date.now() / 1000) - cur.ts) : 0;
+    %>
+
+    <section class="card info">
+        <h2>What this pool is mining</h2>
+        <p class="muted small" style="margin-top:0">
+            A <em>block template</em> is the work the pool hands its miners:
+            which block height to build, on top of which tip, at what
+            difficulty, and which transactions to include. A new one is
+            recorded whenever that work materially changes — a new tip, a
+            different fee total, a different transaction set. Repeated polls of
+            unchanged work are not recorded.
+        </p>
+    </section>
+
+    <% if (cur) { %>
+    <section class="card">
+        <h2>Current template</h2>
+        <div class="grid">
+            <div><label>Building height</label><strong><%= fmtN(cur.height) %></strong></div>
+            <div><label>Network difficulty</label><strong><%= fmtF(cur.network_difficulty, 2) %></strong></div>
+            <div><label>Block value</label><strong><%= fmtSats(cur.coinbase_value_sats) %></strong></div>
+            <div><label>Subsidy</label><strong><%= fmtSats(cur.subsidy_sats) %></strong></div>
+            <div><label>Transaction fees</label><strong><%= fmtSats(cur.tx_fees_sats) %></strong></div>
+            <div><label>Transactions</label><strong><%= fmtN(cur.tx_count) %></strong></div>
+            <div><label>nBits</label><strong class="mono"><%= cur.bits %></strong></div>
+            <div><label>PPS rate</label><strong><%= cur.rate_sats_per_diff > 0
+                    ? fmtF(cur.rate_sats_per_diff, 4) + ' sats/diff' : 'n/a (solo)' %></strong></div>
+            <div><label>Received</label><strong title="<%= fmtTs(cur.ts) %>"><%= ago(cur.ts) %></strong></div>
+            <div><label>Long poll</label><strong><%= cur.longpoll ? 'yes' : 'no' %></strong></div>
+        </div>
+        <p class="muted small" style="margin-top:0.75em">
+            Previous block <span class="mono" title="<%= cur.prev_hash %>"><%= cur.prev_hash.slice(0,20) %>…<%= cur.prev_hash.slice(-8) %></span>
+            <% if (age > 900) { %>
+                &nbsp;·&nbsp;<span style="color:#c66">no new template for
+                <%= Math.floor(age / 60) %> min — the proxy may not be reaching
+                its backend</span>
+            <% } %>
+        </p>
+    </section>
+
+    <section class="card">
+        <h2>Sidechain commitments</h2>
+        <p class="muted small" style="margin-top:0">
+            A drivechain sidechain can only advance when a mainchain block
+            commits to it. Those commitments live in the coinbase, and they
+            only get there if the backend builds the coinbase itself. When the
+            pool builds its own instead, its blocks carry a witness commitment
+            and nothing else — perfectly valid blocks that no sidechain can be
+            merge-mined into.
+        </p>
+        <div class="grid">
+            <div><label>Template source</label><strong class="mono"><%= cur.source %></strong></div>
+            <div><label>Coinbase outputs</label><strong>
+                <%= cur.source === 'enforcer'
+                        ? fmtN(cur.cb_spendable) + ' spendable · ' + fmtN(cur.cb_op_returns) + ' OP_RETURN'
+                        : 'built by the pool' %></strong></div>
+            <div><label>Carries commitments</label><strong style="color:<%= cur.has_commitments ? '#5b8' : '#c66' %>">
+                <%= cur.has_commitments ? '✓ yes' : '✗ no' %></strong></div>
+        </div>
+        <% if (cur.has_commitments) { %>
+            <p class="muted small" style="margin-top:0.75em;color:#5b8">
+                ✓ The backend supplies the coinbase, so blocks from this pool
+                carry the BIP300/301 commitments a sidechain needs.
+            </p>
+        <% } else { %>
+            <p class="muted small" style="margin-top:0.75em;color:#c66">
+                ⚠ Blocks from this pool currently carry no sidechain
+                commitments. They are valid blocks and miners are paid
+                normally, but no sidechain can be merge-mined into them — and
+                on a chain where this pool wins most blocks, that stalls the
+                sidechain entirely.
+            </p>
+        <% } %>
+    </section>
+    <% } %>
+
+    <section class="card">
+        <h2>History</h2>
+        <% if (templates.history.length === 0) { %>
+            <p class="muted">No earlier templates recorded yet.</p>
+        <% } else { %>
+        <p class="muted small" style="margin-top:0">
+            Showing <%= fmtN(templates.history.length) %> of
+            <%= fmtN(templates.total) %> recorded.
+        </p>
+        <div style="overflow-x:auto">
+        <table>
+            <thead><tr>
+                <th>When</th><th>Height</th><th>Difficulty</th>
+                <th>Block value</th><th>Fees</th><th>Txs</th>
+                <th>Source</th><th>Commitments</th><th>PPS rate</th>
+            </tr></thead>
+            <tbody>
+                <% templates.history.forEach(t => { %>
+                <tr>
+                    <td class="muted small" title="<%= fmtTs(t.ts) %>"><%= ago(t.ts) %></td>
+                    <td><strong><%= fmtN(t.height) %></strong></td>
+                    <td class="small"><%= fmtF(t.network_difficulty, 2) %></td>
+                    <td class="small"><%= fmtSats(t.coinbase_value_sats) %></td>
+                    <td class="muted small"><%= fmtSats(t.tx_fees_sats) %></td>
+                    <td class="muted small"><%= fmtN(t.tx_count) %></td>
+                    <td class="mono small"><%= t.source %></td>
+                    <td class="small" style="color:<%= t.has_commitments ? '#5b8' : '#c66' %>">
+                        <%= t.has_commitments ? '✓' : '✗' %>
+                        <% if (t.source === 'enforcer') { %>
+                            <span class="muted">(<%= fmtN(t.cb_op_returns) %> OP_RETURN)</span>
+                        <% } %>
+                    </td>
+                    <td class="small"><%= t.rate_sats_per_diff > 0 ? fmtF(t.rate_sats_per_diff, 4) : '—' %></td>
+                </tr>
+                <% }) %>
+            </tbody>
+        </table>
+        </div>
+        <% } %>
+    </section>
+
+    <% } %>
+
+</main>
+<footer class="foot">
+    <span>auto-refresh 20s</span>
+    <span class="sep">·</span>
+    <span>public · templates</span>
+</footer>
+</body>
+</html>

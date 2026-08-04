@@ -320,6 +320,44 @@ static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
                               rate, gross, s->cfg->fee_bps,
                               net_diff, value, now_s);
         }
+
+        /* Template history. Recorded in every mode — what the pool is mining
+         * is worth showing whether or not it accrues PPS credit. */
+        int cb_spendable = 0, cb_op_returns = 0;
+        if (t->coinbasetxn_hex) {
+            /* Best-effort: a coinbase we cannot parse still gets a row, just
+             * with zero counts, rather than losing the whole template. */
+            if (coinbase_count_outputs(t->coinbasetxn_hex,
+                                       &cb_spendable, &cb_op_returns) < 0) {
+                cb_spendable = 0;
+                cb_op_returns = 0;
+            }
+        }
+        int64_t tx_fees = 0;
+        for (size_t i = 0; i < t->tx_count; i++) {
+            if (t->txs[i].fee > 0) tx_fees += t->txs[i].fee;
+        }
+        char bits_hex[16];
+        snprintf(bits_hex, sizeof bits_hex, "%08x", t->bits);
+
+        store_template_t st = {
+            .ts_s                = now_s,
+            .height              = t->height,
+            .prev_hash           = t->prev_hash_hex,
+            .bits                = bits_hex,
+            .network_difficulty  = net_diff,
+            .coinbase_value_sats = value,
+            .tx_count            = (int)t->tx_count,
+            .tx_fees_sats        = tx_fees,
+            /* A server-provided coinbase is the signal: only that path
+             * carries the BIP300/301 commitments. */
+            .source              = t->coinbasetxn_hex ? "enforcer" : "bitcoind",
+            .cb_spendable        = cb_spendable,
+            .cb_op_returns       = cb_op_returns,
+            .longpoll            = t->longpollid != NULL,
+            .rate_sats_per_diff  = accrues ? rate : 0.0,
+        };
+        store_record_template(s->store, &st);
     }
 }
 

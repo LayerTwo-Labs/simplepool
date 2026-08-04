@@ -414,6 +414,65 @@ static void test_rate_history(void) {
     printf("  ok test_rate_history\n");
 }
 
+/* Template history: append on a material change, stay quiet otherwise. The
+ * dedupe matters — curtime moves every poll, so keying on it would append a
+ * row per poll forever. */
+static void test_template_history(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    store_template_t t;
+    memset(&t, 0, sizeof t);
+    t.ts_s = 1700000000; t.height = 977817;
+    t.prev_hash = "00000000000000000000000000000000000000000000000000000000000000ab";
+    t.bits = "1a3839e6"; t.network_difficulty = 298383.4976083073;
+    t.coinbase_value_sats = 312500500; t.tx_count = 1; t.tx_fees_sats = 500;
+    t.source = "enforcer"; t.cb_spendable = 1; t.cb_op_returns = 2;
+    t.longpoll = 1; t.rate_sats_per_diff = 1036.8368;
+
+    assert(store_record_template(s, &t) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT count(*) FROM templates") == 1);
+
+    /* Re-publishing the same work must not append, even as time moves on. */
+    for (int i = 0; i < 10; ++i) {
+        t.ts_s += 30;
+        assert(store_record_template(s, &t) == 0);
+    }
+    assert(scalar_i64(db, "SELECT count(*) FROM templates") == 1);
+
+    /* A new tip is new work. */
+    t.height = 977818;
+    t.prev_hash = "00000000000000000000000000000000000000000000000000000000000000cd";
+    assert(store_record_template(s, &t) == 0);
+    assert(scalar_i64(db, "SELECT count(*) FROM templates") == 2);
+
+    /* So is a changed block value at the same height (fees moved). */
+    t.coinbase_value_sats = 312501999;
+    assert(store_record_template(s, &t) == 0);
+    assert(scalar_i64(db, "SELECT count(*) FROM templates") == 3);
+
+    /* And so is switching template source, which is the change that decides
+     * whether blocks can carry sidechain commitments at all. */
+    t.source = "bitcoind"; t.cb_spendable = 0; t.cb_op_returns = 0;
+    assert(store_record_template(s, &t) == 0);
+    assert(scalar_i64(db, "SELECT count(*) FROM templates") == 4);
+    assert(scalar_i64(db,
+        "SELECT cb_op_returns FROM templates ORDER BY id DESC LIMIT 1") == 0);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM templates WHERE source='enforcer'") == 3);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_template_history\n");
+}
+
 int main(void) {
     log_init(2 /* WARN */);
     printf("running test_store...\n");
@@ -423,6 +482,7 @@ int main(void) {
     test_drop();
     test_credited_sats();
     test_rate_history();
+    test_template_history();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;

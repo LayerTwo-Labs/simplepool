@@ -1,4 +1,5 @@
-<%# Top nav for the public (read-only) dashboard. Locals: active ('overview'|'blocks'|'worker'). %>
+<%# Top nav for the public (read-only) dashboard.
+    Locals: active ('overview'|'blocks'|'templates'|'worker'). %>
 <% const _pactive = (typeof active === 'string') ? active : ''; %>
 <header class="top">
     <a href="/" class="brand">simplepool</a>
@@ -6,6 +7,7 @@
     <nav class="topnav">
         <a href="/"       class="<%= _pactive === 'overview' ? 'active' : '' %>">Overview</a>
         <a href="/blocks" class="<%= _pactive === 'blocks'   ? 'active' : '' %>">Blocks</a>
+        <a href="/templates" class="<%= _pactive === 'templates' ? 'active' : '' %>">Templates</a>
     </nav>
     <form action="/worker-lookup" method="GET" class="topsearch" role="search">
         <input type="text"

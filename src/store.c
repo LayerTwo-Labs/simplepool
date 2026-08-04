@@ -133,7 +133,30 @@ static const char *SCHEMA_SQL_PARTS[] = {
     "  rate_source         TEXT    NOT NULL"
     ");"
     "CREATE INDEX IF NOT EXISTS rate_history_ts_idx   ON rate_history(ts);"
-    "CREATE INDEX IF NOT EXISTS rate_history_rate_idx ON rate_history(rate_sats_per_diff);",
+    "CREATE INDEX IF NOT EXISTS rate_history_rate_idx ON rate_history(rate_sats_per_diff);"
+    /* What the pool is mining now, and what it mined before. Appended on a
+     * material change only. `source` distinguishes a backend-dictated
+     * coinbase (BIP22 "coinbasetxn", carries the BIP300/301 commitments) from
+     * one we built ourselves (carries none, so no sidechain can be
+     * merge-mined into the block) — see the schema.sql comment. */
+    "CREATE TABLE IF NOT EXISTS templates ("
+    "  id                  INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  ts                  INTEGER NOT NULL,"
+    "  height              INTEGER NOT NULL,"
+    "  prev_hash           TEXT    NOT NULL,"
+    "  bits                TEXT    NOT NULL,"
+    "  network_difficulty  REAL    NOT NULL,"
+    "  coinbase_value_sats INTEGER NOT NULL,"
+    "  tx_count            INTEGER NOT NULL,"
+    "  tx_fees_sats        INTEGER NOT NULL,"
+    "  source              TEXT    NOT NULL,"
+    "  cb_spendable        INTEGER NOT NULL,"
+    "  cb_op_returns       INTEGER NOT NULL,"
+    "  longpoll            INTEGER NOT NULL,"
+    "  rate_sats_per_diff  REAL    NOT NULL"
+    ");"
+    "CREATE INDEX IF NOT EXISTS templates_ts_idx     ON templates(ts);"
+    "CREATE INDEX IF NOT EXISTS templates_height_idx ON templates(height);",
 
     /* ---- part 2 ---- */
     /* PPS accrual ledger. One row per worker; the C proxy only INCREMENTS
@@ -1010,6 +1033,72 @@ int store_record_rate(store_t *s, const char *rate_source,
     sqlite3_bind_double(st, 5, network_difficulty);
     sqlite3_bind_int64 (st, 6, (sqlite3_int64)block_value_sats);
     sqlite3_bind_text  (st, 7, rate_source ? rate_source : "", -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    return 0;
+}
+
+int store_record_template(store_t *s, const store_template_t *t) {
+    if (!s || !t) return -1;
+
+    /* Append only on a material change. The tip, the block value and the
+     * transaction set are what make a template different work; curtime ticks
+     * every poll and would otherwise append a row per poll forever. */
+    static const char *Q_LAST =
+        "SELECT height, prev_hash, coinbase_value_sats, tx_count, bits, source"
+        "  FROM templates ORDER BY id DESC LIMIT 1";
+    sqlite3_stmt *last = NULL;
+    int unchanged = 0;
+    pthread_mutex_lock(&s->node_tip_mu);
+    if (sqlite3_prepare_v2(s->db, Q_LAST, -1, &last, NULL) == SQLITE_OK &&
+        sqlite3_step(last) == SQLITE_ROW)
+    {
+        const unsigned char *ph  = sqlite3_column_text(last, 1);
+        const unsigned char *bt  = sqlite3_column_text(last, 4);
+        const unsigned char *src = sqlite3_column_text(last, 5);
+        unchanged =
+            sqlite3_column_int  (last, 0) == t->height &&
+            sqlite3_column_int64(last, 2) == (sqlite3_int64)t->coinbase_value_sats &&
+            sqlite3_column_int  (last, 3) == t->tx_count &&
+            ph  && strcmp((const char *)ph,  t->prev_hash ? t->prev_hash : "") == 0 &&
+            bt  && strcmp((const char *)bt,  t->bits      ? t->bits      : "") == 0 &&
+            src && strcmp((const char *)src, t->source    ? t->source    : "") == 0;
+    }
+    sqlite3_finalize(last);
+    if (unchanged) {
+        pthread_mutex_unlock(&s->node_tip_mu);
+        return 0;
+    }
+
+    static const char *Q_INS =
+        "INSERT INTO templates (ts, height, prev_hash, bits, network_difficulty,"
+        "  coinbase_value_sats, tx_count, tx_fees_sats, source, cb_spendable,"
+        "  cb_op_returns, longpoll, rate_sats_per_diff) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q_INS, -1, &st, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->node_tip_mu);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    sqlite3_bind_int64 (st,  1, (sqlite3_int64)t->ts_s);
+    sqlite3_bind_int   (st,  2, t->height);
+    sqlite3_bind_text  (st,  3, t->prev_hash ? t->prev_hash : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text  (st,  4, t->bits      ? t->bits      : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(st,  5, t->network_difficulty);
+    sqlite3_bind_int64 (st,  6, (sqlite3_int64)t->coinbase_value_sats);
+    sqlite3_bind_int   (st,  7, t->tx_count);
+    sqlite3_bind_int64 (st,  8, (sqlite3_int64)t->tx_fees_sats);
+    sqlite3_bind_text  (st,  9, t->source    ? t->source    : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int   (st, 10, t->cb_spendable);
+    sqlite3_bind_int   (st, 11, t->cb_op_returns);
+    sqlite3_bind_int   (st, 12, t->longpoll ? 1 : 0);
+    sqlite3_bind_double(st, 13, t->rate_sats_per_diff);
     int rc = sqlite3_step(st);
     pthread_mutex_unlock(&s->node_tip_mu);
     sqlite3_finalize(st);

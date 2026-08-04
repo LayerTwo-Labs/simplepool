@@ -824,3 +824,66 @@ done:
     return ret;
 }
 
+
+/* Count the outputs of a serialized coinbase, split into spendable and
+ * OP_RETURN.
+ *
+ * The OP_RETURN count is the interesting one: a coinbase built from
+ * "coinbasevalue" carries exactly one (the witness commitment), while one
+ * dictated by the CUSF enforcer carries the mandatory BIP300/301 commitments
+ * alongside it. Surfacing the number is how an observer can tell, from the
+ * outside, whether the blocks this pool produces can have a sidechain
+ * merge-mined into them at all.
+ *
+ * Parses only far enough to walk the output list. Returns 0 on success,
+ * negative on malformed input; counts are untouched on failure. */
+int coinbase_count_outputs(const char *tx_hex, int *spendable_out,
+                           int *op_return_out) {
+    if (!tx_hex) return -1;
+    size_t hexlen = strlen(tx_hex);
+    if (hexlen % 2 != 0) return -1;
+    size_t txlen = hexlen / 2;
+    uint8_t *tx = (uint8_t *)malloc(txlen ? txlen : 1);
+    if (!tx) return -1;
+
+    int ret = -1;
+    size_t dl = 0;
+    if (hex_decode(tx_hex, tx, txlen, &dl) < 0 || dl != txlen) goto done;
+
+    size_t off = 0;
+    uint32_t version;
+    if (rd_u32(tx, txlen, &off, &version) < 0) goto done;
+    /* Optional segwit marker+flag. */
+    if (off + 2 <= txlen && tx[off] == 0x00 && tx[off + 1] != 0x00) off += 2;
+
+    uint64_t vin = 0;
+    if (rd_varint(tx, txlen, &off, &vin) < 0) goto done;
+    for (uint64_t i = 0; i < vin; i++) {
+        if (off + 36 > txlen) goto done;
+        off += 36;
+        uint64_t ss = 0;
+        if (rd_varint(tx, txlen, &off, &ss) < 0) goto done;
+        if (off + ss + 4 > txlen) goto done;
+        off += (size_t)ss + 4;   /* scriptSig + sequence */
+    }
+
+    uint64_t vout = 0;
+    if (rd_varint(tx, txlen, &off, &vout) < 0) goto done;
+    int spendable = 0, op_returns = 0;
+    for (uint64_t i = 0; i < vout; i++) {
+        uint64_t val = 0, spk_len = 0;
+        if (rd_u64(tx, txlen, &off, &val) < 0) goto done;
+        if (rd_varint(tx, txlen, &off, &spk_len) < 0) goto done;
+        if (off + spk_len > txlen) goto done;
+        if (spk_len >= 1 && tx[off] == 0x6a) op_returns++;   /* OP_RETURN */
+        else spendable++;
+        off += (size_t)spk_len;
+    }
+
+    if (spendable_out)  *spendable_out  = spendable;
+    if (op_return_out)  *op_return_out  = op_returns;
+    ret = 0;
+done:
+    free(tx);
+    return ret;
+}

@@ -582,3 +582,120 @@ test('admin-deposits renders the status column and the stranded warning', async 
         assert.match(html.replace(/\s+/g, ' '), /Mainchain tip <strong>977,600<\/strong>/);
     });
 });
+
+/* ---------- template history (public page) ------------------------------ */
+
+function addTemplate(db, over = {}) {
+    const t = {
+        ts: 1785840000, height: 977817,
+        prev_hash: '00000000000000000000000000000000000000000000000000000000000000ab',
+        bits: '1a3839e6', network_difficulty: 298383.4976083073,
+        coinbase_value_sats: 312500500, tx_count: 1, tx_fees_sats: 500,
+        source: 'enforcer', cb_spendable: 1, cb_op_returns: 2,
+        longpoll: 1, rate_sats_per_diff: 1036.8368, ...over,
+    };
+    db.prepare(`INSERT INTO templates (ts, height, prev_hash, bits, network_difficulty,
+                    coinbase_value_sats, tx_count, tx_fees_sats, source,
+                    cb_spendable, cb_op_returns, longpoll, rate_sats_per_diff)
+                VALUES (@ts,@height,@prev_hash,@bits,@network_difficulty,
+                        @coinbase_value_sats,@tx_count,@tx_fees_sats,@source,
+                        @cb_spendable,@cb_op_returns,@longpoll,@rate_sats_per_diff)`).run(t);
+    return t;
+}
+
+test('templates reports the newest row as current and the rest as history', () => {
+    const { db } = makeDb();
+    addTemplate(db, { height: 977815, ts: 1785839000 });
+    addTemplate(db, { height: 977816, ts: 1785839500 });
+    addTemplate(db, { height: 977817, ts: 1785840000 });
+
+    const t = stats.templates(db);
+    assert.equal(t.current.height, 977817);
+    assert.equal(t.history.length, 2);
+    assert.equal(t.history[0].height, 977816, 'history is newest-first');
+    assert.equal(t.total, 3);
+});
+
+test('subsidy is derived by removing fees from the block value', () => {
+    const { db } = makeDb();
+    addTemplate(db, { coinbase_value_sats: 312500500, tx_fees_sats: 500 });
+    assert.equal(stats.templates(db).current.subsidy_sats, 312500000);
+});
+
+test('an enforcer template with sidechain commitments reads as mergeable', () => {
+    const { db } = makeDb();
+    addTemplate(db, { source: 'enforcer', cb_op_returns: 2 });
+    const t = stats.templates(db);
+    assert.equal(t.current.has_commitments, true);
+    assert.equal(t.commitments_ok, true);
+});
+
+test('a bitcoind template is flagged as carrying no commitments', () => {
+    /* The condition that stalled Thunder: valid blocks, miners paid, but no
+     * sidechain can be merge-mined into them. */
+    const { db } = makeDb();
+    addTemplate(db, { source: 'bitcoind', cb_spendable: 0, cb_op_returns: 0 });
+    const t = stats.templates(db);
+    assert.equal(t.current.has_commitments, false);
+    assert.equal(t.commitments_ok, false);
+});
+
+test('an enforcer coinbase with only a witness commitment is not mergeable', () => {
+    /* One OP_RETURN is the segwit commitment alone — necessary but not
+     * sufficient. Counting "any OP_RETURN" would call this a pass. */
+    const { db } = makeDb();
+    addTemplate(db, { source: 'enforcer', cb_op_returns: 1 });
+    assert.equal(stats.templates(db).current.has_commitments, false);
+});
+
+test('templates returns null on a DB predating the table', () => {
+    const { db } = makeDb();
+    db.exec('DROP TABLE templates');
+    assert.equal(stats.templates(db), null);
+});
+
+test('an empty templates table yields no current template, not a crash', () => {
+    const { db } = makeDb();
+    const t = stats.templates(db);
+    assert.equal(t.current, null);
+    assert.deepEqual(t.history, []);
+    assert.equal(t.total, 0);
+});
+
+test('the limit is clamped so a hostile query string cannot dump the table', () => {
+    const { db } = makeDb();
+    for (let i = 0; i < 5; i++) addTemplate(db, { height: 977800 + i, ts: 1785839000 + i });
+    assert.equal(stats.templates(db, { limit: 999999 }).history.length, 4);
+    assert.equal(stats.templates(db, { limit: -5 }).history.length, 0);  /* clamped to 1 */
+    /* 0 and non-numeric are falsy/NaN, so they fall back to the default. */
+    assert.equal(stats.templates(db, { limit: 0 }).history.length, 4);
+    assert.equal(stats.templates(db, { limit: 'abc' }).history.length, 4);
+});
+
+test('the public templates page renders, flagging both commitment states', async () => {
+    for (const src of ['enforcer', 'bitcoind']) {
+        const { db } = makeDb();
+        addTemplate(db, { height: 977816, ts: Math.floor(Date.now() / 1000) - 30 });
+        addTemplate(db, {
+            source: src, ts: Math.floor(Date.now() / 1000),
+            cb_op_returns: src === 'enforcer' ? 2 : 0,
+            cb_spendable:  src === 'enforcer' ? 1 : 0,
+        });
+        const html = await render('templates.ejs', {
+            templates: stats.templates(db), fmtBtc: stats.fmtBtc,
+        });
+        assert.match(html, /Current template/);
+        assert.match(html, /977,817/);
+        assert.match(html.replace(/\s+/g, ' '),
+                     src === 'enforcer' ? /✓ yes/ : /carry no sidechain\s*commitments/);
+    }
+});
+
+test('the templates page renders on a DB with no template history', async () => {
+    const { db } = makeDb();
+    db.exec('DROP TABLE templates');
+    const html = await render('templates.ejs', {
+        templates: stats.templates(db), fmtBtc: stats.fmtBtc,
+    });
+    assert.match(html, /has not recorded any templates yet/);
+});
