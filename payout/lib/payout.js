@@ -26,7 +26,7 @@
  * a bad address or transient RPC error must not block other miners. */
 
 import { listDue, listStuck, beginPayout, finalizePayout, abortPayout,
-         recordTxAttempt, asRawTx } from './db.js';
+         recordTxAttempt, asRawTx, lastBroadcastPayout } from './db.js';
 
 /* Fee model: flat per-tx fee, configurable later. Thunder is a sidechain
  * with relatively low fees; 100 sats covers a one-input one-output tx
@@ -34,8 +34,58 @@ import { listDue, listStuck, beginPayout, finalizePayout, abortPayout,
  * deployments. Will revisit once mainnet fee dynamics are observable. */
 const TX_FEE_SATS = 100n;
 
+/* Only one payout can be in flight at a time.
+ *
+ * Thunder's wallet picks UTXOs without excluding those already spent by
+ * transactions sitting in its own mempool. A second transfer therefore selects
+ * the same inputs as the first and is rejected with
+ *
+ *     mempool error: can't add transaction, utxo double spent
+ *
+ * and because a transfer consumes every wallet UTXO and returns the remainder
+ * as change, that change is unspendable until the first tx is mined. So until
+ * it confirms there is nothing to pay from, and every attempt fails
+ * identically. Retrying is not just useless, it buries the real state under
+ * one failure per due worker per tick.
+ *
+ * Returns the blocking payout, or null when it is safe to proceed.
+ *
+ * An unreachable node is treated as blocking: "cannot tell" must not be read
+ * as "nothing pending", or we would broadcast against a wallet we cannot see.
+ * A txid the node has never heard of is NOT blocking — it was evicted or the
+ * node was reset, and nothing is holding the inputs. */
+async function blockingPayout(db, thunder, log) {
+    const last = lastBroadcastPayout(db);
+    if (!last?.txid) return null;
+
+    const st = await thunder.getTransaction(last.txid);
+    if (st.error) {
+        log.warn(`payout: cannot check ${last.txid.slice(0, 16)}… (${st.error}); ` +
+                 'treating as pending');
+        return { ...last, reason: 'unreachable' };
+    }
+    if (!st.known)    return null;   /* evicted or pruned — inputs are free */
+    if (st.confirmed) return null;
+    return { ...last, reason: 'unconfirmed' };
+}
+
 export async function runOnce(ctx, log) {
     const { db, thunder, cfg } = ctx;
+
+    /* Checked before listDue: the answer does not depend on who is owed, and
+     * on a blocked pool this is the difference between one log line per tick
+     * and one per due worker per tick. */
+    if (!cfg.dryRun) {
+        const blocked = await blockingPayout(db, thunder, log);
+        if (blocked) {
+            log.info(
+                `payout: waiting on ${blocked.worker_name || 'worker ' + blocked.worker_id} ` +
+                `txid=${blocked.txid.slice(0, 16)}… (${blocked.reason}); skipping tick. ` +
+                'Thunder must mine a block before its change output is spendable.');
+            return { attempted: 0, paid: 0, failed: 0, waiting_on: blocked.txid };
+        }
+    }
+
     const due = listDue(db, { minSats: cfg.minSats, limit: cfg.maxPerTick });
     if (due.length === 0) {
         log.debug?.('payout: no due workers');
@@ -109,6 +159,16 @@ export async function runOnce(ctx, log) {
             log.info(`payout: ${r.worker_name} -> ${r.thunder_address} ` +
                      `${r.owed_sats} sats txid=${txid}`);
             paid++;
+            /* Stop here. This transfer has just consumed every wallet UTXO
+             * and its change is unconfirmed, so paying the next worker in the
+             * same tick would select the very inputs it spends and be
+             * rejected as a double spend. The remaining workers keep their
+             * in-flight rows clear and are picked up once this confirms. */
+            if (due.length > 1) {
+                log.info(`payout: ${due.length - 1} worker(s) deferred until ` +
+                         `${txid.slice(0, 16)}… confirms`);
+            }
+            break;
         } catch (e) {
             /* DB error after a successful broadcast. The row now has
              * txid set; listStuck() will surface it on next startup. */

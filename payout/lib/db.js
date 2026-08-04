@@ -98,6 +98,23 @@ export function finalizePayout(db, rowId, workerId, sats, feeSats, txid, nowSec)
 /* Drop an in-flight row that we failed to broadcast — the Thunder RPC
  * threw before any txid was returned, so paid_sats was untouched and
  * the worker is safe to retry next tick. */
+/* The most recently broadcast payout, or null if none.
+ *
+ * Used to answer "is a payout still settling?" before starting another.
+ * Ordered by id rather than paid_at: two payouts in the same second are
+ * indistinguishable by timestamp, and picking the wrong one would report a
+ * confirmed payout while an unconfirmed one is still holding the wallet. */
+export function lastBroadcastPayout(db) {
+    return db.prepare(`
+        SELECT p.id, p.worker_id, p.sats, p.txid, p.paid_at, w.name AS worker_name
+        FROM   payouts p
+        LEFT JOIN workers w ON w.id = p.worker_id
+        WHERE  p.txid IS NOT NULL AND p.txid != ''
+        ORDER  BY p.id DESC
+        LIMIT  1
+    `).get() || null;
+}
+
 export function abortPayout(db, rowId) {
     db.prepare(`DELETE FROM payouts_in_flight WHERE id = ?`).run(rowId);
 }
