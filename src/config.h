@@ -40,6 +40,7 @@ typedef struct {
     char db_path[512];
     int  commit_window_ms;
     int  commit_max_shares;
+    int  templates_retention_days;  /* template history kept; 0 = forever */
 
     /* redis broadcast — optional. Empty url disables the module. */
     char redis_url[256];

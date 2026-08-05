@@ -122,9 +122,14 @@ CREATE INDEX IF NOT EXISTS rate_history_rate_idx ON rate_history(rate_sats_per_d
 
 /* What the pool is actually mining, and what it mined before.
  *
- * A row is appended whenever the template materially changes — new tip, new
- * block value, different transaction set. Repeated polls of an unchanged
- * template do not append.
+ * One row per materially distinct template: a new tip, new nBits, a different
+ * source or a different coinbase shape opens a row. Repeated polls fold into
+ * the row they match, refreshing the block value / tx set / rate and bumping
+ * `polls` and `last_seen`, so each row is the *span* over which one template
+ * was mined rather than a single instant. The block value is deliberately not
+ * part of that identity — it drifts with every mempool tick, and keying on it
+ * appended a near-duplicate row per poll, thousands a day of fee churn at a
+ * height already recorded.
  *
  * `source` records where the template came from. 'enforcer' means the backend
  * dictated the coinbase (BIP22 "coinbasetxn"), which is how the mandatory
@@ -147,7 +152,9 @@ CREATE TABLE IF NOT EXISTS templates (
   cb_spendable        INTEGER NOT NULL,  /* coinbase outputs, 0 when we build it */
   cb_op_returns       INTEGER NOT NULL,
   longpoll            INTEGER NOT NULL,  /* 1 when the server long-polls */
-  rate_sats_per_diff  REAL    NOT NULL   /* PPS rate derived from this template */
+  rate_sats_per_diff  REAL    NOT NULL,  /* PPS rate derived from this template */
+  last_seen           INTEGER NOT NULL DEFAULT 0,  /* unix seconds, last poll */
+  polls               INTEGER NOT NULL DEFAULT 1   /* polls folded into this row */
 );
 CREATE INDEX IF NOT EXISTS templates_ts_idx     ON templates(ts);
 CREATE INDEX IF NOT EXISTS templates_height_idx ON templates(height);

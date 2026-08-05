@@ -481,10 +481,19 @@ export function templates(handle, { limit = 50 } = {}) {
             : (typeof handle.get === 'function' ? handle.get() : handle);
     if (!d) return null;
     try {
+        /* last_seen/polls arrived when repeat polls started folding into the
+         * row they match. A DB written by an older proxy that has not been
+         * restarted yet has neither, and every row there is a single
+         * observation — so ts/1 are the honest values, not placeholders. */
+        const cols  = new Set(d.prepare('PRAGMA table_info(templates)').all().map(c => c.name));
+        if (cols.size === 0) return null;
+        const spans = cols.has('last_seen') && cols.has('polls');
         const rows = d.prepare(`
             SELECT id, ts, height, prev_hash, bits, network_difficulty,
                    coinbase_value_sats, tx_count, tx_fees_sats, source,
-                   cb_spendable, cb_op_returns, longpoll, rate_sats_per_diff
+                   cb_spendable, cb_op_returns, longpoll, rate_sats_per_diff,
+                   ${spans ? 'COALESCE(NULLIF(last_seen, 0), ts)' : 'ts'} AS last_seen,
+                   ${spans ? 'MAX(COALESCE(polls, 1), 1)'         : '1'}  AS polls
               FROM templates
              ORDER BY id DESC
              LIMIT ?
@@ -507,6 +516,12 @@ export function templates(handle, { limit = 50 } = {}) {
             cb_op_returns: Number(r.cb_op_returns),
             longpoll:      !!r.longpoll,
             rate_sats_per_diff: Number(r.rate_sats_per_diff),
+            /* A row is a span, not an instant: ts is when this template was
+             * first served, last_seen the most recent poll that still matched
+             * it, and polls how many polls that covers. */
+            last_seen:  Number(r.last_seen),
+            polls:      Number(r.polls),
+            held_sec:   Math.max(0, Number(r.last_seen) - Number(r.ts)),
             /* The subsidy is whatever is left once fees are removed. Derived
              * rather than stored: it is a property of the chain's schedule,
              * not of the template. */

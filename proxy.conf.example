@@ -8,6 +8,12 @@ bitcoind_url = http://127.0.0.1:18443
 # rpcpassword (cookie auth is not supported).
 bitcoind_user = drivepool
 bitcoind_pass = drivepool
+# How often to re-fetch the block template. On a drivechain pool this is also
+# the worst-case delay before a sidechain's BMM request reaches a stratum job:
+# a sidechain publishes its BMM transaction only after it sees the new tip, so
+# any block found within one poll of that cannot carry the commitment. Lower it
+# (5000-10000) if sidechains need to merge-mine reliably; the cost is one extra
+# getblocktemplate call per interval.
 bitcoind_poll_interval_ms = 30000
 
 # Miners are paid directly: the stratum username must be the miner's
@@ -30,6 +36,12 @@ vardiff_window_sec = 30       # how often to retarget
 db_path = ./data/shares.db
 commit_window_ms = 100
 commit_max_shares = 100
+
+# Days of template history to keep on the /templates page. One row is kept per
+# materially distinct template, so this is roughly one row per block plus one
+# per source/commitment change — set 0 to keep everything. Only the dashboard
+# reads this table; the ledger lives in shares and rate_history.
+templates_retention_days = 30
 
 # Redis broadcast (optional). When set, accepted shares / rejects / blocks /
 # tip changes are PUBLISHed on channels pool:shares / pool:rejects /

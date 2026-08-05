@@ -616,6 +616,43 @@ test('templates reports the newest row as current and the rest as history', () =
     assert.equal(t.total, 3);
 });
 
+test('a template row reads as a span: held time and poll count', () => {
+    const { db } = makeDb();
+    addTemplate(db, { height: 977817, ts: 1785840000 });
+    db.prepare('UPDATE templates SET last_seen = ?, polls = ? WHERE height = ?')
+      .run(1785840300, 11, 977817);
+
+    const cur = stats.templates(db).current;
+    assert.equal(cur.ts, 1785840000, 'ts stays first-seen');
+    assert.equal(cur.last_seen, 1785840300);
+    assert.equal(cur.polls, 11);
+    assert.equal(cur.held_sec, 300);
+});
+
+/* Rows written before polls started folding have last_seen 0 from the column
+ * default. Each was a single observation, so ts/1 are exact, not a fallback. */
+test('a row predating the span columns reports itself as a single poll', () => {
+    const { db } = makeDb();
+    addTemplate(db, { height: 977817, ts: 1785840000 });
+
+    const cur = stats.templates(db).current;
+    assert.equal(cur.last_seen, 1785840000);
+    assert.equal(cur.polls, 1);
+    assert.equal(cur.held_sec, 0);
+});
+
+test('a DB whose templates table has no span columns still renders', () => {
+    const { db } = makeDb();
+    db.exec('ALTER TABLE templates DROP COLUMN last_seen');
+    db.exec('ALTER TABLE templates DROP COLUMN polls');
+    addTemplate(db, { height: 977817, ts: 1785840000 });
+
+    const cur = stats.templates(db).current;
+    assert.equal(cur.height, 977817, 'the page must not go blank on an old DB');
+    assert.equal(cur.last_seen, 1785840000);
+    assert.equal(cur.polls, 1);
+});
+
 test('subsidy is derived by removing fees from the block value', () => {
     const { db } = makeDb();
     addTemplate(db, { coinbase_value_sats: 312500500, tx_fees_sats: 500 });
