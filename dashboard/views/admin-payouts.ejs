@@ -42,10 +42,12 @@
             <p class="muted">Nothing in flight — clean.</p>
         <% } else { %>
         <p class="muted small" style="margin-top:0">
-            Rows here need operator attention. Empty <em>txid</em>
-            means the Thunder broadcast may not have gone out; a set
-            <em>txid</em> means the broadcast succeeded but the DB
-            finalize crashed. Never auto-resolved.
+            A row with a <em>txid</em> is a payout waiting to confirm — the
+            normal state, since a miner is credited only once Thunder mines
+            the transaction. It clears on its own; Thunder may need to be
+            nudged to mine.
+            An empty <em>txid</em> is the one that needs you: the broadcast
+            may or may not have gone out, and that is never auto-resolved.
         </p>
         <table>
             <thead><tr>
@@ -60,7 +62,7 @@
                     <td><%= fmtSats(r.sats) %></td>
                     <td class="muted small" title="<%= fmtTs(r.started_at) %>"><%= ago(r.started_at) %></td>
                     <td class="mono small"><%= r.txid || '—' %></td>
-                    <td><%= r.txid ? 'broadcast, finalize pending' : 'unbroadcast' %></td>
+                    <td><%= r.txid ? 'awaiting confirmation' : 'unbroadcast — needs operator' %></td>
                 </tr>
                 <% }) %>
             </tbody>

@@ -41,64 +41,125 @@ PAYOUT_DRY_RUN=1 PAYOUT_DB_PATH=../data/shares.db \
 | `PAYOUT_MAX_PER_TICK` | no | 50 | cap workers paid per scan |
 | `PAYOUT_DRY_RUN` | no | — | `1` = log only |
 | `PAYOUT_DEBUG` | no | — | `1` = verbose |
+| `PAYOUT_NUDGE_MINE` | no | on | `0` = never ask Thunder to mine |
+| `PAYOUT_NUDGE_INTERVAL_MS` | no | 120000 | floor between mine attempts |
 
 ## What it does each tick
 
-1. `SELECT … FROM pps_credits JOIN workers WHERE accrued - paid >= min`
-2. `thunder.balance()` — bail this tick if the reserve is short
-3. For each due worker: `thunder.transfer(addr, owed, fee)`; on success,
-   `UPDATE pps_credits SET paid_sats = paid_sats + owed`
+1. **Settle** — if a batch is outstanding, ask Thunder whether it has been
+   mined. Confirmed: credit every worker in it now. Still in the mempool:
+   nudge Thunder to mine and stop for this tick. Undeterminable: stop and
+   log loudly (see below).
+2. `SELECT … FROM pps_credits JOIN workers WHERE accrued - paid >= min`,
+   excluding anyone with an in-flight row
+3. `thunder.balance()` — bail this tick if the reserve is short
+4. **Broadcast** everyone due in ONE transaction, and stamp its txid onto
+   their in-flight rows. Nobody is credited here.
 
-Payouts are **not batched** into a single tx — one bad address or RPC
-error must not block other miners.
+Payouts *are* batched into a single transaction. Thunder advances only when
+a mainchain block commits to it and cannot spend the change of an unconfirmed
+transaction, so one tx per worker would cost one sidechain block each and the
+queue would drain slower than it fills. The cost is failure isolation: one bad
+address fails the whole batch. That is the right trade — every recipient is an
+address the proxy validated at authorize time, and a failed batch credits
+nobody and strands nobody.
+
+## `paid` means mined, not sent
+
+`pps_credits.paid_sats` moves only when a transaction has been observed in a
+block. A payout sitting in a mempool has discharged no debt, so counting it as
+paid makes `accrued - paid` understate what the pool actually owes — measured
+at 265 BTC for over four hours on drynet3 — and leaves no way back if the
+transaction never lands.
+
+Telling "confirmed" from "gone" is the hard part, because Thunder offers no
+single durable answer. Two sources are consulted and only **positive**
+evidence from either is accepted:
+
+- `get_transaction` → `block_hash`. Authoritative but transient: once the
+  sidechain moves past the block, a long-confirmed txid reads back as `null`,
+  byte-identical to one that never existed.
+- The **wallet UTXO set**, where each UTXO records the outpoint that created
+  it. Thunder admits only confirmed UTXOs, so an outpoint bearing our txid is
+  itself the confirmation — and it is durable, because that change output
+  survives until the next payout spends it, which cannot happen until this one
+  is finalized.
+
+Silence is never read as confirmation, and never as eviction either. Inferring
+"it must have been dropped" from a forgotten txid would re-queue a batch that
+had already been paid.
+
+## Nudging Thunder
+
+Thunder advances only when a mainchain block commits to it, and nothing
+schedules that — so without help a broadcast payout waits for a human to press
+a button, and the whole queue waits behind it. When a batch is outstanding and
+unconfirmed, the loop calls Thunder's `mine`, at most once per
+`PAYOUT_NUDGE_INTERVAL_MS`.
+
+It fires only while something is genuinely waiting to settle, so an idle pool
+spends no BMM bids on empty blocks. A failed nudge never fails the tick.
 
 ## At-most-once payout protocol
 
-Every payout flows through three steps so a crash anywhere in the
-middle can't double-pay:
-
-1. `INSERT INTO payouts_in_flight (worker_id, sats, txid='')` — reserve
-   the slot before Thunder is touched. `listDue()` skips any worker
-   with an in-flight row.
-2. `thunder.transfer(addr, sats, fee)` — broadcast. Since thunder
-   v0.17.0 this is three RPCs under the hood (`create_transfer` →
-   `sign_transaction` → `submit_transaction`); only the last one can
-   put a tx on the network. On clean failure (RPC error before a txid
-   is returned), the row is DELETEd and the worker is eligible next
+1. `INSERT INTO payouts_in_flight (worker_id, sats, txid='')` — one row per
+   worker, before Thunder is touched. `listDue()` skips any worker with an
+   in-flight row.
+2. `transferBatchDetailed(recipients, fee)` — broadcast. Three RPCs under the
+   hood (`create_transfer` → `sign_transaction` → `submit_transaction`); only
+   the last can put a tx on the network. On clean failure (an error before a
+   txid is returned) the rows are DELETEd and the workers are eligible next
    tick.
-3. In ONE SQLite transaction: write the txid onto the in-flight row,
-   `paid_sats += sats`, DELETE the in-flight row.
+3. `attachBatchTxid()` — stamp the txid. The rows **stay** in flight.
+4. On a later tick, once the transaction is confirmed: in ONE SQLite
+   transaction across the whole batch, `paid_sats += sats`, append to
+   `payouts`, DELETE the in-flight rows.
 
 Crash semantics:
 
 | crash point | row state | action |
 | --- | --- | --- |
-| after (1), before (2) | txid='' | manual: did broadcast happen? unlikely. delete row. |
-| after (2), before (3) | txid='<id>' | manual: tx is on Thunder — finalize by hand. |
-| inside (3) | atomic — either fully applied or fully rolled back | nothing |
+| after (1), before (2) | `txid=''` | manual: did the broadcast happen? |
+| after (2), before (3) | `txid=''` | manual: same question, narrower window |
+| after (3), before (4) | `txid` set | none — this is the ordinary waiting state |
+| inside (4) | atomic across the batch — fully applied or fully rolled back | none |
 
-On startup the worker calls `reportStuck()` which logs every in-flight
-row older than 5 minutes. Operator-driven reconciliation only; we
-never silently auto-finalize because we cannot safely distinguish
-"broadcast didn't happen" from "broadcast happened, finalize crashed"
-without Thunder-side mempool/chain lookup.
+`reportStuck()` logs in-flight rows older than 5 minutes **that have no
+txid**. Rows with a txid are routinely hours old — Thunder produces only a
+handful of blocks a day — and reporting them would bury the one row that
+actually needs a human.
 
-To reconcile a stuck row by hand once you've confirmed via the Thunder
-node whether the tx is live:
+### Reconciling by hand
 
-```
-# if the tx exists on Thunder: finalize manually
-sqlite3 data/shares.db "
-  BEGIN;
-  UPDATE pps_credits   SET paid_sats = paid_sats + (SELECT sats FROM payouts_in_flight WHERE id = <id>)
-                       WHERE worker_id = (SELECT worker_id FROM payouts_in_flight WHERE id = <id>);
-  DELETE FROM payouts_in_flight WHERE id = <id>;
-  COMMIT;
-"
+Two situations need an operator. Neither is auto-resolved, because both turn
+on a question only a human can answer: *did this transaction make it onto the
+sidechain?*
 
-# if the tx never made it: just delete the row
+**A row with no txid.** The worker died around the broadcast, so it is unknown
+whether anything went out. Check the Thunder node, then:
+
+```sh
+# the tx is live or mined — adopt it, and the normal settle path takes over
+sqlite3 data/shares.db "UPDATE payouts_in_flight SET txid = '<txid>' WHERE id = <id>;"
+
+# it never went out — release the workers to be paid again next tick
 sqlite3 data/shares.db "DELETE FROM payouts_in_flight WHERE id = <id>;"
 ```
+
+**`CANNOT DETERMINE settlement`.** The loop can see neither the transaction
+nor any wallet UTXO from it, so it has halted payouts rather than guess.
+Establish the truth first — the recipients' balances are the ground truth:
+
+```sh
+CLI=…/thunder_app_cli
+sudo -u forknet $CLI get-transaction <txid>      # non-null = still in mempool
+sudo -u forknet $CLI get-wallet-utxos | grep <txid>
+```
+
+If it was mined, finalize the batch by hand (all rows sharing the txid, in one
+transaction). If it truly never landed, `DELETE` those rows and the workers are
+paid again on the next tick. Do not delete rows you have not positively shown
+to be unmined — that is how a batch gets paid twice.
 
 ## Block-withholding audit (`audit.js`)
 
