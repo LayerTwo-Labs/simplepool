@@ -92,7 +92,7 @@ function thunderStub({ txState = {}, utxoTxids = [], balance = 10n ** 12n,
             return { ok: true,
                      utxos: this.utxoTxids.map(t => ({ txid: t, address: 'a', sats: 1n })) };
         },
-        async mine() { calls.mines++; return 'mined'; },
+        async mine() { calls.mines++; return { parked: true, completed: false }; },
         async transferBatchDetailed(recipients) {
             calls.transfers++;
             calls.lastBatch = recipients;

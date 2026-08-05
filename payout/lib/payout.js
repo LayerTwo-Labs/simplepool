@@ -172,8 +172,9 @@ async function nudgeMine(ctx, log) {
     if (ctx._lastNudgeMs && now - ctx._lastNudgeMs < cfg.nudgeIntervalMs) return false;
     ctx._lastNudgeMs = now;
     try {
-        await thunder.mine();
-        log.info('payout: nudged Thunder to mine (a payout is waiting to confirm)');
+        const r = await thunder.mine();
+        log.info('payout: nudged Thunder to mine (a payout is waiting to confirm)' +
+                 (r.completed ? '' : ' — BMM request parked, awaiting a mainchain block'));
         return true;
     } catch (e) {
         log.warn(`payout: mine nudge failed (${e.message}); will retry next tick`);

@@ -26,12 +26,12 @@ export class ThunderClient {
         this._id = 0;
     }
 
-    async _call(method, params) {
+    async _call(method, params, timeoutMs = this.timeoutMs) {
         const id = ++this._id;
         const headers = { 'Content-Type': 'application/json' };
         if (this.auth) headers.Authorization = this.auth;
         const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), this.timeoutMs);
+        const t = setTimeout(() => ctrl.abort(), timeoutMs);
         let res;
         try {
             res = await fetch(this.url, {
@@ -255,9 +255,28 @@ export class ThunderClient {
      * entirely). The mainchain side is the pool's own coinbase, so the
      * commitment lands on the next block the pool wins.
      *
+     * `mine` PARKS a BMM request and then blocks until a mainchain block
+     * carries it — minutes on drynet3, and unbounded on a quiet chain. We only
+     * need the parking, so this waits just long enough for the request to be
+     * created (observed at ~170ms) and then walks away. The abort does not
+     * undo it: the BMM transaction is already on the mainchain by then.
+     *
+     * So a timeout here is the EXPECTED outcome, not an error, and is reported
+     * as { parked: true, completed: false } rather than thrown. Treating it as
+     * a failure logged a warning on every single nudge and stalled each tick
+     * for the full RPC timeout.
+     *
      * Costs a BMM bid on the mainchain, so callers must rate-limit and only
      * call it when something is genuinely waiting to settle. */
-    async mine() {
-        return this._call('mine', []);
+    async mine(timeoutMs = 3000) {
+        try {
+            const r = await this._call('mine', [], timeoutMs);
+            return { parked: true, completed: true, result: r };
+        } catch (e) {
+            if (e?.name === 'AbortError' || e?.name === 'TimeoutError') {
+                return { parked: true, completed: false };
+            }
+            throw e;
+        }
     }
 }
