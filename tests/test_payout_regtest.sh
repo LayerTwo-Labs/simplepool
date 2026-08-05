@@ -22,9 +22,17 @@
 #      Thunder via a real CreateDepositTransaction + BMM-mined thunder
 #      block — the same flow CLASSIC_PAYOUTS.md prescribes to operators
 #   4. seed a pool DB with one worker owed 250 000 sats
-#   5. run one payout tick (payout/run-once.mjs) against thunder's RPC
-#   6. assert the at-most-once ledger settled: payouts row with a txid,
-#      paid_sats bumped, no in-flight rows — and thunder knows the tx
+#   5. run a payout tick (payout/run-once.mjs) against thunder's RPC and
+#      assert it BROADCASTS without crediting: the batch stays in flight
+#      with its txid, paid_sats is untouched, the ledger is empty
+#   6. run another tick with the tx still in the mempool and assert it
+#      neither credits nor re-broadcasts
+#   7. BMM-mine a thunder block, tick again, and assert the ledger now
+#      settles: payouts row carrying the same txid, paid_sats bumped,
+#      no in-flight rows, and the worker holding an exact-amount UTXO
+#
+# Steps 5-7 are the point: a payout is credited when it is MINED, not
+# when it is sent, so broadcasting and crediting are separate ticks.
 #
 # Deterministic by construction: every run starts from a completely
 # fresh data dir; binaries are cached in REGTEST_BIN_DIR across runs.
@@ -203,35 +211,71 @@ sqlite3 "$PAYOUT_DB" "
     VALUES (1, $OWED_SATS, 0, $NOW);
 "
 
-stage "run one payout tick"
-RESULT="$(
+run_tick() {
     PAYOUT_DB_PATH="$PAYOUT_DB" \
     THUNDER_RPC_URL="$THUNDER_RPC_URL" \
     THUNDER_FROM_ADDRESS="$RESERVE_ADDR" \
     PAYOUT_MIN_SATS=10000 \
     node "$ROOT/payout/run-once.mjs"
-)" || { echo "FAIL: payout tick reported failures: $RESULT" >&2; exit 1; }
+}
+
+paid_sats()  { sqlite3 "$PAYOUT_DB" "SELECT paid_sats FROM pps_credits WHERE worker_id = 1"; }
+ledger_n()   { sqlite3 "$PAYOUT_DB" "SELECT count(*) FROM payouts"; }
+inflight_n() { sqlite3 "$PAYOUT_DB" "SELECT count(*) FROM payouts_in_flight"; }
+
+# A payout is credited when it is MINED, not when it is sent — so the tick
+# that broadcasts and the tick that credits are two different ticks, with a
+# thunder block in between. Everything below walks that sequence.
+
+stage "payout tick 1: broadcast only"
+RESULT="$(run_tick)" || { echo "FAIL: payout tick reported failures: $RESULT" >&2; exit 1; }
 echo "  tick result: $RESULT"
-[ "$(jq -r .paid <<< "$RESULT")" = "1" ] || {
-    echo "FAIL: expected exactly 1 paid worker" >&2; exit 1; }
+[ "$(jq -r .broadcast <<< "$RESULT")" = "1" ] || {
+    echo "FAIL: expected exactly 1 broadcast worker" >&2; exit 1; }
+[ "$(jq -r .paid <<< "$RESULT")" = "0" ] || {
+    echo "FAIL: a broadcast must not report a paid worker" >&2; exit 1; }
 
-stage "assert the ledger settled"
-TXID="$(sqlite3 "$PAYOUT_DB" "SELECT txid FROM payouts WHERE worker_id = 1")"
-PAID="$(sqlite3 "$PAYOUT_DB" "SELECT paid_sats FROM pps_credits WHERE worker_id = 1")"
-INFLIGHT="$(sqlite3 "$PAYOUT_DB" "SELECT count(*) FROM payouts_in_flight")"
-echo "  txid=$TXID paid_sats=$PAID in_flight=$INFLIGHT"
-[ "${#TXID}" -eq 64 ]           || { echo "FAIL: bad txid '$TXID'" >&2; exit 1; }
-[ "$PAID" = "$OWED_SATS" ]      || { echo "FAIL: paid_sats=$PAID != $OWED_SATS" >&2; exit 1; }
-[ "$INFLIGHT" = "0" ]           || { echo "FAIL: $INFLIGHT in-flight rows left" >&2; exit 1; }
+stage "assert the broadcast credited nobody"
+TXID="$(sqlite3 "$PAYOUT_DB" "SELECT txid FROM payouts_in_flight WHERE worker_id = 1")"
+echo "  txid=$TXID paid_sats=$(paid_sats) ledger_rows=$(ledger_n) in_flight=$(inflight_n)"
+[ "${#TXID}" -eq 64 ]     || { echo "FAIL: bad in-flight txid '$TXID'" >&2; exit 1; }
+[ "$(paid_sats)" = "0" ]  || { echo "FAIL: paid_sats moved on a broadcast" >&2; exit 1; }
+[ "$(ledger_n)" = "0" ]   || { echo "FAIL: payouts ledger written before confirmation" >&2; exit 1; }
+[ "$(inflight_n)" = "1" ] || { echo "FAIL: batch must stay in flight until mined" >&2; exit 1; }
 
-stage "assert thunder knows the tx"
+stage "assert thunder has the tx, unconfirmed"
 curl -sS -H 'Content-Type: application/json' \
     -d '{"jsonrpc":"2.0","id":1,"method":"get_transaction","params":["'"$TXID"'"]}' \
-    "$THUNDER_RPC_URL" | jq -e '.result != null' > /dev/null || {
-    echo "FAIL: thunder get_transaction($TXID) returned null" >&2; exit 1; }
+    "$THUNDER_RPC_URL" | jq -e '.result != null and .result.block_hash == null' > /dev/null || {
+    echo "FAIL: thunder should hold $TXID in its mempool, unconfirmed" >&2; exit 1; }
 
-stage "confirm the payout in a thunder block, check the worker's UTXO"
-mine_thunder_block || true
+stage "a tick before confirmation must not credit or re-broadcast"
+RESULT="$(run_tick)" || { echo "FAIL: payout tick reported failures: $RESULT" >&2; exit 1; }
+echo "  tick result: $RESULT"
+[ "$(jq -r .waiting_on <<< "$RESULT")" = "$TXID" ] || {
+    echo "FAIL: expected the tick to wait on $TXID" >&2; exit 1; }
+[ "$(paid_sats)" = "0" ]  || { echo "FAIL: credited before the tx was mined" >&2; exit 1; }
+[ "$(inflight_n)" = "1" ] || { echo "FAIL: batch left flight before confirming" >&2; exit 1; }
+
+stage "mine a thunder block, then settle"
+for attempt in 1 2 3 4 5; do
+    mine_thunder_block || echo "  BMM attempt $attempt missed, retrying"
+    RESULT="$(run_tick)" || { echo "FAIL: payout tick reported failures: $RESULT" >&2; exit 1; }
+    echo "  attempt $attempt: $RESULT"
+    [ "$(jq -r .settled <<< "$RESULT")" = "1" ] && break
+    sleep 1
+done
+[ "$(jq -r .settled <<< "$RESULT")" = "1" ] || {
+    echo "FAIL: payout never settled after 5 thunder blocks" >&2; exit 1; }
+
+stage "assert the ledger settled"
+LEDGER_TXID="$(sqlite3 "$PAYOUT_DB" "SELECT txid FROM payouts WHERE worker_id = 1")"
+echo "  txid=$LEDGER_TXID paid_sats=$(paid_sats) in_flight=$(inflight_n)"
+[ "$LEDGER_TXID" = "$TXID" ]        || { echo "FAIL: ledger txid '$LEDGER_TXID' != '$TXID'" >&2; exit 1; }
+[ "$(paid_sats)" = "$OWED_SATS" ]   || { echo "FAIL: paid_sats=$(paid_sats) != $OWED_SATS" >&2; exit 1; }
+[ "$(inflight_n)" = "0" ]           || { echo "FAIL: $(inflight_n) in-flight rows left" >&2; exit 1; }
+
+stage "check the worker's UTXO"
 # Exact-amount UTXO at the worker address after a mined block is the
 # end-to-end proof the transfer applied. (Wallet-total math is useless
 # here: this wallet is also the thunder block producer, so the tx fee

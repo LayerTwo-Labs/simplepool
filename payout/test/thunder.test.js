@@ -63,3 +63,42 @@ test('submit failure: stage=submit, SIGNED tx retained', async () => {
         return true;
     });
 });
+
+/* `mine` parks a BMM request and then blocks until a mainchain block carries
+ * it — minutes on drynet3. We only need the parking, so the call is given a
+ * short deadline and abandoned. Reporting that as a failure logged a warning
+ * on every nudge and stalled each payout tick for the full RPC timeout. */
+
+test('mine() reports a timeout as parked, not as a failure', async () => {
+    const c = new ThunderClient({ url: 'http://127.0.0.1:1' });
+    c._call = async () => {
+        const e = new Error('This operation was aborted');
+        e.name = 'AbortError';
+        throw e;
+    };
+    assert.deepEqual(await c.mine(), { parked: true, completed: false });
+});
+
+test('mine() reports a completed call as completed', async () => {
+    const c = new ThunderClient({ url: 'http://127.0.0.1:1' });
+    c._call = async (m) => (m === 'mine' ? 'ok' : (() => { throw new Error(m); })());
+    const r = await c.mine();
+    assert.equal(r.parked, true);
+    assert.equal(r.completed, true);
+});
+
+test('mine() still throws on a real RPC error', async () => {
+    /* A node that rejects the call outright is a genuine problem and must not
+     * be swallowed as "parked". */
+    const c = new ThunderClient({ url: 'http://127.0.0.1:1' });
+    c._call = async () => { throw new Error('thunder rpc mine: -1 no mainchain'); };
+    await assert.rejects(c.mine(), /no mainchain/);
+});
+
+test('mine() uses its own short deadline, not the client timeout', async () => {
+    const c = new ThunderClient({ url: 'http://127.0.0.1:1', timeoutMs: 10000 });
+    let seen = null;
+    c._call = async (_m, _p, timeoutMs) => { seen = timeoutMs; return 'ok'; };
+    await c.mine();
+    assert.equal(seen, 3000, 'a blocking call must not hold the tick for the full timeout');
+});
