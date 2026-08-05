@@ -3,8 +3,9 @@
  * The C proxy is the only writer to pps_credits.accrued_sats — every
  * accepted share INSERTs/UPSERTs with `accrued_sats = accrued_sats + delta`
  * via the writer thread. This worker is the only writer to
- * pps_credits.paid_sats, and only ever after a Thunder transaction has
- * been broadcast successfully.
+ * pps_credits.paid_sats, and only ever after a Thunder transaction has been
+ * observed CONFIRMED — not merely broadcast. `paid` therefore means settled,
+ * and `accrued - paid` is a liability the pool can still be held to.
  *
  * Both writers serialise through WAL with a generous busy_timeout, so
  * brief lock contention during the proxy's batch commit is invisible. */
@@ -95,23 +96,6 @@ export function finalizePayout(db, rowId, workerId, sats, feeSats, txid, nowSec)
     })();
 }
 
-/* The most recently broadcast payout, or null if none.
- *
- * Used to answer "is a payout still settling?" before starting another.
- * Ordered by id rather than paid_at: two payouts in the same second are
- * indistinguishable by timestamp, and picking the wrong one would report a
- * confirmed payout while an unconfirmed one is still holding the wallet. */
-export function lastBroadcastPayout(db) {
-    return db.prepare(`
-        SELECT p.id, p.worker_id, p.sats, p.txid, p.paid_at, w.name AS worker_name
-        FROM   payouts p
-        LEFT JOIN workers w ON w.id = p.worker_id
-        WHERE  p.txid IS NOT NULL AND p.txid != ''
-        ORDER  BY p.id DESC
-        LIMIT  1
-    `).get() || null;
-}
-
 /* Drop an in-flight row that we failed to broadcast — the Thunder RPC threw
  * before any txid was returned, so paid_sats was untouched and the worker is
  * safe to retry next tick. */
@@ -137,12 +121,50 @@ export function beginBatch(db, items, nowSec) {
     )();
 }
 
+/* Stamp the txid onto a batch's in-flight rows, immediately after broadcast.
+ *
+ * This is deliberately NOT the finalize: broadcasting is not settling. The
+ * rows stay in payouts_in_flight — so listDue keeps skipping these workers,
+ * and nothing is credited — until the transaction is observed in a block.
+ * The txid is what lets the next tick ask whether that has happened. */
+export function attachBatchTxid(db, rowIds, txid) {
+    const upd = db.prepare('UPDATE payouts_in_flight SET txid = ? WHERE id = ?');
+    db.transaction(() => { for (const id of rowIds) upd.run(txid, id); })();
+}
+
+/* The batch currently awaiting confirmation, or null.
+ *
+ * Rows with txid='' are excluded: those are a crash between INSERT and
+ * broadcast, where we cannot tell whether anything went out. They are
+ * unresolvable from here and belong to listStuck and the operator, not to
+ * the settle path — inferring either way would risk paying twice or not at
+ * all. Only one batch can be outstanding, so the newest txid is the one. */
+export function pendingBatch(db) {
+    const rows = db.prepare(`
+        SELECT  p.id AS rowId, p.worker_id, p.sats, p.txid, p.started_at,
+                w.name AS worker_name
+        FROM    payouts_in_flight p
+        LEFT JOIN workers w ON w.id = p.worker_id
+        WHERE   p.txid IS NOT NULL AND p.txid != ''
+        ORDER BY p.id ASC
+    `).all();
+    if (rows.length === 0) return null;
+    const txid = rows[rows.length - 1].txid;
+    return {
+        txid,
+        started_at: rows[0].started_at,
+        rows: rows.filter(r => r.txid === txid)
+                  .map(r => ({ ...r, sats: BigInt(r.sats) })),
+    };
+}
+
 /* Credit every worker in the batch, atomically, against one txid.
  *
- * The transaction pays a single fee covering all recipients. It is divided
- * evenly across the ledger rows with the remainder on the first, so
- * SUM(payouts.fee_sats) equals what was actually spent — which is what any
- * accounting query over that column assumes. */
+ * Called only once the transaction is confirmed. The transaction pays a
+ * single fee covering all recipients. It is divided evenly across the ledger
+ * rows with the remainder on the first, so SUM(payouts.fee_sats) equals what
+ * was actually spent — which is what any accounting query over that column
+ * assumes. */
 export function finalizeBatch(db, rows, totalFeeSats, txid, nowSec) {
     const n = BigInt(rows.length);
     const fee = BigInt(totalFeeSats);
@@ -174,8 +196,14 @@ export function abortBatch(db, rowIds) {
     db.transaction(() => { for (const id of rowIds) del.run(id); })();
 }
 
-/* Stuck in-flight rows older than `staleAfterSec`. Used at startup to
- * surface anything that needs operator attention; never auto-resolved. */
+/* In-flight rows older than `staleAfterSec` that need a human.
+ *
+ * Only rows with txid='' qualify. Since payouts settle on confirmation
+ * rather than on broadcast, a row WITH a txid is the ordinary waiting state —
+ * Thunder advances a handful of times a day, so those are routinely hours old
+ * and reporting them would be crying wolf on every restart. A row without one
+ * is the genuinely ambiguous case: we crashed around the broadcast and cannot
+ * tell whether it went out. Never auto-resolved. */
 export function listStuck(db, staleAfterSec, nowSec) {
     return db.prepare(`
         SELECT  p.id, p.worker_id, w.name AS worker_name,
@@ -184,6 +212,7 @@ export function listStuck(db, staleAfterSec, nowSec) {
         FROM    payouts_in_flight p
         JOIN    workers           w ON w.id = p.worker_id
         WHERE   p.started_at < ?
+          AND   (p.txid IS NULL OR p.txid = '')
         ORDER BY p.started_at ASC
     `).all(nowSec - staleAfterSec);
 }

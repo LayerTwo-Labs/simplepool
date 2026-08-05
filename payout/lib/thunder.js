@@ -215,4 +215,49 @@ export class ThunderClient {
     async getWalletAddresses() {
         return this._call('get_wallet_addresses', []);
     }
+
+    /* Every wallet UTXO, each tagged with the outpoint that created it.
+     *
+     * Returns [{ txid, address, sats }] for UTXOs that came from a regular
+     * transaction, and drops Deposit/Coinbase outpoints — they have no
+     * originating sidechain txid, so they can never answer the question this
+     * is used for.
+     *
+     * Never throws: an unreachable node returns { ok: false }, because
+     * "cannot tell" and "no such UTXO" decide opposite things and must not
+     * collapse into the same empty array. */
+    async walletUtxos() {
+        let raw;
+        try {
+            raw = await this._call('get_wallet_utxos', []);
+        } catch (e) {
+            return { ok: false, utxos: [], error: e.message };
+        }
+        if (!Array.isArray(raw)) return { ok: false, utxos: [], error: 'not an array' };
+        const utxos = [];
+        for (const u of raw) {
+            const txid = u?.outpoint?.Regular?.txid ?? null;
+            if (typeof txid !== 'string') continue;
+            utxos.push({
+                txid,
+                address: u?.output?.address ?? null,
+                sats: BigInt(u?.output?.content?.Value ?? u?.output?.content?.value ?? 0),
+            });
+        }
+        return { ok: true, utxos };
+    }
+
+    /* Ask Thunder to attempt BMM — the sidechain equivalent of mining a block.
+     *
+     * Thunder advances only when a mainchain block commits to it, and nothing
+     * schedules that on its own, so without this a broadcast payout sits in
+     * the mempool indefinitely (observed: 4h+, and the queue behind it stops
+     * entirely). The mainchain side is the pool's own coinbase, so the
+     * commitment lands on the next block the pool wins.
+     *
+     * Costs a BMM bid on the mainchain, so callers must rate-limit and only
+     * call it when something is genuinely waiting to settle. */
+    async mine() {
+        return this._call('mine', []);
+    }
 }

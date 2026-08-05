@@ -57,12 +57,16 @@ export function perWorkerBalances(handle) {
     }));
 }
 
-/* Current in-flight payouts. A row with an empty txid means the
- * broadcast may or may not have gone out (worker crashed between
- * INSERT and RPC); a row with a txid means the broadcast succeeded
- * but the finalize transaction crashed. Either state requires
- * operator attention — see payout/README.md for the reconciliation
- * runbook. */
+/* Current in-flight payouts.
+ *
+ * A row WITH a txid is a broadcast payout waiting to be mined — routine, and
+ * it clears itself when the worker sees the transaction confirm. Since
+ * Thunder advances only a few times a day these are often hours old, which is
+ * not by itself a problem.
+ *
+ * A row with an EMPTY txid is the one that needs a human: the worker crashed
+ * between INSERT and the Thunder RPC, so we cannot tell whether the broadcast
+ * went out. Never auto-resolved — see payout/README.md for the runbook. */
 export function inFlight(handle) {
     const db = unwrap(handle);
     if (!db) return [];

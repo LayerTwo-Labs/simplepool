@@ -1,19 +1,29 @@
-/* Only one payout can be in flight against a Thunder wallet.
+/* A payout is credited when it is MINED, not when it is sent.
  *
- * Thunder selects UTXOs without excluding those already spent by transactions
- * in its own mempool, and a transfer consumes every wallet UTXO — returning
- * the remainder as change that is unspendable until the tx is mined. So a
- * second transfer picks the very inputs the first one spends and is rejected:
+ * Two rules are being pinned here, and they pull in opposite directions.
  *
- *     mempool error: can't add transaction, utxo double spent
+ * 1. At most one payout in flight. Thunder selects UTXOs without excluding
+ *    those already spent by transactions in its own mempool, and a transfer
+ *    consumes every wallet UTXO — returning the remainder as change that is
+ *    unspendable until the tx is mined. So a second transfer picks the very
+ *    inputs the first one spends and is rejected:
  *
- * Observed in production: one payout broadcast, then four failures every
- * thirty seconds indefinitely, because nothing in the loop knew to wait.
+ *        mempool error: can't add transaction, utxo double spent
  *
- * These tests pin the two rules that follow — wait while a payout is
- * unconfirmed, and never broadcast twice in one tick — and, just as
- * importantly, the cases that must NOT block: a confirmed payout, and a txid
- * the node has forgotten.
+ *    Observed in production: one payout broadcast, then four failures every
+ *    thirty seconds indefinitely, because nothing in the loop knew to wait.
+ *
+ * 2. `paid_sats` means settled. Crediting at broadcast made `accrued - paid`
+ *    understate the pool's real liability for as long as settlement took —
+ *    265 BTC for over four hours on drynet3 — and left no way back if the
+ *    transaction never landed.
+ *
+ * The tension is in telling "confirmed" from "gone". Thunder's get_transaction
+ * reports a block_hash only while the transaction is recent; after the
+ * sidechain moves on, a long-confirmed txid reads back exactly like one that
+ * never existed. Guessing eviction from that silence would re-queue a batch
+ * that was already paid, so the loop refuses to guess — see the
+ * 'cannot be determined' tests, which are the ones protecting real money.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,10 +33,10 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 
 import { runOnce } from '../lib/payout.js';
-import { lastBroadcastPayout } from '../lib/db.js';
+import { pendingBatch, listStuck } from '../lib/db.js';
 
 /* Minimal schema — just the tables the payout loop touches. */
-function makeDb({ payouts = [], owed = {} } = {}) {
+function makeDb({ inFlight = [], owed = {} } = {}) {
     const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sp-payout-')), 'p.db');
     const db = new Database(file);
     db.exec(`
@@ -49,27 +59,43 @@ function makeDb({ payouts = [], owed = {} } = {}) {
         db.prepare('INSERT INTO workers VALUES (?,?,?)').run(i, name, 'addr' + i);
         db.prepare('INSERT INTO pps_credits VALUES (?,?,0,0)').run(i, sats);
     }
-    for (const p of payouts) {
-        db.prepare(`INSERT INTO payouts (worker_id, sats, fee_sats, txid, paid_at)
-                    VALUES (?,?,?,?,?)`).run(p.worker_id ?? 1, p.sats ?? 100, 100, p.txid, p.paid_at ?? 1000);
+    for (const f of inFlight) {
+        db.prepare(`INSERT INTO payouts_in_flight (worker_id, sats, txid, started_at)
+                    VALUES (?,?,?,?)`).run(f.worker_id ?? 1, f.sats ?? 100,
+                                           f.txid ?? '', f.started_at ?? 1000);
     }
     return db;
 }
 
-/* Thunder stub. `txState` maps txid -> {known, confirmed}. */
-function thunderStub({ txState = {}, balance = 10n ** 12n, onTransfer } = {}) {
-    const calls = { transfers: 0, getTx: 0 };
+/* Thunder stub.
+ *   txState  txid -> { known, confirmed }   what get_transaction reports
+ *   utxoTxids                               txids the wallet UTXO set derives
+ *                                           from — the durable confirmation
+ *                                           signal, independent of txState */
+function thunderStub({ txState = {}, utxoTxids = [], balance = 10n ** 12n,
+                       walletOk = true } = {}) {
+    const calls = { transfers: 0, getTx: 0, utxos: 0, mines: 0 };
     return {
         calls,
+        /* Mutable so a test can advance the chain between ticks. */
+        txState,
+        utxoTxids,
+        walletOk,
         async balance() { return { available_sats: String(balance), total_sats: String(balance) }; },
         async getTransaction(txid) {
             calls.getTx++;
-            return txState[txid] ?? { known: false, confirmed: false, blockHash: null };
+            return this.txState[txid] ?? { known: false, confirmed: false, blockHash: null };
         },
+        async walletUtxos() {
+            calls.utxos++;
+            if (!this.walletOk) return { ok: false, utxos: [], error: 'ECONNREFUSED' };
+            return { ok: true,
+                     utxos: this.utxoTxids.map(t => ({ txid: t, address: 'a', sats: 1n })) };
+        },
+        async mine() { calls.mines++; return 'mined'; },
         async transferBatchDetailed(recipients) {
             calls.transfers++;
             calls.lastBatch = recipients;
-            if (onTransfer) onTransfer(calls.transfers);
             return { txid: `tx${calls.transfers}`, unsigned: {}, signed: {},
                      recipients: recipients.length };
         },
@@ -77,11 +103,88 @@ function thunderStub({ txState = {}, balance = 10n ** 12n, onTransfer } = {}) {
 }
 
 const quietLog = { info() {}, warn() {}, error() {}, debug() {} };
-const cfg = { minSats: 10000n, maxPerTick: 50, dryRun: false, intervalMs: 1000 };
+const baseCfg = { minSats: 10000n, maxPerTick: 50, dryRun: false, intervalMs: 1000,
+                  nudgeMine: true, nudgeIntervalMs: 120000 };
+const cfg = baseCfg;
+
+const credited = db => db.prepare('SELECT COUNT(*) n FROM pps_credits WHERE paid_sats > 0').get().n;
+const inFlightRows = db => db.prepare('SELECT COUNT(*) n FROM payouts_in_flight').get().n;
+const ledgerRows = db => db.prepare('SELECT COUNT(*) n FROM payouts').get().n;
+
+/* ---------- broadcasting is not settling ---------------------------------- */
+
+test('a broadcast credits nobody and leaves the batch in flight', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000, rig2: 6_000_000 } });
+    const thunder = thunderStub();
+
+    const r = await runOnce({ db, thunder, cfg }, quietLog);
+
+    assert.equal(thunder.calls.transfers, 1);
+    assert.equal(r.broadcast, 2);
+    assert.equal(r.paid, 0, 'sent is not paid');
+    assert.equal(credited(db), 0, 'pps_credits.paid_sats must not move on a broadcast');
+    assert.equal(ledgerRows(db), 0, 'the payouts ledger records settlements only');
+    assert.equal(inFlightRows(db), 2, 'both workers stay in flight until it confirms');
+    assert.equal(pendingBatch(db).txid, 'tx1');
+});
+
+test('a confirmed batch is credited on the next tick', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000, rig2: 6_000_000 } });
+    const thunder = thunderStub();
+    const ctx = { db, thunder, cfg };
+
+    await runOnce(ctx, quietLog);                       /* broadcast tx1 */
+    thunder.txState.tx1 = { known: true, confirmed: true };
+
+    const r = await runOnce(ctx, quietLog);             /* settle tx1 */
+    assert.equal(r.settled, 2);
+    assert.equal(credited(db), 2);
+    assert.equal(ledgerRows(db), 2);
+    assert.equal(inFlightRows(db), 0);
+    assert.equal(db.prepare('SELECT COUNT(DISTINCT txid) n FROM payouts').get().n, 1,
+                 'one batch, one txid across every ledger row');
+});
+
+test('each worker is credited exactly what was in flight, once', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000, rig2: 6_000_000 } });
+    const thunder = thunderStub();
+    const ctx = { db, thunder, cfg };
+
+    await runOnce(ctx, quietLog);
+    thunder.txState.tx1 = { known: true, confirmed: true };
+    await runOnce(ctx, quietLog);
+    await runOnce(ctx, quietLog);   /* an extra tick must not re-credit */
+
+    const rows = db.prepare('SELECT worker_id, paid_sats FROM pps_credits ORDER BY worker_id').all();
+    assert.deepEqual(rows, [{ worker_id: 1, paid_sats: 5_000_000 },
+                            { worker_id: 2, paid_sats: 6_000_000 }]);
+    assert.equal(ledgerRows(db), 2, 'no duplicate ledger rows');
+});
+
+/* ---------- the durable confirmation oracle ------------------------------- */
+
+test('a wallet UTXO bearing the txid proves confirmation on its own', async () => {
+    /* The case that makes settle-on-confirm workable at all. get_transaction
+     * has already forgotten tx1 — it reads as never-existed — but the wallet
+     * holds a UTXO created by it, and Thunder admits only confirmed UTXOs.
+     * Without this the batch would be undeterminable and the pool would
+     * halt every time settlement outlived the RPC's memory. */
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const thunder = thunderStub();
+    const ctx = { db, thunder, cfg };
+
+    await runOnce(ctx, quietLog);
+    thunder.txState = {};              /* get_transaction has forgotten it */
+    thunder.utxoTxids = ['tx1'];       /* but its change is in the wallet */
+
+    const r = await runOnce(ctx, quietLog);
+    assert.equal(r.settled, 1);
+    assert.equal(credited(db), 1);
+});
 
 test('an unconfirmed payout blocks the tick instead of double spending', async () => {
     const db = makeDb({
-        payouts: [{ txid: 'abc123', worker_id: 1 }],
+        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000 }],
         owed: { rig1: 5_000_000, rig2: 6_000_000 },
     });
     const thunder = thunderStub({ txState: { abc123: { known: true, confirmed: false } } });
@@ -89,55 +192,137 @@ test('an unconfirmed payout blocks the tick instead of double spending', async (
     const r = await runOnce({ db, thunder, cfg }, quietLog);
     assert.equal(r.attempted, 0);
     assert.equal(r.waiting_on, 'abc123');
+    assert.equal(r.reason, 'unconfirmed');
     assert.equal(thunder.calls.transfers, 0, 'must not broadcast while one is pending');
+    assert.equal(credited(db), 0);
 });
 
-test('a confirmed payout does not block', async () => {
+/* ---------- refusing to guess -------------------------------------------- */
+
+test('a txid the node has forgotten is NOT treated as evicted', async () => {
+    /* The double-pay trap. A long-confirmed txid and one that never existed
+     * are byte-identical from get_transaction, so re-queueing on silence
+     * would pay a settled batch a second time. Halt instead. */
     const db = makeDb({
-        payouts: [{ txid: 'abc123', worker_id: 1 }],
+        inFlight: [{ txid: 'gone999', worker_id: 1, sats: 5_000_000 }],
         owed: { rig1: 5_000_000 },
     });
-    const thunder = thunderStub({ txState: { abc123: { known: true, confirmed: true } } });
+    const thunder = thunderStub({ txState: {}, utxoTxids: [] });
 
     const r = await runOnce({ db, thunder, cfg }, quietLog);
-    assert.equal(r.paid, 1);
-    assert.equal(thunder.calls.transfers, 1);
-});
-
-test('a txid the node has forgotten does not block forever', async () => {
-    /* Evicted from the mempool, or the node was reset. Nothing is holding the
-     * inputs, so refusing to pay would strand every miner permanently. */
-    const db = makeDb({
-        payouts: [{ txid: 'gone999', worker_id: 1 }],
-        owed: { rig1: 5_000_000 },
-    });
-    const thunder = thunderStub({ txState: {} });   /* unknown txid */
-
-    const r = await runOnce({ db, thunder, cfg }, quietLog);
-    assert.equal(r.paid, 1);
+    assert.equal(r.reason, 'undetermined');
+    assert.equal(thunder.calls.transfers, 0, 'must not re-pay a batch that may have settled');
+    assert.equal(credited(db), 0, 'must not credit a batch it cannot see');
+    assert.equal(inFlightRows(db), 1, 'must not abandon the batch either');
 });
 
 test('an unreachable node blocks rather than guessing', async () => {
     /* "Cannot tell" must not be read as "nothing pending" — broadcasting
      * against a wallet we cannot see is how the double spend happened. */
-    const db = makeDb({ payouts: [{ txid: 'abc123' }], owed: { rig1: 5_000_000 } });
-    const thunder = thunderStub();
+    const db = makeDb({
+        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000 }],
+        owed: { rig1: 5_000_000 },
+    });
+    const thunder = thunderStub({ walletOk: false });
     thunder.getTransaction = async () => ({ known: false, confirmed: false, error: 'ECONNREFUSED' });
 
     const r = await runOnce({ db, thunder, cfg }, quietLog);
     assert.equal(r.attempted, 0);
     assert.equal(thunder.calls.transfers, 0);
+    assert.equal(credited(db), 0);
 });
 
-test('no prior payout at all does not block a first payout', async () => {
-    const db = makeDb({ owed: { rig1: 5_000_000 } });
+test('a row with no txid is left alone by the settle path', async () => {
+    /* Crashed between INSERT and broadcast: we cannot tell whether anything
+     * went out, so it belongs to the operator, not to the loop. It must not
+     * be read as a pending batch — that would block on a phantom. */
+    const db = makeDb({
+        inFlight: [{ txid: '', worker_id: 1, sats: 5_000_000 }],
+        owed: { rig1: 5_000_000, rig2: 6_000_000 },
+    });
     const thunder = thunderStub();
+
+    assert.equal(pendingBatch(db), null);
     const r = await runOnce({ db, thunder, cfg }, quietLog);
-    assert.equal(r.paid, 1);
-    assert.equal(thunder.calls.getTx, 0, 'nothing to check when no payout was ever made');
+    assert.equal(r.broadcast, 1, 'rig2 is still payable');
+    assert.equal(thunder.calls.lastBatch.length, 1, 'rig1 stays excluded by listDue');
 });
 
-test('every due worker is paid by ONE transaction', async () => {
+test('listStuck reports unbroadcast rows only, not ones awaiting confirmation', async () => {
+    /* Waiting hours for a Thunder block is normal now. Reporting those would
+     * cry wolf on every restart and bury the row that does need a human. */
+    const db = makeDb({
+        inFlight: [{ txid: '',      worker_id: 1, started_at: 0 },
+                   { txid: 'tx777', worker_id: 2, started_at: 0 }],
+        owed: { rig1: 1, rig2: 1 },
+    });
+    const stuck = listStuck(db, 300, 100000);
+    assert.equal(stuck.length, 1);
+    assert.equal(stuck[0].worker_id, 1);
+});
+
+/* ---------- nudging Thunder ---------------------------------------------- */
+
+test('a waiting payout nudges Thunder to mine', async () => {
+    const db = makeDb({
+        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000 }],
+        owed: { rig1: 5_000_000 },
+    });
+    const thunder = thunderStub({ txState: { abc123: { known: true, confirmed: false } } });
+
+    await runOnce({ db, thunder, cfg }, quietLog);
+    assert.equal(thunder.calls.mines, 1, 'nothing else will make Thunder advance');
+});
+
+test('the nudge is rate-limited across ticks', async () => {
+    /* Each nudge costs a mainchain BMM bid, and the tick is far faster than
+     * Thunder can produce blocks. */
+    const db = makeDb({
+        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000 }],
+        owed: { rig1: 5_000_000 },
+    });
+    const thunder = thunderStub({ txState: { abc123: { known: true, confirmed: false } } });
+    const ctx = { db, thunder, cfg };
+
+    await runOnce(ctx, quietLog);
+    await runOnce(ctx, quietLog);
+    await runOnce(ctx, quietLog);
+    assert.equal(thunder.calls.mines, 1, 'once per nudgeIntervalMs, not once per tick');
+});
+
+test('the nudge can be turned off', async () => {
+    const db = makeDb({
+        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000 }],
+        owed: { rig1: 5_000_000 },
+    });
+    const thunder = thunderStub({ txState: { abc123: { known: true, confirmed: false } } });
+
+    await runOnce({ db, thunder, cfg: { ...baseCfg, nudgeMine: false } }, quietLog);
+    assert.equal(thunder.calls.mines, 0);
+});
+
+test('an idle pool spends no BMM bids', async () => {
+    const db = makeDb({ owed: {} });
+    const thunder = thunderStub();
+    await runOnce({ db, thunder, cfg }, quietLog);
+    assert.equal(thunder.calls.mines, 0, 'nudge only when something is waiting to settle');
+});
+
+test('a failing mine nudge does not fail the tick', async () => {
+    const db = makeDb({
+        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000 }],
+        owed: { rig1: 5_000_000 },
+    });
+    const thunder = thunderStub({ txState: { abc123: { known: true, confirmed: false } } });
+    thunder.mine = async () => { throw new Error('no mainchain'); };
+
+    const r = await runOnce({ db, thunder, cfg }, quietLog);
+    assert.equal(r.waiting_on, 'abc123', 'still waiting, still safe');
+});
+
+/* ---------- batching ------------------------------------------------------ */
+
+test('every due worker goes out in ONE transaction', async () => {
     /* The whole point of batching: four workers, one broadcast, one
      * sidechain block. One tx per worker would need four. */
     const db = makeDb({ owed: { rig1: 5_000_000, rig2: 6_000_000, rig3: 7_000_000, rig4: 8_000_000 } });
@@ -146,22 +331,19 @@ test('every due worker is paid by ONE transaction', async () => {
     const r = await runOnce({ db, thunder, cfg }, quietLog);
     assert.equal(thunder.calls.transfers, 1, 'exactly one broadcast');
     assert.equal(thunder.calls.lastBatch.length, 4, 'all four in the same tx');
-    assert.equal(r.paid, 4);
+    assert.equal(r.broadcast, 4);
     assert.equal(r.failed, 0);
-
-    /* All four credited, none left in flight. */
-    assert.equal(db.prepare('SELECT COUNT(*) n FROM pps_credits WHERE paid_sats > 0').get().n, 4);
-    assert.equal(db.prepare('SELECT COUNT(*) n FROM payouts_in_flight').get().n, 0);
-    assert.equal(db.prepare('SELECT COUNT(*) n FROM payouts').get().n, 4);
-    /* All ledger rows share the batch's txid. */
-    assert.equal(db.prepare('SELECT COUNT(DISTINCT txid) n FROM payouts').get().n, 1);
 });
 
-test('the whole queue settles in a single tick', async () => {
+test('the whole queue settles in a single confirmation', async () => {
     const db = makeDb({ owed: { rig1: 5_000_000, rig2: 6_000_000, rig3: 7_000_000 } });
     const thunder = thunderStub();
-    const r = await runOnce({ db, thunder, cfg }, quietLog);
-    assert.equal(r.paid, 3);
+    const ctx = { db, thunder, cfg };
+
+    await runOnce(ctx, quietLog);
+    thunder.txState.tx1 = { known: true, confirmed: true };
+    await runOnce(ctx, quietLog);
+
     assert.equal(db.prepare('SELECT COUNT(*) n FROM pps_credits WHERE accrued_sats > paid_sats').get().n, 0);
 });
 
@@ -169,7 +351,13 @@ test('the batch fee sums to exactly one transaction fee', async () => {
     /* Divided across the ledger rows, so SUM(fee_sats) is what was actually
      * spent — a per-row copy of the full fee would triple-count it. */
     const db = makeDb({ owed: { rig1: 5_000_000, rig2: 6_000_000, rig3: 7_000_000 } });
-    await runOnce({ db, thunder: thunderStub(), cfg }, quietLog);
+    const thunder = thunderStub();
+    const ctx = { db, thunder, cfg };
+
+    await runOnce(ctx, quietLog);
+    thunder.txState.tx1 = { known: true, confirmed: true };
+    await runOnce(ctx, quietLog);
+
     assert.equal(db.prepare('SELECT SUM(fee_sats) f FROM payouts').get().f, 100);
 });
 
@@ -182,18 +370,27 @@ test('a failed batch credits nobody and strands nobody', async () => {
     const r = await runOnce({ db, thunder, cfg }, quietLog);
     assert.equal(r.paid, 0);
     assert.equal(r.failed, 3);
-    assert.equal(db.prepare('SELECT COUNT(*) n FROM pps_credits WHERE paid_sats > 0').get().n, 0);
-    assert.equal(db.prepare('SELECT COUNT(*) n FROM payouts_in_flight').get().n, 0,
+    assert.equal(credited(db), 0);
+    assert.equal(inFlightRows(db), 0,
                  'in-flight rows must be released or the workers are stuck forever');
 });
 
-test('lastBroadcastPayout ignores rows with no txid and picks the newest', async () => {
-    const db = makeDb({ payouts: [
-        { txid: 'old', worker_id: 1, paid_at: 5000 },
-        { txid: '',    worker_id: 1, paid_at: 5000 },   /* never broadcast */
-        { txid: 'new', worker_id: 1, paid_at: 5000 },   /* same second as 'old' */
-    ] });
-    /* Same paid_at throughout: ordering must come from id, not the timestamp,
-     * or a same-second pair reports the wrong one. */
-    assert.equal(lastBroadcastPayout(db).txid, 'new');
+test('no prior payout at all does not block a first payout', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const thunder = thunderStub();
+    const r = await runOnce({ db, thunder, cfg }, quietLog);
+    assert.equal(r.broadcast, 1);
+    assert.equal(thunder.calls.getTx, 0, 'nothing to check when nothing is in flight');
+});
+
+test('pendingBatch groups by the newest txid and ignores unbroadcast rows', async () => {
+    const db = makeDb({
+        inFlight: [{ txid: '',    worker_id: 1 },
+                   { txid: 'new', worker_id: 2 },
+                   { txid: 'new', worker_id: 3 }],
+        owed: { a: 1, b: 1, c: 1 },
+    });
+    const p = pendingBatch(db);
+    assert.equal(p.txid, 'new');
+    assert.equal(p.rows.length, 2);
 });

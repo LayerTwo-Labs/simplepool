@@ -178,9 +178,10 @@ export async function triggerPayout({ payoutAdminUrl }) {
         return {
             ok: true,
             msg: `payout tick fired`,
-            detail: `attempted=${res.attempted ?? 0} paid=${res.paid ?? 0} ` +
-                    `failed=${res.failed ?? 0}` +
-                    (res.reserve_short ? ' (reserve short)' : ''),
+            detail: `attempted=${res.attempted ?? 0} broadcast=${res.broadcast ?? 0} ` +
+                    `settled=${res.settled ?? 0} failed=${res.failed ?? 0}` +
+                    (res.reserve_short ? ' (reserve short)' : '') +
+                    (res.waiting_on ? ` (waiting on ${String(res.waiting_on).slice(0, 16)}…)` : ''),
         };
     } catch (e) {
         return { ok: false, msg: 'payout worker unreachable', detail: e.message };
