@@ -134,11 +134,12 @@ static const char *SCHEMA_SQL_PARTS[] = {
     ");"
     "CREATE INDEX IF NOT EXISTS rate_history_ts_idx   ON rate_history(ts);"
     "CREATE INDEX IF NOT EXISTS rate_history_rate_idx ON rate_history(rate_sats_per_diff);"
-    /* What the pool is mining now, and what it mined before. Appended on a
-     * material change only. `source` distinguishes a backend-dictated
-     * coinbase (BIP22 "coinbasetxn", carries the BIP300/301 commitments) from
-     * one we built ourselves (carries none, so no sidechain can be
-     * merge-mined into the block) — see the schema.sql comment. */
+    /* What the pool is mining now, and what it mined before. One row per
+     * materially distinct template — see store_record_template(). `source`
+     * distinguishes a backend-dictated coinbase (BIP22 "coinbasetxn", carries
+     * the BIP300/301 commitments) from one we built ourselves (carries none,
+     * so no sidechain can be merge-mined into the block) — see the schema.sql
+     * comment. */
     "CREATE TABLE IF NOT EXISTS templates ("
     "  id                  INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  ts                  INTEGER NOT NULL,"
@@ -153,7 +154,9 @@ static const char *SCHEMA_SQL_PARTS[] = {
     "  cb_spendable        INTEGER NOT NULL,"
     "  cb_op_returns       INTEGER NOT NULL,"
     "  longpoll            INTEGER NOT NULL,"
-    "  rate_sats_per_diff  REAL    NOT NULL"
+    "  rate_sats_per_diff  REAL    NOT NULL,"
+    "  last_seen           INTEGER NOT NULL DEFAULT 0,"
+    "  polls               INTEGER NOT NULL DEFAULT 1"
     ");"
     "CREATE INDEX IF NOT EXISTS templates_ts_idx     ON templates(ts);"
     "CREATE INDEX IF NOT EXISTS templates_height_idx ON templates(height);",
@@ -256,6 +259,15 @@ static const char *MIGRATIONS_SQL[] = {
      * it against. rate_history (created by SCHEMA_SQL above) likewise only
      * covers rates published after the upgrade. */
     "ALTER TABLE shares       ADD COLUMN rate_used      REAL NOT NULL DEFAULT 0",
+    /* Template rows used to be append-only per material change, where
+     * "material" included the block value — which moves on nearly every
+     * mempool tick. These two turn each row into a span: `ts` stays first-seen
+     * and `last_seen`/`polls` record how many polls collapsed into it. Rows
+     * predating the columns are each a single observation, so backfilling
+     * last_seen from ts is exact, not a guess. */
+    "ALTER TABLE templates    ADD COLUMN last_seen      INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE templates    ADD COLUMN polls          INTEGER NOT NULL DEFAULT 1",
+    "UPDATE templates SET last_seen = ts WHERE last_seen = 0",
 };
 
 #define EV_SHARE   1
@@ -321,6 +333,7 @@ struct store {
 
     int commit_window_ms;
     int commit_max_shares;
+    int templates_retention_days;   /* 0 = keep every row */
 
     worker_slot_t cache[WORKER_CACHE_SLOTS];
 
@@ -626,6 +639,8 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
 
     s->commit_window_ms = cfg->commit_window_ms > 0 ? cfg->commit_window_ms : 100;
     s->commit_max_shares = cfg->commit_max_shares > 0 ? cfg->commit_max_shares : 100;
+    s->templates_retention_days =
+        cfg->templates_retention_days > 0 ? cfg->templates_retention_days : 0;
     s->ring_cap = g_test_ring_cap > 0 ? g_test_ring_cap : 65536;
     s->ring = calloc(s->ring_cap, sizeof(event_t));
     if (!s->ring) { free(s); return -1; }
@@ -1046,40 +1061,81 @@ int store_record_rate(store_t *s, const char *rate_source,
 int store_record_template(store_t *s, const store_template_t *t) {
     if (!s || !t) return -1;
 
-    /* Append only on a material change. The tip, the block value and the
-     * transaction set are what make a template different work; curtime ticks
-     * every poll and would otherwise append a row per poll forever. */
+    /* Open a new row only when the *work* changes: the tip, the nBits, the
+     * template source or the shape of the server's coinbase.
+     *
+     * The block value and transaction count are deliberately NOT in the key.
+     * They drift with every mempool tick, so keying on them appended a row
+     * per poll at a height already recorded — ~2,880 rows/day here, almost
+     * all of it fee churn. A poll that matches the newest row now refreshes
+     * that row instead.
+     *
+     * source / cb_spendable / cb_op_returns stay in the key on purpose: a
+     * template that stops carrying the BIP300/301 commitments part-way
+     * through a height is precisely the regression the /templates page exists
+     * to surface, so it has to open its own row rather than overwrite the
+     * good one. */
     static const char *Q_LAST =
-        "SELECT height, prev_hash, coinbase_value_sats, tx_count, bits, source"
+        "SELECT id, height, prev_hash, bits, source, cb_spendable, cb_op_returns,"
+        "       longpoll"
         "  FROM templates ORDER BY id DESC LIMIT 1";
     sqlite3_stmt *last = NULL;
     int unchanged = 0;
+    sqlite3_int64 last_id = 0;
     pthread_mutex_lock(&s->node_tip_mu);
     if (sqlite3_prepare_v2(s->db, Q_LAST, -1, &last, NULL) == SQLITE_OK &&
         sqlite3_step(last) == SQLITE_ROW)
     {
-        const unsigned char *ph  = sqlite3_column_text(last, 1);
-        const unsigned char *bt  = sqlite3_column_text(last, 4);
-        const unsigned char *src = sqlite3_column_text(last, 5);
+        const unsigned char *ph  = sqlite3_column_text(last, 2);
+        const unsigned char *bt  = sqlite3_column_text(last, 3);
+        const unsigned char *src = sqlite3_column_text(last, 4);
+        last_id = sqlite3_column_int64(last, 0);
         unchanged =
-            sqlite3_column_int  (last, 0) == t->height &&
-            sqlite3_column_int64(last, 2) == (sqlite3_int64)t->coinbase_value_sats &&
-            sqlite3_column_int  (last, 3) == t->tx_count &&
+            sqlite3_column_int(last, 1) == t->height &&
             ph  && strcmp((const char *)ph,  t->prev_hash ? t->prev_hash : "") == 0 &&
             bt  && strcmp((const char *)bt,  t->bits      ? t->bits      : "") == 0 &&
-            src && strcmp((const char *)src, t->source    ? t->source    : "") == 0;
+            src && strcmp((const char *)src, t->source    ? t->source    : "") == 0 &&
+            sqlite3_column_int(last, 5) == t->cb_spendable &&
+            sqlite3_column_int(last, 6) == t->cb_op_returns &&
+            sqlite3_column_int(last, 7) == (t->longpoll ? 1 : 0);
     }
     sqlite3_finalize(last);
+
+    /* Same work, fresher numbers: fold this poll into the row it belongs to.
+     * `ts` stays first-seen so the row remains a span of one template. */
     if (unchanged) {
+        static const char *Q_UPD =
+            "UPDATE templates SET last_seen = ?, polls = polls + 1,"
+            "  network_difficulty = ?, coinbase_value_sats = ?, tx_count = ?,"
+            "  tx_fees_sats = ?, rate_sats_per_diff = ? WHERE id = ?";
+        sqlite3_stmt *up = NULL;
+        if (sqlite3_prepare_v2(s->db, Q_UPD, -1, &up, NULL) != SQLITE_OK) {
+            pthread_mutex_unlock(&s->node_tip_mu);
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -2;
+        }
+        sqlite3_bind_int64 (up, 1, (sqlite3_int64)t->ts_s);
+        sqlite3_bind_double(up, 2, t->network_difficulty);
+        sqlite3_bind_int64 (up, 3, (sqlite3_int64)t->coinbase_value_sats);
+        sqlite3_bind_int   (up, 4, t->tx_count);
+        sqlite3_bind_int64 (up, 5, (sqlite3_int64)t->tx_fees_sats);
+        sqlite3_bind_double(up, 6, t->rate_sats_per_diff);
+        sqlite3_bind_int64 (up, 7, last_id);
+        int urc = sqlite3_step(up);
         pthread_mutex_unlock(&s->node_tip_mu);
+        sqlite3_finalize(up);
+        if (urc != SQLITE_DONE) {
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -2;
+        }
         return 0;
     }
 
     static const char *Q_INS =
         "INSERT INTO templates (ts, height, prev_hash, bits, network_difficulty,"
         "  coinbase_value_sats, tx_count, tx_fees_sats, source, cb_spendable,"
-        "  cb_op_returns, longpoll, rate_sats_per_diff) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        "  cb_op_returns, longpoll, rate_sats_per_diff, last_seen, polls) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, Q_INS, -1, &st, NULL) != SQLITE_OK) {
         pthread_mutex_unlock(&s->node_tip_mu);
@@ -1099,13 +1155,31 @@ int store_record_template(store_t *s, const store_template_t *t) {
     sqlite3_bind_int   (st, 11, t->cb_op_returns);
     sqlite3_bind_int   (st, 12, t->longpoll ? 1 : 0);
     sqlite3_bind_double(st, 13, t->rate_sats_per_diff);
+    sqlite3_bind_int64 (st, 14, (sqlite3_int64)t->ts_s);
     int rc = sqlite3_step(st);
-    pthread_mutex_unlock(&s->node_tip_mu);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
+        pthread_mutex_unlock(&s->node_tip_mu);
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;
     }
+
+    /* Trim history on the way out. Driven off the template's own timestamp
+     * rather than wall-clock time so a replay or a test is deterministic.
+     * Nothing but the dashboard reads this table, so a dropped row costs
+     * visibility and nothing else — the ledger lives in shares/rate_history. */
+    int keep_days = s->templates_retention_days;
+    if (keep_days > 0) {
+        static const char *Q_TRIM = "DELETE FROM templates WHERE ts < ?";
+        sqlite3_stmt *tr = NULL;
+        if (sqlite3_prepare_v2(s->db, Q_TRIM, -1, &tr, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(tr, 1,
+                (sqlite3_int64)t->ts_s - (sqlite3_int64)keep_days * 86400);
+            sqlite3_step(tr);
+            sqlite3_finalize(tr);
+        }
+    }
+    pthread_mutex_unlock(&s->node_tip_mu);
     return 0;
 }
 

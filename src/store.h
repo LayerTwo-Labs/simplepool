@@ -11,6 +11,10 @@ typedef struct {
     char path[512];
     int  commit_window_ms;     /* default 100 */
     int  commit_max_shares;    /* default 100 */
+    /* Days of template history to keep; 0 disables pruning. Enforced when a
+     * new template row is opened, so a busy pool trims itself and an idle
+     * one leaves the table alone. */
+    int  templates_retention_days;
 } store_cfg_t;
 
 /* Open the DB (creates file + applies schema if missing). Starts a writer
@@ -123,10 +127,17 @@ typedef struct {
     double      rate_sats_per_diff;  /* PPS rate derived from this template */
 } store_template_t;
 
-/* Append one row to the template history, unless the newest row already
- * describes the same work. Synchronous; called at most once per template
- * change. Deduped on tip / value / tx set / bits / source — curtime alone
- * must not append, or the table grows once per poll forever. */
+/* Record the template being mined. Synchronous; called once per poll.
+ *
+ * Keyed on what makes the *work* different — tip, nBits, source and coinbase
+ * shape. A poll matching the newest row updates that row in place (refreshing
+ * the block value, tx set and rate, bumping `polls` and `last_seen`) instead
+ * of appending: the block value drifts with every mempool tick, so keying on
+ * it appended a near-duplicate row per poll — thousands a day, nearly all of
+ * them fee churn at a height already recorded.
+ *
+ * Prunes history older than cfg.templates_retention_days when it opens a new
+ * row. */
 int store_record_template(store_t *s, const store_template_t *t);
 
 /* Record / refresh the upstream bitcoind tip the proxy is mining on.

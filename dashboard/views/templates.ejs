@@ -48,6 +48,8 @@
             <div><label>PPS rate</label><strong><%= cur.rate_sats_per_diff > 0
                     ? fmtF(cur.rate_sats_per_diff, 4) + ' sats/diff' : 'n/a (solo)' %></strong></div>
             <div><label>Received</label><strong title="<%= fmtTs(cur.ts) %>"><%= ago(cur.ts) %></strong></div>
+            <div><label>Last polled</label><strong title="<%= fmtTs(cur.last_seen) %>"><%= ago(cur.last_seen) %>
+                <span class="muted small">(<%= fmtN(cur.polls) %> poll<%= cur.polls === 1 ? '' : 's' %>)</span></strong></div>
             <div><label>Long poll</label><strong><%= cur.longpoll ? 'yes' : 'no' %></strong></div>
         </div>
         <p class="muted small" style="margin-top:0.75em">
@@ -103,12 +105,15 @@
         <% } else { %>
         <p class="muted small" style="margin-top:0">
             Showing <%= fmtN(templates.history.length) %> of
-            <%= fmtN(templates.total) %> recorded.
+            <%= fmtN(templates.total) %> recorded. One row per distinct
+            template — repeat polls fold into the row they match, so
+            <em>Held</em> is how long that template was mined and the block
+            value is the last one seen for it.
         </p>
         <div style="overflow-x:auto">
         <table>
             <thead><tr>
-                <th>When</th><th>Height</th><th>Difficulty</th>
+                <th>When</th><th>Held</th><th>Height</th><th>Difficulty</th>
                 <th>Block value</th><th>Fees</th><th>Txs</th>
                 <th>Source</th><th>Commitments</th><th>PPS rate</th>
             </tr></thead>
@@ -116,6 +121,10 @@
                 <% templates.history.forEach(t => { %>
                 <tr>
                     <td class="muted small" title="<%= fmtTs(t.ts) %>"><%= ago(t.ts) %></td>
+                    <td class="muted small" title="last polled <%= fmtTs(t.last_seen) %>">
+                        <%= t.held_sec > 0 ? t.held_sec + 's' : '—' %>
+                        <span class="muted">(<%= fmtN(t.polls) %>)</span>
+                    </td>
                     <td><strong><%= fmtN(t.height) %></strong></td>
                     <td class="small"><%= fmtF(t.network_difficulty, 2) %></td>
                     <td class="small"><%= fmtSats(t.coinbase_value_sats) %></td>

@@ -13,7 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static char g_db_paths[8][256];
+static char g_db_paths[16][256];
 static int  g_db_count = 0;
 
 static const char *fresh_db_path(void) {
@@ -414,9 +414,10 @@ static void test_rate_history(void) {
     printf("  ok test_rate_history\n");
 }
 
-/* Template history: append on a material change, stay quiet otherwise. The
- * dedupe matters — curtime moves every poll, so keying on it would append a
- * row per poll forever. */
+/* Template history: one row per materially distinct template. Repeat polls
+ * fold into the row they match instead of appending — the block value moves
+ * on nearly every poll, so keying on it grew the table by thousands of rows a
+ * day, all of them fee churn at a height already recorded. */
 static void test_template_history(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg;
@@ -440,6 +441,9 @@ static void test_template_history(void) {
     assert(sqlite3_open(path, &db) == SQLITE_OK);
     assert(scalar_i64(db, "SELECT count(*) FROM templates") == 1);
 
+    assert(scalar_i64(db, "SELECT polls FROM templates") == 1);
+    assert(scalar_i64(db, "SELECT last_seen FROM templates") == 1700000000);
+
     /* Re-publishing the same work must not append, even as time moves on. */
     for (int i = 0; i < 10; ++i) {
         t.ts_s += 30;
@@ -447,30 +451,106 @@ static void test_template_history(void) {
     }
     assert(scalar_i64(db, "SELECT count(*) FROM templates") == 1);
 
+    /* Folded, not discarded: ts stays first-seen, so the row spans the window
+     * the template was actually mined over. */
+    assert(scalar_i64(db, "SELECT polls FROM templates")     == 11);
+    assert(scalar_i64(db, "SELECT ts FROM templates")        == 1700000000);
+    assert(scalar_i64(db, "SELECT last_seen FROM templates") == 1700000300);
+
+    /* Fee churn at the same tip is the common case and must not append — but
+     * the row has to carry the latest numbers, not the first ones. */
+    t.coinbase_value_sats = 312501999; t.tx_count = 42; t.tx_fees_sats = 1999;
+    assert(store_record_template(s, &t) == 0);
+    assert(scalar_i64(db, "SELECT count(*) FROM templates") == 1);
+    assert(scalar_i64(db, "SELECT coinbase_value_sats FROM templates") == 312501999);
+    assert(scalar_i64(db, "SELECT tx_count FROM templates")            == 42);
+    assert(scalar_i64(db, "SELECT tx_fees_sats FROM templates")        == 1999);
+
     /* A new tip is new work. */
     t.height = 977818;
     t.prev_hash = "00000000000000000000000000000000000000000000000000000000000000cd";
     assert(store_record_template(s, &t) == 0);
     assert(scalar_i64(db, "SELECT count(*) FROM templates") == 2);
 
-    /* So is a changed block value at the same height (fees moved). */
-    t.coinbase_value_sats = 312501999;
-    assert(store_record_template(s, &t) == 0);
-    assert(scalar_i64(db, "SELECT count(*) FROM templates") == 3);
-
-    /* And so is switching template source, which is the change that decides
-     * whether blocks can carry sidechain commitments at all. */
+    /* Switching template source decides whether blocks can carry sidechain
+     * commitments at all, so it opens a row even mid-height — folding that
+     * transition away would hide the exact regression this table is for. */
     t.source = "bitcoind"; t.cb_spendable = 0; t.cb_op_returns = 0;
     assert(store_record_template(s, &t) == 0);
-    assert(scalar_i64(db, "SELECT count(*) FROM templates") == 4);
+    assert(scalar_i64(db, "SELECT count(*) FROM templates") == 3);
     assert(scalar_i64(db,
         "SELECT cb_op_returns FROM templates ORDER BY id DESC LIMIT 1") == 0);
     assert(scalar_i64(db,
-        "SELECT count(*) FROM templates WHERE source='enforcer'") == 3);
+        "SELECT count(*) FROM templates WHERE source='enforcer'") == 2);
+
+    /* Losing a sidechain commitment while still on the enforcer is the same
+     * class of regression, and is invisible from every other column. */
+    t.source = "enforcer"; t.cb_spendable = 1; t.cb_op_returns = 2;
+    assert(store_record_template(s, &t) == 0);
+    t.cb_op_returns = 1;
+    assert(store_record_template(s, &t) == 0);
+    assert(scalar_i64(db, "SELECT count(*) FROM templates") == 5);
 
     sqlite3_close(db);
     store_close(s);
     printf("  ok test_template_history\n");
+}
+
+/* Retention keeps the table bounded. Pruning runs when a new row is opened
+ * and is driven off the template's own clock, so this is deterministic. */
+static void test_template_retention(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.templates_retention_days = 7;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    store_template_t t;
+    memset(&t, 0, sizeof t);
+    t.prev_hash = "00000000000000000000000000000000000000000000000000000000000000ab";
+    t.bits = "1a3839e6"; t.network_difficulty = 298383.4976083073;
+    t.coinbase_value_sats = 312500500; t.tx_count = 1; t.tx_fees_sats = 500;
+    t.source = "enforcer"; t.cb_spendable = 1; t.cb_op_returns = 2;
+    t.longpoll = 1; t.rate_sats_per_diff = 1036.8368;
+
+    /* 30 distinct templates, one day apart. */
+    for (int i = 0; i < 30; ++i) {
+        t.ts_s  = 1700000000 + (int64_t)i * 86400;
+        t.height = 977817 + i;
+        assert(store_record_template(s, &t) == 0);
+    }
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    /* The 7-day window holds the row just written plus the seven inside the
+     * cutoff; everything older is gone. */
+    assert(scalar_i64(db, "SELECT count(*) FROM templates") == 8);
+    assert(scalar_i64(db, "SELECT MIN(height) FROM templates") == 977817 + 22);
+    assert(scalar_i64(db, "SELECT MAX(height) FROM templates") == 977817 + 29);
+
+    /* 0 means keep everything. */
+    store_close(s);
+    store_cfg_t keep;
+    memset(&keep, 0, sizeof(keep));
+    snprintf(keep.path, sizeof(keep.path), "%s", fresh_db_path());
+    keep.templates_retention_days = 0;
+    store_t *s2 = NULL;
+    assert(store_open(&keep, &s2) == 0);
+    for (int i = 0; i < 30; ++i) {
+        t.ts_s  = 1700000000 + (int64_t)i * 86400;
+        t.height = 977817 + i;
+        assert(store_record_template(s2, &t) == 0);
+    }
+    sqlite3 *db2 = NULL;
+    assert(sqlite3_open(keep.path, &db2) == SQLITE_OK);
+    assert(scalar_i64(db2, "SELECT count(*) FROM templates") == 30);
+
+    sqlite3_close(db2);
+    sqlite3_close(db);
+    store_close(s2);
+    printf("  ok test_template_retention\n");
 }
 
 int main(void) {
@@ -483,6 +563,7 @@ int main(void) {
     test_credited_sats();
     test_rate_history();
     test_template_history();
+    test_template_retention();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;

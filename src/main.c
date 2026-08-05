@@ -658,6 +658,7 @@ int main(int argc, char **argv) {
     snprintf(scfg.path, sizeof scfg.path, "%s", cfg.db_path);
     scfg.commit_window_ms  = cfg.commit_window_ms;
     scfg.commit_max_shares = cfg.commit_max_shares;
+    scfg.templates_retention_days = cfg.templates_retention_days;
     store_t *store = NULL;
     if (store_open(&scfg, &store) < 0) {
         fprintf(stderr, "store_open failed for %s\n", cfg.db_path);
