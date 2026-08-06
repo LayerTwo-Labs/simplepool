@@ -155,3 +155,11 @@ table.lb tr:hover { background: rgba(255, 255, 255, 0.02); }
 }
 .foot .sep { margin: 0 6px; opacity: 0.5; }
 .foot a { color: var(--accent); }
+
+/* Health banner — hard failures only, so it is loud and it is rare.
+   Sits directly under the nav on every page (partial/health-banner.ejs). */
+.health-alert { border-left: 4px solid #c66; margin-top: 12px; }
+.health-alert h2 { color: #c66; margin: 0 0 6px; font-size: 1rem; }
+.health-list { margin: 0 0 6px; padding-left: 1.2em; }
+.health-list li { margin: 2px 0; }
+.health-warn { border-left: 4px solid #c93; margin-top: 12px; }

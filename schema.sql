@@ -91,7 +91,11 @@ CREATE TABLE IF NOT EXISTS pool_meta (
   effective_fee_bps   REAL,
   network_difficulty  REAL,
   block_value_sats    INTEGER,
-  credited_from       INTEGER,  /* unix seconds */
+  credited_from       INTEGER,
+  /* Mirror of the proxy's in-memory events_lost counter: accepted shares that
+   * never reached the DB after every commit retry failed. Must be 0 — it is
+   * work a miner was told was accepted and that no query can otherwise see. */
+  events_lost         INTEGER NOT NULL DEFAULT 0,  /* unix seconds */
   updated_at          INTEGER   /* unix seconds */
 );
 
