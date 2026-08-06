@@ -5,3 +5,8 @@
 /.regtest-payout/
 /proxy.conf
 /tests/integration.proxy.conf
+# The installer writes proxy.conf.bak.<timestamp> beside proxy.conf on every
+# run. /proxy.conf does not match those, so without this line each run drops
+# another file containing bitcoind RPC credentials into a PUBLIC repo's
+# working tree, one `git add -A` away from being committed.
+/proxy.conf.bak.*

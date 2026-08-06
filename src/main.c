@@ -817,11 +817,19 @@ int main(int argc, char **argv) {
     store_flush(store);
     store_stats_t stats;
     store_get_stats(store, &stats);
-    LOG_INFO("final stats: shares_committed=%llu rejects_committed=%llu blocks=%llu sqlite_errs=%llu",
+    LOG_INFO("final stats: shares_committed=%llu rejects_committed=%llu blocks=%llu sqlite_errs=%llu events_lost=%llu",
              (unsigned long long)stats.shares_committed,
              (unsigned long long)stats.rejects_committed,
              (unsigned long long)stats.blocks_committed,
-             (unsigned long long)stats.pg_errors);
+             (unsigned long long)stats.pg_errors,
+             (unsigned long long)stats.events_lost);
+    /* Loud and separate, because it is the one number here that means miners
+     * are owed work the ledger has no record of. Nothing else reports it. */
+    if (stats.events_lost > 0) {
+        LOG_ERROR("store: %llu accepted event(s) never reached the DB this run "
+                  "— those shares are uncredited and unrecoverable",
+                  (unsigned long long)stats.events_lost);
+    }
     store_close(store);
 
     if (bcast) {
