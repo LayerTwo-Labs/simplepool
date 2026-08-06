@@ -15,6 +15,7 @@ import { renderFile } from 'ejs';
 import { openDb } from './lib/db.js';
 import { openAdminDb } from './lib/db-admin.js';
 import * as stats from './lib/stats.js';
+import { startHealthMonitor, currentHealth } from './lib/health.js';
 import * as fmt from './lib/fmt.js';
 import { createAdminRouter } from './lib/admin-router.js';
 
@@ -41,6 +42,8 @@ app.use((_req, res, next) => {
 /* --- fmt helpers on every render ---------------------------------------- */
 app.use((_req, res, next) => {
     Object.assign(res.locals, fmt.all);
+    /* Every page renders the banner, so every render needs the snapshot. */
+    res.locals.health = currentHealth();
     next();
 });
 
@@ -50,6 +53,13 @@ app.use('/static', express.static(path.join(__dirname, 'public'), { maxAge: '1h'
  * confined to admin write actions (lives inside admin router). */
 const db   = openDb(path.resolve(__dirname, DB_PATH));
 const dbRw = openAdminDb(path.resolve(__dirname, DB_PATH));
+
+/* Hard-failure checks, evaluated on a timer rather than per request: the
+ * duplicate-hash scan measured 2.0s against 337k shares, and better-sqlite3
+ * is synchronous, so running it on the request path would stall the whole
+ * dashboard on every 15s auto-refresh. */
+const HEALTH_INTERVAL_MS = parseInt(process.env.HEALTH_INTERVAL_MS || '300000', 10);
+startHealthMonitor(db, { intervalMs: HEALTH_INTERVAL_MS });
 
 /* --- public-side config ------------------------------------------------- */
 const PUBLIC_STRATUM_URL = process.env.PUBLIC_STRATUM_URL || 'stratum+tcp://<pool-host>:3334';
@@ -200,6 +210,16 @@ app.get('/api/blocks', (req, res) => {
     res.json(stats.allBlocks(db, { limit, beforeTs }));
 });
 app.get('/healthz', (_req, res) => res.json({ ok: true, db_ready: db.ready() }));
+
+/* Full hard-failure detail. Public: what a pool's ledger checks say is
+ * exactly the sort of thing miners should be able to read without asking.
+ * 503 when something is failing so an uptime checker can watch it — and also
+ * before the first pass, because "not yet known" is not "healthy". */
+app.get('/health', (_req, res) => {
+    const h = currentHealth();
+    if (!h) return res.status(503).json({ ok: false, status: 'checking' });
+    res.status(h.ok ? 200 : 503).json(h);
+});
 
 /* ================================ ADMIN ================================ */
 

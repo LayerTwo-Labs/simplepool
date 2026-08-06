@@ -1,0 +1,32 @@
+<%# Hard-failure health banner. Rendered from res.locals.health (a snapshot
+    from the background monitor, or null before the first pass).
+
+    Shown on every page via nav-public / nav-admin, because these are the
+    conditions nobody was going to find by running a query. Silent when
+    everything passes — a banner that is always visible is a banner nobody
+    reads. %>
+<% const _h = typeof health !== 'undefined' ? health : null; %>
+<% if (_h && !_h.ok) { %>
+<section class="card health-alert" role="alert">
+    <h2>⚠ <%= _h.failing.length %> health check<%= _h.failing.length === 1 ? '' : 's' %> failing</h2>
+    <ul class="health-list">
+        <% _h.failing.forEach(c => { %>
+        <li><strong><%= c.label %></strong><% if (c.detail) { %> — <%= c.detail %><% } %></li>
+        <% }) %>
+    </ul>
+    <p class="muted small">
+        <% if (_h.checked_at) { %>checked <%= new Date(_h.checked_at * 1000).toISOString().replace('T',' ').slice(0,19) %> UTC · <% } %>
+        details at <a href="/health">/health</a>
+    </p>
+</section>
+<% } else if (_h && _h.unavailable && _h.unavailable.length > 0) { %>
+<%# Not a pass. A check that could not run has to say so, or an old DB looks
+    identical to a healthy one. %>
+<section class="card health-warn">
+    <p class="small" style="margin:0">
+        <%= _h.unavailable.length %> health check<%= _h.unavailable.length === 1 ? '' : 's' %>
+        could not run against this database —
+        <a href="/health">/health</a>
+    </p>
+</section>
+<% } %>

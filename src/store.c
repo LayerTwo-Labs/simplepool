@@ -120,7 +120,13 @@ static const char *SCHEMA_SQL_PARTS[] = {
     "  network_difficulty  REAL,"
     "  block_value_sats    INTEGER,"
     "  credited_from       INTEGER,"  /* first ts with credited_sats populated */
-    "  updated_at          INTEGER"
+    "  updated_at          INTEGER,"
+    /* Mirror of the writer thread's events_lost counter. Lives here because
+     * it is otherwise process-local: accepted work that never reached the DB
+     * is invisible to every query, so the dashboard could not surface it.
+     * Written on the template path, which is a different connection state
+     * from the batch commit that failed. */
+    "  events_lost         INTEGER NOT NULL DEFAULT 0"
     ");"
     /* Append-only log of every distinct rate the proxy has paid at. pool_meta
      * is overwritten on every template, so without this the rate a share was
@@ -274,6 +280,9 @@ static const char *MIGRATIONS_SQL[] = {
     "ALTER TABLE templates    ADD COLUMN last_seen      INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE templates    ADD COLUMN polls          INTEGER NOT NULL DEFAULT 1",
     "UPDATE templates SET last_seen = ts WHERE last_seen = 0",
+    /* See the pool_meta comment above: without this the counter added in
+     * PR #32 is only ever readable at shutdown. */
+    "ALTER TABLE pool_meta    ADD COLUMN events_lost    INTEGER NOT NULL DEFAULT 0",
 };
 
 /* Retries for one batch. busy_timeout (5s) bounds each attempt, so the worst
@@ -1002,8 +1011,9 @@ int store_record_pool_meta(store_t *s, const char *pool_mode, int fee_bps,
     static const char *Q =
         "INSERT INTO pool_meta (id, pool_mode, fee_bps, rate_source,"
         "  rate_sats_per_diff, gross_sats_per_diff, effective_fee_bps,"
-        "  network_difficulty, block_value_sats, credited_from, updated_at) "
-        "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "  network_difficulty, block_value_sats, credited_from, updated_at,"
+        "  events_lost) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(id) DO UPDATE SET "
         "  pool_mode = excluded.pool_mode,"
         "  fee_bps = excluded.fee_bps,"
@@ -1014,7 +1024,8 @@ int store_record_pool_meta(store_t *s, const char *pool_mode, int fee_bps,
         "  network_difficulty = excluded.network_difficulty,"
         "  block_value_sats = excluded.block_value_sats,"
         "  credited_from = COALESCE(pool_meta.credited_from, excluded.credited_from),"
-        "  updated_at = excluded.updated_at";
+        "  updated_at = excluded.updated_at,"
+        "  events_lost = excluded.events_lost";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
         atomic_fetch_add(&s->pg_errors, 1);
@@ -1031,6 +1042,7 @@ int store_record_pool_meta(store_t *s, const char *pool_mode, int fee_bps,
     sqlite3_bind_int64 (st, 8, (sqlite3_int64)block_value_sats);
     sqlite3_bind_int64 (st, 9, (sqlite3_int64)updated_ts_s);
     sqlite3_bind_int64 (st, 10, (sqlite3_int64)updated_ts_s);
+    sqlite3_bind_int64 (st, 11, (sqlite3_int64)atomic_load(&s->events_lost));
     int rc = sqlite3_step(st);
     pthread_mutex_unlock(&s->node_tip_mu);
     sqlite3_finalize(st);
