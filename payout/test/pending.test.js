@@ -104,7 +104,8 @@ function thunderStub({ txState = {}, utxoTxids = [], balance = 10n ** 12n,
 
 const quietLog = { info() {}, warn() {}, error() {}, debug() {} };
 const baseCfg = { minSats: 10000n, maxPerTick: 50, dryRun: false, intervalMs: 1000,
-                  nudgeMine: true, nudgeIntervalMs: 120000 };
+                  nudgeMine: true, nudgeIntervalMs: 120000, nudgeStallSec: 300 };
+const nowSec = () => Math.floor(Date.now() / 1000);
 const cfg = baseCfg;
 
 const credited = db => db.prepare('SELECT COUNT(*) n FROM pps_credits WHERE paid_sats > 0').get().n;
@@ -263,9 +264,32 @@ test('listStuck reports unbroadcast rows only, not ones awaiting confirmation', 
 
 /* ---------- nudging Thunder ---------------------------------------------- */
 
-test('a waiting payout nudges Thunder to mine', async () => {
+/* The core of the fix. Thunder's `mine` snapshots the mempool into a block
+ * body BEFORE taking the miner lock, then parks that snapshot the instant the
+ * lock frees. A nudge issued while waiting therefore captures a mempool that
+ * predates the NEXT batch and becomes the parked request the moment this one
+ * confirms — so the next batch cannot be in the block it produces, and every
+ * payout costs two sidechain blocks instead of one. */
+test('a batch still within its settling window does not nudge again', async () => {
     const db = makeDb({
-        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000 }],
+        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000,
+                     started_at: nowSec() }],
+        owed: { rig1: 5_000_000 },
+    });
+    const thunder = thunderStub({ txState: { abc123: { known: true, confirmed: false } } });
+
+    await runOnce({ db, thunder, cfg }, quietLog);
+    assert.equal(thunder.calls.mines, 0,
+        'its request is already parked with this batch in the body; ' +
+        'nudging now parks a stale body for the next one');
+});
+
+test('a stalled batch nudges to recover', async () => {
+    /* If our post-broadcast request was not carried, nothing is parked and
+     * nothing will re-park. After stallSec, nudge. */
+    const db = makeDb({
+        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000,
+                     started_at: nowSec() - 600 }],
         owed: { rig1: 5_000_000 },
     });
     const thunder = thunderStub({ txState: { abc123: { known: true, confirmed: false } } });
@@ -274,11 +298,12 @@ test('a waiting payout nudges Thunder to mine', async () => {
     assert.equal(thunder.calls.mines, 1, 'nothing else will make Thunder advance');
 });
 
-test('the nudge is rate-limited across ticks', async () => {
+test('the stall nudge is rate-limited across ticks', async () => {
     /* Each nudge costs a mainchain BMM bid, and the tick is far faster than
      * Thunder can produce blocks. */
     const db = makeDb({
-        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000 }],
+        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000,
+                     started_at: nowSec() - 600 }],
         owed: { rig1: 5_000_000 },
     });
     const thunder = thunderStub({ txState: { abc123: { known: true, confirmed: false } } });
@@ -290,9 +315,28 @@ test('the nudge is rate-limited across ticks', async () => {
     assert.equal(thunder.calls.mines, 1, 'once per nudgeIntervalMs, not once per tick');
 });
 
+/* The rate limiter must never suppress this one: it is the nudge whose body
+ * snapshot has to contain the batch just sent. */
+test('a broadcast nudges even inside the rate-limit window', async () => {
+    const db = makeDb({
+        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000,
+                     started_at: nowSec() - 600 }],
+        owed: { rig1: 5_000_000, rig2: 6_000_000 },
+    });
+    const thunder = thunderStub({ txState: { abc123: { known: true, confirmed: true } } });
+    const ctx = { db, thunder, cfg, _lastNudgeMs: Date.now() };
+
+    const r = await runOnce(ctx, quietLog);
+    assert.equal(r.settled, 1, 'the old batch cleared');
+    assert.ok(r.broadcast > 0, 'and a new one went out');
+    assert.equal(thunder.calls.mines, 1,
+        'forced despite _lastNudgeMs being moments ago');
+});
+
 test('the nudge can be turned off', async () => {
     const db = makeDb({
-        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000 }],
+        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000,
+                     started_at: nowSec() - 600 }],
         owed: { rig1: 5_000_000 },
     });
     const thunder = thunderStub({ txState: { abc123: { known: true, confirmed: false } } });
@@ -310,7 +354,8 @@ test('an idle pool spends no BMM bids', async () => {
 
 test('a failing mine nudge does not fail the tick', async () => {
     const db = makeDb({
-        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000 }],
+        inFlight: [{ txid: 'abc123', worker_id: 1, sats: 5_000_000,
+                     started_at: nowSec() - 600 }],
         owed: { rig1: 5_000_000 },
     });
     const thunder = thunderStub({ txState: { abc123: { known: true, confirmed: false } } });
