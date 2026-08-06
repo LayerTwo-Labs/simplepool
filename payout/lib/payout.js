@@ -147,14 +147,39 @@ async function settlePending(ctx, log) {
         return { blocked: true, txid: pending.txid, reason: 'undetermined' };
     }
 
-    await nudgeMine(ctx, log);
+    /* Deliberately NOT nudging on every tick while we wait — that cost an
+     * entire extra sidechain block per payout.
+     *
+     * Thunder's `mine` snapshots the mempool into a block body BEFORE it takes
+     * the miner lock, then parks that snapshot as its BMM request the instant
+     * the lock frees. A nudge issued while waiting therefore captures a
+     * mempool that predates the NEXT batch, queues behind the in-flight
+     * mine(), and becomes the parked request the moment this batch confirms —
+     * so the next batch, broadcast seconds later, cannot be in the block that
+     * request produces. It waits for the one after.
+     *
+     * Measured on drynet3: 7 of 7 cycles had Thunder park 14-93s before the
+     * broadcast it was supposed to carry, and 42 Thunder blocks yielded only
+     * 25 settlements. One nudge per broadcast (see runOnce) keeps the parked
+     * body and the batch in step.
+     *
+     * The exception is a genuine stall: if our post-broadcast request was not
+     * carried (a BMM miss) nothing is parked and nothing will re-park, so
+     * after stallSec we nudge to recover. That nudge is safe in the sense that
+     * matters — this batch is in the mempool, so the body it builds contains
+     * it — and rare enough not to reintroduce the every-tick problem. */
+    const waited = Math.floor(Date.now() / 1000) - pending.started_at;
+    if (waited >= ctx.cfg.nudgeStallSec) {
+        await nudgeMine(ctx, log, { reason: `no block in ${waited}s` });
+    }
+
     log.info(`payout: waiting on ${short(pending.txid)} (unconfirmed, ` +
-             `${pending.rows.length} worker(s)); skipping tick. ` +
+             `${pending.rows.length} worker(s), ${waited}s); skipping tick. ` +
              'Thunder must mine a block before this settles.');
     return { blocked: true, txid: pending.txid, reason: 'unconfirmed' };
 }
 
-/* Ask Thunder to attempt BMM, at most once per `nudgeIntervalMs`.
+/* Ask Thunder to attempt BMM.
  *
  * Thunder advances only when a mainchain block commits to it and nothing
  * schedules that, so a broadcast payout otherwise waits for a human to press
@@ -163,17 +188,28 @@ async function settlePending(ctx, log) {
  * exactly when something is waiting to settle: no pending batch, no BMM bid
  * spent on an empty block.
  *
+ * Called in exactly two places, and the distinction is the whole point:
+ *   - immediately after a broadcast, so the body Thunder snapshots contains
+ *     the batch we just sent. This one must never be skipped, so it is not
+ *     rate-limited — it is already bounded by the settlement cadence.
+ *   - to break a stall, when a batch has waited long enough that its request
+ *     was evidently not carried. Rate-limited, because repeated nudges are
+ *     what put a stale body in the parked slot to begin with (see
+ *     settlePending).
+ *
  * Best-effort by construction. A failed nudge must not fail the tick — the
- * batch is already broadcast and safe, and the next tick will try again. */
-async function nudgeMine(ctx, log) {
+ * batch is already broadcast and safe, and a later tick will try again. */
+async function nudgeMine(ctx, log, { force = false, reason = '' } = {}) {
     const { thunder, cfg } = ctx;
     if (!cfg.nudgeMine) return false;
     const now = Date.now();
-    if (ctx._lastNudgeMs && now - ctx._lastNudgeMs < cfg.nudgeIntervalMs) return false;
+    if (!force && ctx._lastNudgeMs && now - ctx._lastNudgeMs < cfg.nudgeIntervalMs) {
+        return false;
+    }
     ctx._lastNudgeMs = now;
     try {
         const r = await thunder.mine();
-        log.info('payout: nudged Thunder to mine (a payout is waiting to confirm)' +
+        log.info(`payout: nudged Thunder to mine${reason ? ` (${reason})` : ''}` +
                  (r.completed ? '' : ' — BMM request parked, awaiting a mainchain block'));
         return true;
     } catch (e) {
@@ -287,7 +323,11 @@ export async function runOnce(ctx, log) {
         log.info(`payout: broadcast ${batch.length} worker(s), ${totalOwed} sats, ` +
                  `txid=${res.txid} — awaiting confirmation`);
         for (const b of batch) log.info(`  ${b.worker_name} -> ${b.address} ${b.sats} sats`);
-        await nudgeMine(ctx, log);
+        /* Forced: this is the nudge whose mempool snapshot has to contain the
+         * batch above. Letting the rate limiter skip it hands the parked BMM
+         * slot to a body that predates the broadcast, which costs a whole
+         * sidechain block. */
+        await nudgeMine(ctx, log, { force: true, reason: 'batch just broadcast' });
         return { attempted: due.length, paid: 0, broadcast: batch.length,
                  failed: 0, settled, txid: res.txid };
     } catch (e) {

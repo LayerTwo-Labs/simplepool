@@ -21,10 +21,18 @@
  *                          actually waiting, so an idle pool spends no BMM
  *                          bids on empty blocks.
  *   PAYOUT_NUDGE_INTERVAL_MS
- *                          floor between mine attempts (default 120s). Each
- *                          nudge costs a mainchain BMM bid; the tick is far
- *                          faster than Thunder can produce blocks, so without
- *                          this every tick would pay for one.
+ *                          floor between stall-recovery mine attempts
+ *                          (default 120s). Each nudge costs a mainchain BMM
+ *                          bid. Does NOT apply to the nudge issued right after
+ *                          a broadcast, which must always fire.
+ *   PAYOUT_NUDGE_STALL_SEC how long a broadcast batch may sit unconfirmed
+ *                          before we assume its BMM request was not carried
+ *                          and nudge again (default 300s, ~2 mainchain
+ *                          blocks on drynet3). Do NOT lower this to the tick
+ *                          interval: nudging on every tick makes Thunder park
+ *                          a mempool snapshot that predates the next batch,
+ *                          costing one extra sidechain block per payout. See
+ *                          settlePending() for the mechanism.
  *   THUNDER_RPC_USER       optional basic-auth user
  *   THUNDER_RPC_PASS       optional basic-auth pass
  *   THUNDER_FROM_ADDRESS   pool reserve address to send from (must match
@@ -54,6 +62,7 @@ export function loadConfig() {
         dryRun:        process.env.PAYOUT_DRY_RUN === '1',
         nudgeMine:     process.env.PAYOUT_NUDGE_MINE !== '0',
         nudgeIntervalMs: parseInt(process.env.PAYOUT_NUDGE_INTERVAL_MS || '120000', 10),
+        nudgeStallSec:   parseInt(process.env.PAYOUT_NUDGE_STALL_SEC || '300', 10),
         /* Admin HTTP surface — used by the dashboard's "Trigger payout now"
          * button. Loopback-bound by default; set port=0 to disable. */
         adminHttpBind: process.env.PAYOUT_ADMIN_BIND || '127.0.0.1',

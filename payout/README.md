@@ -93,9 +93,41 @@ had already been paid.
 
 Thunder advances only when a mainchain block commits to it, and nothing
 schedules that — so without help a broadcast payout waits for a human to press
-a button, and the whole queue waits behind it. When a batch is outstanding and
-unconfirmed, the loop calls Thunder's `mine`, at most once per
-`PAYOUT_NUDGE_INTERVAL_MS`.
+a button, and the whole queue waits behind it. The loop calls Thunder's `mine`
+in exactly two places, and **when** it fires matters as much as that it does.
+
+### Once per broadcast, not once per tick
+
+`mine` builds a block body from the mempool *before* it takes the miner lock,
+then parks that snapshot as its BMM request the moment the lock frees:
+
+```rust
+let body = types::Body::new(Vec::new(), coinbase);   // mempool snapshot HERE
+let mut miner_write = miner.write().await;           // then block on the lock
+miner_write.attempt_bmm(bribe.to_sat(), 0, header, body)
+```
+
+So a nudge issued *while waiting* captures a mempool that predates the next
+batch, queues behind the in-flight `mine`, and becomes the parked request the
+instant the current batch confirms. The next batch — broadcast seconds later —
+cannot be in the block that request produces, so it waits for the one after.
+Every payout then costs two sidechain blocks instead of one.
+
+Measured on drynet3 before this was fixed: Thunder parked its request 14–93s
+*ahead* of the broadcast it was meant to carry in 7 of 7 cycles, and 42 Thunder
+blocks produced only 25 settlements.
+
+The loop therefore nudges:
+
+- **right after a broadcast**, so the snapshot contains the batch just sent.
+  Never rate-limited — it is already bounded by the settlement cadence.
+- **to break a stall**, once a batch has sat unconfirmed for
+  `PAYOUT_NUDGE_STALL_SEC` (default 300s), which means its request was not
+  carried and nothing will re-park. Rate-limited by
+  `PAYOUT_NUDGE_INTERVAL_MS`.
+
+Do not lower `PAYOUT_NUDGE_STALL_SEC` towards the tick interval — that
+reintroduces the stale-snapshot problem the split exists to avoid.
 
 It fires only while something is genuinely waiting to settle, so an idle pool
 spends no BMM bids on empty blocks. A failed nudge never fails the tick.
