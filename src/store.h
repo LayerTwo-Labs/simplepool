@@ -164,6 +164,11 @@ typedef struct {
     uint64_t blocks_committed;
     uint64_t batches;
     uint64_t pg_errors;        /* poorly named; sqlite errors */
+    /* Events that left the ring but never reached the DB, after every
+     * commit retry failed. Accepted work that will never be credited —
+     * distinct from shares_dropped, which is enqueue-side overflow.
+     * Must be 0; anything else is a ledger shortfall against miners. */
+    uint64_t events_lost;
 } store_stats_t;
 void store_get_stats(store_t *s, store_stats_t *out);
 
