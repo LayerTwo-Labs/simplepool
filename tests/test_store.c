@@ -496,6 +496,61 @@ static void test_template_history(void) {
     printf("  ok test_template_history\n");
 }
 
+/* A concurrent writer must not cost shares.
+ *
+ * This reproduces a real incident: a maintenance script took the write lock
+ * for a moment, and because the connection had no busy_timeout the writer
+ * thread got SQLITE_BUSY instantly. Its batch was already out of the ring, so
+ * accepted shares — already acknowledged to the miner — were logged and
+ * discarded. Holding the lock here for longer than one commit window forces
+ * exactly that race. */
+static void test_commit_survives_a_locked_db(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms  = 20;    /* wake often, so we hit the lock */
+    cfg.commit_max_shares = 10;    /* several batches, not one */
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* A second connection grabs the write lock, as `sqlite3 < script.sql`
+     * would. */
+    sqlite3 *hog = NULL;
+    assert(sqlite3_open(path, &hog) == SQLITE_OK);
+    assert(sqlite3_exec(hog, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK);
+
+    const int N = 40;
+    for (int i = 0; i < N; ++i) {
+        char w[32];
+        snprintf(w, sizeof(w), "miner%d", i % 4);
+        assert(store_record_share(s, w, 1700000000000ULL + i, 1.0, 0, NULL) == 0);
+    }
+
+    /* Hold it well past several commit windows, then let go. */
+    struct timespec hold = { .tv_sec = 0, .tv_nsec = 300L * 1000000L };
+    nanosleep(&hold, NULL);
+    assert(sqlite3_exec(hog, "COMMIT", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(hog);
+
+    assert(store_flush(s) == 0);
+
+    store_stats_t st;
+    store_get_stats(s, &st);
+    assert(st.events_lost == 0);
+    assert(st.shares_dropped == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    /* Every accepted share is on the ledger. Before the fix this came back
+     * short, with the shortfall visible only as an ERROR line. */
+    assert(scalar_i64(db, "SELECT count(*) FROM shares") == N);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_commit_survives_a_locked_db\n");
+}
+
 /* Retention keeps the table bounded. Pruning runs when a new row is opened
  * and is driven off the template's own clock, so this is deterministic. */
 static void test_template_retention(void) {
@@ -564,6 +619,7 @@ int main(void) {
     test_rate_history();
     test_template_history();
     test_template_retention();
+    test_commit_survives_a_locked_db();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;

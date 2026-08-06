@@ -33,6 +33,12 @@ static const char *SCHEMA_SQL_PARTS[] = {
     "PRAGMA journal_mode = WAL;\n"
     "PRAGMA synchronous = NORMAL;\n"
     "PRAGMA foreign_keys = ON;\n"
+    /* Without this SQLite returns SQLITE_BUSY the instant another connection
+     * holds the write lock — no waiting at all. The writer thread has already
+     * dequeued its batch by then, so a single concurrent writer (a manual
+     * sqlite3 session, a backup, a maintenance script) silently destroyed
+     * shares the miner had been told were accepted. Wait instead. */
+    "PRAGMA busy_timeout = 5000;\n"
     "CREATE TABLE IF NOT EXISTS workers ("
     "  id              INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  name            TEXT UNIQUE NOT NULL,"
@@ -270,6 +276,12 @@ static const char *MIGRATIONS_SQL[] = {
     "UPDATE templates SET last_seen = ts WHERE last_seen = 0",
 };
 
+/* Retries for one batch. busy_timeout (5s) bounds each attempt, so the worst
+ * case is a long stall rather than a fast loop — which is the right trade:
+ * enqueue-side overflow is counted in shares_dropped and visible, whereas a
+ * dropped batch here is credited work vanishing. */
+#define STORE_COMMIT_ATTEMPTS 3
+
 #define EV_SHARE   1
 #define EV_REJECT  2
 #define EV_BLOCK   3
@@ -346,6 +358,7 @@ struct store {
     _Atomic uint64_t credits_committed;
     _Atomic uint64_t batches;
     _Atomic uint64_t pg_errors;
+    _Atomic uint64_t events_lost;
 
     /* Sequence: monotonically increasing counter of enqueued events.
      * 'committed_seq' tracks the highest sequence that has been
@@ -361,6 +374,12 @@ static size_t g_test_ring_cap = 0;
 void store_test_set_ring_capacity(size_t cap) { g_test_ring_cap = cap; }
 
 /* ---- helpers ---------------------------------------------------------- */
+
+/* Linear backoff between commit attempts: 25ms, 50ms, ... */
+static void backoff_sleep(int attempt) {
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 25L * 1000000L * attempt };
+    nanosleep(&ts, NULL);
+}
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -541,6 +560,44 @@ static void process_event(store_t *s, const event_t *ev) {
     }
 }
 
+/* Attempts to land one batch. The events are already out of the ring, so a
+ * failure here destroys accepted work — retry rather than count and move on.
+ *
+ * busy_timeout already makes SQLITE_BUSY rare; these attempts cover a lock
+ * held longer than that, and an I/O error that clears. Counters advance only
+ * on the attempt that actually commits, so a retried batch is counted once.
+ * Returns 0 committed, -1 out of attempts. */
+static int commit_batch(store_t *s, event_t *batch, size_t take) {
+    for (int attempt = 1; attempt <= STORE_COMMIT_ATTEMPTS; ++attempt) {
+        char *err = NULL;
+        if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, &err) != SQLITE_OK) {
+            LOG_WARN("store: BEGIN failed (attempt %d/%d): %s",
+                     attempt, STORE_COMMIT_ATTEMPTS, err ? err : "?");
+            sqlite3_free(err);
+            atomic_fetch_add(&s->pg_errors, 1);
+            backoff_sleep(attempt);
+            continue;
+        }
+
+        for (size_t i = 0; i < take; ++i) process_event(s, &batch[i]);
+
+        if (sqlite3_exec(s->db, "COMMIT", NULL, NULL, &err) == SQLITE_OK) {
+            atomic_fetch_add(&s->batches, 1);
+            return 0;
+        }
+        LOG_WARN("store: COMMIT failed (attempt %d/%d): %s",
+                 attempt, STORE_COMMIT_ATTEMPTS, err ? err : "?");
+        sqlite3_free(err);
+        /* Nothing was durably written, so replaying the batch is safe. The
+         * per-event counters process_event() bumped are lost accuracy we
+         * accept: they describe attempts, the ledger describes reality. */
+        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        atomic_fetch_add(&s->pg_errors, 1);
+        backoff_sleep(attempt);
+    }
+    return -1;
+}
+
 static void *writer_main(void *arg) {
     store_t *s = (store_t *)arg;
 
@@ -585,21 +642,15 @@ static void *writer_main(void *arg) {
         pthread_mutex_unlock(&s->mu);
 
         /* BEGIN/COMMIT outside the producer mutex */
-        char *err = NULL;
-        if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, &err) != SQLITE_OK) {
-            LOG_ERROR("store: BEGIN failed: %s", err ? err : "?");
-            sqlite3_free(err);
-            atomic_fetch_add(&s->pg_errors, 1);
-        } else {
-            for (size_t i = 0; i < take; ++i) process_event(s, &batch[i]);
-            if (sqlite3_exec(s->db, "COMMIT", NULL, NULL, &err) != SQLITE_OK) {
-                LOG_ERROR("store: COMMIT failed: %s", err ? err : "?");
-                sqlite3_free(err);
-                sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
-                atomic_fetch_add(&s->pg_errors, 1);
-            } else {
-                atomic_fetch_add(&s->batches, 1);
-            }
+        if (commit_batch(s, batch, take) != 0) {
+            /* Out of retries. These events left the ring before the
+             * transaction opened and cannot be put back, so say so plainly —
+             * this is accepted work that will never be credited, not a
+             * transient blip. */
+            LOG_ERROR("store: LOST %zu event(s) after %d failed commit attempts"
+                      " — accepted shares in this batch are not credited",
+                      take, STORE_COMMIT_ATTEMPTS);
+            atomic_fetch_add(&s->events_lost, (uint64_t)take);
         }
 
         pthread_mutex_lock(&s->mu);
@@ -1193,4 +1244,5 @@ void store_get_stats(store_t *s, store_stats_t *out) {
     out->blocks_committed = atomic_load(&s->blocks_committed);
     out->batches          = atomic_load(&s->batches);
     out->pg_errors        = atomic_load(&s->pg_errors);
+    out->events_lost      = atomic_load(&s->events_lost);
 }
