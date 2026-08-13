@@ -127,6 +127,39 @@ export class ThunderClient {
                 [recipients[0].address, Number(total), Number(feeSats)]);
         } catch (e) { throw fail('create', e); }
 
+        /* thunder >= 0.17.1 (commit a195d67, "RPC: sign and broadcast txs
+         * created via create_*") changed create_transfer to sign and broadcast
+         * internally, returning a bare Txid instead of an unsigned tx. The
+         * splice-the-outputs path below cannot run against that: by the time we
+         * see the response the transaction is already on the network, and it
+         * pays the WHOLE total to recipients[0].
+         *
+         * That is correct only when every recipient shares one address, which is
+         * the normal case here -- a miner's rigs all authenticate with the same
+         * Thunder address and differ only by the .rig suffix, so they collapse
+         * to a single output anyway.
+         *
+         * When the addresses genuinely differ we cannot fix it after the fact:
+         * the node has already paid the full total to one of them. That is
+         * reported at the 'submit' stage rather than 'create', because the funds
+         * ARE on the network and the caller must treat it with the usual
+         * broadcast ambiguity instead of as a clean abort. */
+        const nodeTxid = typeof unsigned === 'string'
+            ? unsigned
+            : (typeof unsigned?.txid === 'string' ? unsigned.txid : null);
+        if (nodeTxid !== null) {
+            const distinct = new Set(recipients.map(r => r.address));
+            if (distinct.size !== 1) {
+                throw fail('submit', new Error(
+                    `transferBatch: thunder already broadcast ${nodeTxid} paying the ` +
+                    `full ${total} sats to ${recipients[0].address}, but this batch has ` +
+                    `${distinct.size} distinct addresses. Funds are on the network -- ` +
+                    `reconcile by hand (payout/README.md).`));
+            }
+            return { txid: nodeTxid, unsigned: null, signed: null,
+                     recipients: recipients.length, total, broadcastByNode: true };
+        }
+
         const outs = unsigned?.outputs;
         if (!Array.isArray(outs) || outs.length === 0) {
             throw fail('create', new Error('create_transfer returned no outputs'));
@@ -203,6 +236,17 @@ export class ThunderClient {
             unsigned = await this._call('create_transfer',
                 [dest, Number(valueSats), Number(feeSats)]);
         } catch (e) { throw fail('create', e); }
+        /* thunder >= 0.17.1 signs and broadcasts internally, returning a Txid.
+         * Single dest, so there is no address ambiguity to guard against. */
+        {
+            const nodeTxid = typeof unsigned === 'string'
+                ? unsigned
+                : (typeof unsigned?.txid === 'string' ? unsigned.txid : null);
+            if (nodeTxid !== null) {
+                return { txid: nodeTxid, unsigned: null, signed: null,
+                         broadcastByNode: true };
+            }
+        }
         try {
             signed = await this._call('sign_transaction', [unsigned, false]);
         } catch (e) { throw fail('sign', e); }
