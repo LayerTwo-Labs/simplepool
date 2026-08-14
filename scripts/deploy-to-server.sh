@@ -21,7 +21,7 @@
 # What it does on the remote, in order:
 #   1.  git fetch + checkout the requested branch, fast-forward.
 #   2.  apt-get install build deps, nodejs, sqlite3, nginx (idempotent).
-#   3.  make                                 (rebuild the C proxy)
+#   3.  make + record-build.sh              (rebuild the C proxy)
 #   4.  npm install in dashboard/            (only if package-lock changed)
 #   5.  sqlite3-init data/shares.db          (creates schema if missing)
 #   6.  ms-to-seconds timestamp migration    (idempotent UPDATE)
@@ -103,6 +103,10 @@ echo "==> [3/8] build C proxy"
 # as the unprivileged user.
 run_sudo "chown -R ${USER_PART}:${USER_PART} ${ROOT}/build ${ROOT}/data 2>/dev/null || true"
 run_remote "cd ${ROOT} && make"
+# The proxy embeds its own commit (see src/version.c), so the manifest is
+# belt-and-braces for it — but recording one here means /api/versions can still
+# name the commit if the binary is ever replaced by one built elsewhere.
+run_remote "cd ${ROOT} && ./scripts/record-build.sh simplepool . build/simplepool || true"
 
 if [[ "$DO_DASH" == "1" ]]; then
     echo "==> [4/8] npm install in dashboard/"

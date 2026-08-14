@@ -27,6 +27,19 @@ Environment=PAYOUT_ADMIN_URL=http://127.0.0.1:9080
 # ConnectRPC endpoint for CreateDepositTransaction.
 Environment=ENFORCER_GRPC_ADDR=127.0.0.1:50051
 Environment=THUNDER_SIDECHAIN_ID=9
+# --- Build provenance — /api/versions ---
+# Which commit of each component is running. Defaults assume the four
+# checkouts are siblings of this repo; override per component if not.
+# thunder and bitcoind don't embed a commit in their binaries — run
+# scripts/record-build.sh after building them and these paths become
+# unnecessary. Set VERSIONS_USE_CHECKOUT=0 to report only what the
+# binaries and their manifests say, with no source tree consulted.
+# Environment=ENFORCER_REPO_DIR=/home/forknet/forknet-software/bip300301_enforcer
+# Environment=ENFORCER_BIN=/home/forknet/forknet-software/bip300301_enforcer/target/release/bip300301_enforcer
+# Environment=THUNDER_REPO_DIR=/home/forknet/forknet-software/thunder-rust
+# Environment=THUNDER_BIN=/home/forknet/forknet-software/thunder-rust/target/release/thunder_app
+# Environment=BITCOIN_REPO_DIR=/home/forknet/forknet-software/bitcoin
+# Environment=BITCOIND_BIN=/home/forknet/forknet-software/bitcoin/build/bin/bitcoind
 # Environment=POOL_THUNDER_RESERVE_ADDRESS=<paste from proxy.conf>
 # Environment=ADMIN_USER=admin
 # Environment=ADMIN_PASSWORD=<generate with `openssl rand -base64 21`>

@@ -16,6 +16,7 @@ import { openDb } from './lib/db.js';
 import { openAdminDb } from './lib/db-admin.js';
 import * as stats from './lib/stats.js';
 import { startHealthMonitor, currentHealth } from './lib/health.js';
+import { versions } from './lib/versions.js';
 import * as fmt from './lib/fmt.js';
 import { createAdminRouter } from './lib/admin-router.js';
 
@@ -219,6 +220,45 @@ app.get('/health', (_req, res) => {
     const h = currentHealth();
     if (!h) return res.status(503).json({ ok: false, status: 'checking' });
     res.status(h.ok ? 200 : 503).json(h);
+});
+
+/* Which commit of each moving part is actually running — simplepool, the
+ * enforcer, thunder, bitcoind. See lib/versions.js for why each component is
+ * reported from both the live process and its checkout. `?force=1` skips the
+ * cache, which is what you want immediately after a redeploy. */
+app.get('/api/versions', async (req, res, next) => {
+    try {
+        res.json(await versions({ force: req.query.force === '1' }));
+    } catch (e) { next(e); }
+});
+
+/* One URL that answers "how is the pool doing, and what is it running" —
+ * everything the separate endpoints above return, in a single document, so a
+ * miner or a monitor doesn't have to stitch four requests together.
+ *
+ * Deliberately always 200, unlike /health: this is a status report, and a
+ * report that a check is failing was successfully produced. Read
+ * `health.ok` for the condition itself. */
+app.get('/api/status', async (req, res, next) => {
+    try {
+        const [v, h] = [
+            await versions({ force: req.query.force === '1' }).catch(e => ({ error: e.message })),
+            currentHealth(),
+        ];
+        const meta = stats.poolMeta(db);
+        res.json({
+            generated_at: Math.floor(Date.now() / 1000),
+            pool: {
+                mode:        meta ? meta.pool_mode : null,
+                fee_bps:     meta ? meta.fee_bps   : null,
+                stratum_url: PUBLIC_STRATUM_URL,
+                ...stats.overview(db),
+            },
+            node:     stats.nodeStatus(db) || null,
+            health:   h || { ok: false, status: 'checking' },
+            versions: v,
+        });
+    } catch (e) { next(e); }
 });
 
 /* ================================ ADMIN ================================ */

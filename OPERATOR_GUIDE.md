@@ -19,6 +19,8 @@ tracked by git.
 | Public dashboard | `http://<pool-host>:8081/` | none |
 | **Admin dashboard** | `http://<pool-host>:8081/admin` | **`admin` / `<see /root/simplepool-admin-cred.txt on the box>`** |
 | Admin JSON API | `http://<pool-host>:8081/api/admin/summary` | same basic auth |
+| Everything as JSON | `http://<pool-host>:8081/api/status` | none |
+| Which commit is running | `http://<pool-host>:8081/api/versions` | none |
 | Stratum (miner endpoint) | `stratum+tcp://<pool-host>:3334` | username = Thunder base58 address |
 | SSH | `root@<pool-host>` | `<ssh-key>` |
 
@@ -49,6 +51,45 @@ password](#rotating-the-admin-password) below.
 
 - **Config**: `/home/forknet/pps-thunder-test/simplepool/proxy.conf`
   (gitignored). Current `pool_mode = pps-classic`.
+
+---
+
+## Which commit is running
+
+`GET /api/versions` (no auth) answers this for all four moving parts —
+simplepool, the enforcer, thunder, bitcoind — without SSHing in. Each entry
+carries a `provenance` field saying how strong the answer is:
+
+- `binary` — the process prints its own build commit (`--version`). This is
+  the only one that is proof; simplepool and the enforcer do it.
+- `manifest` — a `<binary>.build.json` recorded at build time and pinned to
+  the binary by sha256. This is how thunder and bitcoind get a trustworthy
+  commit.
+- `checkout` — read from the git tree beside the binary. Describes what
+  *would* be built now, not what is running. Treat as a hint.
+
+**After rebuilding thunder, bitcoind, or the enforcer by hand, record it:**
+
+```bash
+~/forknet-software/simplepool/scripts/record-build.sh thunder \
+    ~/forknet-software/thunder-rust \
+    ~/forknet-software/thunder-rust/target/release/thunder_app
+```
+
+Skip that and the endpoint falls back to the checkout — which goes stale the
+moment someone runs `git pull` in that directory without rebuilding, and then
+confidently reports a commit that was never compiled.
+
+Things worth watching in the response:
+
+| field | meaning |
+| --- | --- |
+| `needs_review` | ids of components with anything below going on |
+| `commit_matches: false` | binary and source tree disagree — usually a pull with no rebuild |
+| `running.binary_replaced` | rebuilt but never restarted; the process is running deleted code |
+| `running.process_found: false` | nothing is running that binary — service down, or running a copy from elsewhere |
+| `manifest.verified: false` | rebuilt without re-recording; the manifest describes a previous artifact |
+| `checkout.dirty` | tracked files modified — the named commit is not the whole truth |
 
 ---
 
