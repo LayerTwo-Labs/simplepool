@@ -7,6 +7,7 @@
 #include "share.h"
 #include "store.h"
 #include "stratum.h"
+#include "version.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -572,7 +573,8 @@ static void *tip_watcher(void *arg) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s [config_path]\n"
-            "  config_path  path to proxy.conf (default ./proxy.conf)\n",
+            "  config_path  path to proxy.conf (default ./proxy.conf)\n"
+            "  --version    print build provenance (version, commit, branch)\n",
             prog);
 }
 
@@ -581,6 +583,10 @@ int main(int argc, char **argv) {
     if (argc > 1) {
         if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
             usage(argv[0]);
+            return 0;
+        }
+        if (strcmp(argv[1], "-V") == 0 || strcmp(argv[1], "--version") == 0) {
+            version_print();
             return 0;
         }
         cfg_path = argv[1];
@@ -612,7 +618,9 @@ int main(int argc, char **argv) {
         }
     }
     log_init(cfg.log_level);
-    LOG_INFO("simplepool starting (config=%s)", cfg_path);
+    /* The commit goes in the first log line so the journal records which build
+     * each run was, long after the binary has been replaced. */
+    LOG_INFO("%s starting (config=%s)", version_line(), cfg_path);
 
     /* bitcoind client. */
     bitcoind_client_t btc = {0};

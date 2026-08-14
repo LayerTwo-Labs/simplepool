@@ -62,7 +62,86 @@ snapshot cron — SQLite's WAL mode makes that safe too, just less isolated.
 | `/api/leaderboard`    | JSON                                                    |
 | `/api/worker/:name`   | JSON                                                    |
 | `/api/blocks`         | JSON paginated, `?limit=N&before=<ts>` (default 50)     |
+| `/api/versions`       | Build provenance of every component (see below)         |
+| `/api/status`         | Everything at once: pool, node, health, versions        |
 | `/healthz`            | `{ ok: true, db_ready: bool }`                          |
+| `/health`             | Full hard-failure detail; 503 when a check is failing   |
+
+`/api/status` is the one URL to poll if you want a single document: pool
+totals and hashrate, mainchain tip, the health checks, and which commit of
+each component is running. It always returns 200 — it is a report, and a
+report that a check is failing was still produced successfully. Watch
+`health.ok` for the condition and `/health` for a status code to alert on.
+
+## Build provenance — `/api/versions`
+
+Answers "which commit is this pool actually running?" for simplepool, the
+bip300301 enforcer, thunder, and bitcoind — without SSHing anywhere.
+
+The commit is looked for **in the artifact first and in a source tree only as
+a last resort**, because a checkout's HEAD is not what the running binary was
+built from. Three sources, in descending order of what they prove:
+
+| `provenance` | Source | What it proves |
+| ------------ | ------ | -------------- |
+| `binary`   | `<bin> --version` prints the commit | The answer travels inside the thing it describes. Nothing to keep in sync. |
+| `manifest` | `<bin>.build.json`, pinned by sha256 | Recorded at build time; survives the source being deleted. |
+| `checkout` | the git tree beside the binary | What *would* be built now — not what is running. Never required. |
+
+simplepool and the enforcer embed their commit, so they resolve at `binary`.
+thunder and bitcoind print a version number and no commit; they resolve at
+`manifest` once you have run `scripts/record-build.sh` (below). Without a
+manifest they fall back to `checkout` and say so in `notes`.
+
+Alongside the resolved `commit` / `branch` / `repo`, each component carries
+the evidence it was derived from:
+
+- **`running`** — the live process, found through `/proc/<pid>/exe`, so it
+  describes what is serving traffic rather than whatever now sits at the
+  configured path. `binary_replaced: true` means the file was rebuilt and the
+  service never restarted; `process_found: false` means nothing is running it.
+- **`manifest`** — the recorded build, with `verified` false if the binary's
+  sha256 has moved since (rebuilt without re-recording). A stale manifest is
+  reported, and ranked *below* the checkout rather than trusted.
+- **`checkout`** — remote, branch, HEAD, and whether tracked files have been
+  modified since (`dirty`).
+
+`commit_matches` cross-checks whichever pairs exist, and is `null` — never an
+optimistic `true` — when only one source knew a commit. `all_clean` plus
+`needs_review` summarise the whole report in one field.
+
+### Recording a build
+
+Run this right after building any component that doesn't embed its own
+commit, in the same script that does the build so the two can't drift:
+
+```
+scripts/record-build.sh thunder \
+    ~/forknet-software/thunder-rust \
+    ~/forknet-software/thunder-rust/target/release/thunder_app
+```
+
+It writes `<binary>.build.json` next to the binary. After that the checkout
+can be deleted and `/api/versions` still answers — source is a build-time
+dependency, not a runtime one. `scripts/deploy-to-server.sh` does this for
+simplepool automatically.
+
+### Configuration
+
+Paths default to the layout this pool deploys with — all four checkouts as
+siblings of the simplepool repo — and are overridden per component with
+`SIMPLEPOOL_REPO_DIR` / `SIMPLEPOOL_BIN`, `ENFORCER_REPO_DIR` /
+`ENFORCER_BIN`, `THUNDER_REPO_DIR` / `THUNDER_BIN`, `BITCOIN_REPO_DIR` /
+`BITCOIND_BIN`, and `<COMPONENT>_BUILD_MANIFEST` for a manifest kept
+somewhere other than beside the binary. Set both of a pair empty to drop that
+component. `VERSIONS_USE_CHECKOUT=0` disables the git fallback entirely, for
+a deployment that ships binaries without source.
+
+Results are cached for `VERSIONS_TTL_MS` (default 5 min) since they only
+change on restart; add `?force=1` right after a redeploy.
+
+Absolute paths are deliberately not in the response; repo URLs are stripped
+of any embedded credentials.
 
 ## Public deployment (nginx)
 
