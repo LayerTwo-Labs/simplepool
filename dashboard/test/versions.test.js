@@ -10,7 +10,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { setTimeout as sleep } from 'node:timers/promises';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -152,6 +153,62 @@ test('no manifest and no embedded commit falls back to the tree, and says so', a
     assert.equal(c.commit, repo.head);
     assert.equal(c.commit_matches, null, 'nothing was cross-checked, so nothing is confirmed');
     assert.ok(c.notes.some(n => /not proof of what is running/.test(n)));
+});
+
+/* --- the running process vs the file at that path ------------------------ */
+
+/* Needs a real process running a real binary, so /proc/<pid>/exe has something
+ * to resolve. Linux only — on a macOS dev box the code falls back to the
+ * configured path and there is nothing to assert. */
+const HAS_PROC = fs.existsSync('/proc/self/exe');
+
+test('the version comes from the running process, not the file that replaced it',
+     { skip: HAS_PROC ? false : 'requires /proc' }, async () => {
+    /* `sleep --version` prints "sleep (GNU coreutils) 9.x" — a real binary
+     * that stays alive and reports a parseable version, which a shell script
+     * cannot do (its /proc/<pid>/exe would resolve to the shell). */
+    const dir = tmpdir('replaced');
+    const bin = path.join(dir, 'daemon');
+    fs.copyFileSync('/bin/sleep', bin);
+
+    const child = spawn(bin, ['300'], { stdio: 'ignore' });
+    try {
+        for (let i = 0; i < 50 && !fs.existsSync(`/proc/${child.pid}/exe`); i++) {
+            await sleep(20);
+        }
+
+        /* Rebuild-in-place: same path, different program. The live process
+         * keeps executing the old inode. */
+        fs.rmSync(bin);
+        fs.writeFileSync(bin, '#!/bin/sh\necho "daemon 99.9.9"\necho " commit: feedface"\n');
+        fs.chmodSync(bin, 0o755);
+
+        const c = await describeComponent(spec({ id: 'thunder', bin }));
+
+        assert.equal(c.running.pid, child.pid);
+        assert.equal(c.running.binary_replaced, true);
+        assert.equal(c.running.version_source, 'process');
+        /* The point of the whole exercise: what is running, not what is
+         * staged to run. */
+        assert.match(c.running.version, /^sleep /);
+        assert.equal(c.running.build_commit, null);
+        /* And the pending build is reported alongside rather than instead. */
+        assert.equal(c.on_disk.version, 'daemon 99.9.9');
+        assert.equal(c.on_disk.build_commit, 'feedface');
+        assert.ok(c.notes.some(n => /rebuilt but not restarted/.test(n)));
+    } finally {
+        child.kill('SIGKILL');
+    }
+});
+
+test('with no process running it, the file at the path is the answer',
+     { skip: HAS_PROC ? false : 'requires /proc' }, async () => {
+    const c = await describeComponent(spec({ id: 'thunder', bin: makeBin('thunder_app 0.17.2') }));
+
+    assert.equal(c.running.process_found, false);
+    assert.equal(c.running.version_source, 'path');
+    assert.equal(c.running.version, 'thunder_app 0.17.2');
+    assert.equal(c.on_disk, null, 'nothing pending when nothing is running');
 });
 
 /* --- dirty trees, bad URLs, missing pieces ------------------------------- */

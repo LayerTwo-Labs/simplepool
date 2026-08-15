@@ -12,7 +12,10 @@
  *   binary    the process states its own build commit. simplepool and the
  *             enforcer embed it; `--version` prints it. Nothing to keep in
  *             sync, nothing to fall out of date — the answer travels inside
- *             the thing it describes.
+ *             the thing it describes. Asked through /proc/<pid>/exe rather
+ *             than the configured path, so a component rebuilt but not yet
+ *             restarted reports what it is running, not what it is about to
+ *             run; the pending build appears separately as `on_disk`.
  *   manifest  a <binary>.build.json written by scripts/record-build.sh at the
  *             moment of the build, pinned to the binary by sha256. This is how
  *             thunder and bitcoind — which print a version number and no
@@ -266,7 +269,7 @@ async function runningProcess(bin) {
  * line as the version would be worse than reporting nothing, so the output has
  * to earn the label — a non-zero exit, or a first line with no version number
  * in it, is a component that cannot state its own version. */
-export async function selfReportedVersion(bin) {
+export async function selfReportedVersion(bin, label = null) {
     let out, failed = false;
     try {
         const r = await execFileP(bin, ['--version'], {
@@ -288,8 +291,13 @@ export async function selfReportedVersion(bin) {
      *   "thunder_app 0.17.2"
      *   "simplepool 0.1.0" / " commit: <sha>" / " branch: main"     */
     if (failed || !/\d+\.\d+/.test(first)) {
-        throw new Error(`${path.basename(bin)} does not report --version` +
-                        (first ? ` (said: ${first.slice(0, 80)})` : ''));
+        /* Tagged so the caller can tell "this binary has no --version" — where
+         * retrying against a different path is pointless — from a spawn error
+         * like EACCES, where the fallback path is worth trying. */
+        const err = new Error(`${label || path.basename(bin)} does not report --version` +
+                              (first ? ` (said: ${first.slice(0, 80)})` : ''));
+        err.code = 'NO_VERSION_FLAG';
+        throw err;
     }
     const commit = out.match(/\bcommit:?\s*([0-9a-f]{7,40})\b/i);
     const branch = out.match(/\bbranch:?\s*(\S+)/i);
@@ -299,6 +307,34 @@ export async function selfReportedVersion(bin) {
         build_branch: branch && branch[1] !== 'unknown' ? branch[1] : null,
         dirty:        /\bdirty\b/i.test(out) || null,
     };
+}
+
+/* Ask the *running* process for its version, not the file at the configured
+ * path — during a deploy those are two different programs.
+ *
+ * /proc/<pid>/exe resolves to the inode the process is executing, which stays
+ * readable and executable after the file has been unlinked or replaced by a
+ * rebuild. Without this, a component rebuilt but not yet restarted would be
+ * reported at the version it is *about* to run, which is exactly backwards
+ * during the window when someone is most likely to be reading this.
+ *
+ * Falls back to the configured path when there is no live process, when /proc
+ * isn't there (a macOS dev box), or when exec'ing through /proc is refused. */
+async function runningVersion(spec, proc) {
+    if (proc) {
+        try {
+            const v = await selfReportedVersion(`/proc/${proc.pid}/exe`,
+                                                path.basename(spec.bin));
+            return { ...v, source: 'process' };
+        } catch (e) {
+            /* No --version support is a property of the program, not of how we
+             * reached it, so re-running against the path would fail the same
+             * way for the same reason. Anything else is worth one retry. */
+            if (e.code === 'NO_VERSION_FLAG') throw e;
+        }
+    }
+    const v = await selfReportedVersion(spec.bin);
+    return { ...v, source: proc ? 'path_fallback' : 'path' };
 }
 
 /* --- one component ------------------------------------------------------ */
@@ -311,10 +347,18 @@ function sameCommit(a, b) {
 }
 
 export async function describeComponent(spec) {
-    const [proc, binStat, self, manifest, checkout] = await Promise.all([
-        spec.bin ? runningProcess(spec.bin).catch(() => null) : null,
+    /* The process has to be located before anything is exec'd, because which
+     * program to ask depends on it — see runningVersion(). */
+    const proc = spec.bin ? await runningProcess(spec.bin).catch(() => null) : null;
+
+    const [binStat, self, onDisk, manifest, checkout] = await Promise.all([
         spec.bin ? fsp.stat(spec.bin).catch(() => null) : null,
-        spec.bin ? selfReportedVersion(spec.bin).then(v => ({ v }), e => ({ e })) : null,
+        spec.bin ? runningVersion(spec, proc).then(v => ({ v }), e => ({ e })) : null,
+        /* Only worth a second exec when the two are known to differ: the file
+         * has been replaced since the process started, so this is the version
+         * a restart would pick up. */
+        spec.bin && proc?.binary_replaced
+            ? selfReportedVersion(spec.bin).then(v => ({ v }), e => ({ e })) : null,
         spec.manifest ? manifestInfo(spec.manifest, spec.bin).then(v => ({ v }), e => ({ e })) : null,
         USE_CHECKOUT && spec.repo ? checkoutInfo(spec.repo).then(v => ({ v }), e => ({ e })) : null,
     ]);
@@ -327,7 +371,7 @@ export async function describeComponent(spec) {
          * 'binary' and 'manifest' are claims about the artifact, 'checkout' is
          * a claim about a directory. Null when no commit could be found. */
         provenance: null,
-        running: null, manifest: null, checkout: null,
+        running: null, on_disk: null, manifest: null, checkout: null,
         commit_matches: null, notes: [], error: null,
     };
 
@@ -343,6 +387,14 @@ export async function describeComponent(spec) {
             build_commit:          v ? v.build_commit : null,
             build_commit_short:    v?.build_commit ? v.build_commit.slice(0, 7) : null,
             built_from_dirty_tree: v ? v.dirty : null,
+            /* 'process' — read from /proc/<pid>/exe, so it describes the live
+             * process. 'path' — no process found, so this is the file that
+             * would run. 'path_fallback' — a process exists but could not be
+             * asked, so this describes the file and may not be what is
+             * running. Only 'process' is a statement about the running code. */
+            version_source:        v ? v.source : null,
+            /* Of the file at the configured path, which is not necessarily the
+             * program described above — see binary_replaced. */
             binary_mtime:          binStat ? Math.floor(binStat.mtimeMs / 1000) : null,
             binary_size:           binStat ? binStat.size : null,
             pid:                   proc ? proc.pid : null,
@@ -355,6 +407,31 @@ export async function describeComponent(spec) {
         /* Not an error on its own — thunder and bitcoind simply don't embed a
          * commit, which is what the manifest exists to cover. */
         if (self?.e) out.notes.push(self.e.message);
+
+        /* The one combination where the version above is not a claim about the
+         * running process: the file was replaced, and /proc could not be used
+         * to reach what is actually executing. */
+        if (v?.source === 'path_fallback' && proc?.binary_replaced) {
+            out.notes.push('the running process could not be queried directly; ' +
+                           'this version describes the file on disk, which has ' +
+                           'been replaced since that process started');
+        }
+
+        /* Present only mid-deploy: what a restart would start running. Makes
+         * "rebuilt but not restarted" legible as two concrete versions rather
+         * than a single flag. */
+        if (onDisk?.v) {
+            out.on_disk = {
+                version:            onDisk.v.version,
+                build_commit:       onDisk.v.build_commit,
+                build_commit_short: onDisk.v.build_commit
+                                        ? onDisk.v.build_commit.slice(0, 7) : null,
+                mtime:              binStat ? Math.floor(binStat.mtimeMs / 1000) : null,
+            };
+            out.notes.push('rebuilt but not restarted — the running process is ' +
+                           'still the previous build; restart to pick up ' +
+                           `${out.on_disk.build_commit_short || out.on_disk.version}`);
+        }
     }
 
     if (manifest?.v) out.manifest = manifest.v;
