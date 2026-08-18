@@ -28,6 +28,11 @@ source: <https://github.com/rsantacroce/simplepool>.
 > verify what they're owed. simplepool aims to address this transparency
 > gap. (Hopefully!)
 
+> A single-file, no-JavaScript explainer covering both modes end to end —
+> shares, difficulty, the coinbase, PPS credit, Thunder payouts and how to
+> audit every number — lives at [`docs/simplepool.html`](docs/simplepool.html).
+> Open it from disk or serve it next to the dashboard.
+
 This repository ships **both modes**, selected by `pool_mode` in
 `proxy.conf`:
 
@@ -212,19 +217,45 @@ opens the SQLite store, builds an initial job from `getblocktemplate`,
 serves stratum on the configured port, and watches for new tips on a
 background thread.
 
-## Build
+## Install
 
-Dependencies: `sqlite3`, `libcurl`, `pthread`, plus a C11 compiler.
+On a fresh Ubuntu or Debian server:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/LayerTwo-Labs/simplepool/main/scripts/install.sh | sudo bash
+```
+
+That downloads the published build for the machine's architecture, checks it
+against the release `SHA256SUMS`, then interviews you for the rest — pool mode,
+bitcoind RPC, your operator address, dashboard domain, nginx and TLS — and
+leaves a running pool behind nginx with a `simplepoolctl` command to drive it.
+No compiler and no clone: `--from-source` if you want those instead. Answers
+are saved, so re-running it is how you change your mind about any of them.
+
+```sh
+simplepoolctl status      # what's running, on which ports, at which version
+simplepoolctl doctor      # check the things that actually break in production
+simplepoolctl logs -f     # follow every service at once
+simplepoolctl upgrade     # move to the next release, then restart
+simplepoolctl uninstall   # remove the services (--purge also drops the data)
+```
+
+Full walkthrough, including the manual steps the script automates, is in
+[INSTALL.md](INSTALL.md). To cut a release, see [RELEASING.md](RELEASING.md).
+
+## Build from source
+
+Dependencies: `sqlite3`, `libcurl`, `libhiredis`, `pthread`, plus a C11 compiler.
 
 macOS:
 ```
-brew install sqlite curl
+brew install sqlite curl hiredis
 make
 ```
 
 Debian / Ubuntu:
 ```
-sudo apt install build-essential libsqlite3-dev libcurl4-openssl-dev
+sudo apt install build-essential libsqlite3-dev libcurl4-openssl-dev libhiredis-dev
 make
 ```
 
@@ -276,9 +307,11 @@ at a snapshot via `PROXY_DB_PATH` if you want — see
 
 ## Deploy to a server
 
-There's a one-shot deploy script that brings a fresh Ubuntu 24.04 box
-from nothing to fully serving stratum + dashboard behind nginx. It is
-idempotent: re-run it after every code change.
+[`scripts/install.sh`](scripts/install.sh) (see [Install](#install) above) is
+the way to bring a box up from nothing. `scripts/deploy-to-server.sh` is the
+other direction: it drives an *already installed* box from your workstation,
+which is what you want while iterating on code that isn't released yet. It is
+idempotent: re-run it after every change.
 
 ```
 ./scripts/deploy-to-server.sh \
@@ -317,11 +350,15 @@ or use `stunnel`.
 ### Operations
 
 ```
-sudo systemctl status   simplepool simplepool-dashboard nginx
-sudo journalctl -u simplepool           -f      # stratum log
-sudo journalctl -u simplepool-dashboard -f      # dashboard log
-sudo systemctl restart  simplepool              # after pulling new code
+simplepoolctl status                            # services, ports, ledger totals
+simplepoolctl logs proxy -f                     # stratum log
+simplepoolctl logs dashboard -f                 # dashboard log
+sudo simplepoolctl restart proxy                # after changing proxy.conf
 ```
+
+`simplepoolctl` is a wrapper over systemd — the underlying commands
+(`systemctl status simplepool`, `journalctl -u simplepool -f`) work exactly as
+before, and are what it prints when something needs a closer look.
 
 To pull edits made directly on a server back into a local checkout (so
 you can commit + push from here), use
@@ -423,8 +460,14 @@ src/
 include/             # public headers (empty for now)
 tests/               # unit tests + integration shell script
 deploy/              # systemd unit templates + nginx vhost templates
-scripts/             # deploy + sync helpers
+scripts/
+  install.sh         # bootstrap a fresh box (release download or source build)
+  simplepoolctl      # status / logs / doctor / upgrade / uninstall
+  release.sh         # build a release tarball (CI runs this exact script)
+  deploy-to-server.sh, sync-from-server.sh, record-build.sh, ...
 dashboard/           # Node/Express read-only stats UI
+payout/              # Thunder payout worker (pps-classic)
+docs/simplepool.html # single-file explainer: both modes, end to end
 ```
 
 ## Roadmap
