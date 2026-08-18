@@ -57,13 +57,14 @@ jobs:
           fetch-depth: 0
 
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            libsqlite3-dev \
-            libcurl4-openssl-dev \
-            libhiredis-dev
+        timeout-minutes: 5
+        # No `apt-get update` — see .github/scripts/apt-install.sh for why.
+        run: >
+          .github/scripts/apt-install.sh
+          build-essential
+          libsqlite3-dev
+          libcurl4-openssl-dev
+          libhiredis-dev
 
       - name: Check the tag matches the Makefile VERSION
         if: startsWith(github.ref, 'refs/tags/v')
