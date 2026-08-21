@@ -522,6 +522,19 @@ int coinbase_build_split(uint32_t height, int64_t value_sats,
     size_t en_total = extranonce1_size + extranonce2_size;
     size_t script_sig_len = height_push_len + tag_push_len + en_total;
 
+    /* Consensus caps the coinbase scriptSig at 100 bytes; a block that
+     * exceeds it is rejected outright. The budget is the BIP34 height push
+     * plus the operator's coinbase_tag (up to 76 bytes with its length byte)
+     * plus both extranonces, so a long tag and a wide extranonce can reach it
+     * together. The coinbasetxn path below checks this already -- check here
+     * too rather than emitting a coinbase that only fails at the network. */
+    if (script_sig_len < 2 || script_sig_len > 100) {
+        set_err(errbuf, errlen, "coinbase scriptSig length %zu out of range "
+                "(height %zu + tag %zu + extranonce %zu)",
+                script_sig_len, height_push_len, tag_push_len, en_total);
+        return -1;
+    }
+
     /* Build outputs blob: miner payout, [operator fee], [witness commitment]. */
     bbuf_t outs;
     bbuf_init(&outs);

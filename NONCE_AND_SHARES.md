@@ -44,19 +44,50 @@ simplepool uses the standard stratum-v1 split:
 ```
 coinbase scriptSig layout (assembled at share-check time):
 
-   [ height_push ] [ tag ] [ extranonce1 (4 B) ][ extranonce2 (4 B) ]
+   [ height_push ] [ tag ] [ extranonce1 (4 B) ][ extranonce2 (8 B) ]
                             └── pool assigns ──┘└──  miner picks   ──┘
 ```
 
 - **extranonce1 (4 bytes, `en1`)** — assigned by the pool when the
   connection subscribes. Immutable for the life of that TCP session.
-- **extranonce2 (4 bytes, `en2`)** — the miner's private search field.
+- **extranonce2 (8 bytes, `en2`)** — the miner's private search field.
   Each `mining.submit` carries an `en2` value; the miner sweeps it
   independently.
 
-Together they give each connection **2⁶⁴ distinct coinbases** to try
-before it has to reconnect for a fresh `en1`. At any real hashrate,
-that's effectively unbounded.
+Both widths come from `STRATUM_EXTRANONCE1_SIZE` /
+`STRATUM_EXTRANONCE2_SIZE` in `src/stratum.h`; the `en2` size is what
+the pool reports as the third element of the `mining.subscribe` result.
+
+`en1` is fixed for the life of the connection, so each connection has
+**2⁶⁴ distinct coinbases** to try before it would need to reconnect for
+a fresh one; across the pool the `(en1, en2)` pair space is 2⁹⁶. At any
+real hashrate, both are effectively unbounded.
+
+#### Why extranonce2 is 8 bytes and not the classic 4
+
+Not for search space. Even at 4 bytes a single connection gets 2⁸⁰
+headers per job (see the version-rolling section below), which a 1 EH/s
+farm would take about two weeks to exhaust — and jobs rotate every
+template. Capacity was never the constraint.
+
+The reason is **subdivision**. A stratum proxy sitting between the pool
+and a farm fans one upstream connection out to many downstream miners
+by splitting the `en2` field it was given: high bytes become a
+downstream-miner id, low bytes are passed down as that miner's own
+`en2`. At 4 bytes upstream, a proxy spending 3 on addressing leaves its
+miners a single byte — 256 values — and some firmware refuses to run
+that narrow. At 8 the proxy can spend 3 and still hand down the
+conventional 4, so every downstream miner sees an ordinary pool.
+
+**Changing these widths is consensus-relevant, not cosmetic.** `cb1`
+ends with the scriptSig length varint, computed once from
+`en1_size + en2_size` when the coinbase is rendered. An `en2` of any
+other width produces a coinbase whose declared scriptSig length
+disagrees with the bytes that follow it — an invalid transaction whose
+header nonetheless hashes fine. `handle_submit` therefore rejects any
+submission whose `en2` is not exactly `job->en2_size`
+(`src/stratum.c`, error `wrong extranonce2 size`) rather than crediting
+a share for work that could never become a block.
 
 For each `en2` the miner picks, it then sweeps the header's 4-byte
 `nonce` field (2³² hashes) and, if version-rolling was negotiated,
@@ -65,27 +96,32 @@ also permutes the masked version bits. So each `en2` value gives
 
 ### Extranonce1 allocation — how uniqueness is guaranteed
 
-`src/stratum.c:688-694`:
+In `handle_subscribe` (`src/stratum.c`):
 
 ```c
-/* Allocate extranonce1 from server counter ^ time. */
+/* Take extranonce1 straight from the server counter. */
 unsigned seq = atomic_fetch_add(&s->extranonce1_seq, 1);
-uint32_t mix = seq ^ (uint32_t)now_ms();
+uint32_t mix = (uint32_t)seq;
 c->extranonce1[0] = (uint8_t)(mix >> 24);
 c->extranonce1[1] = (uint8_t)(mix >> 16);
 c->extranonce1[2] = (uint8_t)(mix >> 8);
 c->extranonce1[3] = (uint8_t)mix;
 ```
 
-Two properties matter:
+**Uniqueness across concurrent connects** — `atomic_fetch_add` on
+`extranonce1_seq` guarantees that no two connections can read the same
+`seq` value even if they subscribe in the same nanosecond. The counter
+is seeded from the clock once at startup, so a restart doesn't hand out
+the same values to a fresh set of connections.
 
-1. **Uniqueness across concurrent connects** — `atomic_fetch_add` on
-   `extranonce1_seq` guarantees that no two connections can read the
-   same `seq` value even if they subscribe in the same nanosecond.
-2. **Freshness after counter wrap** — the 32-bit `seq` will wrap
-   after 4.3 billion connections. XORing with `now_ms()` (also 32
-   bits) ensures that even if a rig disconnects and reconnects days
-   later after the counter has cycled, it gets a different `en1`.
+The counter is *not* mixed with the clock at use. An earlier version
+did (`seq ^ now_ms()`), and that destroyed the uniqueness guarantee it
+was meant to reinforce: the XOR collides whenever the delta in the
+clock equals the delta in the counter — an even `seq` at an even
+millisecond and the next `seq` one millisecond later land on the same
+value. A miner opening several connections at once hit that routinely,
+and two connections sharing an `en1` render identical coinbases, so
+both find the same hash from the same nonce.
 
 **No two miners on the pool are searching the same
 `(header, coinbase, nonce)` triple.** That's the fairness guarantee
@@ -116,7 +152,8 @@ into the header's `version` field.
 Current default mask: **`0x1fffe000`** — the 16 bits between position
 13 and 28. That expands the effective per-`(en1, en2)` search space by
 2¹⁶, so a single `en2` value covers 2³² × 2¹⁶ = 2⁴⁸ ≈ 280 trillion
-headers.
+headers, and one connection covers 2⁶⁴ × 2⁴⁸ = 2¹¹² over the full `en2`
+sweep.
 
 **The pool never re-uses a version-rolled header for share
 validation**: on submit, the miner tells us the exact rolled version

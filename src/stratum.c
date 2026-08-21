@@ -200,7 +200,7 @@ struct stratum_conn {
     pthread_t thr;
     int thr_started;
 
-    uint8_t  extranonce1[4];
+    uint8_t  extranonce1[STRATUM_EXTRANONCE1_SIZE];
     double   difficulty;
     int      subscribed;
     int      authorized;
@@ -746,8 +746,8 @@ static int handle_subscribe(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     c->extranonce1[3] = (uint8_t)mix;
     c->subscribed = 1;
 
-    char ex1_hex[9];
-    bytes_to_hex(c->extranonce1, 4, ex1_hex);
+    char ex1_hex[STRATUM_EXTRANONCE1_SIZE * 2 + 1];
+    bytes_to_hex(c->extranonce1, sizeof c->extranonce1, ex1_hex);
 
     cJSON *result = cJSON_CreateArray();
     cJSON *subs = cJSON_CreateArray();
@@ -761,7 +761,10 @@ static int handle_subscribe(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     cJSON_AddItemToArray(subs, sn);
     cJSON_AddItemToArray(result, subs);
     cJSON_AddItemToArray(result, cJSON_CreateString(ex1_hex));
-    cJSON_AddItemToArray(result, cJSON_CreateNumber(4));
+    /* The miner sizes its extranonce2 sweep off this number, and the coinbase
+     * we render for it reserves exactly this many bytes. handle_submit
+     * enforces the agreement. */
+    cJSON_AddItemToArray(result, cJSON_CreateNumber(STRATUM_EXTRANONCE2_SIZE));
 
     return emit_response(buf, len, id, result, NULL);
 }
@@ -1055,6 +1058,28 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         return emit_response(buf, len, id, NULL, err);
     }
 
+    /* The extranonce2 must be exactly the width we advertised on subscribe
+     * and reserved when rendering this job's cb1. cb1 ends with the scriptSig
+     * length varint, which was computed as en1_size + en2_size; splicing in a
+     * different width produces a coinbase whose declared scriptSig length
+     * disagrees with the bytes that follow it. That transaction is invalid,
+     * so any block built on it is rejected by the network -- but its header
+     * still hashes, so without this check the share would look fine and be
+     * credited. Reject instead of silently mining garbage: a miner that
+     * ignored the advertised size needs to hear about it. */
+    if (en2_len != job->en2_size) {
+        free(en2_bytes);
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "wrong extranonce2 size");
+        }
+        LOG_WARN("submit from %s: extranonce2 is %zu bytes, expected %zu "
+                 "(miner ignored the size from mining.subscribe)",
+                 c->worker_name, en2_len, job->en2_size);
+        cJSON *err = make_error(20, "wrong extranonce2 size");
+        return emit_response(buf, len, id, NULL, err);
+    }
+
     /* Render this connection's coinbase for `job` if not cached. The
      * cache is keyed on job_id; submits against an older job retired into
      * the recent ring will rebuild on demand. */
@@ -1069,13 +1094,14 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
 
     /* coinbase = cb1 || ex1 || ex2 || cb2 */
-    size_t cb_len = c->cb1_len + 4 + en2_len + c->cb2_len;
+    size_t en1_len = sizeof c->extranonce1;
+    size_t cb_len = c->cb1_len + en1_len + en2_len + c->cb2_len;
     uint8_t *cb = malloc(cb_len);
     if (!cb) { free(en2_bytes); return -1; }
     size_t off = 0;
-    memcpy(cb + off, c->cb1, c->cb1_len);   off += c->cb1_len;
-    memcpy(cb + off, c->extranonce1, 4);    off += 4;
-    memcpy(cb + off, en2_bytes, en2_len);   off += en2_len;
+    memcpy(cb + off, c->cb1, c->cb1_len);        off += c->cb1_len;
+    memcpy(cb + off, c->extranonce1, en1_len);   off += en1_len;
+    memcpy(cb + off, en2_bytes, en2_len);        off += en2_len;
     memcpy(cb + off, c->cb2, c->cb2_len);   off += c->cb2_len;
     free(en2_bytes);
 

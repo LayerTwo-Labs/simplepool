@@ -682,7 +682,7 @@ footer .wrap > p { max-width: 46rem; }
     <div class="f"><b>height push</b><span>BIP34</span></div>
     <div class="f"><b>coinbase_tag</b><span>e.g. <code>/simplepool/</code></span></div>
     <div class="f pool"><b>extranonce1</b><span>4 B · pool assigns</span></div>
-    <div class="f miner"><b>extranonce2</b><span>4 B · miner sweeps</span></div>
+    <div class="f miner"><b>extranonce2</b><span>8 B · miner sweeps</span></div>
   </div>
   <p class="legend">
     <span><i style="background:var(--solo-bg);border:1px solid var(--solo)"></i>assigned once per connection</span>
@@ -696,6 +696,24 @@ footer .wrap > p { max-width: 46rem; }
     <code>extranonce2</code> value yields a distinct coinbase, therefore a
     distinct coinbase txid, therefore a distinct merkle root, therefore a fresh
     2<sup>32</sup> nonce space to sweep.
+  </p>
+  <p>
+    <code>extranonce2</code> is 8 bytes rather than the classic 4, and the
+    reason is not search space — 4 bytes already outruns any hashrate. It is so
+    that a stratum proxy in front of the pool can subdivide the field, taking
+    the high bytes as a downstream-miner id and passing the low bytes down as
+    that miner's own <code>extranonce2</code>. At 4 bytes a proxy spending 3 on
+    addressing leaves its miners a single byte, which some firmware refuses to
+    run with; at 8 it can spend 3 and still hand down the conventional 4.
+  </p>
+  <p>
+    The width is not advisory. <code>cb1</code> ends with the scriptSig length
+    varint, fixed at render time from the two extranonce sizes, so an
+    <code>extranonce2</code> of any other width yields a coinbase whose declared
+    length disagrees with its contents — an invalid transaction that still
+    hashes like a valid one. The pool rejects such submissions
+    (<code>wrong extranonce2 size</code>) rather than credit a share for work
+    that could never become a block.
   </p>
 
   <h3>Version rolling</h3>
