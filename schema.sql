@@ -83,6 +83,18 @@ CREATE TABLE IF NOT EXISTS node_status (
  * which shares.credited_sats is populated. */
 CREATE TABLE IF NOT EXISTS pool_meta (
   id                  INTEGER PRIMARY KEY CHECK (id = 1),
+  /* Pool identity — what the proxy is configured to be, written once at
+   * startup rather than on the template path. A miner cannot tell any of
+   * this from the stratum URL, so the dashboard has to say it: which chain
+   * the coinbase is being built for, whose tag is in it, and where the
+   * money goes. network_source is 'node' (getblockchaininfo answered) or
+   * 'inferred' (it did not, and the network was read off the operator
+   * address, which cannot distinguish testnet from signet). */
+  network             TEXT,
+  network_source      TEXT,     /* 'node' | 'inferred' */
+  coinbase_tag        TEXT,
+  operator_address    TEXT,     /* fee_bps recipient */
+  pool_btc_address    TEXT,     /* pps-classic only; NULL in solo */
   pool_mode           TEXT,
   fee_bps             INTEGER,
   rate_source         TEXT,     /* 'derived' | 'override' */

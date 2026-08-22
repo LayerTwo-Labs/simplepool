@@ -111,6 +111,20 @@ static const char *SCHEMA_SQL_PARTS[] = {
      * override can differ from the configured fee_bps. */
     "CREATE TABLE IF NOT EXISTS pool_meta ("
     "  id                  INTEGER PRIMARY KEY CHECK (id = 1),"
+    /* Pool identity. Config, not measurement, so it is written once at
+     * startup rather than on the template path. It lives here because the
+     * dashboard has no other honest source for it: a miner pointed at the
+     * stratum port cannot see which chain the coinbase is built for, whose
+     * tag is in it, or where the money goes, and a second copy in the
+     * dashboard's own environment is exactly the drift this table exists
+     * to prevent. network_source records whether getblockchaininfo
+     * answered ('node') or the network was read off the operator address
+     * ('inferred'), which cannot tell testnet from signet. */
+    "  network             TEXT,"
+    "  network_source      TEXT,"    /* 'node' | 'inferred' */
+    "  coinbase_tag        TEXT,"
+    "  operator_address    TEXT,"    /* fee_bps recipient */
+    "  pool_btc_address    TEXT,"    /* pps-classic only; NULL in solo */
     "  pool_mode           TEXT,"
     "  fee_bps             INTEGER,"
     "  rate_source         TEXT,"
@@ -283,6 +297,15 @@ static const char *MIGRATIONS_SQL[] = {
     /* See the pool_meta comment above: without this the counter added in
      * PR #32 is only ever readable at shutdown. */
     "ALTER TABLE pool_meta    ADD COLUMN events_lost    INTEGER NOT NULL DEFAULT 0",
+    /* Pool identity. An upgraded DB has these NULL until the proxy restarts
+     * and writes them, which is why the dashboard renders "unknown" rather
+     * than guessing — a banner that asserts the wrong network is worse than
+     * one that admits it doesn't know yet. */
+    "ALTER TABLE pool_meta    ADD COLUMN network          TEXT",
+    "ALTER TABLE pool_meta    ADD COLUMN network_source   TEXT",
+    "ALTER TABLE pool_meta    ADD COLUMN coinbase_tag     TEXT",
+    "ALTER TABLE pool_meta    ADD COLUMN operator_address TEXT",
+    "ALTER TABLE pool_meta    ADD COLUMN pool_btc_address TEXT",
 };
 
 /* Retries for one batch. busy_timeout (5s) bounds each attempt, so the worst
@@ -984,6 +1007,58 @@ int store_record_node_tip(store_t *s, int height, const char *hash,
     int rc = sqlite3_step(s->st_upsert_node_tip);
     sqlite3_reset(s->st_upsert_node_tip);
     pthread_mutex_unlock(&s->node_tip_mu);
+    if (rc != SQLITE_DONE) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    return 0;
+}
+
+int store_record_pool_identity(store_t *s, const char *network,
+                               const char *network_source,
+                               const char *coinbase_tag,
+                               const char *operator_address,
+                               const char *pool_btc_address)
+{
+    if (!s) return -1;
+    /* Upserts the same id=1 row as store_record_pool_meta(), but only the
+     * identity columns — the two never write each other's fields, so
+     * whichever runs first is harmless. Notably this does NOT touch
+     * updated_at: that timestamp means "when the rate was last refreshed",
+     * and identity is written once at startup, so stamping it here would
+     * make a stalled template path look alive.
+     *
+     * pool_btc_address is stored as NULL rather than "" in solo mode, so a
+     * reader can tell "not applicable in this mode" from "configured
+     * blank". */
+    static const char *Q =
+        "INSERT INTO pool_meta (id, network, network_source, coinbase_tag,"
+        "  operator_address, pool_btc_address) "
+        "VALUES (1, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "  network = excluded.network,"
+        "  network_source = excluded.network_source,"
+        "  coinbase_tag = excluded.coinbase_tag,"
+        "  operator_address = excluded.operator_address,"
+        "  pool_btc_address = excluded.pool_btc_address";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    pthread_mutex_lock(&s->node_tip_mu);
+    sqlite3_bind_text(st, 1, network          ? network          : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, network_source   ? network_source   : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, coinbase_tag     ? coinbase_tag     : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, operator_address ? operator_address : "", -1, SQLITE_TRANSIENT);
+    if (pool_btc_address && pool_btc_address[0]) {
+        sqlite3_bind_text(st, 5, pool_btc_address, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(st, 5);
+    }
+    int rc = sqlite3_step(st);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;

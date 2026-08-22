@@ -282,6 +282,38 @@ int bitcoind_ping(bitcoind_client_t *c, char *errbuf, size_t errlen) {
     return rc;
 }
 
+/* Which chain the backend is on, from getblockchaininfo's `chain` field
+ * ("main" | "test" | "signet" | "regtest").
+ *
+ * Deliberately separate from bitcoind_ping(): the ping is allowed to fall
+ * back to getblocktemplate because the question there is "can you hand me
+ * work?", but there is no second call that answers "which chain?". A backend
+ * that doesn't implement getblockchaininfo — the CUSF enforcer answers
+ * exactly getblocktemplate and submitblock, and that enforcer is the backend
+ * a drivechain pool must point at — simply cannot tell us, and the caller
+ * has to infer it instead. Returns 0 ok, negative otherwise. */
+int bitcoind_get_chain(bitcoind_client_t *c, char *out, size_t cap,
+                       char *errbuf, size_t errlen) {
+    if (!out || cap == 0) return -1;
+    out[0] = '\0';
+    cJSON *result = NULL;
+    int rc = rpc_call(c, "getblockchaininfo", NULL, &result, errbuf, errlen);
+    if (rc != 0) {
+        if (result) cJSON_Delete(result);
+        return rc;
+    }
+    cJSON *chain = result
+        ? cJSON_GetObjectItemCaseSensitive(result, "chain") : NULL;
+    if (!cJSON_IsString(chain) || !chain->valuestring[0]) {
+        set_err(errbuf, errlen, "getblockchaininfo has no `chain` field");
+        if (result) cJSON_Delete(result);
+        return -30;
+    }
+    snprintf(out, cap, "%s", chain->valuestring);
+    cJSON_Delete(result);
+    return 0;
+}
+
 static int hex_to_u32(const char *hex, uint32_t *out) {
     if (!hex || !out) return -1;
     char *end = NULL;

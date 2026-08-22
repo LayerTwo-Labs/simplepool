@@ -82,6 +82,24 @@ int store_record_credit(store_t *s, const char *worker_name,
  * rate_source is "derived" or "override". gross is fair value before the
  * fee; rate is net of it. effective_fee_bps is what the pair actually
  * implies, which under an override need not equal fee_bps. */
+/* The pool's identity: which chain it builds coinbases for, the tag it
+ * stamps into them, and the addresses the money goes to. Upserts the same
+ * id=1 row as store_record_pool_meta() but touches only these columns, so
+ * call order between the two does not matter.
+ *
+ * Written once at startup, because none of it changes while the process
+ * runs — and it is written to the DB at all because the dashboard must not
+ * hold its own copy of the proxy's config. network_source is "node" when
+ * getblockchaininfo answered and "inferred" when the network was read off
+ * the operator address instead. Pass a NULL/empty pool_btc_address in solo
+ * mode; it is stored as NULL so "not applicable" reads differently from
+ * "configured blank". */
+int store_record_pool_identity(store_t *s, const char *network,
+                               const char *network_source,
+                               const char *coinbase_tag,
+                               const char *operator_address,
+                               const char *pool_btc_address);
+
 int store_record_pool_meta(store_t *s, const char *pool_mode, int fee_bps,
                            const char *rate_source,
                            double rate_sats_per_diff,
