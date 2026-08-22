@@ -568,6 +568,62 @@ static void *tip_watcher(void *arg) {
     return NULL;
 }
 
+/* ---------- pool identity ---------- */
+
+/* Which chain this pool is mining, and how confidently we know it.
+ *
+ * getblockchaininfo is authoritative, so ask first. It is also not always
+ * available: the CUSF enforcer serves getblocktemplate and submitblock and
+ * answers "Method not found" to everything else, and that enforcer is
+ * precisely the backend a drivechain pool has to point at for BIP300/301
+ * commitments. So fall back to the network encoded in operator_address —
+ * which is weaker (it cannot tell testnet from signet) but never wrong about
+ * mainnet — and record which of the two answered, so the dashboard can say
+ * "inferred" instead of asserting.
+ *
+ * Also the only place the two are ever compared. A mainnet operator address
+ * on a test chain, or the reverse, pays the fee to a script nobody on that
+ * chain controls: the block is valid, the coinbase looks fine, and the
+ * money is gone. That is worth a loud line in the journal. */
+static void resolve_network(bitcoind_client_t *btc, const proxy_config_t *cfg,
+                            char *net, size_t net_cap,
+                            char *src, size_t src_cap) {
+    const char *from_addr = coinbase_address_network(cfg->operator_address);
+    char node_chain[32] = {0};
+    char nerr[256] = {0};
+
+    if (bitcoind_get_chain(btc, node_chain, sizeof node_chain,
+                           nerr, sizeof nerr) == 0) {
+        snprintf(net, net_cap, "%s", node_chain);
+        snprintf(src, src_cap, "node");
+        if (from_addr &&
+            coinbase_network_is_mainnet(node_chain) !=
+            coinbase_network_is_mainnet(from_addr)) {
+            LOG_WARN("operator_address '%s' is a %s address but the node is "
+                     "on '%s' — the %d bps fee would pay a script nobody on "
+                     "this chain controls. Fix operator_address before "
+                     "mining a block.",
+                     cfg->operator_address, from_addr, node_chain,
+                     cfg->fee_bps);
+        }
+        return;
+    }
+
+    if (from_addr) {
+        snprintf(net, net_cap, "%s", from_addr);
+        snprintf(src, src_cap, "inferred");
+        LOG_INFO("network: backend does not answer getblockchaininfo (%s); "
+                 "inferred '%s' from operator_address", nerr, from_addr);
+        return;
+    }
+
+    snprintf(net, net_cap, "unknown");
+    snprintf(src, src_cap, "unknown");
+    LOG_WARN("network: could not determine which chain this pool is mining "
+             "(getblockchaininfo: %s, and operator_address '%s' encodes no "
+             "network)", nerr, cfg->operator_address);
+}
+
 /* ---------- usage ---------- */
 
 static void usage(const char *prog) {
@@ -673,6 +729,24 @@ int main(int argc, char **argv) {
         bitcoind_client_free(&btc);
         bitcoind_client_free(&btc_lp);
         return 4;
+    }
+
+    /* Pool identity into the DB, before anything else can read the table.
+     * The dashboard shows this to miners; see store.h for why it lives in
+     * the DB rather than in the dashboard's own environment. */
+    {
+        char network[32] = {0}, network_src[16] = {0};
+        resolve_network(&btc, &cfg, network, sizeof network,
+                        network_src, sizeof network_src);
+        const int pps = strcmp(cfg.pool_mode, "pps-classic") == 0;
+        LOG_INFO("pool identity: network=%s (%s) mode=%s fee=%d bps tag=\"%s\" "
+                 "operator=%s%s%s",
+                 network, network_src, cfg.pool_mode, cfg.fee_bps,
+                 cfg.coinbase_tag, cfg.operator_address,
+                 pps ? " pool_btc=" : "", pps ? cfg.pool_btc_address : "");
+        store_record_pool_identity(store, network, network_src,
+                                   cfg.coinbase_tag, cfg.operator_address,
+                                   pps ? cfg.pool_btc_address : NULL);
     }
 
     /* Broadcast (optional). */

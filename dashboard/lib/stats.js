@@ -337,6 +337,44 @@ export function worker(handle, name, windowSec = 86400) {
  *
  * Returns null on a DB predating pool_meta, in which case callers should
  * present the rate as unknown rather than substituting a guess. */
+/* The identity half of pool_meta: which chain the pool builds coinbases
+ * for, the tag it stamps into them, and where the money goes.
+ *
+ * Selected separately from the rate columns, and swallowing its own errors,
+ * because the two halves land in different releases: a dashboard upgraded
+ * ahead of the proxy reads a pool_meta that has no identity columns yet, and
+ * folding this into the main SELECT would turn that into a null poolMeta —
+ * losing the rate figures too, to add a banner.
+ *
+ * Everything is nullable on purpose. Rendering "unknown" is correct until
+ * the proxy has restarted and written the row; guessing a network is not. */
+function poolIdentity(d) {
+    const blank = {
+        network: null, network_source: null, coinbase_tag: null,
+        operator_address: null, pool_btc_address: null,
+    };
+    try {
+        const r = d.prepare(`
+            SELECT network, network_source, coinbase_tag,
+                   operator_address, pool_btc_address
+              FROM pool_meta WHERE id = 1
+        `).get();
+        if (!r) return blank;
+        /* The proxy binds "" for an unset string; normalise to null so
+         * callers have one empty case to test rather than two. */
+        const or_ = v => (v === undefined || v === null || v === '') ? null : v;
+        return {
+            network:          or_(r.network),
+            network_source:   or_(r.network_source),
+            coinbase_tag:     or_(r.coinbase_tag),
+            operator_address: or_(r.operator_address),
+            pool_btc_address: or_(r.pool_btc_address),
+        };
+    } catch {
+        return blank;   /* DB predating the identity columns */
+    }
+}
+
 export function poolMeta(handle) {
     /* Called from stats.js with a lazy handle and from admin.js with an
      * already-resolved better-sqlite3 Database, so accept either rather
@@ -355,6 +393,7 @@ export function poolMeta(handle) {
         const gross = Number(r.gross_sats_per_diff || 0);
         const rate  = Number(r.rate_sats_per_diff  || 0);
         return {
+            ...poolIdentity(d),
             pool_mode:           r.pool_mode || 'solo',
             fee_bps:             Number(r.fee_bps || 0),
             rate_source:         r.rate_source || 'derived',

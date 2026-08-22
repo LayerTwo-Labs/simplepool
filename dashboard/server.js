@@ -45,6 +45,11 @@ app.use((_req, res, next) => {
     Object.assign(res.locals, fmt.all);
     /* Every page renders the banner, so every render needs the snapshot. */
     res.locals.health = currentHealth();
+    /* Same reason: the pool-identity strip is in both navs. Cheap enough to
+     * read per request — one row, by primary key, off a one-row table — and
+     * reading it live means a proxy restart onto a different network shows
+     * up on the next refresh instead of on the next dashboard restart. */
+    res.locals.pool = stats.poolMeta(db);
     next();
 });
 
@@ -251,6 +256,14 @@ app.get('/api/status', async (req, res, next) => {
             pool: {
                 mode:        meta ? meta.pool_mode : null,
                 fee_bps:     meta ? meta.fee_bps   : null,
+                /* Same four facts the header strip shows. A monitor should
+                 * not have to scrape HTML to learn that the pool it is
+                 * watching restarted onto a different network. */
+                network:          meta ? meta.network          : null,
+                network_source:   meta ? meta.network_source   : null,
+                coinbase_tag:     meta ? meta.coinbase_tag     : null,
+                operator_address: meta ? meta.operator_address : null,
+                pool_btc_address: meta ? meta.pool_btc_address : null,
                 stratum_url: PUBLIC_STRATUM_URL,
                 ...stats.overview(db),
             },

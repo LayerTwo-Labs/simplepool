@@ -73,6 +73,38 @@ each component is running. It always returns 200 — it is a report, and a
 report that a check is failing was still produced successfully. Watch
 `health.ok` for the condition and `/health` for a status code to alert on.
 
+## Pool identity
+
+Every page carries a strip under the header naming what this pool actually
+is: the **network** its coinbases are built for, the **mode** (`solo` or
+`pps-classic`) and fee, the **coinbase tag**, the **operator address** the
+fee is paid to, and — under `pps-classic` — the **pool wallet** the
+net-of-fee reward goes to. `/api/status` returns the same five fields under
+`pool`.
+
+None of it is derivable from the stratum URL a miner was handed. The port
+looks identical whether the pool is mining mainnet or regtest, whether a
+block pays its finder or the pool's wallet, and whoever collects the fee.
+
+The dashboard does **not** take these from its own environment. The proxy
+writes them to `pool_meta` at startup and the dashboard reads them back —
+same rule as the PPS rate, and for the same reason: a second copy of the
+config is a copy that can disagree with the pool it claims to describe.
+The practical consequence is that the strip reads `unknown` until the proxy
+has restarted onto a build that publishes them. That is deliberate; a banner
+that asserts the wrong network is worse than one that admits it doesn't know.
+
+`network_source` says how the network was determined:
+
+| Value      | Meaning |
+| ---------- | ------- |
+| `node`     | `getblockchaininfo` answered. Authoritative. |
+| `inferred` | It did not — the CUSF enforcer serves only `getblocktemplate` and `submitblock` — so the network was read off the operator address. Cannot distinguish testnet from signet, and says so. |
+
+A non-mainnet pool is flagged with a warn-coloured rule, because "why has my
+payout not arrived" and "this pool is mining signet" are frequently the same
+question.
+
 ## Build provenance — `/api/versions`
 
 Answers "which commit is this pool actually running?" for simplepool, the

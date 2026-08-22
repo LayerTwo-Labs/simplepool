@@ -62,6 +62,14 @@ void bitcoind_client_free(bitcoind_client_t *c);
  * error. Useful at startup. */
 int bitcoind_ping(bitcoind_client_t *c, char *errbuf, size_t errlen);
 
+/* Which chain the backend reports (getblockchaininfo `chain`): "main",
+ * "test", "signet" or "regtest". Returns 0 and fills `out` on success.
+ * Negative when the backend does not implement getblockchaininfo — the CUSF
+ * enforcer does not — in which case the caller must infer the network some
+ * other way rather than assert one. */
+int bitcoind_get_chain(bitcoind_client_t *c, char *out, size_t cap,
+                       char *errbuf, size_t errlen);
+
 /* Fetch a block template. Allocates the result; caller must call
  * bitcoind_template_free. Returns 0 ok, negative on error. */
 int bitcoind_get_block_template(bitcoind_client_t *c,

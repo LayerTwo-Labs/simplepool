@@ -51,6 +51,22 @@ static int64_t scalar_i64(sqlite3 *db, const char *sql) {
     return v;
 }
 
+/* Copies into `out` because the sqlite3_stmt is finalized before returning.
+ * Writes "" for SQL NULL, and returns whether the column was non-NULL — the
+ * identity test needs to tell "stored blank" from "stored nothing". */
+static int scalar_text(sqlite3 *db, const char *sql, char *out, size_t cap) {
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_step(st);
+    assert(rc == SQLITE_ROW);
+    int is_null = sqlite3_column_type(st, 0) == SQLITE_NULL;
+    const unsigned char *v = sqlite3_column_text(st, 0);
+    snprintf(out, cap, "%s", (is_null || !v) ? "" : (const char *)v);
+    sqlite3_finalize(st);
+    return !is_null;
+}
+
 static double scalar_dbl(sqlite3 *db, const char *sql) {
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
@@ -344,6 +360,75 @@ static void test_credited_sats(void) {
     printf("  ok test_credited_sats\n");
 }
 
+/* Pool identity: written once at startup, and the only source the dashboard
+ * has for what this pool is. Two properties matter beyond the round trip.
+ *
+ * First, it must not collide with the per-template pool_meta write — they
+ * share the id=1 row and run in either order, so each must leave the other's
+ * columns alone, including the write-once credited_from stamp.
+ *
+ * Second, solo mode must store pool_btc_address as NULL rather than "", so a
+ * reader can tell "no pool wallet in this mode" from "operator configured a
+ * blank one". */
+static void test_pool_identity(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Identity first, template second — the startup order. */
+    assert(store_record_pool_identity(s, "signet", "node", "/simplepool/",
+                                      "tb1qoperator", "tb1qpoolwallet") == 0);
+    assert(store_record_pool_meta(s, "pps-classic", 100, "derived",
+                                  2783.22, 2811.33, 100.4,
+                                  111157.455, 312500000, 1700000000ULL) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+
+    char buf[128];
+    assert(scalar_i64(db, "SELECT count(*) FROM pool_meta") == 1);
+    scalar_text(db, "SELECT network FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "signet") == 0);
+    scalar_text(db, "SELECT network_source FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "node") == 0);
+    scalar_text(db, "SELECT coinbase_tag FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "/simplepool/") == 0);
+    scalar_text(db, "SELECT operator_address FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "tb1qoperator") == 0);
+    scalar_text(db, "SELECT pool_btc_address FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "tb1qpoolwallet") == 0);
+
+    /* The template write must not have disturbed identity, and identity must
+     * not have pre-empted the write-once credited_from stamp. */
+    assert(scalar_i64(db, "SELECT fee_bps FROM pool_meta") == 100);
+    assert(scalar_i64(db, "SELECT credited_from FROM pool_meta") == 1700000000);
+
+    /* updated_at means "when the rate was last refreshed". Identity is
+     * written once at startup, so re-writing it must not touch that — else a
+     * stalled template path would keep looking alive. */
+    int64_t seen = scalar_i64(db, "SELECT updated_at FROM pool_meta");
+    assert(store_record_pool_identity(s, "regtest", "inferred", "/other/",
+                                      "bcrt1qop", NULL) == 0);
+    assert(scalar_i64(db, "SELECT updated_at FROM pool_meta") == seen);
+
+    /* Solo mode: NULL, not "". */
+    assert(scalar_text(db, "SELECT pool_btc_address FROM pool_meta",
+                       buf, sizeof buf) == 0);
+    scalar_text(db, "SELECT network FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "regtest") == 0);
+    /* And still no collateral damage to the rate half. */
+    assert(scalar_i64(db, "SELECT credited_from FROM pool_meta") == 1700000000);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pool_identity\n");
+}
+
 /* rate_history is the provenance half of the audit: it must append when the
  * rate moves, stay quiet when it doesn't, and hold rows that re-derive from
  * their own inputs. */
@@ -616,6 +701,7 @@ int main(void) {
     test_concurrent();
     test_drop();
     test_credited_sats();
+    test_pool_identity();
     test_rate_history();
     test_template_history();
     test_template_retention();
