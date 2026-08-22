@@ -105,6 +105,34 @@ A non-mainnet pool is flagged with a warn-coloured rule, because "why has my
 payout not arrived" and "this pool is mining signet" are frequently the same
 question.
 
+## "About the numbers on this page"
+
+The explanatory card on `/` branches on `pool_mode`, because almost nothing
+in it is shared between the modes:
+
+| | `solo` | `pps-classic` |
+| --- | --- | --- |
+| A share that isn't a block | worth nothing | credited at the live rate |
+| Block reward goes to | the finder, in the coinbase | the pool's BTC wallet |
+| Stratum username | a **Bitcoin** address (P2WPKH / P2PKH / P2SH — **not** taproot) | a **Thunder** address |
+| Rejection if you get it wrong | `invalid payout address in stratum username` | `invalid thunder address` |
+
+That last row is why this is not cosmetic. `src/stratum.c` branches on
+`pps_enabled` at authorize, so the card's instructions are load-bearing: a
+solo pool that tells miners to use a Thunder address is telling them to do
+the one thing that cannot work.
+
+Every figure comes from `pool_meta` — rate, gross, fee, operator address,
+pool wallet, network — and the address examples follow the pool's network, so
+a signet pool shows `tb1q…` rather than `bc1q…`. Nothing in the card is a
+literal. The version this replaced hardcoded *"1 000 sats × share
+difficulty"*, which was never true of a rate that is derived per template and
+moves with difficulty; a pinned rate (`rate_source = override`) is now called
+out with the fee it actually implies.
+
+Unknown mode gets prose naming both, and no username form — same rule as the
+identity strip, since guessing wrong costs a miner real time.
+
 ## Build provenance — `/api/versions`
 
 Answers "which commit is this pool actually running?" for simplepool, the

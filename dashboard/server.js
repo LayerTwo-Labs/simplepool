@@ -50,6 +50,11 @@ app.use((_req, res, next) => {
      * reading it live means a proxy restart onto a different network shows
      * up on the next refresh instead of on the next dashboard restart. */
     res.locals.pool = stats.poolMeta(db);
+    /* The about-numbers card needs both to tell a miner how to connect, and
+     * it is a partial rather than an index-only block, so they live here
+     * rather than being threaded through one render call. */
+    res.locals.stratumUrl  = PUBLIC_STRATUM_URL;
+    res.locals.sidechainId = THUNDER_SIDECHAIN_ID;
     next();
 });
 
@@ -148,7 +153,6 @@ app.get('/', (_req, res) => {
     const node   = stats.nodeStatus(db);
     res.render('index', {
         ov, lb, lbAddr, blocks, node,
-        stratumUrl:  PUBLIC_STRATUM_URL,
         fmtHashrate: stats.fmtHashrate,
         fmtBtc:      stats.fmtBtc,
     });
