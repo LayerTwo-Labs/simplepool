@@ -40,6 +40,20 @@ a:hover { text-decoration: underline; }
 .brand { font-weight: 700; font-size: 18px; color: var(--fg); text-decoration: none; }
 .tag { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; }
 
+/* "About the numbers" card. The <h3>/<pre> styling used to be inline style=
+ * attributes on the one hardcoded copy; it moved here when the card became a
+ * partial with three bodies, rather than being repeated three times. */
+.about-h3 { margin-top: 1em; margin-bottom: 0.25em; }
+.about-pre {
+    margin: 0;
+    padding: 0.5em;
+    background: #0002;
+    border-radius: 4px;
+    overflow-x: auto;
+    font-size: 12px;
+}
+.about-note { margin-top: 0.5em; }
+
 /* Pool identity strip — sits between the header and the health banner on
  * every page. Deliberately quiet: it is reference material a miner reads
  * once and then ignores, not an alert. The one exception is a non-mainnet
