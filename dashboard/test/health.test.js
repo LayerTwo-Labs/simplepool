@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import ejs from 'ejs';
 
-import { health, startHealthMonitor, currentHealth } from '../lib/health.js';
+import { subsidyAt, health, startHealthMonitor, currentHealth } from '../lib/health.js';
 import * as fmt from '../lib/fmt.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -54,11 +54,15 @@ function makeDb() {
      * only blocks verified to be in the chain, so a candidate that is merely
      * recorded funds nothing. */
     db.prepare(`INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status,confirmations,checked_via)
-                VALUES (1700000000, 1, 'b1', 309375000, 3125000, 'confirmed', 101, 'node')`).run();
+                VALUES (1700000000, 840001, 'b1', 309375000, 3125000, 'confirmed', 101, 'node')`).run();
+    /* Height and value have to agree: 312,500,000 sats is the subsidy in the
+     * era beginning at 840,000, and a template claiming it at height 2 — where
+     * the subsidy is 50 BTC — is the exact inconsistency the block_value check
+     * exists to catch. */
     db.prepare(`INSERT INTO templates (ts,height,prev_hash,bits,network_difficulty,
                     coinbase_value_sats,tx_count,tx_fees_sats,source,cb_spendable,
                     cb_op_returns,longpoll,rate_sats_per_diff)
-                VALUES (1700000000, 2, 'aa', '1a', 111157.455, 312500000, 1, 0,
+                VALUES (1700000000, 840002, 'aa', '1a', 111157.455, 312500000, 1, 0,
                         'enforcer', 1, 3, 1, ?)`).run(RATE);
     db.prepare(`INSERT INTO pool_meta (id,pool_mode,fee_bps,rate_source,
                     rate_sats_per_diff,gross_sats_per_diff,effective_fee_bps,
@@ -128,6 +132,46 @@ test('no settled candidates is not an orphan-rate failure', () => {
     db.prepare('DELETE FROM blocks_found').run();
     const h = health(db);
     assert.ok(!failing(h).includes('orphan_rate'));
+});
+
+/* An inflated block value is the silent one. On the coinbasetxn path the
+ * backend supplies the coinbase, so the block stays valid and nothing
+ * complains — but the same number sets the PPS rate, so every miner is
+ * overpaid by the same factor and the pool owes money it never earned. */
+test('a block value above the subsidy schedule is caught', () => {
+    const db = makeDb();
+    db.prepare('UPDATE templates SET coinbase_value_sats = ?')
+      .run(312500000 * 6);
+    const h = health(db);
+    assert.ok(failing(h).includes('block_value'));
+});
+
+/* The other direction of the same parse: reading the coinbasetxn `fee` field
+ * as BIP22-strict fees rather than the total output value leaves the block
+ * looking nearly worthless. */
+test('a block value far below the subsidy is caught', () => {
+    const db = makeDb();
+    db.prepare('UPDATE templates SET coinbase_value_sats = 1200').run();
+    const h = health(db);
+    assert.ok(failing(h).includes('block_value'));
+});
+
+/* Fees genuinely push the coinbase above the subsidy, and that is not a
+ * fault — only a value that cannot be explained by fees is. */
+test('a busy block with real fees is not flagged', () => {
+    const db = makeDb();
+    db.prepare(`UPDATE templates SET coinbase_value_sats = ?, tx_fees_sats = ?`)
+      .run(312500000 + 40000000, 40000000);
+    const h = health(db);
+    assert.ok(!failing(h).includes('block_value'));
+});
+
+test('the subsidy schedule is the standard one', () => {
+    assert.equal(subsidyAt(0), 50e8);
+    assert.equal(subsidyAt(209999), 50e8);
+    assert.equal(subsidyAt(210000), 25e8);
+    assert.equal(subsidyAt(840000), 312500000);
+    assert.equal(subsidyAt(210000 * 64), 0);
 });
 
 test('shares accepted but never stored are caught', () => {
@@ -232,7 +276,7 @@ test('a DB missing a table degrades to unavailable, not to healthy', () => {
     db.exec('DROP TABLE payouts_in_flight');
     const h = health(db);
     assert.ok(h.unavailable.some(c => c.id === 'payout_ambiguous'));
-    assert.equal(h.checks.length, 8, 'every check still reported');
+    assert.equal(h.checks.length, 9, 'every check still reported');
 });
 
 test('no DB handle is not healthy', () => {

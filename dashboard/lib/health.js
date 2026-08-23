@@ -28,6 +28,22 @@ import { rateVerification } from './stats.js';
  * drynet3. An hour means something is genuinely wrong, not slow. */
 const PAYOUT_STALL_SEC = 3600;
 
+/* The block subsidy at a height, on the standard schedule: 50 BTC, halved
+ * every 210,000 blocks. Chains derived from Bitcoin — mainnet, testnet,
+ * signet, and forknets that keep their parent's height — all share it;
+ * regtest's 150-block interval is the exception, and a regtest pool will
+ * report this check as failing, which is the correct thing for it to say
+ * rather than silently accepting any number.
+ *
+ * Returns 0 past the last era, where there is nothing left to check. */
+const HALVING_INTERVAL = 210000;
+export function subsidyAt(height) {
+    if (!Number.isFinite(height) || height < 0) return 0;
+    const era = Math.floor(height / HALVING_INTERVAL);
+    if (era >= 64) return 0;
+    return Math.floor(50e8 / Math.pow(2, era));
+}
+
 function one(d, sql, ...args) {
     return d.prepare(sql).get(...args);
 }
@@ -118,6 +134,58 @@ export function health(handle) {
                  detail: m < 0
                     ? `owed ${(-m / 1e8).toFixed(4)} BTC more than mined`
                     : null };
+    }));
+
+    /* Does the block value the pool is being told make arithmetic sense?
+     *
+     * A template reports the coinbase value in one field and the per-transaction
+     * fees in another, and the proxy reads them independently — so
+     * value - fees is an independent estimate of the block subsidy, and the
+     * subsidy is not a free parameter. It is 50 BTC halved once per era, and
+     * nothing else. If that difference is not a halving value, the pool is
+     * being told a block is worth something it is not.
+     *
+     * This matters far beyond reporting. On the coinbasevalue path the proxy
+     * builds the coinbase from this number, so getting it wrong produces a
+     * consensus-invalid block the node refuses. On the coinbasetxn path (the
+     * CUSF enforcer, where the backend supplies the coinbase) the block stays
+     * valid and the error is silent — but the number still sets the PPS rate
+     * every share is credited at, so an inflated value overpays every miner by
+     * the same factor, and the pool owes real money it never earned.
+     *
+     * The two directions are both real failure modes of the same parse:
+     * value far ABOVE the subsidy means the value field is being over-read,
+     * and value at or near ZERO means it is being read as fees-only. */
+    checks.push(guard('block_value', 'Block value matches the subsidy', () => {
+        const rows = d.prepare(`
+            SELECT height, coinbase_value_sats, tx_fees_sats
+              FROM templates
+             WHERE height > 0
+             ORDER BY id DESC LIMIT 50`).all();
+        if (rows.length === 0) return { ok: true, value: null, detail: 'no templates yet' };
+        let worst = null;
+        for (const r of rows) {
+            const expected = subsidyAt(Number(r.height));
+            if (expected <= 0) continue;   /* past the last halving: nothing to check */
+            const implied = Number(r.coinbase_value_sats) - Number(r.tx_fees_sats);
+            const ratio = implied / expected;
+            /* Fees above the subsidy are possible but rare; 2x is generous.
+             * Below the subsidy is not possible at all. */
+            if (ratio >= 1 && ratio <= 2) continue;
+            if (!worst || Math.abs(Math.log(ratio || 1e-9)) > Math.abs(Math.log(worst.ratio || 1e-9))) {
+                worst = { height: Number(r.height), implied, expected, ratio };
+            }
+        }
+        if (!worst) return { ok: true, value: null, detail: null };
+        const btc = n => (n / 1e8).toFixed(4);
+        return {
+            ok: false,
+            value: Math.round(worst.ratio * 100) / 100,
+            detail: `at height ${worst.height} the template implies a ` +
+                    `${btc(worst.implied)} BTC subsidy, but the schedule says ` +
+                    `${btc(worst.expected)} BTC — every reward and the PPS rate ` +
+                    `are scaled by this`,
+        };
     }));
 
     /* How many of the pool's recent candidates actually made it into the
