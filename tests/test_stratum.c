@@ -696,6 +696,79 @@ static void test_accepted_candidate_reports_accepted(void) {
     stratum_server_free(s);
 }
 
+/* A job found by a submit must stay valid for that submit, even though the
+ * tip watcher retires and frees jobs on another thread at every new template.
+ *
+ * This is not hypothetical. find_job used to hand back a borrowed pointer
+ * after releasing its lock, and the production pps pool recorded blocks_found
+ * rows carrying a freed job's fields — heights 0, 2 and 550 on a chain mining
+ * at 963,000+, and two rewards of 1.29 million BTC. A freed job's
+ * network_target_be can also make an ordinary hash look like a solved block,
+ * which is how those rows came to exist at all.
+ *
+ * Ring turnover is the trigger: RECENT_JOBS is 8, and on a chain serving
+ * several templates a second the ring recycles in seconds, so a submit only
+ * has to be slightly slow to be reading freed memory. Here it is forced
+ * deterministically — under ASan this aborts without the reference count. */
+static void test_job_survives_retirement_while_held(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("HELD", net));
+
+    /* What handle_submit does: take the job, then do slow work with it. */
+    stratum_job_t *held = stratum_job_find_for_test(s, "HELD");
+    CHECK(held != NULL);
+    CHECK(stratum_job_height_for_test(held) == 800000);
+    CHECK(stratum_job_value_sats_for_test(held) == 5000000000LL);
+
+    /* Meanwhile the tip watcher churns through enough templates to push HELD
+     * out of the retention ring entirely and free it. */
+    for (int i = 0; i < 24; ++i) {
+        char jid[16];
+        snprintf(jid, sizeof jid, "J%d", i);
+        stratum_server_set_job(s, make_test_job(jid, net));
+    }
+
+    /* It is gone from the lookup — correct, a later submit for it is stale. */
+    stratum_job_t *gone = stratum_job_find_for_test(s, "HELD");
+    CHECK(gone == NULL);
+
+    /* But the holder's copy is still intact, not recycled memory. These are
+     * exactly the two fields that reached blocks_found as garbage. */
+    CHECK(stratum_job_height_for_test(held) == 800000);
+    CHECK(stratum_job_value_sats_for_test(held) == 5000000000LL);
+
+    stratum_job_free(held);
+    stratum_server_free(s);
+}
+
+/* The reference must not leak either: once the holder lets go, the job is
+ * destroyed rather than pinned for the process's lifetime. Run under ASan or
+ * valgrind, a leak here is the failure. */
+static void test_held_job_is_freed_on_release(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("A", net));
+    stratum_job_t *held = stratum_job_find_for_test(s, "A");
+    CHECK(held != NULL);
+    stratum_job_free(held);        /* holder done; server still owns one */
+    stratum_server_free(s);        /* server drops the last one */
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -712,6 +785,8 @@ int main(void) {
     test_dedupe_same_hash_across_job_ids();
     test_rejected_candidate_is_not_a_block();
     test_accepted_candidate_reports_accepted();
+    test_job_survives_retirement_while_held();
+    test_held_job_is_freed_on_release();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

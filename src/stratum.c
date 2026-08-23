@@ -8,6 +8,11 @@
  * "recent jobs" kept alive ~60s for late submits. Connection threads take
  * read locks for notify/submit lookups.
  *
+ * Jobs are reference counted. Anything that reads a job only while holding
+ * the lock that guards its slot (send_current_notify, current_net_diff) needs
+ * nothing more; find_job hands out a counted reference because a submit
+ * outlives the lock, and the tip watcher frees jobs from under it otherwise.
+ *
  * Vardiff adjusts each connection's difficulty toward cfg.vardiff_target_spm
  * shares/minute, clamped so the share target never exceeds the network
  * target (see vardiff_maybe_retarget).
@@ -86,6 +91,20 @@ struct stratum_job {
     size_t   tx_count;
 
     uint64_t created_ms;    /* for retention ring */
+
+    /* References held. The server holds one for current_job and one for each
+     * ring slot; a submit handler holds one for as long as it is reading the
+     * job. Destroyed when the last is dropped.
+     *
+     * Without this a submit read a job the tip watcher had already freed:
+     * find_job() released its lock before returning the pointer, and
+     * retire_job() frees on every new template. On a chain where templates
+     * arrive several times a second the ring turns over in seconds, so the
+     * window was wide open — it produced blocks_found rows carrying a freed
+     * job's height and value (0, 2, 550 and rewards of 1.29M BTC on the
+     * production pool), and a garbage network_target_be can make any hash
+     * look like a solved block. */
+    _Atomic int refs;
 };
 
 stratum_job_t *stratum_job_new(
@@ -104,6 +123,9 @@ stratum_job_t *stratum_job_new(
 {
     stratum_job_t *j = calloc(1, sizeof(*j));
     if (!j) return NULL;
+    /* Set before anything can `goto fail`: the failure path releases, and a
+     * count of 0 there would decrement past zero and leak instead of free. */
+    atomic_init(&j->refs, 1);
     snprintf(j->job_id, sizeof(j->job_id), "%s", job_id ? job_id : "");
     j->version = version;
     if (prev_hash_le) memcpy(j->prev_hash_le, prev_hash_le, 32);
@@ -147,8 +169,20 @@ fail:
     return NULL;
 }
 
+/* Take a reference. Callers must hold whichever lock protects the pointer
+ * they are reading it from, so the job cannot be destroyed between the load
+ * and the increment. */
+static void stratum_job_retain(stratum_job_t *j) {
+    if (j) atomic_fetch_add_explicit(&j->refs, 1, memory_order_relaxed);
+}
+
+/* Drop a reference; destroys on the last one. Named `free` because that is
+ * what every existing caller means by it — the server's ring slot, the
+ * current-job slot, and main.c's error paths each hold exactly one. */
 void stratum_job_free(stratum_job_t *j) {
     if (!j) return;
+    if (atomic_fetch_sub_explicit(&j->refs, 1, memory_order_acq_rel) != 1) return;
+    atomic_thread_fence(memory_order_acquire);
     free(j->wc_hex);
     free(j->coinbasetxn_hex);
     free(j->merkle_branches);
@@ -403,18 +437,21 @@ static void retire_job(stratum_server_t *s, stratum_job_t *j) {
     pthread_mutex_unlock(&s->recent_lock);
 }
 
-/* Find a job by id under read lock (current) or recent ring. Returned
- * pointer is borrowed — only valid while caller holds appropriate locks
- * (current_job: rdlock; recent: recent_lock). For simplicity we return
- * a reference that is safe so long as set_job hasn't replaced it; in this
- * design submit handlers complete quickly and shares for retired jobs are
- * rare. */
+/* Find a job by id in the current slot or the recent ring.
+ *
+ * Returns a COUNTED reference: the caller owns it and must
+ * stratum_job_free() it. The retain happens under the same lock that guards
+ * the slot, so the job cannot be destroyed between finding it and claiming
+ * it. Returning a borrowed pointer here — the previous behaviour — meant a
+ * submit could still be reading a job that retire_job() had freed on the tip
+ * watcher thread, which is a use-after-free in a network-facing path. */
 static stratum_job_t *find_job(stratum_server_t *s, const char *job_id) {
     if (!job_id) return NULL;
     /* current */
     pthread_rwlock_rdlock(&s->job_lock);
     stratum_job_t *cur = s->current_job;
     if (cur && strcmp(cur->job_id, job_id) == 0) {
+        stratum_job_retain(cur);
         pthread_rwlock_unlock(&s->job_lock);
         return cur;
     }
@@ -424,6 +461,7 @@ static stratum_job_t *find_job(stratum_server_t *s, const char *job_id) {
     for (size_t i = 0; i < RECENT_JOBS; ++i) {
         if (s->recent[i] && strcmp(s->recent[i]->job_id, job_id) == 0) {
             stratum_job_t *r = s->recent[i];
+            stratum_job_retain(r);
             pthread_mutex_unlock(&s->recent_lock);
             return r;
         }
@@ -989,33 +1027,15 @@ static char *assemble_block_hex(const stratum_job_t *j,
     return out;
 }
 
-static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
-                         cJSON *params, char **buf, size_t *len) {
-    if (!c->authorized) {
-        cJSON *err = make_error(24, "unauthorized");
-        return emit_response(buf, len, id, NULL, err);
-    }
-    if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) < 5) {
-        cJSON *err = make_error(20, "bad params");
-        return emit_response(buf, len, id, NULL, err);
-    }
-    const char *worker = cJSON_GetArrayItem(params, 0)->valuestring;
-    const char *jid    = cJSON_GetArrayItem(params, 1)->valuestring;
-    const char *en2    = cJSON_GetArrayItem(params, 2)->valuestring;
-    const char *ntime  = cJSON_GetArrayItem(params, 3)->valuestring;
-    const char *nonce  = cJSON_GetArrayItem(params, 4)->valuestring;
-    (void)worker;
-
-    stratum_job_t *job = find_job(s, jid);
-    if (!job) {
-        if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "stale or unknown job");
-        }
-        cJSON *err = make_error(21, "stale or unknown job");
-        return emit_response(buf, len, id, NULL, err);
-    }
-
+/* The body of mining.submit, with `job` guaranteed live for the duration.
+ *
+ * Split from handle_submit so the reference find_job() hands back is released
+ * on exactly one path. This function has nine exits, and a release on each is
+ * a leak — or a double free — waiting for the next edit. */
+static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
+                           cJSON *params, stratum_job_t *job,
+                           const char *en2, const char *ntime,
+                           const char *nonce, char **buf, size_t *len) {
     /* Version rolling (BIP310): the optional 6th submit param carries the
      * version the miner actually hashed. Keep the job's version bits outside
      * the negotiated mask and take the miner's bits inside it; with no param
@@ -1035,7 +1055,10 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             (int32_t)(((uint32_t)job->version & ~mask) | (rolled & mask));
     }
 
-    if (dedupe_check_and_add(c, jid, en2, ntime, nonce,
+    /* job->job_id rather than the submitted string: find_job matched them
+     * exactly, and the job is the one thing here guaranteed to outlive the
+     * call. */
+    if (dedupe_check_and_add(c, job->job_id, en2, ntime, nonce,
                              (uint32_t)submit_version)) {
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
@@ -1227,6 +1250,40 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     return emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
 }
 
+static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
+                         cJSON *params, char **buf, size_t *len) {
+    if (!c->authorized) {
+        cJSON *err = make_error(24, "unauthorized");
+        return emit_response(buf, len, id, NULL, err);
+    }
+    if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) < 5) {
+        cJSON *err = make_error(20, "bad params");
+        return emit_response(buf, len, id, NULL, err);
+    }
+    const char *worker = cJSON_GetArrayItem(params, 0)->valuestring;
+    const char *jid    = cJSON_GetArrayItem(params, 1)->valuestring;
+    const char *en2    = cJSON_GetArrayItem(params, 2)->valuestring;
+    const char *ntime  = cJSON_GetArrayItem(params, 3)->valuestring;
+    const char *nonce  = cJSON_GetArrayItem(params, 4)->valuestring;
+    (void)worker;
+
+    /* Counted reference: the tip watcher may retire and free this job while
+     * the submit below is still reading it. */
+    stratum_job_t *job = find_job(s, jid);
+    if (!job) {
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "stale or unknown job");
+        }
+        cJSON *err = make_error(21, "stale or unknown job");
+        return emit_response(buf, len, id, NULL, err);
+    }
+
+    int rc = submit_with_job(s, c, id, params, job, en2, ntime, nonce, buf, len);
+    stratum_job_free(job);
+    return rc;
+}
+
 int stratum_handle_message(stratum_server_t *s, stratum_conn_t *c,
                            const char *line, char **out_buf, size_t *out_len)
 {
@@ -1275,6 +1332,16 @@ void stratum_conn_free_for_test(stratum_conn_t *c) {
     conn_clear_coinbase(c);
     pthread_mutex_destroy(&c->write_lock);
     free(c);
+}
+
+stratum_job_t *stratum_job_find_for_test(stratum_server_t *s, const char *job_id) {
+    return find_job(s, job_id);
+}
+uint32_t stratum_job_height_for_test(const stratum_job_t *j) {
+    return j ? j->height : 0;
+}
+int64_t stratum_job_value_sats_for_test(const stratum_job_t *j) {
+    return j ? j->value_sats : 0;
 }
 
 const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c) {
