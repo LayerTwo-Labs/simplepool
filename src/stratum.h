@@ -149,6 +149,15 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s);
 void            stratum_conn_free_for_test(stratum_conn_t *c);
 
 /* Test accessors — connection internals are otherwise opaque. */
+/* Rendered coinbase halves + extranonce1 for the current job, so tests can
+ * reproduce the hash a submit will produce and mine nonces to a chosen
+ * difficulty. Returns 0 on success. */
+int stratum_conn_coinbase_for_test(stratum_server_t *s, stratum_conn_t *c,
+                                   const char *job_id,
+                                   const uint8_t **cb1, size_t *cb1_len,
+                                   const uint8_t **cb2, size_t *cb2_len,
+                                   const uint8_t **en1);
+double      stratum_conn_difficulty_for_test(const stratum_conn_t *c);
 const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);
 const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c);
 int         stratum_conn_authorized_for_test(const stratum_conn_t *c);

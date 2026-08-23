@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -262,9 +263,15 @@ struct stratum_conn {
 
     /* Vardiff window state — counts accepted shares since vd_window_start_ms.
      * Every cfg.vardiff_window_sec the rate is compared to vardiff_target_spm
-     * and `difficulty` is multiplied/divided to converge on the target. */
+     * and `difficulty` is multiplied/divided to converge on the target.
+     *
+     * vd_window_min_achieved is the smallest difficulty any share in the
+     * window actually achieved (HUGE_VAL until the first share lands). It
+     * detects a miner whose own local difficulty floor sits far above what
+     * we assigned it — see vardiff_maybe_retarget. */
     uint64_t vd_window_start_ms;
     uint32_t vd_window_shares;
+    double   vd_window_min_achieved;
 
     /* The pre-retarget difficulty, honored for a grace period after a
      * set_difficulty: the miner applies the new value only on a later job,
@@ -695,6 +702,14 @@ static uint64_t diff_grace_ms(const stratum_server_t *s) {
     return g > 60000 ? g : 60000;
 }
 
+/* How many shares a window needs before its minimum achieved difficulty is
+ * treated as evidence of the miner's own floor rather than small-sample
+ * noise, how far above the assigned difficulty that floor has to sit before
+ * we act, and how close under the observed floor we then aim. */
+#define VD_FLOOR_MIN_SAMPLES 5
+#define VD_FLOOR_TRIGGER     4.0
+#define VD_FLOOR_BACKOFF     0.95
+
 /* Vardiff: every cfg.vardiff_window_sec, look at how many shares the
  * connection submitted in that window and rescale its difficulty so the
  * rate converges on cfg.vardiff_target_spm shares/minute. Called from
@@ -704,6 +719,55 @@ static uint64_t diff_grace_ms(const stratum_server_t *s) {
  *   ratio = observed_spm / target_spm
  *   if  ratio in [0.5, 2.0] → leave it (avoid jitter)
  *   else                    → new_diff = old_diff * ratio, clamped
+ *
+ * The rate loop alone cannot correct a miner that enforces its own local
+ * difficulty floor above the difficulty we assigned it. Below that floor the
+ * miner's submission rate does not depend on our difficulty at all — it
+ * submits whatever beats its own target — so the loop has no gradient to
+ * follow, and any share rate that happens to land inside the deadband is a
+ * fixed point. A miner floored at 256 while assigned 1 therefore sits at 1
+ * forever, and since a share is credited at the difficulty we assigned
+ * (share_diff = c->difficulty in handle_submit), the pool books 1/256th of
+ * the work it actually received: a hashrate estimate 256x low, and on a
+ * pps-classic pool a payout 256x short.
+ *
+ * So alongside the rate loop, watch the difficulty the shares actually
+ * achieve. Every share in the window achieving far more than we asked for is
+ * a direct measurement of that floor, with none of the rate loop's
+ * ambiguity, so raise the assigned difficulty to just under it.
+ *
+ * Aim just under the observed minimum — but only just, because the two ways
+ * of missing the floor are not symmetric. Land above it and the accounting
+ * stays exact: the miner keeps submitting everything that beats its own
+ * floor, the pool accepts the fraction that also beats the assigned
+ * difficulty, and crediting each of those at the assigned value books exactly
+ * the work performed. Land below it and every share is accepted but credited
+ * at less than it achieved, which is the under-crediting this whole check
+ * exists to remove, just at a smaller factor. Overshooting costs the miner
+ * rejected submissions; undershooting costs it money.
+ *
+ * So a small backoff, not a generous one. The observed minimum already sits
+ * above the floor — a share clearing floor D achieves D/u for u uniform on
+ * (0,1], so the smallest of n of them lands near D*(n+1)/n — which is what
+ * leaves the result hovering around the floor instead of well under it.
+ * Correcting that overshoot away would center the estimate and, by the
+ * asymmetry above, credit worse.
+ *
+ * VD_FLOOR_TRIGGER is what stops this from ratcheting. Assigning above the
+ * floor does raise the next window's observed minimum, but the next retarget
+ * only fires if that minimum still clears four times the assigned difficulty,
+ * which after a correct jump it does not. It is also what a well-matched
+ * miner has to clear on every share in a window to trip this by chance, which
+ * at five shares is about one window in thirty thousand — and costs it only a
+ * difficulty briefly set too high, which the rate loop then walks back down
+ * and which credits it correctly meanwhile.
+ *
+ * Note this deliberately does not count rejected submissions toward the
+ * window. A stale or unknown-job reject is not work at the assigned
+ * difficulty, and a low-difficulty reject is by definition work that missed
+ * it; feeding either into the rate would push the difficulty up on miners
+ * whose real problem is job latency.
+ *
  * Always emits a single mining.set_difficulty when diff changes. The
  * client picks it up for the next job notify; we don't force a re-notify
  * because handle_submit keeps accepting shares at the old difficulty for
@@ -716,6 +780,7 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
     if (c->vd_window_start_ms == 0) {
         c->vd_window_start_ms = now;
         c->vd_window_shares = 0;
+        c->vd_window_min_achieved = HUGE_VAL;
         return;
     }
     uint64_t elapsed_ms = now - c->vd_window_start_ms;
@@ -736,6 +801,33 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
          * windows. */
         if (new_diff > old_diff * 4.0) new_diff = old_diff * 4.0;
         if (new_diff < old_diff / 4.0) new_diff = old_diff / 4.0;
+    }
+
+    /* Every share this window cleared a difficulty far above the one we
+     * assigned: the miner is filtering locally at a floor of its own. Raise
+     * to just under the floor we measured. Uncapped by the 4x step above —
+     * that cap damps an extrapolation from a share rate, whereas this is a
+     * value we watched every share in the window exceed.
+     *
+     * The comparison is against old_diff, the difficulty actually in force
+     * while these shares were mined, not against the rate loop's proposal.
+     * An accepted share always achieves at least the difficulty it was
+     * accepted under, so the window minimum is always >= old_diff; testing
+     * it against a proposal the rate loop has just cut by 4x would fire on
+     * every such cut and pin the difficulty of every miner that legitimately
+     * slowed down. */
+    int from_floor = 0;
+    if (c->vd_window_shares >= VD_FLOOR_MIN_SAMPLES &&
+        isfinite(c->vd_window_min_achieved) &&
+        c->vd_window_min_achieved > old_diff * VD_FLOOR_TRIGGER) {
+        double floor_diff = c->vd_window_min_achieved * VD_FLOOR_BACKOFF;
+        if (floor_diff > new_diff) {
+            new_diff = floor_diff;
+            from_floor = 1;
+        }
+    }
+
+    if (new_diff != old_diff) {
         if (new_diff < s->cfg.vardiff_min) new_diff = s->cfg.vardiff_min;
         if (new_diff > s->cfg.vardiff_max) new_diff = s->cfg.vardiff_max;
         /* Never raise the share difficulty above the network difficulty:
@@ -749,16 +841,27 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
         if (net_diff > 0.0 && new_diff > net_diff) new_diff = net_diff;
     }
 
+    double window_floor = c->vd_window_min_achieved;
+
     /* Reset the window regardless of whether we changed diff. */
     c->vd_window_start_ms = now;
     c->vd_window_shares = 0;
+    c->vd_window_min_achieved = HUGE_VAL;
 
     if (new_diff != old_diff) {
         c->difficulty = new_diff;
         c->prev_difficulty = old_diff;
         c->diff_changed_ms = now;
-        LOG_INFO("stratum: vardiff %s: %.0f -> %.0f (%.1f spm observed, %.1f target)",
-                 c->worker_name, old_diff, new_diff, observed_spm, target_spm);
+        if (from_floor) {
+            LOG_INFO("stratum: vardiff %s: %.0f -> %.0f (miner floor: every "
+                     "share in the window cleared difficulty %.0f, %.1f spm "
+                     "observed)",
+                     c->worker_name, old_diff, new_diff, window_floor,
+                     observed_spm);
+        } else {
+            LOG_INFO("stratum: vardiff %s: %.0f -> %.0f (%.1f spm observed, %.1f target)",
+                     c->worker_name, old_diff, new_diff, observed_spm, target_spm);
+        }
         send_set_difficulty(buf, len, new_diff);
     }
 }
@@ -960,6 +1063,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     /* Arm vardiff window for this connection. */
     c->vd_window_start_ms = now_ms();
     c->vd_window_shares = 0;
+    c->vd_window_min_achieved = HUGE_VAL;
 
     /* respond true */
     emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
@@ -1255,9 +1359,16 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         s->cfg.on_share(s->cfg.ctx, c->worker_name, c->payout_address,
                         ts_now, share_diff, is_block, sent_hash_hex);
     }
-    /* Tick vardiff: count this accepted share toward the window. May emit
-     * a mining.set_difficulty notification if the window has elapsed. */
+    /* Tick vardiff: count this accepted share toward the window, and track
+     * the difficulty it actually achieved. Reading the hash as a target
+     * gives exactly that: how much harder than difficulty 1 this solution
+     * was. The running minimum is what exposes a miner filtering at a local
+     * floor above its assigned difficulty. */
     c->vd_window_shares++;
+    double achieved = target_to_diff(hash_be);
+    if (achieved < c->vd_window_min_achieved) {
+        c->vd_window_min_achieved = achieved;
+    }
     vardiff_maybe_retarget(s, c, now_ms(), buf, len);
     if (is_block && s->cfg.on_block_found) {
         int64_t fee_sats = 0;
@@ -1359,6 +1470,7 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     c->server = s;
     c->fd = -1;
     c->difficulty = s ? s->cfg.initial_diff : 1.0;
+    c->vd_window_min_achieved = HUGE_VAL;
     pthread_mutex_init(&c->write_lock, NULL);
     return c;
 }
@@ -1378,6 +1490,36 @@ uint32_t stratum_job_height_for_test(const stratum_job_t *j) {
 }
 int64_t stratum_job_value_sats_for_test(const stratum_job_t *j) {
     return j ? j->value_sats : 0;
+}
+
+/* Render (or reuse) this connection's coinbase for the current job and hand
+ * back the pieces a submit is hashed from, plus the connection's assigned
+ * difficulty. Tests use it to compute the hash a given nonce would produce,
+ * which is the only way to pick shares achieving a chosen difficulty instead
+ * of whatever the first nonce happens to land on — and simulating a miner
+ * that filters at its own difficulty floor needs exactly that. */
+int stratum_conn_coinbase_for_test(stratum_server_t *s, stratum_conn_t *c,
+                                   const char *job_id,
+                                   const uint8_t **cb1, size_t *cb1_len,
+                                   const uint8_t **cb2, size_t *cb2_len,
+                                   const uint8_t **en1) {
+    if (!s || !c || !job_id) return -1;
+    int rc = -1;
+    pthread_rwlock_rdlock(&s->job_lock);
+    stratum_job_t *j = s->current_job;
+    if (j && strcmp(j->job_id, job_id) == 0 &&
+        conn_render_coinbase(s, c, j) == 0) {
+        *cb1 = c->cb1; *cb1_len = c->cb1_len;
+        *cb2 = c->cb2; *cb2_len = c->cb2_len;
+        *en1 = c->extranonce1;
+        rc = 0;
+    }
+    pthread_rwlock_unlock(&s->job_lock);
+    return rc;
+}
+
+double stratum_conn_difficulty_for_test(const stratum_conn_t *c) {
+    return c ? c->difficulty : 0.0;
 }
 
 const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c) {

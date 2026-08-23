@@ -3,6 +3,7 @@
 #include "../src/cjson/cJSON.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,7 @@ typedef struct {
     int   rejects;
     int   blocks;
     int   last_is_block;
+    double sum_share_diff;   /* difficulty the pool credited, summed */
     char  last_worker[64];
     char  last_reason[128];
     /* Block-candidate accounting. submit_rejects makes the stubbed
@@ -39,9 +41,10 @@ typedef struct {
 static void on_share(void *ctx, const char *w, const char *addr,
                      uint64_t ts, double d,
                      int is_block, const char *blk) {
-    (void)ts; (void)d; (void)blk; (void)addr;
+    (void)ts; (void)blk; (void)addr;
     obs_t *o = ctx;
     o->shares++;
+    o->sum_share_diff += d;
     o->last_is_block = is_block;
     if (is_block) o->blocks++;
     snprintf(o->last_worker, sizeof(o->last_worker), "%s", w ? w : "");
@@ -360,6 +363,253 @@ static void test_block_wins_over_low_difficulty(void) {
     CHECK(obs.blocks == 1);
     CHECK(obs.last_is_block == 1);
     free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* ---- vardiff vs. a miner enforcing its own difficulty floor ------------ */
+
+/* Reproduce the hash a submit would produce, so a test can pick nonces that
+ * achieve a chosen difficulty. make_test_job carries no merkle branches, so
+ * the merkle root is just the coinbase txid. */
+static double achieved_diff_for_nonce(stratum_server_t *s, stratum_conn_t *c,
+                                      const char *job_id, const char *en2_hex,
+                                      uint32_t nonce) {
+    const uint8_t *cb1 = NULL, *cb2 = NULL, *en1 = NULL;
+    size_t cb1_len = 0, cb2_len = 0;
+    if (stratum_conn_coinbase_for_test(s, c, job_id, &cb1, &cb1_len,
+                                       &cb2, &cb2_len, &en1) != 0) return 0.0;
+
+    uint8_t en2[4];
+    for (int i = 0; i < 4; ++i) {
+        unsigned byte = 0;
+        sscanf(en2_hex + 2 * i, "%2x", &byte);
+        en2[i] = (uint8_t)byte;
+    }
+
+    size_t cb_len = cb1_len + 4 + 4 + cb2_len;
+    uint8_t *cb = malloc(cb_len);
+    if (!cb) return 0.0;
+    size_t off = 0;
+    memcpy(cb + off, cb1, cb1_len); off += cb1_len;
+    memcpy(cb + off, en1, 4);       off += 4;
+    memcpy(cb + off, en2, 4);       off += 4;
+    memcpy(cb + off, cb2, cb2_len);
+
+    uint8_t cb_txid_le[32], root_le[32], header[80], hash_be[32];
+    dsha256(cb, cb_len, cb_txid_le);
+    free(cb);
+    merkle_root_from_branches(cb_txid_le, NULL, 0, root_le);
+    uint8_t prev[32] = {0};
+    build_header(1, prev, root_le, 0x60000000u, 0x1d00ffffu, nonce, header);
+    hash_header(header, hash_be);
+    return target_to_diff(hash_be);
+}
+
+/* Find the next nonce at or above `from` whose share achieves at least `want`
+ * and less than `want_max`. Returns the achieved difficulty and writes the
+ * nonce, or 0.0 if none was found.
+ *
+ * The upper bound matters because extranonce1 is seeded from the clock, so
+ * every run mines a different set of hashes. Without it, how far a share
+ * overshoots its target is left to chance, and a test that depends on shares
+ * NOT overshooting by some factor becomes a rare flake. */
+static double mine_nonce(stratum_server_t *s, stratum_conn_t *c,
+                         const char *job_id, const char *en2_hex,
+                         double want, double want_max,
+                         uint32_t from, uint32_t *out_nonce) {
+    for (uint32_t n = from; n < from + 4000000u; ++n) {
+        double d = achieved_diff_for_nonce(s, c, job_id, en2_hex, n);
+        if (d >= want && d < want_max) { *out_nonce = n; return d; }
+    }
+    return 0.0;
+}
+
+static void submit_nonce(stratum_server_t *s, stratum_conn_t *c,
+                         const char *en2_hex, uint32_t nonce,
+                         char **out, size_t *olen) {
+    char msg[256];
+    snprintf(msg, sizeof msg,
+             "{\"id\":9,\"method\":\"mining.submit\","
+             "\"params\":[\"w\",\"J1\",\"%s\",\"60000000\",\"%08x\"]}",
+             en2_hex, nonce);
+    stratum_handle_message(s, c, msg, out, olen);
+}
+
+/* Pull the difficulty out of a mining.set_difficulty notification. */
+static double set_diff_value(const char *out) {
+    const char *p = out ? strstr(out, "mining.set_difficulty") : NULL;
+    if (!p) return -1.0;
+    p = strstr(p, "\"params\":[");
+    if (!p) return -1.0;
+    return atof(p + strlen("\"params\":["));
+}
+
+static void handshake(stratum_server_t *s, stratum_conn_t *c) {
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out);
+}
+
+/* A miner enforcing a local difficulty floor 1000x above what the pool
+ * assigned it. Every share it sends clears the floor, but the pool credits
+ * each one at the difficulty it assigned and the rate loop sees a share rate
+ * inside its deadband, so nothing ever moves it off vardiff_min. Vardiff must
+ * notice that every share in the window cleared far more than it asked for,
+ * and raise the difficulty to just under the floor it measured.
+ *
+ * Scaled down from the difficulties this was found at in production (assigned
+ * 1, floor 256): difficulty D takes D * 2^32 hashes to mine, so a real 256
+ * would be 2^40 hashes per share. The logic is all ratios, so 1e-9 against a
+ * 1e-6 floor exercises exactly the same path for ~4300 hashes a share. */
+static void test_vardiff_tracks_miner_local_floor(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e-9,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 250.0,
+                           .vardiff_min = 1e-9,
+                           .vardiff_max = 1e15,
+                           .vardiff_window_sec = 1,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    /* All-zero network target: nothing is ever a block, so acceptance comes
+     * only from the share-difficulty path. */
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+    CHECK(stratum_conn_difficulty_for_test(c) == 1e-9);
+
+    /* Mine six shares that each clear the miner's own floor of 1e-6. */
+    const int N = 6;
+    uint32_t nonce[6];
+    double   achieved[6];
+    double   floor_seen = 1e300;
+    uint32_t from = 1;
+    int mined = 1;
+    for (int i = 0; i < N; ++i) {
+        achieved[i] = mine_nonce(s, c, "J1", "deadbeef", 1e-6, HUGE_VAL,
+                                 from, &nonce[i]);
+        if (achieved[i] <= 0.0) { mined = 0; break; }
+        if (achieved[i] < floor_seen) floor_seen = achieved[i];
+        from = nonce[i] + 1;
+    }
+    CHECK(mined == 1);
+    if (!mined) { stratum_conn_free_for_test(c); stratum_server_free(s); return; }
+
+    char *out = NULL; size_t olen = 0;
+    /* First five land inside the window: counted, no retarget yet. */
+    for (int i = 0; i < N - 1; ++i) {
+        submit_nonce(s, c, "deadbeef", nonce[i], &out, &olen);
+        CHECK(set_diff_value(out) < 0.0);
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.shares == N - 1);
+    CHECK(obs.rejects == 0);
+    /* Every one was credited at the assigned 1e-9, not the >=1e-6 it actually
+     * achieved: the pool books a thousandth of the work it received, which is
+     * the under-crediting this fix is about. */
+    CHECK(obs.sum_share_diff > 0.999e-9 * (N - 1) &&
+          obs.sum_share_diff < 1.001e-9 * (N - 1));
+    CHECK(floor_seen > 500.0 * (obs.sum_share_diff / (N - 1)));
+
+    sleep_ms(1100);
+    submit_nonce(s, c, "deadbeef", nonce[N - 1], &out, &olen);
+    CHECK(obs.shares == N);
+    CHECK(obs.rejects == 0);
+
+    /* Difficulty must now sit just under the floor we measured. */
+    double got = set_diff_value(out);
+    double want = floor_seen * 0.95;
+    CHECK(got > 0.0);
+    CHECK(got > want * 0.999 && got < want * 1.001);
+    /* Under the smallest difficulty actually observed, so the retarget never
+     * lands somewhere no share in the window would have reached. */
+    CHECK(got < floor_seen);
+    CHECK(got > 1e-7);                /* and off vardiff_min for good */
+    double held = stratum_conn_difficulty_for_test(c);
+    CHECK(held > got * 0.999 && held < got * 1.001);
+    free(out);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* The floor detector must not block a legitimate downward retarget. A miner
+ * whose shares match its assigned difficulty still achieves slightly more
+ * than it on every accepted share, so testing the window minimum against the
+ * rate loop's already-cut proposal would fire on every 4x cut and pin the
+ * difficulty of every miner that simply slowed down. */
+static void test_vardiff_still_lowers_for_a_matched_miner(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e-6,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 6000.0,
+                           .vardiff_min = 1e-12,
+                           .vardiff_max = 1e15,
+                           .vardiff_window_sec = 1,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+    CHECK(stratum_conn_difficulty_for_test(c) == 1e-6);
+
+    /* A matched miner: every share clears the difficulty it was assigned and
+     * overshoots by less than 2x, so the window minimum is nowhere near the
+     * 4x the floor check triggers on. Bounding the overshoot is what keeps
+     * that true on every run rather than almost every run. */
+    const int N = 6;
+    uint32_t nonce[6];
+    uint32_t from = 1;
+    int mined = 1;
+    for (int i = 0; i < N; ++i) {
+        double d = mine_nonce(s, c, "J1", "deadbeef", 1e-6, 2e-6,
+                              from, &nonce[i]);
+        if (d <= 0.0) { mined = 0; break; }
+        from = nonce[i] + 1;
+    }
+    CHECK(mined == 1);
+    if (!mined) { stratum_conn_free_for_test(c); stratum_server_free(s); return; }
+
+    char *out = NULL; size_t olen = 0;
+    for (int i = 0; i < N - 1; ++i) {
+        submit_nonce(s, c, "deadbeef", nonce[i], &out, &olen);
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.shares == N - 1);
+    CHECK(obs.rejects == 0);
+
+    /* Six shares against a 6000/min target is far under rate: the retarget
+     * cuts by the 4x step cap, to a quarter of 1e-6. Before the floor check
+     * was made to compare against the difficulty actually in force, the
+     * window minimum (always at least the assigned difficulty, and here about
+     * 1.17e-6) beat this proposal times four, and pinned the difficulty
+     * instead of letting it fall. */
+    sleep_ms(1100);
+    submit_nonce(s, c, "deadbeef", nonce[N - 1], &out, &olen);
+    CHECK(obs.rejects == 0);
+    double got = set_diff_value(out);
+    CHECK(got > 2.49e-7 && got < 2.51e-7);
+    free(out);
+
     stratum_conn_free_for_test(c);
     stratum_server_free(s);
 }
@@ -894,6 +1144,8 @@ int main(void) {
     test_authorize_rejects_non_address();
     test_authorize_address_with_label();
     test_block_wins_over_low_difficulty();
+    test_vardiff_tracks_miner_local_floor();
+    test_vardiff_still_lowers_for_a_matched_miner();
     test_vardiff_clamped_to_network_diff();
     test_vardiff_grace_accepts_old_diff_shares();
     test_socket_setup_applies_rcvtimeo();
