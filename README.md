@@ -429,6 +429,27 @@ recorded in `blocks_found` with `height`, `hash`, `finder_id`,
 (paid to `operator_address`). The matching `shares` row has
 `is_block = 1` and the block hash.
 
+That row is a block **candidate**, and `status` says which it turned out
+to be. `submitblock` can refuse it (`rejected`, with the node's reason in
+`submit_error`); an accepted one is `pending` until the block is verified
+to be in the chain (`confirmed`), and a reorg moves it to `orphaned`.
+**Only `confirmed` counts as a block or as pool revenue** — every count and
+every sum of `reward_sats` filters on it, because a refused or reorged
+candidate pays nothing. On a low-difficulty chain most candidates are one
+of the latter, which is normal; the dashboard reports the orphan rate
+rather than hiding it.
+
+Verification prefers `getblockhash`. Backends that do not serve it — the
+CUSF enforcer answers only `getblocktemplate` and `submitblock` — are
+handled by comparing against the chain of tips the pool has already
+observed through `templates`, and `checked_via` records which of the two
+answered. A candidate neither can speak to stays `pending` and counts as
+nothing.
+
+`shares.is_block` keeps its own meaning: the hash met the network target.
+That is what the miner did, and it stays true whatever the chain later
+decided.
+
 ## Run against local regtest
 
 The repo ships a best-effort integration test that exercises the proxy
