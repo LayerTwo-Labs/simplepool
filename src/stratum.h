@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 typedef struct stratum_job stratum_job_t;
@@ -46,15 +47,30 @@ typedef void (*share_observer_fn)(void *ctx, const char *worker_name,
                                   int is_block, const char *block_hash_or_null);
 typedef void (*reject_observer_fn)(void *ctx, const char *worker_name,
                                    uint64_t ts_ms, const char *reason);
-typedef void (*block_submit_fn)(void *ctx, const char *block_hex);
-/* Fires once per solved block, after the share has been recorded. Used by
- * main.c to insert into blocks_found with reward/fee/finder address. */
+/* Submits the assembled block upstream. Returns 0 when the node accepted it,
+ * non-zero when it refused, filling errbuf with the node's reason.
+ *
+ * The result is not advisory. A share meeting network difficulty makes a
+ * *candidate*, not a block: submitblock refuses stale, duplicate and
+ * high-hash candidates routinely, and on a low-difficulty chain that is the
+ * common case. Recording one as a block credits the pool with revenue that
+ * never existed. */
+typedef int (*block_submit_fn)(void *ctx, const char *block_hex,
+                               char *errbuf, size_t errlen);
+/* Fires once per block candidate, after the share has been recorded. Used by
+ * main.c to insert into blocks_found with reward/fee/finder address.
+ *
+ * `accepted` is whether on_block's submission was taken by the node, and
+ * `submit_error` the reason when it was not. A candidate the node refused is
+ * still reported here — it is recorded as 'rejected' rather than dropped,
+ * because a silent reject is how phantom rewards went unnoticed. */
 typedef void (*block_found_fn)(void *ctx,
                                const char *worker_name,
                                const char *finder_address,
                                uint64_t ts_ms, uint32_t height,
                                const char *block_hash,
-                               int64_t reward_sats, int64_t fee_sats);
+                               int64_t reward_sats, int64_t fee_sats,
+                               int accepted, const char *submit_error);
 
 typedef struct {
     char   bind_addr[64];
@@ -80,6 +96,17 @@ typedef struct {
      */
     int     pps_enabled;
     char    pool_btc_address[128];   /* pps-classic: coinbase spendable output */
+
+    /* Points at the proxy's PPS accrual gate — non-zero while network
+     * difficulty is below the configured floor and nothing is being credited.
+     * NULL when the caller has no gate.
+     *
+     * The server reads it so it can turn miners away instead of accepting
+     * work it will not pay for. A miner whose shares are accepted but never
+     * credited is mining for free without being told, which is worse than
+     * being refused. */
+    const _Atomic int *pps_gate;
+    int     pps_refuse_shares_below_min;
 
     /* Vardiff (see config.h for prose). 0 disables and pins to initial_diff. */
     int    vardiff_enabled;
@@ -132,6 +159,14 @@ int         stratum_conn_subscribed_for_test(const stratum_conn_t *c);
  * SO_RCVTIMEO (poll interval derived from idle_timeout_sec). Exposed for
  * tests. */
 int stratum_socket_setup_for_test(int fd, int idle_timeout_sec);
+
+/* Test-only: look a job up exactly as the submit path does, returning a
+ * COUNTED reference the caller must stratum_job_free(). Exists so a test can
+ * pin the property that makes the submit path safe — that a job stays valid
+ * for a holder even after the tip watcher has retired and freed it. */
+stratum_job_t *stratum_job_find_for_test(stratum_server_t *s, const char *job_id);
+uint32_t stratum_job_height_for_test(const stratum_job_t *j);
+int64_t  stratum_job_value_sats_for_test(const stratum_job_t *j);
 
 /* Process one JSON-RPC line. Appends one or more newline-delimited JSON
  * messages to *out_buf (caller-owned, will be realloc'd). Returns 0 on

@@ -58,6 +58,9 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     snprintf(cfg->pool_mode, sizeof cfg->pool_mode, "%s", "solo");
     cfg->pool_btc_address[0] = '\0';
     cfg->pps_sats_per_diff = 0.0;
+    cfg->pps_min_network_difficulty = 0.0;
+    cfg->block_interval_sec = 600;
+    cfg->pps_refuse_shares_below_min = 1;
 }
 
 static char *strtrim(char *s) {
@@ -159,6 +162,9 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "pool_mode")                 == 0) copy_str(cfg->pool_mode, sizeof cfg->pool_mode, v);
         else if (strcmp(k, "pool_btc_address")          == 0) copy_str(cfg->pool_btc_address, sizeof cfg->pool_btc_address, v);
         else if (strcmp(k, "pps_sats_per_diff")         == 0) cfg->pps_sats_per_diff = atof(v);
+        else if (strcmp(k, "pps_min_network_difficulty") == 0) cfg->pps_min_network_difficulty = atof(v);
+        else if (strcmp(k, "block_interval_sec")        == 0) cfg->block_interval_sec = atoi(v);
+        else if (strcmp(k, "pps_refuse_shares_below_min") == 0) cfg->pps_refuse_shares_below_min = atoi(v);
         /* Retired with pool_mode=pps (the drivechain-in-coinbase build).
          * Accepted and ignored so an existing proxy.conf keeps loading;
          * the Thunder reserve address now lives only on the dashboard,
@@ -223,6 +229,17 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                     "config: 'pool_btc_address' is required when pool_mode=pps-classic");
             return -9;
         }
+        if (cfg->pps_min_network_difficulty < 0.0) {
+            set_err(errbuf, errlen,
+                    "config: 'pps_min_network_difficulty' cannot be negative "
+                    "(0 disables the check)");
+            return -10;
+        }
+    }
+    if (cfg->block_interval_sec <= 0) {
+        set_err(errbuf, errlen,
+                "config: 'block_interval_sec' must be > 0 (600 for Bitcoin)");
+        return -11;
     }
     return 0;
 }

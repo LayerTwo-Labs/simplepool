@@ -429,6 +429,54 @@ recorded in `blocks_found` with `height`, `hash`, `finder_id`,
 (paid to `operator_address`). The matching `shares` row has
 `is_block = 1` and the block hash.
 
+That row is a block **candidate**, and `status` says which it turned out
+to be. `submitblock` can refuse it (`rejected`, with the node's reason in
+`submit_error`); an accepted one is `pending` until the block is verified
+to be in the chain (`confirmed`), and a reorg moves it to `orphaned`.
+**Only `confirmed` counts as a block or as pool revenue** — every count and
+every sum of `reward_sats` filters on it, because a refused or reorged
+candidate pays nothing. On a low-difficulty chain most candidates are one
+of the latter, which is normal; the dashboard reports the orphan rate
+rather than hiding it.
+
+Verification prefers `getblockhash`. Backends that do not serve it — the
+CUSF enforcer answers only `getblocktemplate` and `submitblock` — are
+handled by comparing against the chain of tips the pool has already
+observed through `templates`, and `checked_via` records which of the two
+answered. A candidate neither can speak to stays `pending` and counts as
+nothing.
+
+`shares.is_block` keeps its own meaning: the hash met the network target.
+That is what the miner did, and it stays true whatever the chain later
+decided.
+
+### PPS is only safe once difficulty has caught up
+
+`pool_mode = pps-classic` derives the rate from each template as
+`coinbasevalue / network_difficulty`, which is a share's expected value. That
+holds only while difficulty is calibrated to hashrate. On a new chain it is
+not — difficulty starts at 1 and climbs — and until it catches up the pool
+produces solutions far faster than the chain accepts blocks, so the formula
+prices every share as though it were worth a whole block.
+
+Set `pps_min_network_difficulty` to the difficulty at which your pool alone
+would find one block per block interval:
+
+```
+pps_min_network_difficulty = hashrate_H/s * block_interval_sec / 2^32
+```
+
+A 40 TH/s pool on a 600-second chain needs roughly **5,600,000**. Below that
+the proxy credits nothing, refuses new miners by default rather than taking
+work it will not pay for, and resumes on its own once the chain retargets. A
+separate automatic ceiling caps accrual at what the chain can actually mint,
+but it needs a minute of hashrate history and so cannot cover a restart — the
+floor is what does.
+
+Left at 0 the check is off, which is only safe on mainnet, testnet or signet.
+A pool that skipped it on a forknet accrued 15,561,471 BTC of liability in
+under four hours against 943.60 BTC actually mined.
+
 ## Run against local regtest
 
 The repo ships a best-effort integration test that exercises the proxy

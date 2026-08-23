@@ -82,6 +82,29 @@ double pps_rate_from_template(int64_t value_sats, double net_diff, int fee_bps) 
     return net > 0.0 ? net : 0.0;
 }
 
+double pps_min_safe_difficulty(double diff_per_sec, int block_interval_sec) {
+    if (!isfinite(diff_per_sec) || diff_per_sec <= 0.0) return 0.0;
+    if (block_interval_sec <= 0) return 0.0;
+    double d = diff_per_sec * (double)block_interval_sec;
+    return isfinite(d) ? d : 0.0;
+}
+
+double pps_rate_apply_issuance_ceiling(double rate, int64_t value_sats,
+                                       double diff_per_sec,
+                                       int block_interval_sec) {
+    if (!isfinite(rate) || rate <= 0.0) return rate;
+    if (value_sats <= 0) return rate;
+    if (!isfinite(diff_per_sec) || diff_per_sec <= 0.0) return rate;
+    if (block_interval_sec <= 0) return rate;
+    /* Sats the chain can mint per second, divided by the difficulty the pool
+     * presents per second: the most any single unit of difficulty can be
+     * worth without the pool promising more than exists. */
+    double issuance_per_sec = (double)value_sats / (double)block_interval_sec;
+    double ceiling = issuance_per_sec / diff_per_sec;
+    if (!isfinite(ceiling) || ceiling < 0.0) return rate;
+    return rate < ceiling ? rate : ceiling;
+}
+
 void worker_diff_to_target(double diff, uint8_t target_be[32]) {
     memset(target_be, 0, 32);
     if (!isfinite(diff) || diff <= 0.0) {
@@ -90,10 +113,25 @@ void worker_diff_to_target(double diff, uint8_t target_be[32]) {
     }
     u128 hi = be16_to_u128(DIFF1_TARGET);
     double scaled = (double)hi / diff;
-    /* Clamp to [0, 2^128 - 1]. */
-    const double max_u128 = ldexp(1.0, 128); /* 2^128 */
     if (scaled < 0.0) scaled = 0.0;
-    if (scaled >= max_u128) scaled = max_u128 - 1.0;
+    /* Saturate rather than convert.
+     *
+     * The previous clamp was `if (scaled >= 2^128) scaled = 2^128 - 1.0`,
+     * which does nothing: a double has 53 bits of mantissa, so near 2^128 the
+     * spacing between representable values is 2^75 and 2^128 - 1 rounds
+     * straight back to 2^128. The conversion that followed was then out of
+     * range for u128 — undefined behaviour, and in practice a target of
+     * either zero (every share rejected as low difficulty) or all-ones
+     * (every share accepted), decided by the compiler.
+     *
+     * Reachable whenever the worker difficulty is below ~2.3e-10, which a
+     * configured initial_diff or vardiff_min can be. Write the easiest
+     * possible target directly instead, which is what a difficulty that small
+     * means and what the diff <= 0 branch above already does. */
+    if (!(scaled < ldexp(1.0, 128))) {
+        memset(target_be, 0xff, 32);
+        return;
+    }
     u128 hi_scaled = (u128)scaled;
     u128_to_be16(hi_scaled, target_be);
 }

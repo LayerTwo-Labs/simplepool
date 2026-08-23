@@ -46,7 +46,7 @@
                 <div><label>Accepted</label><strong><%= fmtN(ov.accepted) %></strong></div>
                 <div><label>Rejected</label><strong><%= fmtN(ov.rejected) %></strong></div>
                 <div><label>Reject rate</label><strong><%= ov.reject_rate_pct.toFixed(2) %>%</strong></div>
-                <div><label>Blocks found</label><strong><%= fmtN(ov.blocks) %></strong></div>
+                <div><label>Blocks found</label><strong title="confirmed to be in the chain"><%= fmtN(ov.blocks) %></strong></div>
                 <div><label>Best share (24h)</label><strong><%= fmtN(Math.round(ov.best_share_24h)) %></strong></div>
             </div>
         </section>
@@ -56,10 +56,19 @@
             <div class="grid">
                 <div><label>Shares</label><strong><%= fmtN(ov.shares_lifetime) %></strong></div>
                 <div><label>Rejects</label><strong><%= fmtN(ov.rejects_lifetime) %></strong></div>
-                <div><label>Blocks</label><strong><%= fmtN(ov.blocks_lifetime) %></strong></div>
+                <div><label>Blocks</label><strong title="confirmed to be in the chain"><%= fmtN(ov.blocks_lifetime) %></strong></div>
                 <div><label>Best share ever</label><strong><%= fmtN(Math.round(ov.best_share_lifetime)) %></strong></div>
                 <div><label>Tracking since</label><strong title="<%= fmtTs(ov.oldest_share_ts) %>"><%= ago(ov.oldest_share_ts) %></strong></div>
             </div>
+            <% if (ov.blocks_orphaned || ov.blocks_rejected || ov.blocks_pending) { %>
+            <p class="muted small">
+                Candidates that are not blocks:
+                <%= fmtN(ov.blocks_orphaned) %> orphaned,
+                <%= fmtN(ov.blocks_rejected) %> rejected by the node,
+                <%= fmtN(ov.blocks_pending) %> not yet verified.
+                Only confirmed blocks are counted above, and only they pay the pool.
+            </p>
+            <% } %>
         </section>
 
         <section class="card">
@@ -123,13 +132,14 @@
                 <p class="muted">No blocks found.</p>
             <% } else { %>
             <table class="lb">
-                <thead><tr><th>Height</th><th>Finder</th><th>Reward</th><th>Hash</th><th>When</th></tr></thead>
+                <thead><tr><th>Height</th><th>Finder</th><th>Reward</th><th>Status</th><th>Hash</th><th>When</th></tr></thead>
                 <tbody>
                 <% blocks.forEach(b => { %>
                     <tr>
                         <td><%= fmtN(b.height) %></td>
                         <td><% if (b.finder) { %><a href="/worker/<%= encodeURIComponent(b.finder) %>"><%= b.finder %></a><% } else { %>—<% } %></td>
-                        <td><%= fmtBtc(b.reward_sats) %></td>
+                        <td><%= b.status === 'confirmed' ? fmtBtc(b.reward_sats) : '—' %></td>
+                        <td><%- blockStatus(b) %></td>
                         <td class="mono small"><%= b.hash %></td>
                         <td title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
                     </tr>

@@ -26,6 +26,14 @@ typedef struct {
     int   last_is_block;
     char  last_worker[64];
     char  last_reason[128];
+    /* Block-candidate accounting. submit_rejects makes the stubbed
+     * submitblock refuse, which is the common case on a low-difficulty
+     * chain and the one that used to be recorded as a block anyway. */
+    int   submit_rejects;
+    int   submits;
+    int   found_calls;
+    int   last_accepted;
+    char  last_submit_error[128];
 } obs_t;
 
 static void on_share(void *ctx, const char *w, const char *addr,
@@ -44,7 +52,29 @@ static void on_reject(void *ctx, const char *w, uint64_t ts, const char *r) {
     o->rejects++;
     snprintf(o->last_reason, sizeof(o->last_reason), "%s", r ? r : "");
 }
-static void on_block(void *ctx, const char *hex) { (void)ctx; (void)hex; }
+static int on_block(void *ctx, const char *hex, char *errbuf, size_t errlen) {
+    (void)hex;
+    obs_t *o = ctx;
+    if (!o) return 0;
+    o->submits++;
+    if (o->submit_rejects) {
+        snprintf(errbuf, errlen, "inconclusive");
+        return -30;
+    }
+    return 0;
+}
+static void on_block_found(void *ctx, const char *w, const char *addr,
+                           uint64_t ts, uint32_t height, const char *hash,
+                           int64_t reward, int64_t fee,
+                           int accepted, const char *submit_error) {
+    (void)w; (void)addr; (void)ts; (void)height; (void)hash;
+    (void)reward; (void)fee;
+    obs_t *o = ctx;
+    o->found_calls++;
+    o->last_accepted = accepted;
+    snprintf(o->last_submit_error, sizeof(o->last_submit_error), "%s",
+             submit_error ? submit_error : "");
+}
 
 /* Helper: parse the first line of an output buffer. Mutates buf (NUL terminator). */
 static cJSON *parse_first_line(char *buf) {
@@ -582,6 +612,280 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     stratum_server_free(s);
 }
 
+/* A candidate the node refuses is reported as not accepted, with the node's
+ * reason. Before this the submitblock result was discarded and the candidate
+ * was recorded as a found block regardless — on a low-difficulty chain that
+ * is nearly every candidate, and every one of them credited the pool with a
+ * reward that never existed. */
+static void test_rejected_candidate_is_not_a_block(void) {
+    obs_t obs = {0};
+    obs.submit_rejects = 1;
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e12,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block,
+                           .on_block_found = on_block_found };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    int rc = stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(obs.submits == 1);          /* it was offered to the node */
+    CHECK(obs.found_calls == 1);      /* and still reported, not dropped */
+    CHECK(obs.last_accepted == 0);    /* but not as an accepted block */
+    CHECK(strstr(obs.last_submit_error, "inconclusive") != NULL);
+    /* The share itself is untouched: the miner did the work, and in
+     * pps-classic absorbing this variance is exactly what the pool is for. */
+    CHECK(obs.rejects == 0);
+    CHECK(obs.shares == 1);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* The accepting path still reports accepted, with no error text — a
+ * candidate the node took is 'pending', never 'rejected'. */
+static void test_accepted_candidate_reports_accepted(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e12,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block,
+                           .on_block_found = on_block_found };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(obs.found_calls == 1);
+    CHECK(obs.last_accepted == 1);
+    CHECK(obs.last_submit_error[0] == '\0');
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* A job found by a submit must stay valid for that submit, even though the
+ * tip watcher retires and frees jobs on another thread at every new template.
+ *
+ * This is not hypothetical. find_job used to hand back a borrowed pointer
+ * after releasing its lock, and the production pps pool recorded blocks_found
+ * rows carrying a freed job's fields — heights 0, 2 and 550 on a chain mining
+ * at 963,000+, and two rewards of 1.29 million BTC. A freed job's
+ * network_target_be can also make an ordinary hash look like a solved block,
+ * which is how those rows came to exist at all.
+ *
+ * Ring turnover is the trigger: RECENT_JOBS is 8, and on a chain serving
+ * several templates a second the ring recycles in seconds, so a submit only
+ * has to be slightly slow to be reading freed memory. Here it is forced
+ * deterministically — under ASan this aborts without the reference count. */
+static void test_job_survives_retirement_while_held(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("HELD", net));
+
+    /* What handle_submit does: take the job, then do slow work with it. */
+    stratum_job_t *held = stratum_job_find_for_test(s, "HELD");
+    CHECK(held != NULL);
+    CHECK(stratum_job_height_for_test(held) == 800000);
+    CHECK(stratum_job_value_sats_for_test(held) == 5000000000LL);
+
+    /* Meanwhile the tip watcher churns through enough templates to push HELD
+     * out of the retention ring entirely and free it. */
+    for (int i = 0; i < 24; ++i) {
+        char jid[16];
+        snprintf(jid, sizeof jid, "J%d", i);
+        stratum_server_set_job(s, make_test_job(jid, net));
+    }
+
+    /* It is gone from the lookup — correct, a later submit for it is stale. */
+    stratum_job_t *gone = stratum_job_find_for_test(s, "HELD");
+    CHECK(gone == NULL);
+
+    /* But the holder's copy is still intact, not recycled memory. These are
+     * exactly the two fields that reached blocks_found as garbage. */
+    CHECK(stratum_job_height_for_test(held) == 800000);
+    CHECK(stratum_job_value_sats_for_test(held) == 5000000000LL);
+
+    stratum_job_free(held);
+    stratum_server_free(s);
+}
+
+/* The reference must not leak either: once the holder lets go, the job is
+ * destroyed rather than pinned for the process's lifetime. Run under ASan or
+ * valgrind, a leak here is the failure. */
+static void test_held_job_is_freed_on_release(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("A", net));
+    stratum_job_t *held = stratum_job_find_for_test(s, "A");
+    CHECK(held != NULL);
+    stratum_job_free(held);        /* holder done; server still owns one */
+    stratum_server_free(s);        /* server drops the last one */
+}
+
+/* While accrual is suspended the pool must turn miners away, not bank their
+ * work. A miner whose shares are accepted but never credited is mining for
+ * free without being told — worse than being refused, because they cannot
+ * tell it is happening. */
+static void test_gated_pps_refuses_authorize_and_submits(void) {
+    obs_t obs = {0};
+    _Atomic int gate = 1;
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .pps_enabled = 1, .pps_gate = &gate,
+                          .pps_refuse_shares_below_min = 1,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    snprintf(cfg.pool_btc_address, sizeof cfg.pool_btc_address, "%s", TEST_ADDR);
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+
+    /* Authorize is refused, and the reason says what to do about it. */
+    int rc = stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"2sYBNmMJMMZHi6xasMcCPgNiYJ1z\",\"x\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(strstr(out, "not crediting shares") != NULL);
+    CHECK(stratum_conn_authorized_for_test(c) == 0);
+    free(out); out=NULL; olen=0;
+
+    /* A miner that got in before the gate closed is stopped too. */
+    gate = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.authorize\","
+         "\"params\":[\"2sYBNmMJMMZHi6xasMcCPgNiYJ1z\",\"x\"]}",
+        &out, &olen);
+    CHECK(stratum_conn_authorized_for_test(c) == 1);
+    free(out); out=NULL; olen=0;
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J1", net));
+    gate = 1;
+    stratum_handle_message(s, c,
+        "{\"id\":4,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(strstr(out, "not crediting shares") != NULL);
+    CHECK(obs.shares == 0);            /* nothing banked */
+    free(out); out=NULL; olen=0;
+
+    /* And once the chain retargets, work is taken again. */
+    gate = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":5,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000002\"]}",
+        &out, &olen);
+    CHECK(obs.shares == 1);
+    free(out);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* An operator who has deliberately turned the refusal off keeps taking work. */
+static void test_gate_can_be_disabled(void) {
+    obs_t obs = {0};
+    _Atomic int gate = 1;
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .pps_enabled = 1, .pps_gate = &gate,
+                          .pps_refuse_shares_below_min = 0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    snprintf(cfg.pool_btc_address, sizeof cfg.pool_btc_address, "%s", TEST_ADDR);
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"2sYBNmMJMMZHi6xasMcCPgNiYJ1z\",\"x\"]}",
+        &out, &olen);
+    CHECK(stratum_conn_authorized_for_test(c) == 1);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* Solo has no accrual to suspend, so the gate must never touch it. */
+static void test_solo_is_never_gated(void) {
+    obs_t obs = {0};
+    _Atomic int gate = 1;
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .pps_enabled = 0, .pps_gate = &gate,
+                          .pps_refuse_shares_below_min = 1,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}", &out, &olen);
+    CHECK(stratum_conn_authorized_for_test(c) == 1);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -596,6 +900,13 @@ int main(void) {
     test_socket_setup_disabled();
     test_extranonce1_unique_across_connections();
     test_dedupe_same_hash_across_job_ids();
+    test_rejected_candidate_is_not_a_block();
+    test_accepted_candidate_reports_accepted();
+    test_job_survives_retirement_while_held();
+    test_held_job_is_freed_on_release();
+    test_gated_pps_refuses_authorize_and_submits();
+    test_gate_can_be_disabled();
+    test_solo_is_never_gated();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

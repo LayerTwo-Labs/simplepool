@@ -234,13 +234,23 @@ PAYOUT_DB_PATH=../data/shares.db node audit.js --json    # for cron / slack
 ```
 
 For each worker over the window:
-- **expected_blocks** = `pool_blocks * (worker_accrued / pool_accrued)`
-- **actual_blocks**   = blocks they actually found
-- **z**               = `(expected - actual) / sqrt(expected)`
+- **expected_solutions** = `pool_solutions * (worker_accrued / pool_accrued)`
+- **actual_solutions**   = network-target solutions they actually submitted
+- **z**                  = `(expected - actual) / sqrt(expected)`
 
 A worker is flagged `suspicious` when:
-- `expected_blocks >= 5` (below this, randomness dominates), AND
+- `expected_solutions >= 5` (below this, randomness dominates), AND
 - `z >= 3` (≈1-in-740 false-positive rate under honest mining)
+
+**Solutions, not blocks.** These counts come from `shares.is_block` and are
+deliberately *not* filtered to confirmed blocks the way the dashboard's block
+counts are. The question here is whether a miner is quietly discarding the
+submission that solves a block, so what matters is what they submitted — a
+miner whose solution the node refused, or whose block was reorged out, has
+withheld nothing. Filtering on confirmed would flag honest miners on exactly
+the low-difficulty chains where orphans are routine. Expect this number to
+exceed the dashboard's "Blocks found"; both are correct, and they answer
+different questions.
 
 Run on a cron and pipe the `--json` output to your alert sink of choice.
 The audit reads the DB only — safe to run while the proxy is writing.

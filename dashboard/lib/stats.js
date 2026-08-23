@@ -12,11 +12,24 @@ const EMPTY_OVERVIEW = {
     accepted: 0,
     rejected: 0,
     blocks: 0,
+    blocks_pending: 0,
+    blocks_orphaned: 0,
+    blocks_rejected: 0,
     workers_active: 0,
     hashrate: 0,
     window_sec: 86400,
     db_ready: false,
 };
+
+/* A row in blocks_found is a block CANDIDATE. Only status='confirmed' is a
+ * block the pool actually mined and can be paid for, so every count and every
+ * sum of reward_sats filters on it. Counting all of them is what made a pool
+ * that had mined nothing look like it had mined thousands of blocks.
+ *
+ * The other statuses are reported alongside rather than hidden: a pool whose
+ * candidates are nearly all orphaned has a real operational problem, and
+ * hiding the rows is what kept it invisible. */
+const CONFIRMED = "status = 'confirmed'";
 
 function db(handle) {
     return handle.get();
@@ -41,7 +54,9 @@ export function overview(handle, windowSec = 86400) {
         'SELECT COUNT(*) AS n, COALESCE(SUM(difficulty),0) AS sum_diff, COALESCE(MAX(difficulty),0) AS best FROM shares WHERE ts >= ?'
     ).get(since);
     const rej = d.prepare('SELECT COUNT(*) AS n FROM rejects WHERE ts >= ?').get(since);
-    const blk = d.prepare('SELECT COUNT(*) AS n FROM blocks_found WHERE ts >= ?').get(since);
+    const blk = d.prepare(
+        `SELECT COUNT(*) AS n FROM blocks_found WHERE ts >= ? AND ${CONFIRMED}`
+    ).get(since);
     const wk = d.prepare(
         'SELECT COUNT(DISTINCT worker_id) AS n FROM shares WHERE ts >= ?'
     ).get(since);
@@ -50,7 +65,15 @@ export function overview(handle, windowSec = 86400) {
     ).get();
     const last = d.prepare('SELECT MAX(ts) AS ts FROM shares').get();
     const totalRej = d.prepare('SELECT COUNT(*) AS n FROM rejects').get();
-    const totalBlk = d.prepare('SELECT COUNT(*) AS n FROM blocks_found').get();
+    const totalBlk = d.prepare(
+        `SELECT COUNT(*) AS n FROM blocks_found WHERE ${CONFIRMED}`
+    ).get();
+    const candidates = d.prepare(`
+        SELECT COUNT(*) FILTER (WHERE status = 'pending')  AS pending,
+               COUNT(*) FILTER (WHERE status = 'orphaned') AS orphaned,
+               COUNT(*) FILTER (WHERE status = 'rejected') AS rejected
+          FROM blocks_found
+    `).get();
 
     const total24h = acc.n + rej.n;
     const rejectRate24h = total24h > 0 ? (rej.n / total24h) * 100 : 0;
@@ -59,6 +82,9 @@ export function overview(handle, windowSec = 86400) {
         accepted: acc.n,
         rejected: rej.n,
         blocks: blk.n,
+        blocks_pending:  Number(candidates?.pending  || 0),
+        blocks_orphaned: Number(candidates?.orphaned || 0),
+        blocks_rejected: Number(candidates?.rejected || 0),
         workers_active: wk.n,
         hashrate: (acc.sum_diff * TWO_32) / windowSec,   // 24h estimate
         hashrate_1h: hashrateOver(d, nowSec, 3600),
@@ -299,7 +325,8 @@ export function worker(handle, name, windowSec = 86400) {
 
     /* Blocks found BY this worker specifically. */
     const workerBlocks = d.prepare(`
-        SELECT id, ts, height, hash, reward_sats, fee_sats
+        SELECT id, ts, height, hash, reward_sats, fee_sats,
+               status, confirmations, checked_via
         FROM   blocks_found
         WHERE  finder_id = ?
         ORDER  BY ts DESC, id DESC
@@ -308,6 +335,9 @@ export function worker(handle, name, windowSec = 86400) {
         id: r.id, ts: Number(r.ts), height: Number(r.height), hash: r.hash,
         reward_sats: Number(r.reward_sats || 0),
         fee_sats:    Number(r.fee_sats || 0),
+        status: r.status || 'pending',
+        confirmations: Number(r.confirmations || 0),
+        checked_via: r.checked_via || null,
     }));
 
     return {
@@ -613,6 +643,9 @@ export function recentBlocks(handle, limit = 25) {
                b.finder_address,
                b.reward_sats,
                b.fee_sats,
+               b.status,
+               b.confirmations,
+               b.checked_via,
                w.name AS finder
           FROM blocks_found b
           LEFT JOIN workers w ON w.id = b.finder_id
@@ -631,7 +664,8 @@ export function allBlocks(handle, { limit = 50, beforeTs = null } = {}) {
     if (beforeTs == null) {
         rows = d.prepare(`
             SELECT b.ts, b.height, b.hash, b.finder_address,
-                   b.reward_sats, b.fee_sats, w.name AS finder
+                   b.reward_sats, b.fee_sats, b.status, b.confirmations,
+                   b.checked_via, w.name AS finder
               FROM blocks_found b
               LEFT JOIN workers w ON w.id = b.finder_id
              ORDER BY b.ts DESC
@@ -640,7 +674,8 @@ export function allBlocks(handle, { limit = 50, beforeTs = null } = {}) {
     } else {
         rows = d.prepare(`
             SELECT b.ts, b.height, b.hash, b.finder_address,
-                   b.reward_sats, b.fee_sats, w.name AS finder
+                   b.reward_sats, b.fee_sats, b.status, b.confirmations,
+                   b.checked_via, w.name AS finder
               FROM blocks_found b
               LEFT JOIN workers w ON w.id = b.finder_id
              WHERE b.ts < ?
