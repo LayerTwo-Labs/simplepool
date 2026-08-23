@@ -178,7 +178,36 @@ static void test_pps_rate(void) {
     CHECK(pps_rate_from_template(subsidy, 111157.0, -1)    == 0.0);
 }
 
+/* A difficulty small enough to overflow the target conversion must saturate,
+ * not produce whatever the compiler felt like.
+ *
+ * DIFF1_TARGET's top 16 bytes are ~7.9e28, so anything below ~2.3e-10 makes
+ * the scaled target exceed 2^128. The old clamp tried to pin it to 2^128 - 1,
+ * a value no double can hold, so the conversion was undefined — and the two
+ * plausible outcomes are opposites: a zero target rejects every share, an
+ * all-ones target accepts every share. UBSan flags the conversion; this pins
+ * the answer. */
+static void test_tiny_difficulty_saturates_the_target(void) {
+    uint8_t target[32];
+    for (double d = 1e-10; d > 1e-300; d /= 1e10) {
+        worker_diff_to_target(d, target);
+        int all_ff = 1, all_00 = 1;
+        for (int i = 0; i < 32; ++i) {
+            if (target[i] != 0xff) all_ff = 0;
+            if (target[i] != 0x00) all_00 = 0;
+        }
+        /* An impossibly small difficulty means an impossibly easy target.
+         * Never the reverse. */
+        CHECK(!all_00);
+        if (d <= 1e-11) CHECK(all_ff);
+    }
+    /* And the ordinary range is untouched. */
+    worker_diff_to_target(1.0, target);
+    CHECK(target[0] == 0x00 && target[4] == 0xff && target[5] == 0xff);
+}
+
 int main(void) {
+    test_tiny_difficulty_saturates_the_target();
     test_dsha256();
     test_nbits();
     test_worker_diff();

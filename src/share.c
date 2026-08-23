@@ -90,10 +90,25 @@ void worker_diff_to_target(double diff, uint8_t target_be[32]) {
     }
     u128 hi = be16_to_u128(DIFF1_TARGET);
     double scaled = (double)hi / diff;
-    /* Clamp to [0, 2^128 - 1]. */
-    const double max_u128 = ldexp(1.0, 128); /* 2^128 */
     if (scaled < 0.0) scaled = 0.0;
-    if (scaled >= max_u128) scaled = max_u128 - 1.0;
+    /* Saturate rather than convert.
+     *
+     * The previous clamp was `if (scaled >= 2^128) scaled = 2^128 - 1.0`,
+     * which does nothing: a double has 53 bits of mantissa, so near 2^128 the
+     * spacing between representable values is 2^75 and 2^128 - 1 rounds
+     * straight back to 2^128. The conversion that followed was then out of
+     * range for u128 — undefined behaviour, and in practice a target of
+     * either zero (every share rejected as low difficulty) or all-ones
+     * (every share accepted), decided by the compiler.
+     *
+     * Reachable whenever the worker difficulty is below ~2.3e-10, which a
+     * configured initial_diff or vardiff_min can be. Write the easiest
+     * possible target directly instead, which is what a difficulty that small
+     * means and what the diff <= 0 branch above already does. */
+    if (!(scaled < ldexp(1.0, 128))) {
+        memset(target_be, 0xff, 32);
+        return;
+    }
     u128 hi_scaled = (u128)scaled;
     u128_to_be16(hi_scaled, target_be);
 }
