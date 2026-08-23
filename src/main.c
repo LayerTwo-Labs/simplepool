@@ -434,37 +434,61 @@ static void on_reject_cb(void *ctx, const char *worker_name, uint64_t ts_ms,
     }
 }
 
-static void on_block_cb(void *ctx, const char *block_hex) {
+/* Returns 0 when the node accepted the block, non-zero when it refused.
+ * The caller records the candidate accordingly — a refusal that goes only to
+ * the log is what let rejected candidates be counted as pool revenue. */
+static int on_block_cb(void *ctx, const char *block_hex,
+                       char *errbuf, size_t errlen) {
     server_ctx_t *s = (server_ctx_t *)ctx;
-    if (!s || !s->btc) return;
-    char err[512] = {0};
-    int rc = bitcoind_submit_block(s->btc, block_hex, err, sizeof err);
+    if (!s || !s->btc) {
+        snprintf(errbuf, errlen, "no bitcoind client");
+        return -1;
+    }
+    int rc = bitcoind_submit_block(s->btc, block_hex, errbuf, errlen);
     if (rc == 0) {
         LOG_INFO("submitted block to bitcoind successfully");
     } else {
-        LOG_ERROR("submitblock failed: %s", err);
+        LOG_ERROR("submitblock failed: %s", errbuf);
     }
+    return rc;
 }
 
 static void on_block_found_cb(void *ctx, const char *worker_name,
                               const char *finder_address,
                               uint64_t ts_ms, uint32_t height,
                               const char *block_hash,
-                              int64_t reward_sats, int64_t fee_sats) {
+                              int64_t reward_sats, int64_t fee_sats,
+                              int accepted, const char *submit_error) {
     server_ctx_t *s = (server_ctx_t *)ctx;
+    /* Accepted only makes it a candidate the chain has not rejected — it is
+     * still 'pending' until something verifies the block is in the chain.
+     * Nothing here may write 'confirmed'. */
+    int status = accepted ? STORE_BLOCK_PENDING : STORE_BLOCK_REJECTED;
     if (s && s->store) {
         store_record_block(s->store, ts_ms, (int)height, block_hash,
                            worker_name, finder_address,
-                           reward_sats, fee_sats);
+                           reward_sats, fee_sats, status,
+                           accepted ? NULL : submit_error);
     }
-    if (s && s->bcast) {
+    /* pool:blocks carries solved blocks. A candidate the node refused is not
+     * one, so it does not go out on that channel — the DB row is where a
+     * refusal is visible. */
+    if (s && s->bcast && accepted) {
         broadcast_block(s->bcast, worker_name, finder_address,
                         ts_ms, height, block_hash, reward_sats, fee_sats);
     }
-    LOG_INFO("BLOCK FOUND: height=%u finder=%s reward=%lld fee=%lld hash=%s",
-             height, worker_name ? worker_name : "?",
-             (long long)reward_sats, (long long)fee_sats,
-             block_hash ? block_hash : "?");
+    if (accepted) {
+        LOG_INFO("BLOCK CANDIDATE ACCEPTED: height=%u finder=%s reward=%lld "
+                 "fee=%lld hash=%s (pending confirmation)",
+                 height, worker_name ? worker_name : "?",
+                 (long long)reward_sats, (long long)fee_sats,
+                 block_hash ? block_hash : "?");
+    } else {
+        LOG_WARN("BLOCK CANDIDATE REJECTED: height=%u finder=%s hash=%s "
+                 "reason=%s", height, worker_name ? worker_name : "?",
+                 block_hash ? block_hash : "?",
+                 submit_error && submit_error[0] ? submit_error : "unknown");
+    }
 }
 
 /* ---------- tip watcher ---------- */

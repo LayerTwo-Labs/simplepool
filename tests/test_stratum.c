@@ -26,6 +26,14 @@ typedef struct {
     int   last_is_block;
     char  last_worker[64];
     char  last_reason[128];
+    /* Block-candidate accounting. submit_rejects makes the stubbed
+     * submitblock refuse, which is the common case on a low-difficulty
+     * chain and the one that used to be recorded as a block anyway. */
+    int   submit_rejects;
+    int   submits;
+    int   found_calls;
+    int   last_accepted;
+    char  last_submit_error[128];
 } obs_t;
 
 static void on_share(void *ctx, const char *w, const char *addr,
@@ -44,7 +52,29 @@ static void on_reject(void *ctx, const char *w, uint64_t ts, const char *r) {
     o->rejects++;
     snprintf(o->last_reason, sizeof(o->last_reason), "%s", r ? r : "");
 }
-static void on_block(void *ctx, const char *hex) { (void)ctx; (void)hex; }
+static int on_block(void *ctx, const char *hex, char *errbuf, size_t errlen) {
+    (void)hex;
+    obs_t *o = ctx;
+    if (!o) return 0;
+    o->submits++;
+    if (o->submit_rejects) {
+        snprintf(errbuf, errlen, "inconclusive");
+        return -30;
+    }
+    return 0;
+}
+static void on_block_found(void *ctx, const char *w, const char *addr,
+                           uint64_t ts, uint32_t height, const char *hash,
+                           int64_t reward, int64_t fee,
+                           int accepted, const char *submit_error) {
+    (void)w; (void)addr; (void)ts; (void)height; (void)hash;
+    (void)reward; (void)fee;
+    obs_t *o = ctx;
+    o->found_calls++;
+    o->last_accepted = accepted;
+    snprintf(o->last_submit_error, sizeof(o->last_submit_error), "%s",
+             submit_error ? submit_error : "");
+}
 
 /* Helper: parse the first line of an output buffer. Mutates buf (NUL terminator). */
 static cJSON *parse_first_line(char *buf) {
@@ -582,6 +612,90 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     stratum_server_free(s);
 }
 
+/* A candidate the node refuses is reported as not accepted, with the node's
+ * reason. Before this the submitblock result was discarded and the candidate
+ * was recorded as a found block regardless — on a low-difficulty chain that
+ * is nearly every candidate, and every one of them credited the pool with a
+ * reward that never existed. */
+static void test_rejected_candidate_is_not_a_block(void) {
+    obs_t obs = {0};
+    obs.submit_rejects = 1;
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e12,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block,
+                           .on_block_found = on_block_found };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    int rc = stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(obs.submits == 1);          /* it was offered to the node */
+    CHECK(obs.found_calls == 1);      /* and still reported, not dropped */
+    CHECK(obs.last_accepted == 0);    /* but not as an accepted block */
+    CHECK(strstr(obs.last_submit_error, "inconclusive") != NULL);
+    /* The share itself is untouched: the miner did the work, and in
+     * pps-classic absorbing this variance is exactly what the pool is for. */
+    CHECK(obs.rejects == 0);
+    CHECK(obs.shares == 1);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* The accepting path still reports accepted, with no error text — a
+ * candidate the node took is 'pending', never 'rejected'. */
+static void test_accepted_candidate_reports_accepted(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e12,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block,
+                           .on_block_found = on_block_found };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(obs.found_calls == 1);
+    CHECK(obs.last_accepted == 1);
+    CHECK(obs.last_submit_error[0] == '\0');
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -596,6 +710,8 @@ int main(void) {
     test_socket_setup_disabled();
     test_extranonce1_unique_across_connections();
     test_dedupe_same_hash_across_job_ids();
+    test_rejected_candidate_is_not_a_block();
+    test_accepted_candidate_reports_accepted();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

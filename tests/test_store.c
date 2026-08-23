@@ -116,7 +116,8 @@ static void test_basic(void) {
 
     /* Block path */
     rc = store_record_block(s, 9999, 12345, "abc123hash", "worker3",
-                            "bcrt1qexampleaddr", 4950000000LL, 50000000LL);
+                            "bcrt1qexampleaddr", 4950000000LL, 50000000LL,
+                            STORE_BLOCK_PENDING, NULL);
     assert(rc == 0);
     rc = store_flush(s);
     assert(rc == 0);
@@ -693,6 +694,89 @@ static void test_template_retention(void) {
     printf("  ok test_template_retention\n");
 }
 
+/* Block-candidate accounting. A share meeting network difficulty is only a
+ * candidate: submitblock refuses stale, duplicate and high-hash ones
+ * routinely, and on a low-difficulty chain that is nearly all of them. Every
+ * row used to be written as a found block with its full reward, which is what
+ * disabled the solvency check — it sums reward_sats across the table. */
+static void test_block_candidate_status(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    int rc = store_open(&cfg, &s);
+    assert(rc == 0);
+
+    /* Accepted by the node: recorded, but only as pending. Nothing on the
+     * submit path is allowed to claim a block is in the chain. */
+    rc = store_record_block(s, 1000, 800001, "hash_accepted", "w1",
+                            "bcrt1qaddr", 5000000000LL, 0,
+                            STORE_BLOCK_PENDING, NULL);
+    assert(rc == 0);
+
+    /* Refused by the node: recorded so the refusal is visible, but as
+     * 'rejected' — never counted, and carrying the node's reason. */
+    rc = store_record_block(s, 1001, 800001, "hash_rejected", "w1",
+                            "bcrt1qaddr", 5000000000LL, 0,
+                            STORE_BLOCK_REJECTED, "inconclusive");
+    assert(rc == 0);
+
+    /* A coinbase height of zero cannot exist. Refused outright rather than
+     * filed at a height no chain has. */
+    rc = store_record_block(s, 1002, 0, "hash_zero_height", "w1",
+                            "bcrt1qaddr", 5000000000LL, 0,
+                            STORE_BLOCK_PENDING, NULL);
+    assert(rc != 0);
+
+    rc = store_flush(s);
+    assert(rc == 0);
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    assert(rc == SQLITE_OK);
+
+    assert(scalar_i64(db, "SELECT count(*) FROM blocks_found") == 2);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE hash='hash_zero_height'") == 0);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE status='pending'") == 1);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE status='rejected'") == 1);
+    /* Nothing may be born confirmed. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE status='confirmed'") == 0);
+
+    char err[128] = {0};
+    int had = scalar_text(db,
+        "SELECT submit_error FROM blocks_found WHERE hash='hash_rejected'",
+        err, sizeof err);
+    assert(had && strcmp(err, "inconclusive") == 0);
+    /* An accepted candidate has no error to carry. */
+    had = scalar_text(db,
+        "SELECT submit_error FROM blocks_found WHERE hash='hash_accepted'",
+        err, sizeof err);
+    assert(!had);
+
+    /* This is the number the solvency check would sum. A rejected candidate
+     * must contribute nothing to it. */
+    assert(scalar_i64(db,
+        "SELECT COALESCE(SUM(reward_sats),0) FROM blocks_found "
+        "WHERE status='confirmed'") == 0);
+
+    /* The stats counter follows the same rule: refused candidates are not
+     * blocks, so the shutdown line does not report them as such. */
+    store_stats_t st = {0};
+    store_get_stats(s, &st);
+    assert(st.blocks_committed == 1);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_block_candidate_status\n");
+}
+
 int main(void) {
     log_init(2 /* WARN */);
     printf("running test_store...\n");
@@ -706,6 +790,7 @@ int main(void) {
     test_template_history();
     test_template_retention();
     test_commit_survives_a_locked_db();
+    test_block_candidate_status();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;

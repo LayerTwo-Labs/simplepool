@@ -42,10 +42,30 @@ int store_record_reject(store_t *s, const char *worker_name,
 /* Record a block found. Thread-safe.
  * finder_address may be NULL (legacy callers); reward_sats/fee_sats may be
  * 0 to skip recording. */
+/* Lifecycle of a block candidate. A share that meets network difficulty is
+ * only ever a *candidate*: submitblock can refuse it, and even an accepted
+ * one can be reorged out. Only CONFIRMED means the pool mined a block that
+ * is in the chain, and only CONFIRMED may be counted as pool revenue —
+ * summing rewards across every row is what silently disabled the solvency
+ * check. PENDING is not a transient: against a backend that answers only
+ * getblocktemplate/submitblock there may be nothing that can verify a block
+ * for some time, and "not yet verified" must count as nothing. */
+#define STORE_BLOCK_PENDING    0
+#define STORE_BLOCK_CONFIRMED  1
+#define STORE_BLOCK_ORPHANED   2
+#define STORE_BLOCK_REJECTED   3
+
+/* The text written to blocks_found.status. Never NULL. */
+const char *store_block_status_text(int status);
+
+/* `status` is one of STORE_BLOCK_*; `submit_error` is the reason string from
+ * submitblock and may be NULL for anything but a rejected candidate. A
+ * height <= 0 is refused outright. */
 int store_record_block(store_t *s, uint64_t ts_ms, int height,
                        const char *hash, const char *finder_name,
                        const char *finder_address,
-                       int64_t reward_sats, int64_t fee_sats);
+                       int64_t reward_sats, int64_t fee_sats,
+                       int status, const char *submit_error);
 
 /* Record an accepted share with the miner's payout_address so the worker
  * row can be tagged. payout_address may be NULL (legacy/tests). The

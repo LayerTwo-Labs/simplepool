@@ -44,6 +44,9 @@
 /* Server-wide ring, so it has to cover every live connection's recent
  * submissions rather than just one's. */
 #define SHARE_DEDUPE_RING 16384
+/* Matches store.c's REASON_MAX so a submitblock reason survives the trip to
+ * the DB intact rather than being truncated twice. */
+#define REASON_TEXT_MAX   128
 #define RECENT_JOBS    8
 #define RECENT_JOB_TTL_MS 60000
 
@@ -1162,6 +1165,11 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
 
     char block_hash_hex[65] = {0};
+    /* Whether the node took the candidate. Only meaningful when is_block.
+     * Defaults to accepted so a server with no on_block hook (tests) behaves
+     * as before; every real path assigns it from the submission. */
+    int  block_accepted = 1;
+    char submit_err[REASON_TEXT_MAX] = {0};
     if (is_block) {
         bytes_to_hex(hash_be, 32, block_hash_hex);
         if (!meets_worker) {
@@ -1172,8 +1180,22 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         }
         char *block_hex = assemble_block_hex(job, cb, cb_len, header);
         if (block_hex) {
-            if (s->cfg.on_block) s->cfg.on_block(s->cfg.ctx, block_hex);
+            if (s->cfg.on_block) {
+                int rc = s->cfg.on_block(s->cfg.ctx, block_hex,
+                                         submit_err, sizeof submit_err);
+                block_accepted = (rc == 0);
+            }
             free(block_hex);
+        } else {
+            /* Nothing was submitted, so nothing can have been accepted.
+             * Falling through as "found" here would file a block the node
+             * was never even shown. */
+            block_accepted = 0;
+            snprintf(submit_err, sizeof submit_err, "block assembly failed");
+        }
+        if (!block_accepted) {
+            LOG_WARN("stratum: candidate from '%s' at height %u was not "
+                     "accepted: %s", c->worker_name, job->height, submit_err);
         }
     }
     free(cb);
@@ -1199,7 +1221,8 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         int64_t reward_sats = job->value_sats - fee_sats;
         s->cfg.on_block_found(s->cfg.ctx, c->worker_name,
                               c->payout_address, ts_now, job->height,
-                              block_hash_hex, reward_sats, fee_sats);
+                              block_hash_hex, reward_sats, fee_sats,
+                              block_accepted, submit_err);
     }
     return emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
 }

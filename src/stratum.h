@@ -46,15 +46,30 @@ typedef void (*share_observer_fn)(void *ctx, const char *worker_name,
                                   int is_block, const char *block_hash_or_null);
 typedef void (*reject_observer_fn)(void *ctx, const char *worker_name,
                                    uint64_t ts_ms, const char *reason);
-typedef void (*block_submit_fn)(void *ctx, const char *block_hex);
-/* Fires once per solved block, after the share has been recorded. Used by
- * main.c to insert into blocks_found with reward/fee/finder address. */
+/* Submits the assembled block upstream. Returns 0 when the node accepted it,
+ * non-zero when it refused, filling errbuf with the node's reason.
+ *
+ * The result is not advisory. A share meeting network difficulty makes a
+ * *candidate*, not a block: submitblock refuses stale, duplicate and
+ * high-hash candidates routinely, and on a low-difficulty chain that is the
+ * common case. Recording one as a block credits the pool with revenue that
+ * never existed. */
+typedef int (*block_submit_fn)(void *ctx, const char *block_hex,
+                               char *errbuf, size_t errlen);
+/* Fires once per block candidate, after the share has been recorded. Used by
+ * main.c to insert into blocks_found with reward/fee/finder address.
+ *
+ * `accepted` is whether on_block's submission was taken by the node, and
+ * `submit_error` the reason when it was not. A candidate the node refused is
+ * still reported here — it is recorded as 'rejected' rather than dropped,
+ * because a silent reject is how phantom rewards went unnoticed. */
 typedef void (*block_found_fn)(void *ctx,
                                const char *worker_name,
                                const char *finder_address,
                                uint64_t ts_ms, uint32_t height,
                                const char *block_hash,
-                               int64_t reward_sats, int64_t fee_sats);
+                               int64_t reward_sats, int64_t fee_sats,
+                               int accepted, const char *submit_error);
 
 typedef struct {
     char   bind_addr[64];
