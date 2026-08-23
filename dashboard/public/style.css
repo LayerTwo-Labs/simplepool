@@ -184,6 +184,13 @@ table.lb tr.block { background: rgba(77, 138, 77, 0.18); }
 table.lb tr:hover { background: rgba(255, 255, 255, 0.02); }
 
 .muted { color: var(--muted); }
+
+/* Block-candidate verdicts. Only "in chain" is a block the pool was paid for;
+ * orphaned and rejected are ordinary outcomes rather than errors — amber, not
+ * red — but they must never read as successes, and "unverified" stays muted
+ * because it is not a claim either way. */
+.blk-ok  { color: var(--block); }
+.blk-bad { color: var(--warn); }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .small { font-size: 12px; }
 

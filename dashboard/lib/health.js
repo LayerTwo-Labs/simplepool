@@ -96,17 +96,60 @@ export function health(handle) {
     }));
 
     /* Mined minus owed. Negative means the pool cannot cover its PPS
-     * liability out of what it has actually earned. */
+     * liability out of what it has actually earned.
+     *
+     * CONFIRMED ONLY. A row in blocks_found is a block candidate: submitblock
+     * may have refused it, or the chain may have reorged it out, and either
+     * way it pays nothing. Summing every row credited the pool with revenue
+     * that never existed and made this check — the one thing standing between
+     * an operator and paying out more than was ever mined — permanently and
+     * silently green.
+     *
+     * A young pps-classic pool will read red here: it credits shares before
+     * its first confirmed block, so the margin is legitimately negative until
+     * one lands. That is the honest number, not a fault in the check. */
     checks.push(guard('margin', 'Pool solvency', () => {
         const r = one(d, `
             SELECT (SELECT COALESCE(SUM(reward_sats),0) + COALESCE(SUM(fee_sats),0)
-                      FROM blocks_found)
+                      FROM blocks_found WHERE status = 'confirmed')
                  - (SELECT COALESCE(SUM(credited_sats),0) FROM shares) AS margin`);
         const m = Number(r?.margin || 0);
         return { ok: m >= 0, value: m,
                  detail: m < 0
                     ? `owed ${(-m / 1e8).toFixed(4)} BTC more than mined`
                     : null };
+    }));
+
+    /* How many of the pool's recent candidates actually made it into the
+     * chain. On the alphanet forknet this was effectively 0%, invisible
+     * because every candidate was counted as a block — the pool looked like
+     * it was winning constantly while earning nothing. A sustained high
+     * orphan rate is a real operational signal (a slow or badly-peered node,
+     * a template far behind the tip), not chain noise to be swallowed.
+     *
+     * Only settled candidates count toward the ratio: 'pending' means nothing
+     * has been able to verify it yet, which is not evidence either way. */
+    checks.push(guard('orphan_rate', 'Blocks reaching the chain', () => {
+        const r = one(d, `
+            SELECT COUNT(*) FILTER (WHERE status = 'confirmed') AS good,
+                   COUNT(*) FILTER (WHERE status IN ('orphaned','rejected')) AS lost
+              FROM (SELECT status FROM blocks_found
+                     WHERE status <> 'pending'
+                     ORDER BY ts DESC LIMIT 100)`);
+        const good = Number(r?.good || 0);
+        const lost = Number(r?.lost || 0);
+        const settled = good + lost;
+        /* Nothing settled yet is not a failure — say so rather than
+         * reporting a 0% success rate the pool has not earned. */
+        if (settled === 0) return { ok: true, value: null, detail: 'no settled candidates yet' };
+        const pct = (good / settled) * 100;
+        return {
+            ok: pct >= 50,
+            value: Math.round(pct),
+            detail: pct >= 50
+                ? null
+                : `only ${good} of the last ${settled} candidates reached the chain`,
+        };
     }));
 
     /* In-flight rows with no txid mean the worker died around a broadcast and

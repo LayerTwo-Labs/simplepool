@@ -50,9 +50,11 @@ function makeDb() {
                     fee_bps, network_difficulty, block_value_sats, rate_source)
                 VALUES (1700000000, ?, ?, 100, 111157.455, 312500000, 'derived')`)
       .run(RATE, GROSS);
-    /* Mined comfortably more than owed. */
-    db.prepare(`INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats)
-                VALUES (1700000000, 1, 'b1', 309375000, 3125000)`).run();
+    /* Mined comfortably more than owed. Explicitly CONFIRMED: solvency counts
+     * only blocks verified to be in the chain, so a candidate that is merely
+     * recorded funds nothing. */
+    db.prepare(`INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status,confirmations,checked_via)
+                VALUES (1700000000, 1, 'b1', 309375000, 3125000, 'confirmed', 101, 'node')`).run();
     db.prepare(`INSERT INTO templates (ts,height,prev_hash,bits,network_difficulty,
                     coinbase_value_sats,tx_count,tx_fees_sats,source,cb_spendable,
                     cb_op_returns,longpoll,rate_sats_per_diff)
@@ -69,11 +71,63 @@ function makeDb() {
 
 const failing = h => h.failing.map(c => c.id);
 
+/* Replace the confirmed block with one in some other state. Each of these is
+ * a candidate that pays nothing, so each must leave the pool insolvent. */
+const withBlockStatus = (status) => {
+    const db = makeDb();
+    db.prepare('UPDATE blocks_found SET status = ?').run(status);
+    return db;
+};
+
 test('a healthy pool reports nothing', () => {
     const h = health(makeDb());
     assert.equal(h.ok, true, failing(h).join(','));
     assert.deepEqual(failing(h), []);
     assert.deepEqual(h.unavailable.map(c => c.id), []);
+});
+
+/* The bug this whole column exists for. submitblock refuses stale, duplicate
+ * and high-hash candidates routinely — on a low-difficulty chain almost every
+ * one of them — and each refusal used to be summed as pool revenue, so the
+ * solvency guard reported healthy no matter how much was owed. */
+test('a rejected candidate funds nothing', () => {
+    const h = health(withBlockStatus('rejected'));
+    assert.ok(failing(h).includes('margin'));
+});
+
+test('an orphaned candidate funds nothing', () => {
+    const h = health(withBlockStatus('orphaned'));
+    assert.ok(failing(h).includes('margin'));
+});
+
+/* Pending is not a transient here: against a backend that serves only
+ * getblocktemplate and submitblock there may be nothing able to verify a
+ * block for some time. Counting it optimistically would reintroduce exactly
+ * the bug, so it has to count as nothing. */
+test('an unverified candidate funds nothing', () => {
+    const h = health(withBlockStatus('pending'));
+    assert.ok(failing(h).includes('margin'));
+});
+
+test('a pool whose candidates never reach the chain is caught', () => {
+    const db = makeDb();
+    /* Keep the confirmed block so solvency stays green and only the orphan
+     * rate can fire — otherwise the assertion proves nothing. */
+    for (let i = 0; i < 20; i++) {
+        db.prepare(`INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status)
+                    VALUES (?, ?, ?, 0, 0, 'orphaned')`)
+          .run(1700000100 + i, 100 + i, `orphan${i}`);
+    }
+    const h = health(db);
+    assert.ok(failing(h).includes('orphan_rate'));
+});
+
+/* A pool that has found nothing yet has not failed at anything. */
+test('no settled candidates is not an orphan-rate failure', () => {
+    const db = makeDb();
+    db.prepare('DELETE FROM blocks_found').run();
+    const h = health(db);
+    assert.ok(!failing(h).includes('orphan_rate'));
 });
 
 test('shares accepted but never stored are caught', () => {
@@ -178,7 +232,7 @@ test('a DB missing a table degrades to unavailable, not to healthy', () => {
     db.exec('DROP TABLE payouts_in_flight');
     const h = health(db);
     assert.ok(h.unavailable.some(c => c.id === 'payout_ambiguous'));
-    assert.equal(h.checks.length, 7, 'every check still reported');
+    assert.equal(h.checks.length, 8, 'every check still reported');
 });
 
 test('no DB handle is not healthy', () => {
