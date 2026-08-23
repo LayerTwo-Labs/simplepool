@@ -986,6 +986,207 @@ const char *store_block_status_text(int status) {
     }
 }
 
+int store_list_unresolved_blocks(store_t *s, int tip_height, int final_depth,
+                                 store_block_candidate_t *out, size_t cap)
+{
+    if (!s || !out || cap == 0) return -1;
+    /* Deliberately narrower than the templates pass: only pending and
+     * confirmed rows, and only while shallow. Re-checking every orphan over
+     * RPC forever would be one call per settled row per tick — on a
+     * low-difficulty chain that is the whole table. Restoring an orphan after
+     * a second reorg is left to the templates pass, which does it in bulk SQL
+     * for nothing. */
+    static const char *Q =
+        "SELECT hash, height FROM blocks_found "
+        " WHERE status IN ('pending','confirmed') "
+        "   AND confirmations < ? "
+        "   AND height <= ? "
+        " ORDER BY height DESC, id DESC LIMIT ?";
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    pthread_mutex_lock(&s->node_tip_mu);
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->node_tip_mu);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    sqlite3_bind_int(st, 1, final_depth);
+    sqlite3_bind_int(st, 2, tip_height);
+    sqlite3_bind_int(st, 3, (int)cap);
+    while (n < (int)cap && sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *h = sqlite3_column_text(st, 0);
+        if (!h) continue;
+        snprintf(out[n].hash, sizeof(out[n].hash), "%s", (const char *)h);
+        out[n].height = sqlite3_column_int(st, 1);
+        n++;
+    }
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    return n;
+}
+
+int store_set_block_status(store_t *s, const char *hash, int status,
+                           int confirmations, const char *checked_via)
+{
+    if (!s || !hash) return -1;
+    static const char *Q =
+        "UPDATE blocks_found SET status = ?, confirmations = ?, checked_via = ? "
+        " WHERE hash = ?";
+    sqlite3_stmt *st = NULL;
+    pthread_mutex_lock(&s->node_tip_mu);
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->node_tip_mu);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    sqlite3_bind_text(st, 1, store_block_status_text(status), -1, SQLITE_STATIC);
+    sqlite3_bind_int (st, 2, confirmations < 0 ? 0 : confirmations);
+    if (checked_via)
+        sqlite3_bind_text(st, 3, checked_via, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(st, 3);
+    sqlite3_bind_text(st, 4, hash, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    if (rc != SQLITE_DONE) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    return 0;
+}
+
+/* Count rows in one status. Caller holds node_tip_mu. */
+static int count_blocks_with_status(store_t *s, const char *status) {
+    static const char *Q = "SELECT COUNT(*) FROM blocks_found WHERE status = ?";
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, status, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+int store_reconcile_blocks_from_templates(store_t *s, int tip_height,
+                                          int *confirmed, int *orphaned,
+                                          int *pending)
+{
+    if (!s) return -1;
+    /* Compare against the LATEST observation at height+1, not merely any of
+     * them. After a reorg both the winning and the losing prev_hash have been
+     * seen at that height, so "a template exists whose prev_hash is ours" would
+     * keep calling a reorged-out block confirmed forever. The newest row is
+     * what the node believes now.
+     *
+     * Every non-rejected status is in the WHERE, so the pass is idempotent and
+     * symmetric: a confirmed block is demoted when it is reorged out — losing
+     * the chain has to take the reward back, not merely fail to grant it — and
+     * an orphan is promoted again if a later reorg restores it. Only 'rejected'
+     * is terminal: the node never accepted that candidate, so no amount of
+     * reorganising can put it in the chain. */
+    static const char *Q_RESOLVE =
+        "WITH tip_at AS ("
+        "  SELECT b.id AS bid,"
+        "         (SELECT t.prev_hash FROM templates t"
+        "           WHERE t.height = b.height + 1"
+        "           ORDER BY t.id DESC LIMIT 1) AS observed"
+        "    FROM blocks_found b"
+        "   WHERE b.status <> 'rejected'"
+        ") "
+        "UPDATE blocks_found SET"
+        "  status = CASE WHEN (SELECT observed FROM tip_at WHERE bid = blocks_found.id)"
+        "                     = blocks_found.hash THEN 'confirmed' ELSE 'orphaned' END,"
+        "  checked_via = 'tips',"
+        "  confirmations = CASE WHEN (SELECT observed FROM tip_at WHERE bid = blocks_found.id)"
+        "                            = blocks_found.hash"
+        "                       THEN MAX(0, ? - blocks_found.height + 1) ELSE 0 END "
+        " WHERE status <> 'rejected'"
+        "   AND (SELECT observed FROM tip_at WHERE bid = blocks_found.id) IS NOT NULL";
+
+    /* A height at or above the tip cannot be a block in the chain, and a
+     * height of 0 was never valid. Neither is verifiable, and leaving them
+     * pending would leave junk looking merely unverified. */
+    static const char *Q_IMPOSSIBLE =
+        "UPDATE blocks_found SET status = 'orphaned', confirmations = 0,"
+        "       checked_via = 'tips' "
+        " WHERE status <> 'rejected' AND (height <= 0 OR height > ?)";
+
+    pthread_mutex_lock(&s->node_tip_mu);
+    char *err = NULL;
+    sqlite3_stmt *st = NULL;
+    int rc = 0;
+    if (sqlite3_prepare_v2(s->db, Q_RESOLVE, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(st, 1, tip_height);
+        if (sqlite3_step(st) != SQLITE_DONE) rc = -2;
+        sqlite3_finalize(st);
+    } else {
+        rc = -2;
+    }
+    st = NULL;
+    if (tip_height > 0 &&
+        sqlite3_prepare_v2(s->db, Q_IMPOSSIBLE, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(st, 1, tip_height);
+        if (sqlite3_step(st) != SQLITE_DONE) rc = -2;
+        sqlite3_finalize(st);
+    }
+    sqlite3_free(err);
+    if (confirmed) *confirmed = count_blocks_with_status(s, "confirmed");
+    if (orphaned)  *orphaned  = count_blocks_with_status(s, "orphaned");
+    if (pending)   *pending   = count_blocks_with_status(s, "pending");
+    pthread_mutex_unlock(&s->node_tip_mu);
+    if (rc != 0) atomic_fetch_add(&s->pg_errors, 1);
+    return rc;
+}
+
+int store_finalize_block_hash_index(store_t *s) {
+    if (!s) return -1;
+    /* Carry any resolved verdict onto the row that will survive, so collapsing
+     * duplicates cannot lose a confirmation. */
+    static const char *Q_PROMOTE =
+        "UPDATE blocks_found SET status = ("
+        "  SELECT b2.status FROM blocks_found b2"
+        "   WHERE b2.hash = blocks_found.hash AND b2.status <> 'pending'"
+        "   ORDER BY b2.id LIMIT 1) "
+        " WHERE status = 'pending' AND EXISTS ("
+        "  SELECT 1 FROM blocks_found b3"
+        "   WHERE b3.hash = blocks_found.hash AND b3.status <> 'pending')";
+    /* Keep the earliest sighting of each hash — that is when the pool
+     * actually found it. Competing candidates at one height have DIFFERENT
+     * hashes and are all kept: several rows per height is expected on a
+     * low-difficulty chain, and status is what stops them counting. */
+    static const char *Q_DEDUPE =
+        "DELETE FROM blocks_found WHERE id NOT IN ("
+        "  SELECT MIN(id) FROM blocks_found GROUP BY hash)";
+    static const char *Q_INDEX =
+        "CREATE UNIQUE INDEX IF NOT EXISTS blocks_found_hash_idx "
+        "  ON blocks_found(hash)";
+
+    pthread_mutex_lock(&s->node_tip_mu);
+    int rc = 0;
+    char *err = NULL;
+    if (sqlite3_exec(s->db, Q_PROMOTE, NULL, NULL, &err) != SQLITE_OK) {
+        LOG_WARN("store: block hash promote failed: %s", err ? err : "?");
+        rc = -2;
+    }
+    sqlite3_free(err); err = NULL;
+    if (sqlite3_exec(s->db, Q_DEDUPE, NULL, NULL, &err) != SQLITE_OK) {
+        LOG_WARN("store: block hash dedupe failed: %s", err ? err : "?");
+        rc = -2;
+    }
+    sqlite3_free(err); err = NULL;
+    if (sqlite3_exec(s->db, Q_INDEX, NULL, NULL, &err) != SQLITE_OK) {
+        /* Loud: a missing unique index is exactly the silent failure this
+         * function exists to avoid. */
+        LOG_ERROR("store: blocks_found unique hash index NOT created: %s",
+                  err ? err : "?");
+        rc = -2;
+    }
+    sqlite3_free(err);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    return rc;
+}
+
 int store_record_block(store_t *s, uint64_t ts_ms, int height,
                        const char *hash, const char *finder_name,
                        const char *finder_address,

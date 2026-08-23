@@ -58,6 +58,56 @@ int store_record_reject(store_t *s, const char *worker_name,
 /* The text written to blocks_found.status. Never NULL. */
 const char *store_block_status_text(int status);
 
+/* A candidate still in play: not yet resolved, or confirmed but not yet deep
+ * enough to be final. */
+typedef struct {
+    char hash[80];
+    int  height;
+} store_block_candidate_t;
+
+/* Candidates worth re-checking against the node, most recent first, at most
+ * `cap` of them. Rows already `rejected` or `orphaned` are settled, and a
+ * `confirmed` row past `final_depth` confirmations is treated as final and
+ * stops being re-checked. Returns how many were written, or negative on
+ * error. Rows older than the node path reaches are handled in bulk by
+ * store_reconcile_blocks_from_templates(). */
+int store_list_unresolved_blocks(store_t *s, int tip_height, int final_depth,
+                                 store_block_candidate_t *out, size_t cap);
+
+/* Set one candidate's verdict. `checked_via` is 'node' or 'tips' — which
+ * source answered, the same distinction pool_meta.network_source draws. */
+int store_set_block_status(store_t *s, const char *hash, int status,
+                           int confirmations, const char *checked_via);
+
+/* Classify candidates from the templates table alone — no RPC.
+ *
+ * Every getblocktemplate poll is an observation of the node's tip: a template
+ * building height H+1 with prev_hash X says the tip at H was X. `templates`
+ * keeps one row per materially distinct template, so it is a historical chain
+ * of tips this pool actually saw, and comparing a candidate against the most
+ * recent observation at its height+1 says whether it is still the chain's.
+ *
+ * This is the only path available against a backend that serves nothing but
+ * getblocktemplate and submitblock, and it is also how a table of pre-existing
+ * rows gets classified in bulk. A candidate whose height+1 was never observed
+ * stays pending — which counts as nothing — rather than being guessed at.
+ *
+ * Writes the resulting totals (not deltas) to the out params when non-NULL. */
+int store_reconcile_blocks_from_templates(store_t *s, int tip_height,
+                                          int *confirmed, int *orphaned,
+                                          int *pending);
+
+/* Collapse rows that share a block hash, then create the UNIQUE index on it.
+ *
+ * Deliberately not a migration: CREATE UNIQUE INDEX fails outright on a table
+ * that already holds duplicates, and the migration runner only tolerates
+ * "duplicate column" — so as a migration it would silently never exist on the
+ * databases that needed it. Duplicates arise because the stratum dedupe guard
+ * is an in-memory ring that empties on restart, so the same solution can be
+ * recorded twice. The surviving row keeps the earliest sighting but inherits
+ * any resolved status its duplicates reached. */
+int store_finalize_block_hash_index(store_t *s);
+
 /* `status` is one of STORE_BLOCK_*; `submit_error` is the reason string from
  * submitblock and may be NULL for anything but a rejected candidate. A
  * height <= 0 is refused outright. */

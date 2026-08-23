@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -134,7 +135,20 @@ typedef struct {
      * lock per share would not be. Zero means "no accrual" (solo, or a
      * template we could not derive a rate from). */
     _Atomic double  pps_rate;
+
+    /* Whether the backend serves getblockhash: 0 unknown, 1 yes, -1 no.
+     * Latched on the first "Method not found", because a backend that does
+     * not implement the method never starts to — the CUSF enforcer serves
+     * exactly getblocktemplate and submitblock. -1 is not a failure state,
+     * it selects the observed-tip path. */
+    _Atomic int     gbh_state;
 } server_ctx_t;
+
+/* A block this deep stops being re-checked. */
+#define BLOCK_FINAL_DEPTH      100
+/* Per tip change. Bounds how long reconciliation can hold the shared client's
+ * connection lock, which submitblock also needs. */
+#define RECONCILE_MAX_PER_TICK  16
 
 /* The rate this proxy will credit at: the operator's override verbatim if
  * set, otherwise fair value derived from the template. See the
@@ -491,6 +505,70 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
     }
 }
 
+/* ---------- block confirmation ---------- */
+
+/* Decide which of the pool's candidates are actually in the chain.
+ *
+ * Preferred path is getblockhash: authoritative, one call per unresolved
+ * candidate. Not always available — the CUSF enforcer, which is the backend a
+ * drivechain pool must point at, answers "Method not found" to everything but
+ * getblocktemplate and submitblock. So fall back to the chain of tips the pool
+ * has already observed: a template building height H+1 with prev_hash X says
+ * the node's tip at H was X. That needs no RPC at all.
+ *
+ * Whichever answered is recorded in checked_via, the same way
+ * pool_meta.network_source distinguishes an authoritative answer from an
+ * inferred one. Nothing here invents a verdict: a candidate that neither path
+ * can speak to stays pending, and pending counts as nothing. */
+static void reconcile_blocks(server_ctx_t *s, int tip_height) {
+    if (!s || !s->store || tip_height <= 0) return;
+
+    if (atomic_load(&s->gbh_state) >= 0) {
+        store_block_candidate_t cands[RECONCILE_MAX_PER_TICK];
+        int n = store_list_unresolved_blocks(s->store, tip_height,
+                                             BLOCK_FINAL_DEPTH, cands,
+                                             RECONCILE_MAX_PER_TICK);
+        for (int i = 0; i < n; ++i) {
+            char have[80] = {0};
+            char gerr[256] = {0};
+            int rc = bitcoind_get_block_hash(s->btc, cands[i].height, have,
+                                             sizeof have, gerr, sizeof gerr);
+            if (rc == BITCOIND_ERR_UNSUPPORTED) {
+                atomic_store(&s->gbh_state, -1);
+                LOG_INFO("backend does not serve getblockhash — confirming "
+                         "blocks from the observed chain of template tips "
+                         "instead");
+                break;
+            }
+            if (rc != 0) {
+                /* Transient. Leave the rows alone and retry on the next tip
+                 * rather than recording a verdict we did not get. */
+                LOG_WARN("getblockhash(%d) failed: %s", cands[i].height, gerr);
+                return;
+            }
+            atomic_store(&s->gbh_state, 1);
+            int match = strcasecmp(have, cands[i].hash) == 0;
+            store_set_block_status(s->store, cands[i].hash,
+                                   match ? STORE_BLOCK_CONFIRMED
+                                         : STORE_BLOCK_ORPHANED,
+                                   match ? tip_height - cands[i].height + 1 : 0,
+                                   "node");
+            if (!match) {
+                LOG_WARN("block %s at height %d is no longer in the chain — "
+                         "marked orphaned", cands[i].hash, cands[i].height);
+            }
+        }
+        if (atomic_load(&s->gbh_state) > 0) return;
+    }
+
+    int confirmed = 0, orphaned = 0, pending = 0;
+    if (store_reconcile_blocks_from_templates(s->store, tip_height, &confirmed,
+                                              &orphaned, &pending) == 0) {
+        LOG_DEBUG("block reconcile: confirmed=%d orphaned=%d pending=%d",
+                  confirmed, orphaned, pending);
+    }
+}
+
 /* ---------- tip watcher ---------- */
 
 static void *tip_watcher(void *arg) {
@@ -557,6 +635,11 @@ static void *tip_watcher(void *arg) {
             need_rebuild = 1;
         }
         pthread_mutex_unlock(&s->lock);
+
+        /* A new tip is exactly when a candidate's fate can have changed:
+         * either it is the one that extended the chain, or something else
+         * was. */
+        if (t->height - 1 != s->last_height) reconcile_blocks(s, t->height - 1);
 
         if (need_rebuild) {
             char berr[256] = {0};
@@ -826,6 +909,35 @@ int main(int argc, char **argv) {
         if (bcast) {
             broadcast_node_tip(bcast, tmpl->height - 1, tmpl->prev_hash_hex, now_s);
         }
+    }
+
+    /* Classify whatever is already on record, once, before serving.
+     *
+     * Rows written before blocks_found had a status are all 'pending', which
+     * counts as nothing — correct, but useless. The templates table is a log
+     * of the tips this pool observed, so one bulk SQL pass settles every
+     * candidate whose next height was ever seen, with no RPC and no reliance
+     * on a backend that may serve only two methods. What it cannot reach
+     * stays pending.
+     *
+     * Then, and only then, the UNIQUE index on hash: it fails outright on a
+     * table that still holds duplicates, which is why it is not a migration —
+     * the migration runner would swallow that failure as a warning and leave
+     * the index missing on exactly the databases that needed it. */
+    {
+        int confirmed = 0, orphaned = 0, pending = 0;
+        if (store_reconcile_blocks_from_templates(store, tmpl->height - 1,
+                                                  &confirmed, &orphaned,
+                                                  &pending) == 0) {
+            LOG_INFO("blocks on record: confirmed=%d orphaned=%d pending=%d",
+                     confirmed, orphaned, pending);
+            if (pending > 0) {
+                LOG_INFO("%d block candidate(s) could not be verified from "
+                         "observed tips and count as nothing until they are",
+                         pending);
+            }
+        }
+        store_finalize_block_hash_index(store);
     }
 
     /* Seed the rate before any share can arrive — a share credited at 0

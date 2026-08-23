@@ -517,6 +517,41 @@ int bitcoind_submit_block(bitcoind_client_t *c, const char *block_hex,
     return 0;
 }
 
+int bitcoind_get_block_hash(bitcoind_client_t *c, int height,
+                            char *out, size_t cap,
+                            char *errbuf, size_t errlen) {
+    if (!out || cap == 0) return -1;
+    out[0] = '\0';
+    if (height < 0) {
+        set_err(errbuf, errlen, "negative height");
+        return -1;
+    }
+    cJSON *params = cJSON_CreateArray();
+    if (!params) { set_err(errbuf, errlen, "oom"); return -20; }
+    cJSON_AddItemToArray(params, cJSON_CreateNumber((double)height));
+
+    cJSON *result = NULL;
+    int rc = rpc_call(c, "getblockhash", params, &result, errbuf, errlen);
+    if (rc != 0) {
+        if (result) cJSON_Delete(result);
+        /* JSON-RPC -32601. rpc_call surfaces only the message, and both
+         * bitcoind and jsonrpsee spell it the same way. A backend that does
+         * not serve the method will never start serving it, so the caller
+         * latches this rather than retrying every tick. */
+        if (errbuf && strstr(errbuf, "ethod not found"))
+            return BITCOIND_ERR_UNSUPPORTED;
+        return rc;
+    }
+    if (!result || !cJSON_IsString(result) || !result->valuestring[0]) {
+        set_err(errbuf, errlen, "getblockhash returned no hash");
+        if (result) cJSON_Delete(result);
+        return -30;
+    }
+    snprintf(out, cap, "%s", result->valuestring);
+    cJSON_Delete(result);
+    return 0;
+}
+
 void bitcoind_template_free(bitcoind_template_t *t) {
     if (!t) return;
     if (t->txs) {

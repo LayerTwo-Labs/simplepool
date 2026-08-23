@@ -777,6 +777,162 @@ static void test_block_candidate_status(void) {
     printf("  ok test_block_candidate_status\n");
 }
 
+/* Reconciliation against the observed chain of tips, which is the only path
+ * available when the backend serves nothing but getblocktemplate and
+ * submitblock — the CUSF enforcer a drivechain pool must point at.
+ *
+ * A template building height H+1 with prev_hash X is the node saying its tip
+ * at H was X. So a candidate at H is the chain's iff the newest observation
+ * at H+1 names it. */
+static void test_reconcile_from_templates(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Two competing candidates at the same height — expected on a
+     * low-difficulty chain, and both rows must survive. */
+    assert(store_record_block(s, 1000, 800001, "hash_win", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    assert(store_record_block(s, 1001, 800001, "hash_lose", "w2", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    /* A candidate whose next height was never observed. Unverifiable, so it
+     * must stay pending — and pending is never revenue. */
+    assert(store_record_block(s, 1002, 800004, "hash_unseen", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    assert(store_flush(s) == 0);
+
+    store_template_t t = {
+        .ts_s = 2000, .height = 800002, .prev_hash = "hash_win",
+        .bits = "1d00ffff", .network_difficulty = 1.0,
+        .coinbase_value_sats = 5000000000LL, .tx_count = 1,
+        .tx_fees_sats = 0, .source = "enforcer", .cb_spendable = 1,
+        .cb_op_returns = 2, .longpoll = 1, .rate_sats_per_diff = 0.0,
+    };
+    assert(store_record_template(s, &t) == 0);
+
+    int confirmed = 0, orphaned = 0, pending = 0;
+    assert(store_reconcile_blocks_from_templates(s, 800005, &confirmed,
+                                                 &orphaned, &pending) == 0);
+    assert(confirmed == 1);
+    assert(orphaned == 1);
+    assert(pending == 1);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    char st[32] = {0};
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_win'",
+                st, sizeof st);
+    assert(strcmp(st, "confirmed") == 0);
+    /* tip 800005, block at 800001 → 5 confirmations. */
+    assert(scalar_i64(db,
+        "SELECT confirmations FROM blocks_found WHERE hash='hash_win'") == 5);
+    scalar_text(db, "SELECT checked_via FROM blocks_found WHERE hash='hash_win'",
+                st, sizeof st);
+    assert(strcmp(st, "tips") == 0);
+
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_lose'",
+                st, sizeof st);
+    assert(strcmp(st, "orphaned") == 0);
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_unseen'",
+                st, sizeof st);
+    assert(strcmp(st, "pending") == 0);
+
+    /* Both candidates at 800001 are still on record. Losing a race is not a
+     * reason to forget the work was done. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE height=800001") == 2);
+
+    /* A reorg: a later template at the same height now builds on someone
+     * else. The confirmed block must be demoted, not left paid. */
+    store_template_t t2 = t;
+    t2.ts_s = 3000;
+    t2.prev_hash = "hash_lose";
+    t2.bits = "1d00fffe";   /* different work, so it opens its own row */
+    assert(store_record_template(s, &t2) == 0);
+    assert(store_reconcile_blocks_from_templates(s, 800006, &confirmed,
+                                                 &orphaned, &pending) == 0);
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_win'",
+                st, sizeof st);
+    assert(strcmp(st, "orphaned") == 0);
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_lose'",
+                st, sizeof st);
+    assert(strcmp(st, "confirmed") == 0);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_reconcile_from_templates\n");
+}
+
+/* The unique index has to survive a table that already holds duplicates —
+ * as a plain migration it would fail and be swallowed as a warning, leaving
+ * it absent on exactly the databases that needed it. */
+static void test_block_hash_index_after_dedupe(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* The same solution recorded twice — the stratum dedupe ring is in
+     * memory, so a restart can do this. */
+    assert(store_record_block(s, 1000, 800001, "dup_hash", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    assert(store_record_block(s, 1001, 800001, "dup_hash", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    /* Distinct competing candidates must NOT be collapsed. */
+    assert(store_record_block(s, 1002, 800001, "other_hash", "w2", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    assert(store_flush(s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT count(*) FROM blocks_found") == 3);
+
+    /* A verdict reached on the duplicate must not be lost when it is
+     * collapsed away. */
+    assert(store_set_block_status(s, "dup_hash", STORE_BLOCK_CONFIRMED, 3,
+                                  "tips") == 0);
+    assert(sqlite3_exec(db, "UPDATE blocks_found SET status='pending' "
+                            "WHERE id=(SELECT MIN(id) FROM blocks_found "
+                            "           WHERE hash='dup_hash')",
+                        NULL, NULL, NULL) == SQLITE_OK);
+
+    assert(store_finalize_block_hash_index(s) == 0);
+
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE hash='dup_hash'") == 1);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE hash='other_hash'") == 1);
+    char st[32] = {0};
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='dup_hash'",
+                st, sizeof st);
+    assert(strcmp(st, "confirmed") == 0);
+    /* The index actually exists — the whole point. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM sqlite_master WHERE type='index' "
+        "  AND name='blocks_found_hash_idx'") == 1);
+
+    /* And it now holds: a re-found hash cannot create a second row, and the
+     * OR IGNORE means it does not fail the batch either. */
+    assert(store_record_block(s, 1003, 800001, "dup_hash", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    assert(store_flush(s) == 0);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE hash='dup_hash'") == 1);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_block_hash_index_after_dedupe\n");
+}
+
 int main(void) {
     log_init(2 /* WARN */);
     printf("running test_store...\n");
@@ -791,6 +947,8 @@ int main(void) {
     test_template_retention();
     test_commit_survives_a_locked_db();
     test_block_candidate_status();
+    test_reconcile_from_templates();
+    test_block_hash_index_after_dedupe();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;
