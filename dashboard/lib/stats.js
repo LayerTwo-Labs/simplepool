@@ -212,9 +212,12 @@ export function worker(handle, name, windowSec = 86400) {
     `).all(w.id);
 
     // Compute the share's "actual difficulty": diff1_target / hash_value.
-    // diff1_target = 0x00000000_ffff0000_0000... (256-bit), so actual_diff
-    // approximates 2^32 / int(top 8 hex digits) for the leading non-zero
-    // 32 bits. Plenty good for ranking 'how lucky was each share'.
+    // diff1_target = 0x00000000_ffff0000_0000... (256-bit) — note it already
+    // carries 8 leading zero nibbles of its own. Writing the hash as
+    // v * 16^(56-i) for i leading zero nibbles and v the next 8 hex digits,
+    // and diff1_target as 0xffff0000 * 16^48, the ratio comes out as
+    // (0xffff0000 / v) * 16^(i-8). The -8 is diff1's own leading zeros;
+    // dropping it overstates every share by 16^8 = 2^32.
     const shares = sharesRaw.map(s => {
         let actual = null;
         if (s.share_hash && /^[0-9a-fA-F]+$/.test(s.share_hash)) {
@@ -226,8 +229,10 @@ export function worker(handle, name, windowSec = 86400) {
             const slice = h.slice(i, i + 8).padEnd(8, '0');
             const v = parseInt(slice, 16);
             if (v > 0) {
-                // Leading zeros add 16^(zeros) ≈ 4*zeros bits of difficulty.
-                const zeroFactor = Math.pow(16, i);
+                // Leading zeros beyond diff1's own eight are what make a
+                // share harder than difficulty 1; fewer than eight means a
+                // share easier than 1, so the exponent may go negative.
+                const zeroFactor = Math.pow(16, i - 8);
                 actual = (0xffff0000 / v) * zeroFactor;
             }
         }
