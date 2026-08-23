@@ -415,6 +415,19 @@ static int buf_append_json_line(char **buf, size_t *len, cJSON *obj) {
     return rc;
 }
 
+/* Is PPS accrual currently suspended? While it is, work handed to this pool
+ * earns nothing, so the pool says so rather than banking it silently. */
+static int pps_gated(const stratum_server_t *s) {
+    return s->cfg.pps_enabled && s->cfg.pps_refuse_shares_below_min &&
+           s->cfg.pps_gate &&
+           atomic_load_explicit(s->cfg.pps_gate, memory_order_relaxed) != 0;
+}
+
+#define PPS_GATED_MSG \
+    "pool is not crediting shares right now: network difficulty is below " \
+    "the minimum this pool will pay PPS at. Point your miner elsewhere " \
+    "until it retargets."
+
 /* ---- job retention ring ---- */
 
 static void retire_job(stratum_server_t *s, stratum_job_t *j) {
@@ -883,6 +896,17 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             "stratum username must be <bitcoin_address>[.<rig_label>]");
         return emit_response(buf, len, id, NULL, err);
     }
+    /* Refuse before taking the address: the miner learns at connect time,
+     * which is the only point at which they can still do something about it. */
+    if (pps_gated(s)) {
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, worker, now_ms(),
+                             "pps accrual suspended (difficulty below floor)");
+        }
+        cJSON *err = make_error(24, PPS_GATED_MSG);
+        return emit_response(buf, len, id, NULL, err);
+    }
+
     memcpy(c->payout_address, worker, addr_len);
     c->payout_address[addr_len] = '\0';
 
@@ -1266,6 +1290,18 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     const char *ntime  = cJSON_GetArrayItem(params, 3)->valuestring;
     const char *nonce  = cJSON_GetArrayItem(params, 4)->valuestring;
     (void)worker;
+
+    /* A miner that authorized before the gate closed is still connected and
+     * still hashing. Accepting those shares would bank work the pool has
+     * already decided not to pay for. */
+    if (pps_gated(s)) {
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "pps accrual suspended (difficulty below floor)");
+        }
+        cJSON *err = make_error(24, PPS_GATED_MSG);
+        return emit_response(buf, len, id, NULL, err);
+    }
 
     /* Counted reference: the tip watcher may retire and free this job while
      * the submit below is still reading it. */

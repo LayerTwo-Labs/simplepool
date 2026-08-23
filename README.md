@@ -450,6 +450,33 @@ nothing.
 That is what the miner did, and it stays true whatever the chain later
 decided.
 
+### PPS is only safe once difficulty has caught up
+
+`pool_mode = pps-classic` derives the rate from each template as
+`coinbasevalue / network_difficulty`, which is a share's expected value. That
+holds only while difficulty is calibrated to hashrate. On a new chain it is
+not — difficulty starts at 1 and climbs — and until it catches up the pool
+produces solutions far faster than the chain accepts blocks, so the formula
+prices every share as though it were worth a whole block.
+
+Set `pps_min_network_difficulty` to the difficulty at which your pool alone
+would find one block per block interval:
+
+```
+pps_min_network_difficulty = hashrate_H/s * block_interval_sec / 2^32
+```
+
+A 40 TH/s pool on a 600-second chain needs roughly **5,600,000**. Below that
+the proxy credits nothing, refuses new miners by default rather than taking
+work it will not pay for, and resumes on its own once the chain retargets. A
+separate automatic ceiling caps accrual at what the chain can actually mint,
+but it needs a minute of hashrate history and so cannot cover a restart — the
+floor is what does.
+
+Left at 0 the check is off, which is only safe on mainnet, testnet or signet.
+A pool that skipped it on a forknet accrued 15,561,471 BTC of liability in
+under four hours against 943.60 BTC actually mined.
+
 ## Run against local regtest
 
 The repo ships a best-effort integration test that exercises the proxy

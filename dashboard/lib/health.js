@@ -36,6 +36,11 @@ const PAYOUT_STALL_SEC = 3600;
  * rather than silently accepting any number.
  *
  * Returns 0 past the last era, where there is nothing left to check. */
+/* Target seconds between blocks. 600 on Bitcoin and everything derived from
+ * it; the proxy has this as block_interval_sec but the dashboard reads the DB
+ * only, and a chain that changed it would need this changed too. */
+const BLOCK_INTERVAL_SEC = 600;
+
 const HALVING_INTERVAL = 210000;
 export function subsidyAt(height) {
     if (!Number.isFinite(height) || height < 0) return 0;
@@ -134,6 +139,50 @@ export function health(handle) {
                  detail: m < 0
                     ? `owed ${(-m / 1e8).toFixed(4)} BTC more than mined`
                     : null };
+    }));
+
+    /* Is PPS fair value still fair on this chain?
+     *
+     * The rate is block_value / network_difficulty — a share's expected value,
+     * and correct only while the pool's solutions can actually become blocks.
+     * A chain accepts one block per interval however fast work arrives, so
+     * once the pool's own difficulty throughput exceeds a block's worth per
+     * interval, the formula is promising blocks that will never be minted, and
+     * it overstates by exactly that ratio.
+     *
+     * The boundary is the difficulty at which this pool alone would find one
+     * block per interval: difficulty_per_second * block_interval.
+     *
+     * Computed here from the shares table rather than read from the proxy, so
+     * it is an independent check on the number the proxy decided to use. The
+     * production pps pool ran at 9,349 difficulty/s on a chain at difficulty
+     * 1, needed 5,609,561, and accrued 15,561,471 BTC against 943.60 BTC
+     * mined. Nothing in the dashboard said a word. */
+    checks.push(guard('pps_difficulty', 'Difficulty supports PPS', () => {
+        const meta = one(d, 'SELECT pool_mode, network_difficulty FROM pool_meta WHERE id = 1');
+        if (!meta || meta.pool_mode !== 'pps-classic') {
+            return { ok: true, value: null, detail: 'solo — no accrual' };
+        }
+        const r = one(d, `
+            SELECT COALESCE(SUM(difficulty),0) AS sd,
+                   MIN(ts) AS a, MAX(ts) AS b
+              FROM shares WHERE ts >= (SELECT MAX(ts) - 3600 FROM shares)`);
+        const span = Number(r?.b || 0) - Number(r?.a || 0);
+        if (!r || span <= 0) return { ok: true, value: null, detail: 'not enough shares yet' };
+        const dps = Number(r.sd) / span;
+        const needed = dps * BLOCK_INTERVAL_SEC;
+        const actual = Number(meta.network_difficulty || 0);
+        if (needed <= 0 || actual <= 0) return { ok: true, value: null, detail: null };
+        const ratio = actual / needed;
+        return {
+            ok: ratio >= 1,
+            value: Math.round(ratio * 1000) / 1000,
+            detail: ratio >= 1 ? null
+                : `network difficulty ${actual.toFixed(0)} is ${(1/ratio).toFixed(1)}x ` +
+                  `below the ${needed.toFixed(0)} this pool's ${dps.toFixed(0)} ` +
+                  `difficulty/s needs — every share is priced as if the chain ` +
+                  `could absorb it`,
+        };
     }));
 
     /* Does the block value the pool is being told make arithmetic sense?

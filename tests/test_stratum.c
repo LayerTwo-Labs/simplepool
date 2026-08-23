@@ -769,6 +769,123 @@ static void test_held_job_is_freed_on_release(void) {
     stratum_server_free(s);        /* server drops the last one */
 }
 
+/* While accrual is suspended the pool must turn miners away, not bank their
+ * work. A miner whose shares are accepted but never credited is mining for
+ * free without being told — worse than being refused, because they cannot
+ * tell it is happening. */
+static void test_gated_pps_refuses_authorize_and_submits(void) {
+    obs_t obs = {0};
+    _Atomic int gate = 1;
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .pps_enabled = 1, .pps_gate = &gate,
+                          .pps_refuse_shares_below_min = 1,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    snprintf(cfg.pool_btc_address, sizeof cfg.pool_btc_address, "%s", TEST_ADDR);
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+
+    /* Authorize is refused, and the reason says what to do about it. */
+    int rc = stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"2sYBNmMJMMZHi6xasMcCPgNiYJ1z\",\"x\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(strstr(out, "not crediting shares") != NULL);
+    CHECK(stratum_conn_authorized_for_test(c) == 0);
+    free(out); out=NULL; olen=0;
+
+    /* A miner that got in before the gate closed is stopped too. */
+    gate = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.authorize\","
+         "\"params\":[\"2sYBNmMJMMZHi6xasMcCPgNiYJ1z\",\"x\"]}",
+        &out, &olen);
+    CHECK(stratum_conn_authorized_for_test(c) == 1);
+    free(out); out=NULL; olen=0;
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J1", net));
+    gate = 1;
+    stratum_handle_message(s, c,
+        "{\"id\":4,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(strstr(out, "not crediting shares") != NULL);
+    CHECK(obs.shares == 0);            /* nothing banked */
+    free(out); out=NULL; olen=0;
+
+    /* And once the chain retargets, work is taken again. */
+    gate = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":5,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000002\"]}",
+        &out, &olen);
+    CHECK(obs.shares == 1);
+    free(out);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* An operator who has deliberately turned the refusal off keeps taking work. */
+static void test_gate_can_be_disabled(void) {
+    obs_t obs = {0};
+    _Atomic int gate = 1;
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .pps_enabled = 1, .pps_gate = &gate,
+                          .pps_refuse_shares_below_min = 0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    snprintf(cfg.pool_btc_address, sizeof cfg.pool_btc_address, "%s", TEST_ADDR);
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"2sYBNmMJMMZHi6xasMcCPgNiYJ1z\",\"x\"]}",
+        &out, &olen);
+    CHECK(stratum_conn_authorized_for_test(c) == 1);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* Solo has no accrual to suspend, so the gate must never touch it. */
+static void test_solo_is_never_gated(void) {
+    obs_t obs = {0};
+    _Atomic int gate = 1;
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .pps_enabled = 0, .pps_gate = &gate,
+                          .pps_refuse_shares_below_min = 1,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}", &out, &olen);
+    CHECK(stratum_conn_authorized_for_test(c) == 1);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -787,6 +904,9 @@ int main(void) {
     test_accepted_candidate_reports_accepted();
     test_job_survives_retirement_while_held();
     test_held_job_is_freed_on_release();
+    test_gated_pps_refuses_authorize_and_submits();
+    test_gate_can_be_disabled();
+    test_solo_is_never_gated();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

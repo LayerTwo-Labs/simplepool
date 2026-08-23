@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 typedef struct stratum_job stratum_job_t;
@@ -95,6 +96,17 @@ typedef struct {
      */
     int     pps_enabled;
     char    pool_btc_address[128];   /* pps-classic: coinbase spendable output */
+
+    /* Points at the proxy's PPS accrual gate — non-zero while network
+     * difficulty is below the configured floor and nothing is being credited.
+     * NULL when the caller has no gate.
+     *
+     * The server reads it so it can turn miners away instead of accepting
+     * work it will not pay for. A miner whose shares are accepted but never
+     * credited is mining for free without being told, which is worse than
+     * being refused. */
+    const _Atomic int *pps_gate;
+    int     pps_refuse_shares_below_min;
 
     /* Vardiff (see config.h for prose). 0 disables and pins to initial_diff. */
     int    vardiff_enabled;

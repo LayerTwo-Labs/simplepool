@@ -136,6 +136,19 @@ typedef struct {
      * template we could not derive a rate from). */
     _Atomic double  pps_rate;
 
+    /* Observed share-difficulty throughput, in difficulty units per second,
+     * and the window it is accumulated over. This is the pool's own hashrate
+     * expressed in the same units the PPS rate is paid in, which is what the
+     * issuance ceiling needs: accrual per second is rate * this. */
+    _Atomic double  diff_accum;        /* difficulty seen this window */
+    _Atomic uint64_t diff_window_ms;   /* when the window opened */
+    _Atomic double  diff_per_sec;      /* last completed measurement, 0 = none */
+
+    /* Set when accrual is refused because network difficulty is below
+     * cfg->pps_min_network_difficulty. Read by the stratum server, which
+     * turns miners away rather than letting them work uncredited. */
+    _Atomic int     pps_gated;
+
     /* Whether the backend serves getblockhash: 0 unknown, 1 yes, -1 no.
      * Latched on the first "Method not found", because a backend that does
      * not implement the method never starts to — the CUSF enforcer serves
@@ -143,6 +156,11 @@ typedef struct {
      * it selects the observed-tip path. */
     _Atomic int     gbh_state;
 } server_ctx_t;
+
+/* How long to accumulate share difficulty before turning it into a rate.
+ * Long enough to be stable, short enough that a pool starting up is measured
+ * within a minute. */
+#define HASHRATE_WINDOW_MS 60000
 
 /* A block this deep stops being re-checked. */
 #define BLOCK_FINAL_DEPTH      100
@@ -275,6 +293,28 @@ static stratum_job_t *build_job_from_template(const proxy_config_t *cfg,
  * Warns when an override implies a materially different fee from fee_bps —
  * that mismatch is invisible otherwise, and a stale override is how the fee
  * silently drifts to zero (or negative) as difficulty moves. */
+/* Close the hashrate window if it has run long enough, and return the best
+ * available difficulty-per-second measurement (0 when there is none yet). */
+static double observed_diff_per_sec(server_ctx_t *s) {
+    uint64_t now = now_ms();
+    uint64_t opened = atomic_load_explicit(&s->diff_window_ms, memory_order_relaxed);
+    if (opened == 0) {
+        atomic_store_explicit(&s->diff_window_ms, now, memory_order_relaxed);
+        return 0.0;
+    }
+    if (now - opened >= HASHRATE_WINDOW_MS) {
+        double accum = atomic_exchange_explicit(&s->diff_accum, 0.0,
+                                                memory_order_relaxed);
+        atomic_store_explicit(&s->diff_window_ms, now, memory_order_relaxed);
+        double secs = (double)(now - opened) / 1000.0;
+        if (secs > 0.0) {
+            atomic_store_explicit(&s->diff_per_sec, accum / secs,
+                                  memory_order_relaxed);
+        }
+    }
+    return atomic_load_explicit(&s->diff_per_sec, memory_order_relaxed);
+}
+
 static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
     if (!s || !s->cfg || !t) return;
 
@@ -297,6 +337,69 @@ static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
     double eff_fee_bps = (gross > 0.0) ? (1.0 - rate / gross) * 10000.0 : 0.0;
 
     int accrues = strcmp(s->cfg->pool_mode, "pps-classic") == 0;
+
+    /* Two guards, in order. Both only matter while accruing.
+     *
+     * The floor is the operator's, and it is the one that works from the
+     * first share: below the configured difficulty the fair-value formula is
+     * not fair, so nothing accrues at all. The ceiling is automatic and needs
+     * no configuration, but it needs a hashrate measurement, so it cannot
+     * cover the first minute after a restart. They cover each other. */
+    double dps = observed_diff_per_sec(s);
+    int gated = 0;
+    if (accrues && s->cfg->pps_min_network_difficulty > 0.0 &&
+        net_diff > 0.0 && net_diff < s->cfg->pps_min_network_difficulty) {
+        gated = 1;
+        rate = 0.0;
+    }
+    if (accrues && !gated) {
+        double capped = pps_rate_apply_issuance_ceiling(
+            rate, value, dps, s->cfg->block_interval_sec);
+        if (capped < rate) {
+            LOG_WARN("pps rate capped at %.6f sats/diff (fair value says "
+                     "%.6f): at %.2f difficulty/s this pool would accrue "
+                     "faster than the chain can issue %lld sats every %ds. "
+                     "Network difficulty %.2f is below the %.2f this pool's "
+                     "own hashrate requires — set "
+                     "pps_min_network_difficulty and stop accruing until the "
+                     "chain catches up.",
+                     capped, rate, dps, (long long)value,
+                     s->cfg->block_interval_sec, net_diff,
+                     pps_min_safe_difficulty(dps, s->cfg->block_interval_sec));
+        }
+        rate = capped;
+    }
+
+    /* Report the transition, not every template — this path runs per poll. */
+    int was_gated = atomic_exchange_explicit(&s->pps_gated, gated,
+                                             memory_order_relaxed);
+    if (accrues && gated && !was_gated) {
+        LOG_WARN("PPS ACCRUAL SUSPENDED: network difficulty %.2f is below the "
+                 "configured floor of %.2f. Shares are not being credited "
+                 "because at this difficulty each one would be priced as "
+                 "though it were worth a whole block. Accrual resumes on its "
+                 "own once the chain retargets.",
+                 net_diff, s->cfg->pps_min_network_difficulty);
+    } else if (accrues && !gated && was_gated) {
+        LOG_INFO("pps accrual resumed: network difficulty %.2f is at or above "
+                 "the configured floor of %.2f", net_diff,
+                 s->cfg->pps_min_network_difficulty);
+    }
+
+    /* No floor configured is a real risk, not a neutral default. Say so once
+     * there is a measurement to say it with. */
+    if (accrues && s->cfg->pps_min_network_difficulty <= 0.0 && dps > 0.0) {
+        double need = pps_min_safe_difficulty(dps, s->cfg->block_interval_sec);
+        if (need > 0.0 && net_diff > 0.0 && net_diff < need) {
+            LOG_WARN("pps_min_network_difficulty is unset and network "
+                     "difficulty %.2f is below the %.2f this pool's own "
+                     "%.2f difficulty/s requires. Every share is being priced "
+                     "as though the chain could absorb it; it cannot. Set "
+                     "pps_min_network_difficulty=%.0f",
+                     net_diff, need, dps, need);
+        }
+    }
+
     atomic_store_explicit(&s->pps_rate, accrues ? rate : 0.0,
                           memory_order_relaxed);
 
@@ -383,6 +486,16 @@ static void on_share_cb(void *ctx, const char *worker_name,
                         double difficulty, int is_block,
                         const char *block_hash_or_null) {
     server_ctx_t *s = (server_ctx_t *)ctx;
+
+    /* Fold this share into the hashrate window. Difficulty per second is what
+     * the issuance ceiling is judged against — accrual per second is exactly
+     * rate * this — so it is accumulated in the same units the rate is paid
+     * in, before any decision about crediting. */
+    if (s) {
+        double prev = atomic_load_explicit(&s->diff_accum, memory_order_relaxed);
+        atomic_store_explicit(&s->diff_accum, prev + difficulty,
+                              memory_order_relaxed);
+    }
 
     /* PPS accrual. Credit the worker proportional to share difficulty at the
      * rate derived from the current template (or the operator's override).
@@ -990,6 +1103,10 @@ int main(int argc, char **argv) {
     stcfg.on_reject      = on_reject_cb;
     stcfg.on_block       = on_block_cb;
     stcfg.on_block_found = on_block_found_cb;
+    /* Let the server see the accrual gate so it can refuse work the pool has
+     * decided not to pay for. */
+    stcfg.pps_gate = &sctx.pps_gated;
+    stcfg.pps_refuse_shares_below_min = cfg.pps_refuse_shares_below_min;
 
     stratum_server_t *srv = NULL;
     if (stratum_server_start(&stcfg, &srv) < 0) {

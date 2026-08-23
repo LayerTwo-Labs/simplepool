@@ -82,6 +82,29 @@ double pps_rate_from_template(int64_t value_sats, double net_diff, int fee_bps) 
     return net > 0.0 ? net : 0.0;
 }
 
+double pps_min_safe_difficulty(double diff_per_sec, int block_interval_sec) {
+    if (!isfinite(diff_per_sec) || diff_per_sec <= 0.0) return 0.0;
+    if (block_interval_sec <= 0) return 0.0;
+    double d = diff_per_sec * (double)block_interval_sec;
+    return isfinite(d) ? d : 0.0;
+}
+
+double pps_rate_apply_issuance_ceiling(double rate, int64_t value_sats,
+                                       double diff_per_sec,
+                                       int block_interval_sec) {
+    if (!isfinite(rate) || rate <= 0.0) return rate;
+    if (value_sats <= 0) return rate;
+    if (!isfinite(diff_per_sec) || diff_per_sec <= 0.0) return rate;
+    if (block_interval_sec <= 0) return rate;
+    /* Sats the chain can mint per second, divided by the difficulty the pool
+     * presents per second: the most any single unit of difficulty can be
+     * worth without the pool promising more than exists. */
+    double issuance_per_sec = (double)value_sats / (double)block_interval_sec;
+    double ceiling = issuance_per_sec / diff_per_sec;
+    if (!isfinite(ceiling) || ceiling < 0.0) return rate;
+    return rate < ceiling ? rate : ceiling;
+}
+
 void worker_diff_to_target(double diff, uint8_t target_be[32]) {
     memset(target_be, 0, 32);
     if (!isfinite(diff) || diff <= 0.0) {

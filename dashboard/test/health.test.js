@@ -174,6 +174,30 @@ test('the subsidy schedule is the standard one', () => {
     assert.equal(subsidyAt(210000 * 64), 0);
 });
 
+/* The check that would have caught the production blow-up before it cost
+ * anything. Twenty shares of difficulty 10-29 over 19 seconds is ~20
+ * difficulty/s, needing ~12,000 — against a pool_meta difficulty of 1. */
+test('a difficulty too low for PPS to be fair is caught', () => {
+    const db = makeDb();
+    db.prepare('UPDATE pool_meta SET network_difficulty = 1').run();
+    const h = health(db);
+    assert.ok(failing(h).includes('pps_difficulty'));
+});
+
+test('a properly calibrated difficulty passes', () => {
+    const db = makeDb();   /* fixture is mainnet difficulty */
+    const h = health(db);
+    assert.ok(!failing(h).includes('pps_difficulty'));
+});
+
+/* Solo pays from the block's own coinbase, so there is no rate to be unfair. */
+test('solo mode is not judged on PPS difficulty', () => {
+    const db = makeDb();
+    db.prepare("UPDATE pool_meta SET pool_mode='solo', network_difficulty=1").run();
+    const h = health(db);
+    assert.ok(!failing(h).includes('pps_difficulty'));
+});
+
 test('shares accepted but never stored are caught', () => {
     const db = makeDb();
     db.prepare('UPDATE pool_meta SET events_lost = 7 WHERE id = 1').run();
@@ -276,7 +300,7 @@ test('a DB missing a table degrades to unavailable, not to healthy', () => {
     db.exec('DROP TABLE payouts_in_flight');
     const h = health(db);
     assert.ok(h.unavailable.some(c => c.id === 'payout_ambiguous'));
-    assert.equal(h.checks.length, 9, 'every check still reported');
+    assert.equal(h.checks.length, 10, 'every check still reported');
 });
 
 test('no DB handle is not healthy', () => {
