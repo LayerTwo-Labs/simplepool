@@ -34,7 +34,11 @@ function arg(name, dflt) {
 
 const HOST    = arg('host', '127.0.0.1');
 const PORT    = parseInt(arg('port', '0'), 10);
-const USER    = arg('user', 'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080');
+/* Matches cpuminer.js's default: base58 of twenty zero bytes, which is a
+ * valid Thunder address. A pps-classic pool refuses a Bitcoin address on
+ * authorize, and that is the mode the regtest e2e runs in. Pass --user for a
+ * solo pool, which wants a Bitcoin address instead. */
+const USER    = arg('user', '11111111111111111111');
 const FLOOD   = parseInt(arg('flood', '0'), 10);
 const JOB_ID  = arg('job-id', null);
 const TIMEOUT = parseInt(arg('timeout', '30'), 10) * 1000;
@@ -117,6 +121,19 @@ sock.on('data', (d) => {
         if (!line.trim()) continue;
         let msg;
         try { msg = JSON.parse(line); } catch { continue; }
+
+        /* An error on subscribe or authorize means no job is ever coming, so
+         * waiting for one just burns the timeout and reports nothing useful.
+         * Say what the pool said. This is how a probe pointed at a
+         * pps-classic pool with a Bitcoin-address username should read --
+         * "invalid thunder address", not a 30-second silence. */
+        if ((msg.id === 1 || msg.id === 2) && msg.error) {
+            const e = msg.error;
+            out.error = 'handshake refused: ' +
+                (Array.isArray(e) ? String(e[1] || e[0]) : JSON.stringify(e));
+            done(1);
+            return;
+        }
 
         if (msg.id === 1 && Array.isArray(msg.result)) {
             out.extranonce2_size = msg.result[2];
