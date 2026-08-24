@@ -185,6 +185,56 @@ export function health(handle) {
         };
     }));
 
+    /* Is every stratum port actually able to serve the difficulty it was
+     * configured for?
+     *
+     * The pool never assigns a share difficulty above the network difficulty:
+     * a miner filters locally against the stratum target, so a share target
+     * harder than the network target throws away valid blocks before the pool
+     * ever sees them. The clamp is right, and it is silent.
+     *
+     * That silence is the problem for a high-difficulty port. An operator
+     * configures 500000 to satisfy a marketplace floor, the chain is at 1200,
+     * and the port serves 1200 while every dashboard reads normal. The
+     * marketplace then measures the difficulty it was actually given, decides
+     * the pool cannot hold its floor, and cancels the order -- and nothing in
+     * the pool ever said why. Binary, actionable, and invisible to every other
+     * query, which is what this banner is for.
+     *
+     * Only ports asking for more than the default are checked. A home-miner
+     * port sitting under the network difficulty is the normal case, not a
+     * finding. */
+    checks.push(guard('listener_difficulty', 'Stratum ports can hold their difficulty', () => {
+        const meta = one(d, 'SELECT network_difficulty, listeners FROM pool_meta WHERE id = 1');
+        const actual = Number(meta?.network_difficulty || 0);
+        if (!meta || !meta.listeners || actual <= 0) {
+            return { ok: true, value: null, detail: 'no ports published yet' };
+        }
+        let ls;
+        try { ls = JSON.parse(meta.listeners); } catch { ls = null; }
+        if (!Array.isArray(ls) || ls.length === 0) {
+            return { ok: true, value: null, detail: 'no ports published yet' };
+        }
+        const over = ls.filter(l => Number(l?.initial_diff || 0) > actual);
+        if (over.length === 0) {
+            return { ok: true, value: ls.length, detail: null };
+        }
+        const worst = over.reduce((a, b) =>
+            Number(a.initial_diff) > Number(b.initial_diff) ? a : b);
+        return {
+            ok: false,
+            value: over.length,
+            detail: `port ${worst.port}${worst.label ? ` (${worst.label})` : ''} ` +
+                    `is configured for difficulty ` +
+                    `${Number(worst.initial_diff).toFixed(0)} but network ` +
+                    `difficulty is only ${actual.toFixed(0)}, so miners there ` +
+                    `are served ${actual.toFixed(0)} instead — raising it ` +
+                    `above the chain would discard valid blocks. Rented ` +
+                    `hashrate measuring this port will read it as below its ` +
+                    `floor`,
+        };
+    }));
+
     /* Does the block value the pool is being told make arithmetic sense?
      *
      * A template reports the coinbase value in one field and the per-transaction

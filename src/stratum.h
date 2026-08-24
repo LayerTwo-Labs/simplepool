@@ -98,11 +98,44 @@ typedef void (*block_found_fn)(void *ctx,
                                int64_t reward_sats, int64_t fee_sats,
                                int accepted, const char *submit_error);
 
+/* A listening port and the difficulty policy for the miners that arrive on
+ * it. The pool serves one kind of miner badly if it serves only one policy:
+ * a home ASIC needs a difficulty low enough to report shares regularly, and
+ * an aggregated fleet from a hashrate marketplace needs one high enough that
+ * its share rate stays sane -- 1 PH/s at difficulty 1024 is ~227 shares per
+ * second down a single connection, and the marketplaces refuse to deliver
+ * below their own floor for exactly that reason.
+ *
+ * One difficulty cannot be both, and vardiff cannot bridge it: it moves by at
+ * most 4x per window, so climbing from 1 to 65536 takes eight windows -- four
+ * minutes at the default -- and the reject flood on the way there is what
+ * gets a rented order cancelled. Hence a port per policy, each one already at
+ * the right difficulty when the miner connects.
+ *
+ * A field left at 0 falls back to the server-wide default. */
+typedef struct {
+    int    port;
+    double initial_diff;
+    double vardiff_min;
+    double vardiff_max;
+    /* Free-form, for logs and for the dashboard to tell miners which port to
+     * point which machine at. Empty for the default listener. */
+    char   label[32];
+} stratum_listener_t;
+
+#define STRATUM_MAX_LISTENERS 8
+
 typedef struct {
     char   bind_addr[64];
     int    bind_port;
     int    max_conns;            /* default 500 */
     double initial_diff;         /* default 1.0 */
+
+    /* Extra listeners beyond bind_port, each with its own difficulty policy.
+     * bind_port is always served, using the server-wide defaults, so a config
+     * that sets none of these behaves exactly as before. */
+    stratum_listener_t listeners[STRATUM_MAX_LISTENERS];
+    int    listener_count;
     /* Coinbase split — in solo mode each connection's coinbase pays the
      * miner directly. In PPS mode (pps_enabled=1) every coinbase instead
      * pays the single pool-owned pool_btc_address. In both modes
@@ -184,6 +217,12 @@ int stratum_conn_coinbase_for_test(stratum_server_t *s, stratum_conn_t *c,
                                    const uint8_t **cb2, size_t *cb2_len,
                                    const uint8_t **en1);
 double      stratum_conn_difficulty_for_test(const stratum_conn_t *c);
+/* Apply a listener's difficulty policy to a connection, exactly as the accept
+ * path does when a miner arrives on that port. Exposed so per-port policy can
+ * be tested without binding a fixed port, which in CI is a race with whatever
+ * else is on the box. */
+void        stratum_conn_apply_listener_for_test(stratum_conn_t *c,
+                                                 const stratum_listener_t *pol);
 const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);
 const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c);
 int         stratum_conn_authorized_for_test(const stratum_conn_t *c);

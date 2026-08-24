@@ -91,6 +91,71 @@ static int parse_log_level(const char *v) {
     return -1;
 }
 
+static void copy_str(char *dst, size_t cap, const char *src);
+
+/* Parse one `listener = port=3335 min_diff=65536 label=braiins` line into
+ * `out`. Fields are separated by whitespace or commas and may appear in any
+ * order; `port` is the only required one, and anything left unset falls back
+ * to the server-wide default at accept time.
+ *
+ * min_diff sets the vardiff floor and, unless initial_diff says otherwise,
+ * the starting difficulty too. That pairing is the whole point of a rental
+ * port: the miner has to arrive already at the floor, because vardiff cannot
+ * climb to it fast enough to matter. Returns 0 on success. */
+static int parse_listener(const char *v, stratum_listener_t *out,
+                          char *errbuf, size_t errlen) {
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", v);
+    memset(out, 0, sizeof *out);
+
+    double min_diff = 0.0, initial = 0.0;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, " \t,", &save); tok;
+         tok = strtok_r(NULL, " \t,", &save)) {
+        char *eq = strchr(tok, '=');
+        if (!eq) {
+            set_err(errbuf, errlen, "listener field '%s' is not key=value", tok);
+            return -1;
+        }
+        *eq = '\0';
+        const char *fk = tok, *fv = eq + 1;
+        if      (strcmp(fk, "port")         == 0) out->port = atoi(fv);
+        else if (strcmp(fk, "min_diff")     == 0) min_diff = atof(fv);
+        else if (strcmp(fk, "initial_diff") == 0) initial = atof(fv);
+        else if (strcmp(fk, "max_diff")     == 0) out->vardiff_max = atof(fv);
+        else if (strcmp(fk, "label")        == 0) copy_str(out->label, sizeof out->label, fv);
+        else {
+            set_err(errbuf, errlen, "unknown listener field '%s'", fk);
+            return -1;
+        }
+    }
+    if (out->port <= 0 || out->port > 65535) {
+        set_err(errbuf, errlen, "listener needs a port between 1 and 65535");
+        return -1;
+    }
+    /* The label is published to the DB inside a JSON blob and rendered into
+     * the dashboard. Constraining it here means neither of those has to
+     * escape it, and an operator typo fails at startup rather than producing
+     * a banner that silently breaks. */
+    for (const char *q = out->label; *q; ++q) {
+        if (!isalnum((unsigned char)*q) && *q != '-' && *q != '_') {
+            set_err(errbuf, errlen,
+                    "listener port %d: label may only contain letters, "
+                    "digits, '-' and '_'", out->port);
+            return -1;
+        }
+    }
+    out->vardiff_min  = min_diff;
+    out->initial_diff = initial > 0.0 ? initial : min_diff;
+    if (out->vardiff_max > 0.0 && out->initial_diff > out->vardiff_max) {
+        set_err(errbuf, errlen,
+                "listener port %d: initial difficulty %g is above max_diff %g",
+                out->port, out->initial_diff, out->vardiff_max);
+        return -1;
+    }
+    return 0;
+}
+
 static void copy_str(char *dst, size_t cap, const char *src) {
     snprintf(dst, cap, "%s", src);
 }
@@ -130,6 +195,24 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "listen_port")               == 0) cfg->listen_port = atoi(v);
         else if (strcmp(k, "max_conns")                 == 0) cfg->max_conns = atoi(v);
         else if (strcmp(k, "initial_diff")              == 0) cfg->initial_diff = atof(v);
+        else if (strcmp(k, "listener")                  == 0) {
+            /* Repeatable, unlike every other key here: each one adds a port
+             * rather than replacing the last. */
+            if (cfg->listener_count >= STRATUM_MAX_LISTENERS) {
+                set_err(errbuf, errlen, "config: line %d: at most %d listeners",
+                        lineno, STRATUM_MAX_LISTENERS);
+                fclose(f);
+                return -1;
+            }
+            stratum_listener_t l;
+            char lerr[256] = {0};
+            if (parse_listener(v, &l, lerr, sizeof lerr) != 0) {
+                set_err(errbuf, errlen, "config: line %d: %s", lineno, lerr);
+                fclose(f);
+                return -1;
+            }
+            cfg->listeners[cfg->listener_count++] = l;
+        }
         else if (strcmp(k, "bitcoind_url")              == 0) copy_str(cfg->bitcoind_url, sizeof cfg->bitcoind_url, v);
         else if (strcmp(k, "bitcoind_user")             == 0) copy_str(cfg->bitcoind_user, sizeof cfg->bitcoind_user, v);
         else if (strcmp(k, "bitcoind_pass")             == 0) copy_str(cfg->bitcoind_pass, sizeof cfg->bitcoind_pass, v);
