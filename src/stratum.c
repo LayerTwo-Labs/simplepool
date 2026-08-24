@@ -321,7 +321,8 @@ struct stratum_conn {
      * so the count is folded into a single periodic report instead. */
     uint64_t rl_window_start_ms;
     uint32_t rl_window_count;
-    uint32_t rl_limited;
+    uint32_t rl_limited;        /* refused since the last report */
+    uint64_t rl_limited_total;  /* refused over the connection's life */
     uint64_t rl_reported_ms;
 
     /* Monotonic timestamp of the most recent recv() that got any bytes.
@@ -759,6 +760,7 @@ static int submit_rate_exceeded(stratum_server_t *s, stratum_conn_t *c,
         return 0;
     }
     c->rl_limited++;
+    c->rl_limited_total++;
     return 1;
 }
 
@@ -777,16 +779,17 @@ static void submit_rate_report(stratum_server_t *s, stratum_conn_t *c,
         now_mono - c->rl_reported_ms < RL_REPORT_INTERVAL_MS) return;
 
     LOG_WARN("stratum: %s is over the submit ceiling of %d/s — %u submit(s) "
-             "refused since the last report. At difficulty %g its hashrate is "
-             "producing more shares than the pool will take; vardiff is "
-             "raising it",
+             "refused since the last report, %llu on this connection. At "
+             "difficulty %g its hashrate is producing more shares than the "
+             "pool will take; vardiff is raising it",
              c->worker_name, s->cfg.max_submits_per_sec, c->rl_limited,
-             c->difficulty);
+             (unsigned long long)c->rl_limited_total, c->difficulty);
     if (s->cfg.on_reject) {
         char msg[192];
         snprintf(msg, sizeof msg,
-                 "submitting too fast: %u refused at over %d/s",
-                 c->rl_limited, s->cfg.max_submits_per_sec);
+                 "submitting too fast: %u refused at over %d/s (%llu total)",
+                 c->rl_limited, s->cfg.max_submits_per_sec,
+                 (unsigned long long)c->rl_limited_total);
         /* Wall clock here, not the monotonic value the interval is measured
          * with: this one is a timestamp that gets stored and read back. */
         s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(), msg);
@@ -1701,6 +1704,14 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
 
 void stratum_conn_free_for_test(stratum_conn_t *c) {
     if (!c) return;
+    /* A flood usually ends by going quiet, and the refusals since the last
+     * periodic report would otherwise die with the connection -- so the
+     * operator would see "1 refused" for a burst of nine hundred. Force the
+     * final report out before the counters go. */
+    if (c->server && c->rl_limited > 0) {
+        c->rl_reported_ms = 0;   /* bypass the interval; this is the last one */
+        submit_rate_report(c->server, c, mono_ms());
+    }
     conn_clear_coinbase(c);
     pthread_mutex_destroy(&c->write_lock);
     pthread_mutex_destroy(&c->jobdiff_lock);

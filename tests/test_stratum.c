@@ -1106,7 +1106,14 @@ static void test_submit_ceiling_refuses_past_the_limit(void) {
     CHECK(obs.rejects == 1);
     CHECK(strstr(obs.last_reason, "submitting too fast") != NULL);
 
+    /* ...but the ones after that first report are not lost. A flood usually
+     * ends by going quiet, well inside the reporting interval, so the tail is
+     * flushed when the connection goes away. Without this an operator sees
+     * "1 refused" for a burst of thirty-five. */
     stratum_conn_free_for_test(c);
+    CHECK(obs.rejects == 2);
+    CHECK(strstr(obs.last_reason, "35 total") != NULL);
+
     stratum_server_free(s);
 }
 
