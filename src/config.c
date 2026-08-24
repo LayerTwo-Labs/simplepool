@@ -24,6 +24,9 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->listen_port  = 3334;
     cfg->max_conns    = 500;
     cfg->initial_diff = 1.0;
+    /* Far above any correctly configured miner and far below what one
+     * mismatched connection can otherwise cost. See proxy.conf.example. */
+    cfg->max_submits_per_sec = 20000;
 
     snprintf(cfg->bitcoind_url,  sizeof cfg->bitcoind_url,  "%s", "http://127.0.0.1:18443");
     /* No default credentials: when bitcoind_user/bitcoind_pass are omitted the
@@ -194,6 +197,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         if      (strcmp(k, "listen_addr")               == 0) copy_str(cfg->listen_addr, sizeof cfg->listen_addr, v);
         else if (strcmp(k, "listen_port")               == 0) cfg->listen_port = atoi(v);
         else if (strcmp(k, "max_conns")                 == 0) cfg->max_conns = atoi(v);
+        else if (strcmp(k, "max_submits_per_sec")       == 0) cfg->max_submits_per_sec = atoi(v);
         else if (strcmp(k, "initial_diff")              == 0) cfg->initial_diff = atof(v);
         else if (strcmp(k, "listener")                  == 0) {
             /* Repeatable, unlike every other key here: each one adds a port
@@ -318,6 +322,12 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                     "(0 disables the check)");
             return -10;
         }
+    }
+    if (cfg->max_submits_per_sec < 0) {
+        set_err(errbuf, errlen,
+                "config: 'max_submits_per_sec' cannot be negative "
+                "(0 disables the ceiling)");
+        return -13;
     }
     if (cfg->block_interval_sec <= 0) {
         set_err(errbuf, errlen,

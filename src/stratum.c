@@ -309,6 +309,21 @@ struct stratum_conn {
     struct { char job_id[32]; double difficulty; } job_diffs[JOB_DIFF_RING];
     size_t   job_diffs_head;
 
+    /* Submit rate limiting. A fixed one-second window: cheaper than a token
+     * bucket and the burst it lets through is one window's worth, which at
+     * these magnitudes is the same protection. Measured on the monotonic
+     * clock -- these are intervals, and an NTP step must not hand a
+     * connection a fresh window or freeze it in one.
+     *
+     * rl_limited counts what has been refused since the last time we said so.
+     * Reporting every refusal would put the flood straight into the reject
+     * table -- tens of thousands of rows a second describing one condition --
+     * so the count is folded into a single periodic report instead. */
+    uint64_t rl_window_start_ms;
+    uint32_t rl_window_count;
+    uint32_t rl_limited;
+    uint64_t rl_reported_ms;
+
     /* Monotonic timestamp of the most recent recv() that got any bytes.
      * The conn thread checks this against cfg.idle_timeout_sec after each
      * SO_RCVTIMEO wake-up so silent connections are reaped. */
@@ -720,6 +735,64 @@ static double current_net_diff(stratum_server_t *s) {
     if (s->current_job) d = target_to_diff(s->current_job->network_target_be);
     pthread_rwlock_unlock(&s->job_lock);
     return d;
+}
+
+/* How often a connection that is over its submit ceiling says so, rather than
+ * once per refused share. */
+#define RL_REPORT_INTERVAL_MS 10000
+
+/* Has this connection used up its submits for the current second?
+ *
+ * Called before anything expensive, so a flood costs a JSON parse and a reply
+ * instead of a coinbase render and four SHA256 passes. Returns non-zero when
+ * the submit must be refused, and counts it for the periodic report. */
+static int submit_rate_exceeded(stratum_server_t *s, stratum_conn_t *c,
+                                uint64_t now_mono) {
+    int limit = s->cfg.max_submits_per_sec;
+    if (limit <= 0) return 0;
+    if (now_mono - c->rl_window_start_ms >= 1000) {
+        c->rl_window_start_ms = now_mono;
+        c->rl_window_count = 0;
+    }
+    if (c->rl_window_count < (uint32_t)limit) {
+        c->rl_window_count++;
+        return 0;
+    }
+    c->rl_limited++;
+    return 1;
+}
+
+/* Say once per RL_REPORT_INTERVAL_MS that this connection is over its ceiling,
+ * carrying the count of everything refused since the last time. One line and
+ * one reject row per interval, whatever the rate -- the alternative writes the
+ * flood into the database that exists to account for shares.
+ *
+ * The message names the difficulty, because that is the actual fault: a
+ * connection only reaches this rate when what it was assigned is far below
+ * what its hashrate warrants, and vardiff is still climbing towards it. */
+static void submit_rate_report(stratum_server_t *s, stratum_conn_t *c,
+                               uint64_t now_mono) {
+    if (c->rl_limited == 0) return;
+    if (c->rl_reported_ms != 0 &&
+        now_mono - c->rl_reported_ms < RL_REPORT_INTERVAL_MS) return;
+
+    LOG_WARN("stratum: %s is over the submit ceiling of %d/s — %u submit(s) "
+             "refused since the last report. At difficulty %g its hashrate is "
+             "producing more shares than the pool will take; vardiff is "
+             "raising it",
+             c->worker_name, s->cfg.max_submits_per_sec, c->rl_limited,
+             c->difficulty);
+    if (s->cfg.on_reject) {
+        char msg[192];
+        snprintf(msg, sizeof msg,
+                 "submitting too fast: %u refused at over %d/s",
+                 c->rl_limited, s->cfg.max_submits_per_sec);
+        /* Wall clock here, not the monotonic value the interval is measured
+         * with: this one is a timestamp that gets stored and read back. */
+        s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(), msg);
+    }
+    c->rl_limited = 0;
+    c->rl_reported_ms = now_mono;
 }
 
 /* Record the difficulty `job_id` went out to this connection under. Called
@@ -1503,6 +1576,15 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                          cJSON *params, char **buf, size_t *len) {
     if (!c->authorized) {
         cJSON *err = make_error(24, "unauthorized");
+        return emit_response(buf, len, id, NULL, err);
+    }
+    /* Before the params are even looked at: past the ceiling this share is
+     * not going to be validated, so nothing beyond the reply should be spent
+     * on it. */
+    uint64_t rl_now = mono_ms();
+    if (submit_rate_exceeded(s, c, rl_now)) {
+        submit_rate_report(s, c, rl_now);
+        cJSON *err = make_error(20, "submitting too fast");
         return emit_response(buf, len, id, NULL, err);
     }
     if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) < 5) {

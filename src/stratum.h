@@ -179,6 +179,31 @@ typedef struct {
      * that connect but never authenticate. 0 disables (legacy). Default 600. */
     int    idle_timeout_sec;
 
+    /* Ceiling on mining.submit per second, per connection. 0 disables.
+     *
+     * A connection's share rate is its hashrate divided by the difficulty it
+     * was assigned, and nothing stops those from being wildly mismatched: an
+     * aggregated fleet pointed at a home-miner port is 1 PH/s against
+     * difficulty 1, which is ~232,000 submits per second down one socket.
+     * Validating a submit costs about 9 microseconds, so that single
+     * connection asks for more than two cores -- and every share it lands
+     * goes through the store's ring, which drops events once full. Work the
+     * miner was told was accepted then never gets credited.
+     *
+     * The ceiling is deliberately far above anything a correctly configured
+     * miner reaches. With vardiff on, the steady state is vardiff_target_spm
+     * -- 0.2/s at the default -- for a connection of any size, because that
+     * is what vardiff converges on. The rates that approach this limit are
+     * transients while vardiff climbs, and they only get near it when the
+     * difficulty is already badly wrong.
+     *
+     * Over the limit the submit is refused with a stratum error before any
+     * hashing, so a flood costs a parse and a reply rather than a full
+     * validation. Refusing is also the honest answer: the miner learns its
+     * difficulty is wrong, where accepting the work and losing it in a full
+     * ring tells it everything is fine. */
+    int    max_submits_per_sec;
+
     void  *ctx;
     share_observer_fn  on_share;
     reject_observer_fn on_reject;

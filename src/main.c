@@ -1110,6 +1110,7 @@ int main(int argc, char **argv) {
     stcfg.vardiff_max        = cfg.vardiff_max;
     stcfg.vardiff_window_sec = cfg.vardiff_window_sec;
     stcfg.idle_timeout_sec   = cfg.idle_timeout_sec;
+    stcfg.max_submits_per_sec = cfg.max_submits_per_sec;
     stcfg.listener_count     = cfg.listener_count;
     for (int i = 0; i < cfg.listener_count; ++i) {
         stcfg.listeners[i] = cfg.listeners[i];

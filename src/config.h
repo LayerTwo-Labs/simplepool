@@ -19,6 +19,10 @@ typedef struct {
     stratum_listener_t listeners[STRATUM_MAX_LISTENERS];
     int  listener_count;
 
+    /* Per-connection ceiling on mining.submit per second. 0 disables.
+     * See stratum.h for why it sits where it does. */
+    int  max_submits_per_sec;
+
     /* vardiff — auto-adjust each connection's difficulty to keep the
      * share rate near `target_spm` shares/minute. Set vardiff_enabled = 0
      * to pin every connection to initial_diff (the legacy behaviour). */

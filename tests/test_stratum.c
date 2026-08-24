@@ -1059,6 +1059,141 @@ static void test_listener_difficulty_still_clamped_to_the_network(void) {
     stratum_server_free(s);
 }
 
+/* The submit ceiling.
+ *
+ * A connection's share rate is its hashrate over the difficulty it was given,
+ * and a fleet pointed at a home-miner port makes those wildly mismatched: 1
+ * PH/s against difficulty 1 is ~232,000 submits per second down one socket.
+ * Past the ceiling a submit is refused before any validation work, so the
+ * flood costs a reply rather than a coinbase render and four SHA256 passes. */
+static void test_submit_ceiling_refuses_past_the_limit(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-12,   /* any hash clears it */
+                          .max_submits_per_sec = 5,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    char *out = NULL; size_t olen = 0;
+    char msg[256];
+    /* Five land, the rest are refused — all inside one second, so they share
+     * a window. Distinct nonces, so nothing is refused as a duplicate. */
+    for (int i = 0; i < 40; ++i) {
+        snprintf(msg, sizeof msg,
+                 "{\"id\":9,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\","
+                 "\"60000000\",\"%08x\"]}", (unsigned)(i + 1));
+        stratum_handle_message(s, c, msg, &out, &olen);
+        if (i >= 5) {
+            CHECK(out != NULL && strstr(out, "submitting too fast") != NULL);
+        }
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.shares == 5);
+
+    /* One report for the whole flood, not one per refusal: reporting each
+     * would write tens of thousands of rows a second into the table that
+     * exists to account for shares. */
+    CHECK(obs.rejects == 1);
+    CHECK(strstr(obs.last_reason, "submitting too fast") != NULL);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* The window rolls: a miner refused in one second is served again in the
+ * next. The ceiling throttles, it does not ban. */
+static void test_submit_ceiling_window_rolls(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-12,
+                          .max_submits_per_sec = 2,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    char *out = NULL; size_t olen = 0;
+    char msg[256];
+    unsigned nonce = 1;
+    for (int i = 0; i < 4; ++i) {
+        snprintf(msg, sizeof msg,
+                 "{\"id\":9,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\","
+                 "\"60000000\",\"%08x\"]}", nonce++);
+        stratum_handle_message(s, c, msg, &out, &olen);
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.shares == 2);
+
+    sleep_ms(1100);
+    for (int i = 0; i < 2; ++i) {
+        snprintf(msg, sizeof msg,
+                 "{\"id\":9,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\","
+                 "\"60000000\",\"%08x\"]}", nonce++);
+        stratum_handle_message(s, c, msg, &out, &olen);
+        CHECK(out != NULL && strstr(out, "submitting too fast") == NULL);
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.shares == 4);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* Zero means no ceiling, which is what every existing deployment and every
+ * other test in this file runs with. */
+static void test_submit_ceiling_zero_disables(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-12,
+                          .max_submits_per_sec = 0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    char *out = NULL; size_t olen = 0;
+    char msg[256];
+    for (int i = 0; i < 50; ++i) {
+        snprintf(msg, sizeof msg,
+                 "{\"id\":9,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\","
+                 "\"60000000\",\"%08x\"]}", (unsigned)(i + 1));
+        stratum_handle_message(s, c, msg, &out, &olen);
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.shares == 50);
+    CHECK(obs.rejects == 0);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 /* Idle-socket reaper: verify the accepted-socket setup path applies
  * SO_RCVTIMEO derived from idle_timeout_sec. We can't cheaply test the
  * "silent client gets dropped" path in a unit test — that would need a
@@ -1488,6 +1623,9 @@ int main(void) {
     test_vardiff_tracks_miner_local_floor();
     test_vardiff_still_lowers_for_a_matched_miner();
     test_vardiff_clamped_to_network_diff();
+    test_submit_ceiling_refuses_past_the_limit();
+    test_submit_ceiling_window_rolls();
+    test_submit_ceiling_zero_disables();
     test_listener_policy_sets_the_connections_difficulty();
     test_listener_policy_falls_back_per_field();
     test_listener_difficulty_still_clamped_to_the_network();

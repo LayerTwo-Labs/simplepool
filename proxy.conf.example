@@ -71,6 +71,29 @@ vardiff_window_sec = 30       # how often to retarget
 # their difficulty" health check) rather than leaving it to be discovered
 # when an order is cancelled.
 
+# Ceiling on mining.submit per second, per connection. 0 disables it.
+#
+# A connection's share rate is its hashrate divided by the difficulty it was
+# assigned, and nothing stops those from being badly mismatched — an
+# aggregated fleet pointed at a home-miner port is 1 PH/s against difficulty
+# 1, which is ~232,000 submits per second down one socket. Validating a submit
+# costs about 9 microseconds, so that one connection asks for more than two
+# cores, and every share it lands passes through the store's ring, which drops
+# events once full: work a miner was told was accepted, never credited.
+#
+# The default is far above anything a correctly configured miner reaches. With
+# vardiff on, the steady state is vardiff_target_spm — 0.2/s at the default —
+# for a connection of ANY size, because that is what vardiff converges on. The
+# only rates that come near this ceiling are transients while vardiff climbs,
+# and they only get near it when the difficulty is already badly wrong. For
+# scale, the largest plausible legitimate burst — 1 EH/s at difficulty
+# 65536, before vardiff has raised it — is about 3,500/s.
+#
+# Raise it if you pin a low difficulty for a very large miner
+# (vardiff_enabled = 0), since then a high sustained rate is the correct
+# behaviour rather than a symptom.
+max_submits_per_sec = 20000
+
 db_path = ./data/shares.db
 commit_window_ms = 100
 commit_max_shares = 100
