@@ -193,9 +193,26 @@ different `share_hash`, which then fails the target check → reject.
 
 Every share is checked against TWO thresholds:
 
-- **Worker target** — the difficulty the pool is currently holding
-  this connection at (set via `mining.set_difficulty` per vardiff).
-  A hash below this counts as an accepted share and earns PPS credit.
+- **Worker target** — the difficulty *the submitted job* went out
+  under, not whatever the connection has drifted to since. A hash
+  below this counts as an accepted share and earns PPS credit.
+
+  The distinction matters because `mining.set_difficulty` takes effect
+  on the *next* job the miner is notified of. A miner still working a
+  job it was handed before a retarget is mining to the difficulty that
+  job carried, and on a slow chain those shares keep arriving long
+  after the retarget. The pool records the difficulty each job was
+  notified under, per connection, and judges the submit against that —
+  so any number of retargets can happen in between without turning
+  honest work into rejects. A share is credited at the difficulty it
+  is judged under.
+
+  Some firmware applies a `set_difficulty` to work already in hand
+  rather than waiting for the next job. When that moves the difficulty
+  *down*, the resulting shares are below what the job was sent at but
+  are exactly what the miner was told to do, so they are accepted at
+  the lower value. A share is never credited at a difficulty it did
+  not actually meet.
 
 - **Network target** — the current chain difficulty from
   `getblocktemplate` / the enforcer. A hash below this is a valid
