@@ -340,12 +340,29 @@ listener = port=3335 min_diff=65536 label=braiins
 listener = port=3336 min_diff=500000 label=nicehash
 ```
 
+Open the new ports in the firewall — a `listener` line binds a socket, it
+does not touch `ufw`:
+
+```sh
+sudo ufw allow 3335/tcp
+sudo ufw allow 3336/tcp
+```
+
 Restart, and confirm both ports came up:
 
 ```sh
 journalctl -u simplepool -n 20 | grep listening
 # stratum listening on 0.0.0.0:3334 (difficulty from 1)
 # stratum listening on 0.0.0.0:3335 — braiins (difficulty from 65536, floor 65536)
+```
+
+Then check they are reachable and not just bound, which the log cannot tell
+you apart:
+
+```sh
+sudo simplepoolctl doctor
+#     stratum port 3335 accepting connections     ok
+#     firewall allows port 3335                   ok
 ```
 
 The dashboard's identity strip then lists every port with what it is for,
