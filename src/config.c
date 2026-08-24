@@ -324,5 +324,28 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                 "config: 'block_interval_sec' must be > 0 (600 for Bitcoin)");
         return -11;
     }
+    /* Two listeners on one port, or a listener on listen_port. Caught here
+     * rather than at bind() because the failure there is EADDRINUSE —
+     * "Address already in use", which reads as another process holding the
+     * port and sends the operator hunting for one that does not exist. The
+     * ports are also checked against each other in file order, so the message
+     * names the line that is actually wrong. */
+    for (int i = 0; i < cfg->listener_count; ++i) {
+        if (cfg->listeners[i].port == cfg->listen_port) {
+            set_err(errbuf, errlen,
+                    "config: listener port %d is already listen_port — give "
+                    "the extra listener a different port",
+                    cfg->listeners[i].port);
+            return -12;
+        }
+        for (int j = 0; j < i; ++j) {
+            if (cfg->listeners[i].port == cfg->listeners[j].port) {
+                set_err(errbuf, errlen,
+                        "config: two listeners both use port %d",
+                        cfg->listeners[i].port);
+                return -12;
+            }
+        }
+    }
     return 0;
 }

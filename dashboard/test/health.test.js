@@ -401,3 +401,18 @@ test('a proxy that has not published its ports is not a finding', () => {
     assert.equal(c.ok, true);
     assert.match(c.detail, /no ports published/);
 });
+
+test('a port floored above the chain is reported even if it starts low', () => {
+    /* initial_diff=1 with min_diff=500000: the miner connects at a difficulty
+     * that looks perfectly normal, then vardiff tries to climb to the floor
+     * and is clamped. The port still cannot hold what it was configured for,
+     * and this shape is harder to debug than the obvious one, not easier. */
+    const db = makeDb();
+    db.prepare('UPDATE pool_meta SET network_difficulty = 1200, listeners = ?')
+      .run(JSON.stringify([
+          { port: 3336, label: 'nicehash', min_diff: 500000, initial_diff: 1 },
+      ]));
+    const c = health(db).checks.find(x => x.id === 'listener_difficulty');
+    assert.equal(c.ok, false);
+    assert.match(c.detail, /500000/);
+});

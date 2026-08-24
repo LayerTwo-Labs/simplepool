@@ -215,18 +215,25 @@ export function health(handle) {
         if (!Array.isArray(ls) || ls.length === 0) {
             return { ok: true, value: null, detail: 'no ports published yet' };
         }
-        const over = ls.filter(l => Number(l?.initial_diff || 0) > actual);
+        /* What the port is actually asking the chain for is the higher of the
+         * two: the starting difficulty and the vardiff floor are both clamped
+         * to the network, so a port that starts at 1 but is floored at 500000
+         * cannot hold its floor either — and that configuration is the more
+         * confusing one to debug, because the miner connects at a difficulty
+         * that looks fine. */
+        const asks = l => Math.max(Number(l?.initial_diff || 0),
+                                   Number(l?.min_diff || 0));
+        const over = ls.filter(l => asks(l) > actual);
         if (over.length === 0) {
             return { ok: true, value: ls.length, detail: null };
         }
-        const worst = over.reduce((a, b) =>
-            Number(a.initial_diff) > Number(b.initial_diff) ? a : b);
+        const worst = over.reduce((a, b) => (asks(a) > asks(b) ? a : b));
         return {
             ok: false,
             value: over.length,
             detail: `port ${worst.port}${worst.label ? ` (${worst.label})` : ''} ` +
                     `is configured for difficulty ` +
-                    `${Number(worst.initial_diff).toFixed(0)} but network ` +
+                    `${asks(worst).toFixed(0)} but network ` +
                     `difficulty is only ${actual.toFixed(0)}, so miners there ` +
                     `are served ${actual.toFixed(0)} instead — raising it ` +
                     `above the chain would discard valid blocks. Rented ` +
