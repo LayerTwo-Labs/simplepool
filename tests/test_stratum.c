@@ -114,7 +114,7 @@ static stratum_job_t *make_test_job(const char *job_id,
     return stratum_job_new(job_id, 1, prev,
                            /*value_sats*/ 5000000000LL,
                            /*wc_hex*/ NULL,
-                           /*en1*/ 4, /*en2*/ 4,
+                           STRATUM_EXTRANONCE1_SIZE, STRATUM_EXTRANONCE2_SIZE,
                            NULL, 0, 0x1d00ffffu, 0x60000000u,
                            network_target_be, 800000, NULL, 0,
                            /*coinbasetxn_hex*/ NULL,
@@ -148,9 +148,11 @@ static void test_subscribe(void) {
         cJSON *subs = cJSON_GetArrayItem(result, 0);
         CHECK(cJSON_IsArray(subs) && cJSON_GetArraySize(subs) == 2);
         cJSON *ex1 = cJSON_GetArrayItem(result, 1);
-        CHECK(cJSON_IsString(ex1) && strlen(ex1->valuestring) == 8);
+        CHECK(cJSON_IsString(ex1) &&
+              strlen(ex1->valuestring) == STRATUM_EXTRANONCE1_SIZE * 2);
         cJSON *ex2sz = cJSON_GetArrayItem(result, 2);
-        CHECK(cJSON_IsNumber(ex2sz) && ex2sz->valueint == 4);
+        CHECK(cJSON_IsNumber(ex2sz) &&
+              ex2sz->valueint == STRATUM_EXTRANONCE2_SIZE);
         cJSON_Delete(resp);
     }
     free(out);
@@ -254,7 +256,7 @@ static void test_submit_share_and_dedupe(void) {
 
     int rc = stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(rc == 0);
     CHECK(obs.shares == 1);
@@ -265,12 +267,77 @@ static void test_submit_share_and_dedupe(void) {
     /* Duplicate: same parameters again. */
     rc = stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(rc == 0);
     CHECK(obs.shares == 1);  /* not incremented */
     CHECK(obs.rejects >= 1);
     CHECK(strstr(obs.last_reason, "duplicate") != NULL);
+    free(out);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* An extranonce2 of any width other than the one advertised on subscribe
+ * must be rejected, not credited. cb1 carries a scriptSig length varint
+ * computed from en1_size + en2_size, so a short or long extranonce2 yields a
+ * coinbase whose declared scriptSig length disagrees with its contents --
+ * an invalid transaction. The header over that coinbase still hashes, so an
+ * unchecked pool would credit the share and only discover the problem when
+ * the network rejected a block. */
+static void test_submit_rejects_wrong_extranonce2_size(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-12,   /* any hash clears the target */
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    /* Four bytes -- what a miner that ignored mining.subscribe and assumed
+     * the classic width would send. */
+    int rc = stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(obs.shares == 0);
+    CHECK(obs.rejects == 1);
+    CHECK(strstr(obs.last_reason, "extranonce2 size") != NULL);
+    CHECK(out != NULL && strstr(out, "wrong extranonce2 size") != NULL);
+    free(out); out=NULL; olen=0;
+
+    /* Too wide is equally wrong. */
+    rc = stratum_handle_message(s, c,
+        "{\"id\":4,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe00\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(obs.shares == 0);
+    CHECK(obs.rejects == 2);
+    free(out); out=NULL; olen=0;
+
+    /* Exactly the advertised width still works. */
+    rc = stratum_handle_message(s, c,
+        "{\"id\":5,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(obs.shares == 1);
     free(out);
 
     stratum_conn_free_for_test(c);
@@ -355,7 +422,7 @@ static void test_block_wins_over_low_difficulty(void) {
 
     int rc = stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(rc == 0);
     CHECK(obs.rejects == 0);
@@ -380,20 +447,24 @@ static double achieved_diff_for_nonce(stratum_server_t *s, stratum_conn_t *c,
     if (stratum_conn_coinbase_for_test(s, c, job_id, &cb1, &cb1_len,
                                        &cb2, &cb2_len, &en1) != 0) return 0.0;
 
-    uint8_t en2[4];
-    for (int i = 0; i < 4; ++i) {
+    uint8_t en2[STRATUM_EXTRANONCE2_SIZE];
+    for (size_t i = 0; i < STRATUM_EXTRANONCE2_SIZE; ++i) {
         unsigned byte = 0;
         sscanf(en2_hex + 2 * i, "%2x", &byte);
         en2[i] = (uint8_t)byte;
     }
 
-    size_t cb_len = cb1_len + 4 + 4 + cb2_len;
+    size_t cb_len = cb1_len + STRATUM_EXTRANONCE1_SIZE +
+                    STRATUM_EXTRANONCE2_SIZE + cb2_len;
     uint8_t *cb = malloc(cb_len);
     if (!cb) return 0.0;
     size_t off = 0;
-    memcpy(cb + off, cb1, cb1_len); off += cb1_len;
-    memcpy(cb + off, en1, 4);       off += 4;
-    memcpy(cb + off, en2, 4);       off += 4;
+    memcpy(cb + off, cb1, cb1_len);
+    off += cb1_len;
+    memcpy(cb + off, en1, STRATUM_EXTRANONCE1_SIZE);
+    off += STRATUM_EXTRANONCE1_SIZE;
+    memcpy(cb + off, en2, STRATUM_EXTRANONCE2_SIZE);
+    off += STRATUM_EXTRANONCE2_SIZE;
     memcpy(cb + off, cb2, cb2_len);
 
     uint8_t cb_txid_le[32], root_le[32], header[80], hash_be[32];
@@ -498,7 +569,7 @@ static void test_vardiff_tracks_miner_local_floor(void) {
     uint32_t from = 1;
     int mined = 1;
     for (int i = 0; i < N; ++i) {
-        achieved[i] = mine_nonce(s, c, "J1", "deadbeef", 1e-6, HUGE_VAL,
+        achieved[i] = mine_nonce(s, c, "J1", "deadbeefcafebabe", 1e-6, HUGE_VAL,
                                  from, &nonce[i]);
         if (achieved[i] <= 0.0) { mined = 0; break; }
         if (achieved[i] < floor_seen) floor_seen = achieved[i];
@@ -510,7 +581,7 @@ static void test_vardiff_tracks_miner_local_floor(void) {
     char *out = NULL; size_t olen = 0;
     /* First five land inside the window: counted, no retarget yet. */
     for (int i = 0; i < N - 1; ++i) {
-        submit_nonce(s, c, "deadbeef", nonce[i], &out, &olen);
+        submit_nonce(s, c, "deadbeefcafebabe", nonce[i], &out, &olen);
         CHECK(set_diff_value(out) < 0.0);
         free(out); out = NULL; olen = 0;
     }
@@ -524,7 +595,7 @@ static void test_vardiff_tracks_miner_local_floor(void) {
     CHECK(floor_seen > 500.0 * (obs.sum_share_diff / (N - 1)));
 
     sleep_ms(1100);
-    submit_nonce(s, c, "deadbeef", nonce[N - 1], &out, &olen);
+    submit_nonce(s, c, "deadbeefcafebabe", nonce[N - 1], &out, &olen);
     CHECK(obs.shares == N);
     CHECK(obs.rejects == 0);
 
@@ -581,7 +652,7 @@ static void test_vardiff_still_lowers_for_a_matched_miner(void) {
     uint32_t from = 1;
     int mined = 1;
     for (int i = 0; i < N; ++i) {
-        double d = mine_nonce(s, c, "J1", "deadbeef", 1e-6, 2e-6,
+        double d = mine_nonce(s, c, "J1", "deadbeefcafebabe", 1e-6, 2e-6,
                               from, &nonce[i]);
         if (d <= 0.0) { mined = 0; break; }
         from = nonce[i] + 1;
@@ -591,7 +662,7 @@ static void test_vardiff_still_lowers_for_a_matched_miner(void) {
 
     char *out = NULL; size_t olen = 0;
     for (int i = 0; i < N - 1; ++i) {
-        submit_nonce(s, c, "deadbeef", nonce[i], &out, &olen);
+        submit_nonce(s, c, "deadbeefcafebabe", nonce[i], &out, &olen);
         free(out); out = NULL; olen = 0;
     }
     CHECK(obs.shares == N - 1);
@@ -604,7 +675,7 @@ static void test_vardiff_still_lowers_for_a_matched_miner(void) {
      * 1.17e-6) beat this proposal times four, and pinned the difficulty
      * instead of letting it fall. */
     sleep_ms(1100);
-    submit_nonce(s, c, "deadbeef", nonce[N - 1], &out, &olen);
+    submit_nonce(s, c, "deadbeefcafebabe", nonce[N - 1], &out, &olen);
     CHECK(obs.rejects == 0);
     double got = set_diff_value(out);
     CHECK(got > 2.49e-7 && got < 2.51e-7);
@@ -653,7 +724,7 @@ static void test_vardiff_clamped_to_network_diff(void) {
     sleep_ms(1100);
     stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(out != NULL);
     CHECK(strstr(out, "mining.set_difficulty") != NULL);
@@ -700,7 +771,7 @@ static void test_vardiff_grace_accepts_old_diff_shares(void) {
     sleep_ms(1100);
     stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(strstr(out, "mining.set_difficulty") != NULL);
     CHECK(obs.shares == 1);
@@ -710,7 +781,7 @@ static void test_vardiff_grace_accepts_old_diff_shares(void) {
      * grace window must accept it. */
     stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000002\"]}",
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000002\"]}",
         &out, &olen);
     CHECK(obs.shares == 2);
     CHECK(obs.rejects == 0);
@@ -842,7 +913,7 @@ static void test_dedupe_same_hash_across_job_ids(void) {
 
     stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(obs.shares == 1);
     free(out); out=NULL; olen=0;
@@ -851,7 +922,7 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     stratum_server_set_job(s, make_test_job("J2", net));
     stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J2\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J2\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(obs.shares == 1);  /* still one */
     CHECK(obs.rejects >= 1);
@@ -893,7 +964,7 @@ static void test_rejected_candidate_is_not_a_block(void) {
 
     int rc = stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(rc == 0);
     CHECK(obs.submits == 1);          /* it was offered to the node */
@@ -936,7 +1007,7 @@ static void test_accepted_candidate_reports_accepted(void) {
 
     stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(obs.found_calls == 1);
     CHECK(obs.last_accepted == 1);
@@ -1065,7 +1136,7 @@ static void test_gated_pps_refuses_authorize_and_submits(void) {
     gate = 1;
     stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(strstr(out, "not crediting shares") != NULL);
     CHECK(obs.shares == 0);            /* nothing banked */
@@ -1075,7 +1146,7 @@ static void test_gated_pps_refuses_authorize_and_submits(void) {
     gate = 0;
     stratum_handle_message(s, c,
         "{\"id\":5,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000002\"]}",
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000002\"]}",
         &out, &olen);
     CHECK(obs.shares == 1);
     free(out);
@@ -1141,6 +1212,7 @@ int main(void) {
     test_authorize_triggers_setdiff_notify();
     test_submit_unknown_job();
     test_submit_share_and_dedupe();
+    test_submit_rejects_wrong_extranonce2_size();
     test_authorize_rejects_non_address();
     test_authorize_address_with_label();
     test_block_wins_over_low_difficulty();
