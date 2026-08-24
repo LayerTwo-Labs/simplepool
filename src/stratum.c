@@ -55,6 +55,11 @@
 #define REASON_TEXT_MAX   128
 #define RECENT_JOBS    8
 #define RECENT_JOB_TTL_MS 60000
+/* Per-connection record of the difficulty each job went out under. Only jobs
+ * find_job() can still resolve are ever submitted against -- the current one
+ * plus RECENT_JOBS retired -- so anything past that is unreachable. Sized
+ * above it so the entry is still there when the submit arrives. */
+#define JOB_DIFF_RING  16
 
 /* BIP320 reserved version-rolling bits (ASICBoost). Advertised in
  * mining.configure; only these block-header version bits may be rolled by a
@@ -238,7 +243,7 @@ struct stratum_conn {
     pthread_t thr;
     int thr_started;
 
-    uint8_t  extranonce1[4];
+    uint8_t  extranonce1[STRATUM_EXTRANONCE1_SIZE];
     double   difficulty;
     int      subscribed;
     int      authorized;
@@ -273,13 +278,19 @@ struct stratum_conn {
     uint32_t vd_window_shares;
     double   vd_window_min_achieved;
 
-    /* The pre-retarget difficulty, honored for a grace period after a
-     * set_difficulty: the miner applies the new value only on a later job,
-     * so in-flight and old-job shares still arrive at the old difficulty.
-     * A back-to-back retarget overwrites this — only the latest old value
-     * is honored. */
-    double   prev_difficulty;
-    uint64_t diff_changed_ms;
+    /* The difficulty each job was notified to this connection under, so a
+     * submit is judged at the difficulty that was in force for THAT job
+     * rather than whatever the connection has drifted to since. A miner
+     * applies a set_difficulty on a later job, so shares for jobs already in
+     * hand keep arriving at the difficulty those jobs went out under, and on
+     * a slow chain they keep arriving well past the vardiff window.
+     *
+     * Written by whichever thread sends the notify — the connection's own
+     * thread on authorize, the job-swap thread on broadcast — and read by
+     * the connection thread on submit, so it carries its own lock. */
+    pthread_mutex_t  jobdiff_lock;
+    struct { char job_id[32]; double difficulty; } job_diffs[JOB_DIFF_RING];
+    size_t   job_diffs_head;
 
     /* Monotonic timestamp of the most recent recv() that got any bytes.
      * The conn thread checks this against cfg.idle_timeout_sec after each
@@ -694,12 +705,49 @@ static double current_net_diff(stratum_server_t *s) {
     return d;
 }
 
-/* How long shares at the pre-retarget difficulty stay acceptable. The miner
- * applies a set_difficulty on a later job notify, which on a slow chain can
- * lag well past the vardiff window. */
-static uint64_t diff_grace_ms(const stratum_server_t *s) {
-    uint64_t g = (uint64_t)s->cfg.vardiff_window_sec * 2000ULL;
-    return g > 60000 ? g : 60000;
+/* Record the difficulty `job_id` went out to this connection under. Called
+ * from the notify path, which is the moment the agreement is struck: the
+ * miner has already applied every set_difficulty we sent before this notify,
+ * and will not apply the next one until the notify after it.
+ *
+ * An id already in the ring is updated in place rather than duplicated. That
+ * only happens when the same job is notified twice — a client that authorizes
+ * again — and there the freshest value is the right one, because the miner
+ * restarts on the difficulty it holds now. */
+static void conn_record_job_difficulty(stratum_conn_t *c, const char *job_id,
+                                       double difficulty) {
+    if (!c || !job_id || !job_id[0] || difficulty <= 0.0) return;
+    pthread_mutex_lock(&c->jobdiff_lock);
+    for (size_t i = 0; i < JOB_DIFF_RING; ++i) {
+        if (strcmp(c->job_diffs[i].job_id, job_id) == 0) {
+            c->job_diffs[i].difficulty = difficulty;
+            pthread_mutex_unlock(&c->jobdiff_lock);
+            return;
+        }
+    }
+    size_t slot = c->job_diffs_head;
+    snprintf(c->job_diffs[slot].job_id, sizeof c->job_diffs[slot].job_id,
+             "%s", job_id);
+    c->job_diffs[slot].difficulty = difficulty;
+    c->job_diffs_head = (slot + 1) % JOB_DIFF_RING;
+    pthread_mutex_unlock(&c->jobdiff_lock);
+}
+
+/* The difficulty `job_id` went out under, or 0.0 if this connection was never
+ * told about that job — which means it cannot be mining it, so the caller
+ * falls back to the connection's current difficulty. */
+static double conn_job_difficulty(stratum_conn_t *c, const char *job_id) {
+    double d = 0.0;
+    if (!c || !job_id || !job_id[0]) return 0.0;
+    pthread_mutex_lock(&c->jobdiff_lock);
+    for (size_t i = 0; i < JOB_DIFF_RING; ++i) {
+        if (strcmp(c->job_diffs[i].job_id, job_id) == 0) {
+            d = c->job_diffs[i].difficulty;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&c->jobdiff_lock);
+    return d;
 }
 
 /* How many shares a window needs before its minimum achieved difficulty is
@@ -770,8 +818,9 @@ static uint64_t diff_grace_ms(const stratum_server_t *s) {
  *
  * Always emits a single mining.set_difficulty when diff changes. The
  * client picks it up for the next job notify; we don't force a re-notify
- * because handle_submit keeps accepting shares at the old difficulty for
- * a grace period (diff_grace_ms). */
+ * because every job already carries the difficulty it went out under
+ * (conn_record_job_difficulty), so shares for jobs the miner already holds
+ * stay acceptable at that difficulty for as long as the job itself lives. */
 static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
                                    uint64_t now,
                                    char **buf, size_t *len)
@@ -850,8 +899,6 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
 
     if (new_diff != old_diff) {
         c->difficulty = new_diff;
-        c->prev_difficulty = old_diff;
-        c->diff_changed_ms = now;
         if (from_floor) {
             LOG_INFO("stratum: vardiff %s: %.0f -> %.0f (miner floor: every "
                      "share in the window cleared difficulty %.0f, %.1f spm "
@@ -876,7 +923,13 @@ static void send_current_notify(stratum_server_t *s, stratum_conn_t *c,
     if (cur && conn_render_coinbase(s, c, cur) == 0) {
         cJSON *p = make_notify_params(cur, c->cb1, c->cb1_len,
                                       c->cb2, c->cb2_len, clean);
-        if (p) emit_notification(buf, len, "mining.notify", p);
+        if (p) {
+            emit_notification(buf, len, "mining.notify", p);
+            /* Only once the notify is really going out: an unsent job is one
+             * the miner cannot submit against, and recording it would put a
+             * stale difficulty in the ring under a live id. */
+            conn_record_job_difficulty(c, cur->job_id, c->difficulty);
+        }
     }
     pthread_rwlock_unlock(&s->job_lock);
 }
@@ -903,8 +956,8 @@ static int handle_subscribe(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     c->extranonce1[3] = (uint8_t)mix;
     c->subscribed = 1;
 
-    char ex1_hex[9];
-    bytes_to_hex(c->extranonce1, 4, ex1_hex);
+    char ex1_hex[STRATUM_EXTRANONCE1_SIZE * 2 + 1];
+    bytes_to_hex(c->extranonce1, sizeof c->extranonce1, ex1_hex);
 
     cJSON *result = cJSON_CreateArray();
     cJSON *subs = cJSON_CreateArray();
@@ -918,7 +971,10 @@ static int handle_subscribe(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     cJSON_AddItemToArray(subs, sn);
     cJSON_AddItemToArray(result, subs);
     cJSON_AddItemToArray(result, cJSON_CreateString(ex1_hex));
-    cJSON_AddItemToArray(result, cJSON_CreateNumber(4));
+    /* The miner sizes its extranonce2 sweep off this number, and the coinbase
+     * we render for it reserves exactly this many bytes. handle_submit
+     * enforces the agreement. */
+    cJSON_AddItemToArray(result, cJSON_CreateNumber(STRATUM_EXTRANONCE2_SIZE));
 
     return emit_response(buf, len, id, result, NULL);
 }
@@ -1209,6 +1265,28 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         return emit_response(buf, len, id, NULL, err);
     }
 
+    /* The extranonce2 must be exactly the width we advertised on subscribe
+     * and reserved when rendering this job's cb1. cb1 ends with the scriptSig
+     * length varint, which was computed as en1_size + en2_size; splicing in a
+     * different width produces a coinbase whose declared scriptSig length
+     * disagrees with the bytes that follow it. That transaction is invalid,
+     * so any block built on it is rejected by the network -- but its header
+     * still hashes, so without this check the share would look fine and be
+     * credited. Reject instead of silently mining garbage: a miner that
+     * ignored the advertised size needs to hear about it. */
+    if (en2_len != job->en2_size) {
+        free(en2_bytes);
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "wrong extranonce2 size");
+        }
+        LOG_WARN("submit from %s: extranonce2 is %zu bytes, expected %zu "
+                 "(miner ignored the size from mining.subscribe)",
+                 c->worker_name, en2_len, job->en2_size);
+        cJSON *err = make_error(20, "wrong extranonce2 size");
+        return emit_response(buf, len, id, NULL, err);
+    }
+
     /* Render this connection's coinbase for `job` if not cached. The
      * cache is keyed on job_id; submits against an older job retired into
      * the recent ring will rebuild on demand. */
@@ -1223,13 +1301,14 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
 
     /* coinbase = cb1 || ex1 || ex2 || cb2 */
-    size_t cb_len = c->cb1_len + 4 + en2_len + c->cb2_len;
+    size_t en1_len = sizeof c->extranonce1;
+    size_t cb_len = c->cb1_len + en1_len + en2_len + c->cb2_len;
     uint8_t *cb = malloc(cb_len);
     if (!cb) { free(en2_bytes); return -1; }
     size_t off = 0;
-    memcpy(cb + off, c->cb1, c->cb1_len);   off += c->cb1_len;
-    memcpy(cb + off, c->extranonce1, 4);    off += 4;
-    memcpy(cb + off, en2_bytes, en2_len);   off += en2_len;
+    memcpy(cb + off, c->cb1, c->cb1_len);        off += c->cb1_len;
+    memcpy(cb + off, c->extranonce1, en1_len);   off += en1_len;
+    memcpy(cb + off, en2_bytes, en2_len);        off += en2_len;
     memcpy(cb + off, c->cb2, c->cb2_len);   off += c->cb2_len;
     free(en2_bytes);
 
@@ -1262,8 +1341,21 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         return emit_response(buf, len, id, NULL, err);
     }
 
+    /* Judge the share at the difficulty THIS job went out under, not at
+     * whatever the connection has drifted to since. A miner applies a
+     * set_difficulty on the next job it is notified, so every share for a job
+     * already in its hands was mined against the difficulty in force when
+     * that job was sent -- and on a slow chain those keep arriving long after
+     * the retarget. Reading the difficulty back off the job is what makes
+     * that exact, and holds across any number of retargets in between.
+     *
+     * A connection that was never notified of the job cannot be mining it;
+     * fall back to its current difficulty rather than invent one. */
+    double assigned_diff = conn_job_difficulty(c, job->job_id);
+    if (assigned_diff <= 0.0) assigned_diff = c->difficulty;
+
     uint8_t worker_target[32];
-    worker_diff_to_target(c->difficulty, worker_target);
+    worker_diff_to_target(assigned_diff, worker_target);
 
     char sent_hash_hex[65] = {0};
     char worker_target_hex[65] = {0};
@@ -1285,18 +1377,21 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     uint64_t ts_now   = now_ms();
     int is_block      = be32_cmp(hash_be, job->network_target_be) <= 0;
     int meets_worker  = be32_cmp(hash_be, worker_target) < 0;
-    double share_diff = c->difficulty;
+    double share_diff = assigned_diff;
 
-    /* Honor the pre-retarget difficulty for a grace period: the miner only
-     * applies a set_difficulty on a later job, so shares mined against the
-     * old difficulty keep arriving after a retarget. */
-    if (!meets_worker && c->prev_difficulty > 0.0 &&
-        ts_now - c->diff_changed_ms < diff_grace_ms(s)) {
-        uint8_t prev_target[32];
-        worker_diff_to_target(c->prev_difficulty, prev_target);
-        if (be32_cmp(hash_be, prev_target) < 0) {
+    /* Spec says a set_difficulty takes effect on the next job, but plenty of
+     * firmware applies it to work already in hand. When the retarget went
+     * *down* that produces shares below what this job was sent at, which are
+     * honest work performed exactly as instructed. Take them at the lower
+     * value -- a share is only ever credited at a difficulty it actually met.
+     * A retarget that went up needs no such allowance: those shares clear the
+     * job's difficulty on their own. */
+    if (!meets_worker && c->difficulty < assigned_diff) {
+        uint8_t current_target[32];
+        worker_diff_to_target(c->difficulty, current_target);
+        if (be32_cmp(hash_be, current_target) < 0) {
             meets_worker = 1;
-            share_diff = c->prev_difficulty;
+            share_diff = c->difficulty;
         }
     }
 
@@ -1472,6 +1567,7 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     c->difficulty = s ? s->cfg.initial_diff : 1.0;
     c->vd_window_min_achieved = HUGE_VAL;
     pthread_mutex_init(&c->write_lock, NULL);
+    pthread_mutex_init(&c->jobdiff_lock, NULL);
     return c;
 }
 
@@ -1479,6 +1575,7 @@ void stratum_conn_free_for_test(stratum_conn_t *c) {
     if (!c) return;
     conn_clear_coinbase(c);
     pthread_mutex_destroy(&c->write_lock);
+    pthread_mutex_destroy(&c->jobdiff_lock);
     free(c);
 }
 

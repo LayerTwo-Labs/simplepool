@@ -8,13 +8,39 @@
 
 typedef struct stratum_job stratum_job_t;
 
+/* The extranonce split, advertised on mining.subscribe and baked into every
+ * per-connection coinbase.
+ *
+ * extranonce1 is the pool's per-connection identifier; it must be unique
+ * across live connections or two miners render identical coinbases (see
+ * handle_subscribe). extranonce2 is the miner's private search field: it
+ * owns those bytes and sweeps them freely.
+ *
+ * extranonce2 is 8 bytes rather than the classic 4. Raw search space is not
+ * the reason -- 4 bytes already gives one connection 2^80 headers per job,
+ * which no hashrate exhausts. The reason is subdivision: a stratum proxy in
+ * front of the pool carves extranonce2 into a downstream-miner id (high
+ * bytes) plus the downstream miner's own extranonce2 (low bytes). At 4 bytes
+ * a proxy spending 3 on addressing leaves its miners a single byte, which
+ * some firmware refuses to run with. At 8 it can spend 3 and still hand down
+ * the conventional 4, so downstream miners see an ordinary pool.
+ *
+ * Widening these is a consensus-relevant change, not a cosmetic one: cb1
+ * carries the scriptSig length varint computed from en1_size + en2_size, so
+ * a submitted extranonce2 of any other length yields a coinbase whose
+ * declared scriptSig length disagrees with its contents. handle_submit
+ * rejects on length for exactly that reason. Keep the coinbase scriptSig
+ * (BIP34 height push + coinbase_tag + en1 + en2) within 100 bytes. */
+#define STRATUM_EXTRANONCE1_SIZE 4
+#define STRATUM_EXTRANONCE2_SIZE 8
+
 /* Create a job from template fields. The coinbase is *not* baked into the
  * job — each connection renders its own coinbase paying its miner address
  * (minus the configured operator fee). The job carries everything else
  * the server needs to materialise a per-connection coinbase on demand:
  *   - value_sats:           coinbasevalue from getblocktemplate
  *   - witness_commitment_hex: optional, may be NULL
- *   - en1_size / en2_size:  extranonce sizes, both currently 4
+ *   - en1_size / en2_size:  extranonce sizes; see STRATUM_EXTRANONCE*_SIZE
  *
  * tx_hex_list may be NULL if tx_count == 0. The job takes ownership of
  * its own heap copies; caller's buffers are not retained.

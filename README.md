@@ -148,7 +148,7 @@ sequenceDiagram
     Note over M,P: per-connection setup
     M->>P: TCP connect :3334
     M->>P: mining.subscribe
-    P-->>M: extranonce1 (4B, per-conn), en2_size
+    P-->>M: extranonce1 (4B, per-conn), en2_size (8B)
     M->>P: mining.authorize "<bc1q…>[.rig_label]"
     P->>P: validate bech32/base58 → cache payout_address<br/>arm vardiff window
     P-->>M: result: true
