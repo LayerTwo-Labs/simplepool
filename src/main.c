@@ -1144,13 +1144,22 @@ int main(int argc, char **argv) {
         stcfg.listeners[i] = cfg.listeners[i];
     }
 
-    /* PPS. pool_mode=pps-classic takes Thunder-address usernames, pays every
-     * coinbase into the pool's BTC wallet, and accrues per-share credits. */
-    stcfg.pps_enabled = (strcmp(cfg.pool_mode, "pps-classic") == 0);
+    /* Which of the two things pool_mode decides applies here. See
+     * stratum.h — pplns-btc is the mode that makes them independent: it
+     * pools the reward (coinbase pays the pool) but pays out on L1 (the
+     * username is a Bitcoin address). */
+    int mode_pps_classic   = strcmp(cfg.pool_mode, "pps-classic")   == 0;
+    int mode_pplns_thunder = strcmp(cfg.pool_mode, "pplns-thunder") == 0;
+    int mode_pplns_btc     = strcmp(cfg.pool_mode, "pplns-btc")     == 0;
+    int mode_pplns         = mode_pplns_thunder || mode_pplns_btc;
+
+    stcfg.pps_accrues         = mode_pps_classic;
+    stcfg.coinbase_pays_pool  = mode_pps_classic || mode_pplns;
+    stcfg.username_is_thunder = mode_pps_classic || mode_pplns_thunder;
     snprintf(stcfg.pool_btc_address, sizeof stcfg.pool_btc_address, "%s",
              cfg.pool_btc_address);
 
-    if (stcfg.pps_enabled) {
+    if (stcfg.coinbase_pays_pool) {
         /* Fail fast on a misconfigured pool_btc_address so we don't drop
          * every rendered job at runtime. */
         uint8_t spk[64];

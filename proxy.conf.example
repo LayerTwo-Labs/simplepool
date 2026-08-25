@@ -152,6 +152,29 @@ redis_reconnect_backoff_ms = 2000
 # pool_mode controls the coinbase shape and the username validation:
 #   solo        default. Coinbase pays the miner (stratum username is a
 #               BTC address) minus the operator fee. No PPS accrual.
+#   pplns-thunder / pplns-btc
+#               Pay Per Last N Shares. The coinbase pays pool_btc_address, as
+#               in pps-classic, but nothing is credited when a share arrives.
+#               When a block matures, the reward and its transaction fees are
+#               split across everyone whose shares fall inside the last-N
+#               window, in proportion to the difficulty each contributed.
+#
+#               The difference that matters to an operator is who carries the
+#               variance. PPS guarantees a price per share, so a run of bad
+#               luck is the operator's problem and has to be absorbed by a
+#               reserve measured in block rewards. PPLNS never owes more than
+#               it has just been paid, so there is no reserve to size and
+#               operator ruin is not a failure mode. The miners carry the
+#               variance instead, which is why the fee is normally set lower
+#               than under PPS -- there is no risk premium to charge.
+#
+#               The suffix picks the payout rail, and it is one knob rather
+#               than two because a pool runs one or the other: the rail
+#               decides what a stratum username IS. pplns-thunder takes
+#               Thunder addresses and pays over Thunder, exactly as
+#               pps-classic does. pplns-btc takes Bitcoin addresses and pays
+#               on L1 from the pool's wallet.
+#
 #   pps-classic Coinbase pays a pool BTC address (pool_btc_address below)
 #               as a normal P2WPKH/P2PKH output. Miners authorize with a
 #               Thunder address (base58 of a 20-byte hash) and accrue in
@@ -160,8 +183,24 @@ redis_reconnect_backoff_ms = 2000
 #               drains that reserve to miners.
 pool_mode = solo
 
-# pps-classic — required
+# pps-classic and both pplns modes — required
 # pool_btc_address = REPLACE_WITH_POOL_BTC_ADDRESS
+
+# pplns — the window, as a multiple of the CURRENT network difficulty.
+# 2.0 means "the last two blocks' worth of expected work".
+#
+# A multiple rather than an absolute share count or difficulty sum, because it
+# self-scales across retargets. An absolute window silently changes meaning
+# every time the chain retargets: on a forknet moving 4x it becomes four times
+# longer or shorter than the operator chose, with nothing in the config having
+# changed to say so.
+#
+# Below 1.0 the window covers less work than a block is expected to take, so a
+# block pays out across less work than it took to find. That rewards whoever
+# happened to be connected at the moment over the work that actually produced
+# the block -- which is the pool-hopping incentive PPLNS exists to remove. The
+# proxy warns if you set it there.
+# pplns_window_diff_multiple = 2.0
 
 # pps-classic — OPTIONAL rate override, sats credited per unit of share
 # difficulty. Leave it commented out and the proxy derives the rate from each

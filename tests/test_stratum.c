@@ -1511,7 +1511,8 @@ static void test_gated_pps_refuses_authorize_and_submits(void) {
     obs_t obs = {0};
     _Atomic int gate = 1;
     stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
-                          .pps_enabled = 1, .pps_gate = &gate,
+                          .pps_accrues = 1, .username_is_thunder = 1,
+                          .coinbase_pays_pool = 1, .pps_gate = &gate,
                           .pps_refuse_shares_below_min = 1,
                           .ctx = &obs, .on_share = on_share,
                           .on_reject = on_reject, .on_block = on_block };
@@ -1573,7 +1574,8 @@ static void test_gate_can_be_disabled(void) {
     obs_t obs = {0};
     _Atomic int gate = 1;
     stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
-                          .pps_enabled = 1, .pps_gate = &gate,
+                          .pps_accrues = 1, .username_is_thunder = 1,
+                          .coinbase_pays_pool = 1, .pps_gate = &gate,
                           .pps_refuse_shares_below_min = 0,
                           .ctx = &obs, .on_share = on_share,
                           .on_reject = on_reject, .on_block = on_block };
@@ -1600,7 +1602,7 @@ static void test_solo_is_never_gated(void) {
     obs_t obs = {0};
     _Atomic int gate = 1;
     stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
-                          .pps_enabled = 0, .pps_gate = &gate,
+                          .pps_accrues = 0, .pps_gate = &gate,
                           .pps_refuse_shares_below_min = 1,
                           .ctx = &obs, .on_share = on_share,
                           .on_reject = on_reject, .on_block = on_block };
@@ -2049,6 +2051,135 @@ static void test_authorized_miner_gets_the_long_idle_budget(void) {
     stratum_server_free(s2);
 }
 
+
+/* ---------------------------------------------------------------------- */
+/* PPLNS modes                                                             */
+/* ---------------------------------------------------------------------- */
+
+#define THUNDER_ADDR "2sYBNmMJMMZHi6xasMcCPgNiYJ1z"
+
+/* Build a server in one of the PPLNS shapes. Both pool the reward, so both
+ * pay the coinbase to the pool; they differ only in what a username is. */
+static stratum_server_t *pplns_server(stratum_cfg_t *cfg, obs_t *obs,
+                                      _Atomic int *gate, int username_thunder) {
+    *cfg = (stratum_cfg_t){ .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                            /* the whole point: pooled reward, and for
+                             * pplns-btc a Bitcoin username alongside it */
+                            .coinbase_pays_pool = 1,
+                            .username_is_thunder = username_thunder,
+                            .pps_accrues = 0,
+                            .pps_gate = gate,
+                            .pps_refuse_shares_below_min = 1,
+                            .ctx = obs, .on_share = on_share,
+                            .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg->bind_addr, sizeof cfg->bind_addr, "127.0.0.1");
+    snprintf(cfg->pool_btc_address, sizeof cfg->pool_btc_address, "%s", TEST_ADDR);
+    stratum_server_t *s = NULL;
+    stratum_server_start(cfg, &s);
+    return s;
+}
+
+/* pplns-btc is the mode that proves pool_mode was conflating two independent
+ * facts. It pools the reward like PPS — so the coinbase pays the pool — while
+ * paying out on L1 like solo, so the stratum username is a Bitcoin address.
+ * No previous mode needed that combination, and a single "is this PPS" flag
+ * could not express it. */
+static void test_pplns_btc_takes_a_bitcoin_username(void) {
+    obs_t obs = {0};
+    _Atomic int gate = 0;
+    stratum_cfg_t cfg;
+    stratum_server_t *s = pplns_server(&cfg, &obs, &gate, /*thunder*/0);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}", &out, &olen);
+    CHECK(stratum_conn_authorized_for_test(c) == 1);
+    free(out);
+
+    /* And a Thunder address is not a Bitcoin address, so it is refused here
+     * even though pps-classic and pplns-thunder would take it. */
+    stratum_conn_t *c2 = stratum_conn_new_for_test(s);
+    out = NULL; olen = 0;
+    stratum_handle_message(s, c2, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c2,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" THUNDER_ADDR "\",\"x\"]}", &out, &olen);
+    CHECK(stratum_conn_authorized_for_test(c2) == 0);
+    free(out);
+
+    stratum_conn_free_for_test(c);
+    stratum_conn_free_for_test(c2);
+    stratum_server_free(s);
+}
+
+/* pplns-thunder is pps-classic's username rule with PPLNS accounting. */
+static void test_pplns_thunder_takes_a_thunder_username(void) {
+    obs_t obs = {0};
+    _Atomic int gate = 0;
+    stratum_cfg_t cfg;
+    stratum_server_t *s = pplns_server(&cfg, &obs, &gate, /*thunder*/1);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" THUNDER_ADDR "\",\"x\"]}", &out, &olen);
+    CHECK(stratum_conn_authorized_for_test(c) == 1);
+    free(out);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* The accrual gate exists because pps-classic prices a share the moment it
+ * arrives, and on a trivially easy chain that price is wrong. PPLNS prices a
+ * share only in hindsight, out of a block actually found, so there is nothing
+ * to misprice and nothing to suspend.
+ *
+ * Worth pinning explicitly because main.c installs the gate pointer for every
+ * mode, so anything keying on the pointer rather than on "does this mode
+ * accrue" silently suspends a pool that was never accruing — refusing miners
+ * from a mode that had no exposure in the first place. */
+static void test_pplns_is_never_gated(void) {
+    for (int thunder = 0; thunder <= 1; ++thunder) {
+        obs_t obs = {0};
+        _Atomic int gate = 1;          /* fully gated, and irrelevant here */
+        stratum_cfg_t cfg;
+        stratum_server_t *s = pplns_server(&cfg, &obs, &gate, thunder);
+
+        uint8_t net[32]; memset(net, 0xff, 32);
+        stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+        stratum_conn_t *c = stratum_conn_new_for_test(s);
+        char *out = NULL; size_t olen = 0;
+        stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                               &out, &olen); free(out); out = NULL; olen = 0;
+        char msg[256];
+        snprintf(msg, sizeof msg,
+                 "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",
+                 thunder ? THUNDER_ADDR : TEST_ADDR);
+        stratum_handle_message(s, c, msg, &out, &olen);
+        CHECK(stratum_conn_authorized_for_test(c) == 1);
+        free(out);
+
+        stratum_conn_free_for_test(c);
+        stratum_server_free(s);
+    }
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -2081,6 +2212,9 @@ int main(void) {
     test_gated_pps_refuses_authorize_and_submits();
     test_gate_can_be_disabled();
     test_solo_is_never_gated();
+    test_pplns_btc_takes_a_bitcoin_username();
+    test_pplns_thunder_takes_a_thunder_username();
+    test_pplns_is_never_gated();
     test_clean_jobs_only_on_a_new_tip();
     test_promised_min_diff_survives_the_network_clamp();
     test_vardiff_cannot_retarget_below_a_promised_floor();

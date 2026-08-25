@@ -84,8 +84,26 @@ typedef struct {
      * operator later batches that BTC into Thunder via the admin
      * dashboard's deposit action, and the payout worker drains the Thunder
      * reserve to miners. */
-    char pool_mode[16];                       /* "solo" | "pps-classic" */
-    /* pps-classic: coinbase pays this BTC address (P2WPKH/P2PKH/P2SH) for
+    /* "solo" | "pps-classic" | "pplns-thunder" | "pplns-btc"
+     *
+     * The two pplns values are one knob rather than a mode plus a rail knob
+     * because an operator runs one or the other: a pool cannot pay some
+     * miners over Thunder and others on L1 from the same window, since the
+     * rail decides what a username even is. Encoding it as a single value
+     * makes the inconsistent configuration unrepresentable instead of
+     * merely rejected. */
+    char pool_mode[24];
+    /* PPLNS window size, as a multiple of the CURRENT network difficulty.
+     * 2.0 means "the last two blocks' worth of expected work".
+     *
+     * A multiple rather than an absolute figure because it self-scales
+     * across retargets. An absolute share count or difficulty sum silently
+     * changes meaning every time the chain retargets — on a forknet moving
+     * 4x that turns the window into something four times longer or shorter
+     * than the operator chose, without anything in the config changing. */
+    double pplns_window_diff_multiple;        /* default 2.0 */
+
+    /* pooled modes: coinbase pays this BTC address (P2WPKH/P2PKH/P2SH) for
      * the net-of-fee reward. Required when pool_mode = pps-classic;
      * ignored otherwise. */
     char pool_btc_address[128];
