@@ -117,7 +117,7 @@ static void test_basic(void) {
     /* Block path */
     rc = store_record_block(s, 9999, 12345, "abc123hash", "worker3",
                             "bcrt1qexampleaddr", 4950000000LL, 50000000LL,
-                            STORE_BLOCK_PENDING, NULL);
+                            STORE_BLOCK_PENDING, NULL, 0.0);
     assert(rc == 0);
     rc = store_flush(s);
     assert(rc == 0);
@@ -716,21 +716,21 @@ static void test_block_candidate_status(void) {
      * submit path is allowed to claim a block is in the chain. */
     rc = store_record_block(s, 1000, 800001, "hash_accepted", "w1",
                             "bcrt1qaddr", 5000000000LL, 0,
-                            STORE_BLOCK_PENDING, NULL);
+                            STORE_BLOCK_PENDING, NULL, 0.0);
     assert(rc == 0);
 
     /* Refused by the node: recorded so the refusal is visible, but as
      * 'rejected' — never counted, and carrying the node's reason. */
     rc = store_record_block(s, 1001, 800001, "hash_rejected", "w1",
                             "bcrt1qaddr", 5000000000LL, 0,
-                            STORE_BLOCK_REJECTED, "inconclusive");
+                            STORE_BLOCK_REJECTED, "inconclusive", 0.0);
     assert(rc == 0);
 
     /* A coinbase height of zero cannot exist. Refused outright rather than
      * filed at a height no chain has. */
     rc = store_record_block(s, 1002, 0, "hash_zero_height", "w1",
                             "bcrt1qaddr", 5000000000LL, 0,
-                            STORE_BLOCK_PENDING, NULL);
+                            STORE_BLOCK_PENDING, NULL, 0.0);
     assert(rc != 0);
 
     rc = store_flush(s);
@@ -799,13 +799,13 @@ static void test_reconcile_from_templates(void) {
     /* Two competing candidates at the same height — expected on a
      * low-difficulty chain, and both rows must survive. */
     assert(store_record_block(s, 1000, 800001, "hash_win", "w1", "addr",
-                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
     assert(store_record_block(s, 1001, 800001, "hash_lose", "w2", "addr",
-                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
     /* A candidate whose next height was never observed. Unverifiable, so it
      * must stay pending — and pending is never revenue. */
     assert(store_record_block(s, 1002, 800004, "hash_unseen", "w1", "addr",
-                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
     assert(store_flush(s) == 0);
 
     store_template_t t = {
@@ -886,12 +886,12 @@ static void test_block_hash_index_after_dedupe(void) {
     /* The same solution recorded twice — the stratum dedupe ring is in
      * memory, so a restart can do this. */
     assert(store_record_block(s, 1000, 800001, "dup_hash", "w1", "addr",
-                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
     assert(store_record_block(s, 1001, 800001, "dup_hash", "w1", "addr",
-                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
     /* Distinct competing candidates must NOT be collapsed. */
     assert(store_record_block(s, 1002, 800001, "other_hash", "w2", "addr",
-                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
     assert(store_flush(s) == 0);
 
     sqlite3 *db = NULL;
@@ -925,7 +925,7 @@ static void test_block_hash_index_after_dedupe(void) {
     /* And it now holds: a re-found hash cannot create a second row, and the
      * OR IGNORE means it does not fail the batch either. */
     assert(store_record_block(s, 1003, 800001, "dup_hash", "w1", "addr",
-                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
     assert(store_flush(s) == 0);
     assert(scalar_i64(db,
         "SELECT count(*) FROM blocks_found WHERE hash='dup_hash'") == 1);
@@ -933,6 +933,135 @@ static void test_block_hash_index_after_dedupe(void) {
     sqlite3_close(db);
     store_close(s);
     printf("  ok test_block_hash_index_after_dedupe\n");
+}
+
+/* PPLNS: a matured block is split across the last-N window in proportion to
+ * difficulty, and exactly once.
+ *
+ * The window is 100 difficulty units. Shares are laid down so the boundary
+ * lands in a known place: alice contributes 10 shares of difficulty 5 (50),
+ * bob 10 of difficulty 5 (50) interleaved, and behind them sits a wall of
+ * older work by carol that must NOT be paid — it is outside the window, which
+ * is the entire point of PPLNS and the thing a naive "sum all shares" query
+ * gets wrong. */
+static void test_pplns_distributes_the_window(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Old work, well outside the window. */
+    for (int i = 0; i < 40; ++i) {
+        assert(store_record_share_addr(s, "carol", "addr_c",
+                                       1000ULL + (uint64_t)i, 25.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    /* The window: alice and bob, 50 difficulty each. */
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "alice", "addr_a",
+                                       2000ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+        assert(store_record_share_addr(s, "bob", "addr_b",
+                                       2100ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    /* The block-finding share itself, by alice, difficulty 0 so it does not
+     * shift the split — this test is about the window, not about the finder
+     * getting anything extra. Under PPLNS the finder gets no premium. */
+    assert(store_record_share_addr(s, "alice", "addr_a", 3000, 0.0,
+                                   1, "blk_pplns", 0, 0.0) == 0);
+    /* window = 100 difficulty units, gross = 100000 sats. */
+    assert(store_record_block(s, 3000, 800100, "blk_pplns", "alice", "addr_a",
+                              90000, 10000, STORE_BLOCK_PENDING, NULL,
+                              100.0) == 0);
+    assert(store_flush(s) == 0);
+
+    /* Pending: nothing is owed yet. */
+    int blocks = 0, workers = 0;
+    assert(store_pplns_distribute(s, 100, 0, &blocks, &workers, NULL, 0) == 0);
+    assert(blocks == 0);
+
+    /* Confirmed but immature: still nothing. A coinbase output is unspendable
+     * until 100 deep, so crediting here would create a balance the pool
+     * cannot fund. */
+    assert(store_set_block_status(s, "blk_pplns", STORE_BLOCK_CONFIRMED,
+                                  6, "node") == 0);
+    assert(store_pplns_distribute(s, 100, 0, &blocks, &workers, NULL, 0) == 0);
+    assert(blocks == 0);
+
+    /* Matured. */
+    assert(store_set_block_status(s, "blk_pplns", STORE_BLOCK_CONFIRMED,
+                                  100, "node") == 0);
+    assert(store_pplns_distribute(s, 100, 0, &blocks, &workers, NULL, 0) == 1);
+    assert(blocks == 1);
+    assert(workers == 2);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+
+    int64_t a = scalar_i64(db, "SELECT accrued_sats FROM pps_credits WHERE worker_id ="
+                               " (SELECT id FROM workers WHERE name='alice')");
+    int64_t b = scalar_i64(db, "SELECT accrued_sats FROM pps_credits WHERE worker_id ="
+                               " (SELECT id FROM workers WHERE name='bob')");
+    int64_t c = scalar_i64(db, "SELECT COALESCE(SUM(accrued_sats),0) FROM pps_credits"
+                               " WHERE worker_id ="
+                               " (SELECT id FROM workers WHERE name='carol')");
+    /* 50/50 of reward+fees. Fees are included deliberately: PPLNS shares what
+     * the block actually earned, not a subsidy-only estimate. */
+    assert(a == 50000);
+    assert(b == 50000);
+    /* carol mined before the window and is paid nothing, however much work she
+     * did. That is what makes the window a window. */
+    assert(c == 0);
+
+    /* Exactly once. Crediting is additive, so a second pass would double every
+     * balance and leave no trace in the amounts themselves. */
+    assert(store_pplns_distribute(s, 100, 0, &blocks, &workers, NULL, 0) == 0);
+    assert(blocks == 0);
+    assert(scalar_i64(db, "SELECT accrued_sats FROM pps_credits WHERE worker_id ="
+                          " (SELECT id FROM workers WHERE name='alice')") == 50000);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pplns_distributes_the_window\n");
+}
+
+/* The operator fee comes off the top, exactly as in solo and PPS. */
+static void test_pplns_takes_the_operator_fee(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "solo_miner", "addr_a",
+                                       2000ULL + (uint64_t)i, 10.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_record_share_addr(s, "solo_miner", "addr_a", 3000, 0.0,
+                                   1, "blk_fee", 0, 0.0) == 0);
+    assert(store_record_block(s, 3000, 800200, "blk_fee", "solo_miner", "addr_a",
+                              100000, 0, STORE_BLOCK_PENDING, NULL, 100.0) == 0);
+    assert(store_flush(s) == 0);
+    assert(store_set_block_status(s, "blk_fee", STORE_BLOCK_CONFIRMED, 100, "node") == 0);
+
+    int blocks = 0, workers = 0;
+    /* 100 bps = 1%. */
+    assert(store_pplns_distribute(s, 100, 100, &blocks, &workers, NULL, 0) == 1);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT accrued_sats FROM pps_credits") == 99000);
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pplns_takes_the_operator_fee\n");
 }
 
 int main(void) {
@@ -951,6 +1080,8 @@ int main(void) {
     test_block_candidate_status();
     test_reconcile_from_templates();
     test_block_hash_index_after_dedupe();
+    test_pplns_distributes_the_window();
+    test_pplns_takes_the_operator_fee();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;

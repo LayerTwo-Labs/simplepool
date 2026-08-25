@@ -99,6 +99,8 @@ static const char *SCHEMA_SQL_PARTS[] = {
      * distinction pool_meta.network_source draws. */
     "  status          TEXT NOT NULL DEFAULT 'pending',"
     "  confirmations   INTEGER NOT NULL DEFAULT 0,"
+    "  pplns_window_diff REAL    NOT NULL DEFAULT 0,"
+    "  pplns_distributed INTEGER NOT NULL DEFAULT 0,"
     "  submit_error    TEXT,"
     "  checked_via     TEXT"
     ");"
@@ -343,6 +345,24 @@ static const char *MIGRATIONS_SQL[] = {
     "ALTER TABLE blocks_found ADD COLUMN submit_error  TEXT",
     "ALTER TABLE blocks_found ADD COLUMN checked_via   TEXT",
     "CREATE INDEX IF NOT EXISTS blocks_found_status_idx ON blocks_found(status)",
+    /* PPLNS distribution.
+     *
+     * pplns_window_diff is the window size in difficulty units, snapshotted
+     * when the block was found rather than recomputed at distribution time.
+     * The window is configured as a multiple of network difficulty, and a
+     * block is not distributed until it matures ~100 blocks later — by which
+     * time the chain may have retargeted. Recomputing then would pay the
+     * block out across a window its own miners never worked under, and would
+     * make the same block distribute differently depending on when the pass
+     * happened to run. Storing it makes the split deterministic and
+     * reproducible from the row alone.
+     *
+     * pplns_distributed is the exactly-once latch. Crediting is additive, so
+     * a second pass over the same block silently doubles everyone's balance —
+     * a failure that leaves no trace in the amounts themselves. */
+    "ALTER TABLE blocks_found ADD COLUMN pplns_window_diff REAL    NOT NULL DEFAULT 0",
+    "ALTER TABLE blocks_found ADD COLUMN pplns_distributed INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS blocks_found_pplns_idx ON blocks_found(pplns_distributed, status)",
 };
 
 /* Retries for one batch. busy_timeout (5s) bounds each attempt, so the worst
@@ -371,6 +391,11 @@ typedef struct {
     int      height;
     int64_t  reward_sats;       /* EV_BLOCK only */
     int64_t  fee_sats;          /* EV_BLOCK only */
+    /* EV_BLOCK only: the PPLNS window in difficulty units as it stood when
+     * this block was found. Snapshotted rather than recomputed at
+     * distribution time, which happens ~100 blocks later and possibly after
+     * a retarget. See the migration note on blocks_found. */
+    double   pplns_window_diff;
     uint8_t  block_status;      /* EV_BLOCK only: STORE_BLOCK_* */
     int64_t  delta_sats;        /* EV_CREDIT only */
     double   rate_used;         /* EV_SHARE only: multiplicand for delta_sats */
@@ -611,6 +636,7 @@ static void process_event(store_t *s, const event_t *ev) {
                               SQLITE_TRANSIENT);
         else
             sqlite3_bind_null(s->st_insert_block, 9);
+        sqlite3_bind_double(s->st_insert_block, 10, ev->pplns_window_diff);
         if (sqlite3_step(s->st_insert_block) != SQLITE_DONE) {
             atomic_fetch_add(&s->pg_errors, 1);
         } else if (sqlite3_changes(s->db) > 0 &&
@@ -845,8 +871,8 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
     static const char *Q_INS_BLOCK =
         "INSERT OR IGNORE INTO blocks_found "
         "  (ts, height, hash, finder_id, finder_address, reward_sats, fee_sats,"
-        "   status, submit_error) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        "   status, submit_error, pplns_window_diff) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     /* Single-row upsert keyed on id=1. tip_observed_at is only set when
      * the tip actually changes (height or hash differ from the stored
      * row), so 'time since last tip change' stays meaningful across
@@ -1195,7 +1221,8 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
                        const char *hash, const char *finder_name,
                        const char *finder_address,
                        int64_t reward_sats, int64_t fee_sats,
-                       int status, const char *submit_error)
+                       int status, const char *submit_error,
+                       double pplns_window_diff)
 {
     if (!s || !hash) return -1;
     /* A coinbase height of zero is never valid. bitcoind_parse_template
@@ -1214,6 +1241,7 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
     ev.reward_sats = reward_sats;
     ev.fee_sats = fee_sats;
     ev.block_status = (uint8_t)status;
+    ev.pplns_window_diff = pplns_window_diff;
     if (submit_error)
         strncpy(ev.reason, submit_error, REASON_MAX - 1);
     strncpy(ev.hash, hash, HASH_STR_MAX - 1);
@@ -1225,6 +1253,171 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
         return -1;
     }
     return 0;
+}
+
+/* ---- PPLNS distribution ------------------------------------------------ */
+
+int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
+                           int *out_blocks, int *out_workers,
+                           char *errbuf, size_t errlen)
+{
+    if (out_blocks)  *out_blocks  = 0;
+    if (out_workers) *out_workers = 0;
+    if (!s || !s->db) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "store not open");
+        return -1;
+    }
+    if (maturity_confs < 0) maturity_confs = 0;
+
+    /* Eligible blocks. All three conditions are load-bearing — see store.h. */
+    static const char *Q_DUE =
+        "SELECT id, hash, "
+        "       COALESCE(reward_sats,0) + COALESCE(fee_sats,0) AS gross, "
+        "       pplns_window_diff "
+        "  FROM blocks_found "
+        " WHERE status = 'confirmed' AND pplns_distributed = 0 "
+        "   AND confirmations >= ? AND pplns_window_diff > 0 "
+        " ORDER BY height ASC";
+
+    /* The window: shares at or before this block's own share, newest first,
+     * taken until their difficulty sums to the window.
+     *
+     * The comparison is against the running total EXCLUDING the current row
+     * (running - difficulty < window), so the share that crosses the boundary
+     * is included whole rather than split. Splitting it would be arithmetically
+     * neater and would mean crediting a worker for a fraction of a share it
+     * either found or did not — the window is a rule for choosing which work
+     * gets paid, not a claim that exactly N difficulty was performed.
+     *
+     * A pool younger than its own window simply runs out of rows and pays the
+     * full reward across everything it has. */
+    static const char *Q_WINDOW =
+        "WITH anchored AS ("
+        "  SELECT id, worker_id, difficulty, "
+        "         SUM(difficulty) OVER (ORDER BY id DESC ROWS UNBOUNDED PRECEDING) AS running "
+        "    FROM shares "
+        "   WHERE id <= (SELECT MAX(id) FROM shares WHERE block_hash = ?) "
+        ") "
+        "SELECT worker_id, SUM(difficulty) AS wd, "
+        "       (SELECT SUM(difficulty) FROM anchored WHERE running - difficulty < ?2) AS total "
+        "  FROM anchored "
+        " WHERE running - difficulty < ?2 "
+        " GROUP BY worker_id";
+
+    static const char *Q_CREDIT =
+        "INSERT INTO pps_credits (worker_id, accrued_sats, paid_sats, last_updated) "
+        "VALUES (?, ?, 0, ?) "
+        "ON CONFLICT(worker_id) DO UPDATE SET "
+        "  accrued_sats = pps_credits.accrued_sats + excluded.accrued_sats, "
+        "  last_updated = excluded.last_updated";
+
+    static const char *Q_MARK =
+        "UPDATE blocks_found SET pplns_distributed = 1 WHERE id = ?";
+
+    sqlite3_stmt *due = NULL;
+    if (sqlite3_prepare_v2(s->db, Q_DUE, -1, &due, NULL) != SQLITE_OK) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        return -1;
+    }
+    sqlite3_bind_int(due, 1, maturity_confs);
+
+    int blocks = 0, workers = 0, rc_out = 0;
+    while (sqlite3_step(due) == SQLITE_ROW) {
+        sqlite3_int64 block_id = sqlite3_column_int64(due, 0);
+        const char *hash = (const char *)sqlite3_column_text(due, 1);
+        sqlite3_int64 gross = sqlite3_column_int64(due, 2);
+        double window = sqlite3_column_double(due, 3);
+        char hbuf[HASH_STR_MAX];
+        snprintf(hbuf, sizeof hbuf, "%s", hash ? hash : "");
+
+        /* Net of the operator fee, the same basis points solo and PPS use.
+         * On PPLNS the fee is normally set lower: there is no variance being
+         * absorbed, so there is no risk premium to charge for. */
+        int64_t payable = gross;
+        if (fee_bps > 0 && fee_bps <= 10000) {
+            payable = gross - (gross * (int64_t)fee_bps) / 10000;
+        }
+        if (payable <= 0) {
+            /* Nothing to share out, but the block is still settled: leaving
+             * the latch clear would re-examine it on every pass forever. */
+            sqlite3_stmt *mk = NULL;
+            if (sqlite3_prepare_v2(s->db, Q_MARK, -1, &mk, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(mk, 1, block_id);
+                sqlite3_step(mk);
+                sqlite3_finalize(mk);
+            }
+            continue;
+        }
+
+        /* One transaction per block: every credit for it lands or none does,
+         * and a failure leaves the latch clear so the next pass retries. A
+         * partial distribution is the one outcome that cannot be corrected by
+         * running again, because crediting is additive. */
+        if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+            rc_out = -1;
+            break;
+        }
+
+        sqlite3_stmt *win = NULL, *cred = NULL, *mark = NULL;
+        int ok = sqlite3_prepare_v2(s->db, Q_WINDOW, -1, &win, NULL) == SQLITE_OK &&
+                 sqlite3_prepare_v2(s->db, Q_CREDIT, -1, &cred, NULL) == SQLITE_OK &&
+                 sqlite3_prepare_v2(s->db, Q_MARK,   -1, &mark, NULL) == SQLITE_OK;
+        int credited_here = 0;
+        int64_t distributed = 0;
+        if (ok) {
+            sqlite3_bind_text  (win, 1, hbuf, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_double(win, 2, window);
+            while (sqlite3_step(win) == SQLITE_ROW) {
+                sqlite3_int64 wid = sqlite3_column_int64(win, 0);
+                double wd    = sqlite3_column_double(win, 1);
+                double total = sqlite3_column_double(win, 2);
+                if (!(total > 0.0) || !(wd > 0.0)) continue;
+                /* Truncating division, so the sum of credits can fall a few
+                 * sats short of payable. Rounding up instead would let it
+                 * exceed the block, which is the direction that turns into an
+                 * unfundable balance. */
+                int64_t amt = (int64_t)((double)payable * (wd / total));
+                if (amt <= 0) continue;
+                sqlite3_bind_int64(cred, 1, wid);
+                sqlite3_bind_int64(cred, 2, amt);
+                sqlite3_bind_int64(cred, 3, (sqlite3_int64)time(NULL));
+                if (sqlite3_step(cred) != SQLITE_DONE) { ok = 0; }
+                sqlite3_reset(cred);
+                if (!ok) break;
+                distributed += amt;
+                credited_here++;
+            }
+        }
+        if (ok) {
+            sqlite3_bind_int64(mark, 1, block_id);
+            if (sqlite3_step(mark) != SQLITE_DONE) ok = 0;
+        }
+        sqlite3_finalize(win);
+        sqlite3_finalize(cred);
+        sqlite3_finalize(mark);
+
+        if (ok) {
+            sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
+            blocks++;
+            workers += credited_here;
+            LOG_INFO("pplns: block %.16s… distributed %lld sats of %lld across "
+                     "%d worker(s), window %.2f",
+                     hbuf, (long long)distributed, (long long)payable,
+                     credited_here, window);
+        } else {
+            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+            if (errbuf && errlen)
+                snprintf(errbuf, errlen, "distribute %.16s: %s", hbuf,
+                         sqlite3_errmsg(s->db));
+            rc_out = -1;
+            break;
+        }
+    }
+    sqlite3_finalize(due);
+
+    if (out_blocks)  *out_blocks  = blocks;
+    if (out_workers) *out_workers = workers;
+    return rc_out < 0 ? rc_out : blocks;
 }
 
 int store_record_credit(store_t *s, const char *worker_name,

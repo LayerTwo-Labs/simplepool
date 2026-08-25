@@ -135,6 +135,12 @@ typedef struct {
      * lock per share would not be. Zero means "no accrual" (solo, or a
      * template we could not derive a rate from). */
     _Atomic double  pps_rate;
+    /* Network difficulty from the most recent template. PPLNS reads it when a
+     * block is found, to snapshot the window that block will later be
+     * distributed across — by the time it matures the chain may have
+     * retargeted, and recomputing then would pay it out across a window its
+     * own miners never worked under. */
+    _Atomic double  net_difficulty;
 
     /* Observed share-difficulty throughput, in difficulty units per second,
      * and the window it is accumulated over. This is the pool's own hashrate
@@ -326,6 +332,10 @@ static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
         nbits_to_target(t->bits, target_be);
     }
     double net_diff = target_to_diff(target_be);
+    if (net_diff > 0.0 && isfinite(net_diff)) {
+        atomic_store_explicit(&s->net_difficulty, net_diff,
+                              memory_order_relaxed);
+    }
     int64_t value   = t->coinbase_value_sats;
 
     int overridden  = s->cfg->pps_sats_per_diff > 0.0;
@@ -592,10 +602,23 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
      * Nothing here may write 'confirmed'. */
     int status = accepted ? STORE_BLOCK_PENDING : STORE_BLOCK_REJECTED;
     if (s && s->store) {
+        /* Snapshot the PPLNS window for this block. Zero in every other mode,
+         * and zero here too if no template has been priced yet — a block with
+         * no window is skipped by the distributor rather than distributed
+         * across a window of nothing. */
+        double window_diff = 0.0;
+        if (s->cfg && s->cfg->pplns_window_diff_multiple > 0.0 &&
+            (strcmp(s->cfg->pool_mode, "pplns-thunder") == 0 ||
+             strcmp(s->cfg->pool_mode, "pplns-btc") == 0)) {
+            double nd = atomic_load_explicit(&s->net_difficulty,
+                                             memory_order_relaxed);
+            if (nd > 0.0) window_diff = nd * s->cfg->pplns_window_diff_multiple;
+        }
         store_record_block(s->store, ts_ms, (int)height, block_hash,
                            worker_name, finder_address,
                            reward_sats, fee_sats, status,
-                           accepted ? NULL : submit_error);
+                           accepted ? NULL : submit_error,
+                           window_diff);
     }
     /* pool:blocks carries solved blocks. A candidate the node refused is not
      * one, so it does not go out on that channel — the DB row is where a
@@ -633,6 +656,16 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
  * pool_meta.network_source distinguishes an authoritative answer from an
  * inferred one. Nothing here invents a verdict: a candidate that neither path
  * can speak to stays pending, and pending counts as nothing. */
+/* Confirmations a block needs before PPLNS will pay it out.
+ *
+ * 100 because that is when a coinbase output becomes spendable. Crediting
+ * earlier would create a balance the pool genuinely cannot fund yet — which
+ * is the reserve requirement PPLNS exists to remove, reintroduced by
+ * accident. It also makes orphan handling a non-question: a block 100 deep
+ * is not coming back out of the chain, so there is no credit to reverse and
+ * no need for a reversal path that would otherwise have to exist. */
+#define PPLNS_MATURITY_CONFS 100
+
 static void reconcile_blocks(server_ctx_t *s, int tip_height) {
     if (!s || !s->store || tip_height <= 0) return;
 
@@ -679,6 +712,31 @@ static void reconcile_blocks(server_ctx_t *s, int tip_height) {
                                               &orphaned, &pending) == 0) {
         LOG_DEBUG("block reconcile: confirmed=%d orphaned=%d pending=%d",
                   confirmed, orphaned, pending);
+    }
+
+    /* PPLNS pays out here rather than at block-find time, because this is the
+     * only place that knows a block is still in the chain and how deep. A
+     * distribution is the last irreversible step in the pipeline: crediting is
+     * additive and there is no negative share, so anything credited from a
+     * block that later turns out not to be ours cannot be taken back. Running
+     * it off the confirmation pass, gated on maturity, means it only ever sees
+     * blocks that are 100 deep — by which point "still in the chain" has
+     * stopped being a question. */
+    if (s->cfg && (strcmp(s->cfg->pool_mode, "pplns-thunder") == 0 ||
+                   strcmp(s->cfg->pool_mode, "pplns-btc") == 0)) {
+        int blocks = 0, workers = 0;
+        char derr[256] = {0};
+        int rc = store_pplns_distribute(s->store, PPLNS_MATURITY_CONFS,
+                                        s->cfg->fee_bps, &blocks, &workers,
+                                        derr, sizeof derr);
+        if (rc < 0) {
+            LOG_WARN("pplns distribution failed: %s — nothing was credited, "
+                     "the block stays undistributed and the next tip retries",
+                     derr[0] ? derr : "unknown");
+        } else if (blocks > 0) {
+            LOG_INFO("pplns: distributed %d matured block(s) across %d "
+                     "worker credit(s)", blocks, workers);
+        }
     }
 }
 
