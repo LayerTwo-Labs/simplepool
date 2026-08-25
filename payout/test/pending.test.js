@@ -249,20 +249,26 @@ test('an unreachable node blocks rather than guessing', async () => {
     assert.equal(credited(db), 0);
 });
 
-test('a row with no txid is left alone by the settle path', async () => {
+test('a row with no txid halts payouts instead of starting a second one', async () => {
     /* Crashed between INSERT and broadcast: we cannot tell whether anything
-     * went out, so it belongs to the operator, not to the loop. It must not
-     * be read as a pending batch — that would block on a phantom. */
+     * went out. It is still not a *settleable* batch, and pendingBatch must
+     * not read it as one — blocking on a phantom txid would never clear.
+     *
+     * But un-settleable is not un-outstanding. A transfer may be live on those
+     * UTXOs, so paying a different worker now puts a SECOND transaction against
+     * the same inputs, and Thunder picks inputs without excluding what its own
+     * mempool already spent. One of the two ends up live and untracked. Having
+     * listDue exclude rig1 is not enough; the whole tick stops. */
     const db = makeDb({
         inFlight: [{ txid: '', worker_id: 1, sats: 5_000_000 }],
         owed: { rig1: 5_000_000, rig2: 6_000_000 },
     });
     const thunder = thunderStub();
 
-    assert.equal(pendingBatch(db), null);
+    assert.equal(pendingBatch(db), null, 'still not a settleable batch');
     const r = await runOnce({ db, thunder, cfg }, quietLog);
-    assert.equal(r.broadcast, 1, 'rig2 is still payable');
-    assert.equal(thunder.calls.lastBatch.length, 1, 'rig1 stays excluded by listDue');
+    assert.equal(r.reason, 'in-flight-unresolved');
+    assert.equal(thunder.calls.transfers, 0, 'rig2 waits too — one payout at a time');
 });
 
 test('listStuck reports unbroadcast rows only, not ones awaiting confirmation', async () => {
@@ -433,6 +439,70 @@ test('the biggest debt goes first, and the rest are not stranded', async () => {
     assert.equal(
         db.prepare('SELECT COUNT(*) n FROM pps_credits WHERE accrued_sats > paid_sats').get().n,
         0, 'every address paid, just not in the same block');
+});
+
+/* ---------- batching across addresses, once the node has proved it can ---- */
+
+test('a node that returns an unsigned tx batches every address together', async () => {
+    /* The splice path worked, so create_transfer handed back something to
+     * split and a multi-address batch is expressible. From the next tick on,
+     * everyone due goes out in one transaction — which is the whole point of
+     * batching, and what a sidechain that advances a few times a day needs. */
+    const db = makeDb({
+        owed:   { rig1: 5_000_000, rig2: 6_000_000, other: 20_000_000, third: 1_000_000 },
+        addrOf: name => ({ other: 'addrB', third: 'addrC' }[name] ?? 'addrA'),
+    });
+    const thunder = thunderStub();          /* stub omits broadcastByNode: old API */
+    const ctx = { db, thunder, cfg };
+
+    await runOnce(ctx, quietLog);                       /* one address, and it learns */
+    assert.equal(ctx._nodeBroadcastsOnCreate, false);
+    thunder.txState.tx1 = { known: true, confirmed: true };
+
+    await runOnce(ctx, quietLog);                       /* settle, then batch the rest */
+    assert.equal(thunder.calls.transfers, 2);
+    assert.equal(addrsIn(thunder).size, 2, 'addrA and addrC in ONE transaction');
+    assert.equal(thunder.calls.lastBatch.length, 3);
+});
+
+test('a node that broadcasts on create never gets a multi-address batch', async () => {
+    const db = makeDb({
+        owed:   { rig1: 5_000_000, other: 20_000_000 },
+        addrOf: name => (name === 'other' ? 'addrB' : 'addrA'),
+    });
+    const thunder = thunderStub();
+    thunder.transferBatchDetailed = async (recipients) => {
+        thunder.calls.transfers++;
+        thunder.calls.lastBatch = recipients;
+        assert.equal(new Set(recipients.map(r => r.address)).size, 1,
+            'never handed more than one address');
+        return { txid: `tx${thunder.calls.transfers}`, recipients: recipients.length,
+                 broadcastByNode: true };
+    };
+    const ctx = { db, thunder, cfg };
+
+    await runOnce(ctx, quietLog);
+    assert.equal(ctx._nodeBroadcastsOnCreate, true);
+    thunder.txState.tx1 = { known: true, confirmed: true };
+
+    await runOnce(ctx, quietLog);
+    assert.equal(addrsIn(thunder).size, 1, 'still one address per transaction');
+});
+
+test('an unproven node is treated as the dangerous one', async () => {
+    /* No transfer has come back yet, so nothing is known about create_transfer.
+     * Guessing "it can batch" costs someone else's balance; guessing the other
+     * way costs a sidechain block. */
+    const db = makeDb({
+        owed:   { rig1: 5_000_000, other: 20_000_000 },
+        addrOf: name => (name === 'other' ? 'addrB' : 'addrA'),
+    });
+    const thunder = thunderStub();
+    const ctx = { db, thunder, cfg };
+    assert.equal(ctx._nodeBroadcastsOnCreate, undefined);
+
+    await runOnce(ctx, quietLog);
+    assert.equal(addrsIn(thunder).size, 1);
 });
 
 /* ---------- do not build against a Thunder that cannot settle ------------- */

@@ -53,7 +53,7 @@
 
 import { listDue, listStuck, recordTxAttempt, asRawTx,
          beginBatch, finalizeBatch, abortBatch, attachBatchTxid,
-         pendingBatch } from './db.js';
+         pendingBatch, inFlightCount } from './db.js';
 
 /* Fee model: flat per-tx fee, configurable later. Thunder is a sidechain
  * with relatively low fees; 100 sats covers a one-input one-output tx
@@ -221,22 +221,24 @@ async function nudgeMine(ctx, log, { force = false, reason = '' } = {}) {
 /* Everyone due, grouped by the address their money actually goes to, biggest
  * debt first.
  *
- * This is not an optimisation — it is what makes a batch safe to send.
- * Thunder >= 0.17.1 (commit a195d67) signs and broadcasts inside
- * `create_transfer`, and that RPC takes exactly ONE destination. A batch
- * spanning several addresses is therefore paid, in full, to whichever address
- * happened to be listed first, and there is no catching it afterwards: by the
- * time the response arrives the money is on the network and in someone else's
- * balance. thunder.js does refuse that result, but refusing it is already too
- * late — it fired twice on avonpool on 2026-08-24 and left an untracked
- * transaction sitting on the wallet's only UTXO.
+ * Batching every due worker into ONE transaction is the goal and stays the
+ * goal: Thunder advances only when a mainchain block commits to it, so a
+ * transaction per recipient costs a sidechain block per recipient and the
+ * queue drains slower than it fills.
  *
- * So a batch that cannot be sent safely is never built. Each tick pays one
- * address and the others wait for a tick of their own, which costs nothing:
- * payouts already serialise, because Thunder's wallet cannot spend the change
- * of an unconfirmed transaction (see settlePending). Throughput is bounded by
- * distinct addresses, not by workers — a miner's rigs share one address and
- * still collapse into a single transaction, which was the point of batching.
+ * Whether that is achievable is the node's decision, not ours. The batch is
+ * built by asking `create_transfer` for the total and splitting its payment
+ * output into one per recipient — and Thunder >= 0.17.1 (commit a195d67)
+ * signs and broadcasts inside `create_transfer`, which takes exactly ONE
+ * destination. On such a node there is nothing to split: the response arrives
+ * with the whole total already paid to whichever address was listed first, and
+ * no error can call that back. It fired twice on avonpool on 2026-08-24 and
+ * left an untracked transaction sitting on the wallet's only UTXO.
+ *
+ * So grouping is the fallback for a node that cannot build the batch, and
+ * runOnce() uses it only until the node has proved otherwise — see
+ * `canBatchAcrossAddresses`. Rigs share an address either way, so the common
+ * case is one transaction regardless.
  *
  * Sorted by debt so the largest liability clears first; ties keep listDue's
  * order. */
@@ -272,23 +274,63 @@ export async function runOnce(ctx, log) {
         }
     }
 
+    /* One payout transaction at a time, and "at a time" is counted in rows, not
+     * in settleable batches.
+     *
+     * settlePending() has just handled every row that carries a txid. What can
+     * still be here is a row with txid='' — a crash around a broadcast, where
+     * it is unknown whether a transfer went out. listDue excludes those
+     * WORKERS, but not the situation: any other worker coming due would start
+     * a second payout, and Thunder picks its inputs without excluding what its
+     * own mempool has already spent, so the two collide on the same UTXOs. One
+     * of them is then live and untracked, which is the state this whole file
+     * exists to avoid.
+     *
+     * reportStuck() and payout/README.md tell the operator how to resolve it;
+     * until they do, nothing new goes out. */
+    if (!cfg.dryRun) {
+        const outstanding = inFlightCount(db);
+        if (outstanding > 0) {
+            log.error(
+                `payout: ${outstanding} in-flight payout row(s) are unresolved — no txid, ` +
+                'so it cannot be told whether a transfer went out. Not starting another ' +
+                'payout: a second transaction would spend the same UTXOs. Reconcile first ' +
+                '(payout/README.md -> Reconciling by hand).');
+            return { attempted: 0, paid: 0, failed: 0, settled, reason: 'in-flight-unresolved' };
+        }
+    }
+
     const allDue = listDue(db, { minSats: cfg.minSats, limit: cfg.maxPerTick });
     if (allDue.length === 0) {
         log.debug?.('payout: no due workers');
         return { attempted: 0, paid: 0, failed: 0, settled };
     }
 
-    /* One transaction, one payout address — see groupByAddress. */
-    const groups  = groupByAddress(allDue);
-    const due     = groups[0].rows;
-    const queued  = groups.length - 1;
+    /* Batch everyone into one transaction where the node can build one.
+     *
+     * `_nodeBroadcastsOnCreate` is what a previous transfer proved about this
+     * Thunder: false means create_transfer handed back an unsigned transaction
+     * and the splice worked, so a multi-address batch is safe and every due
+     * worker goes out together. true means it signed and broadcast on its own,
+     * so only one destination is expressible. undefined means no transfer has
+     * come back yet — and an unproven node is treated as the dangerous one,
+     * because the cost of guessing wrong is somebody else's balance.
+     *
+     * Learned from the result rather than probed, because every probe of this
+     * question is itself a transfer. One address goes out first; the answer
+     * arrives with it. */
+    const groups = groupByAddress(allDue);
+    const canBatchAcrossAddresses = ctx._nodeBroadcastsOnCreate === false;
+    const due    = canBatchAcrossAddresses ? allDue : groups[0].rows;
+    const queued = canBatchAcrossAddresses ? 0 : groups.length - 1;
 
     const totalOwed = due.reduce((a, r) => a + r.owed_sats, 0n);
     /* One transaction, one fee — not one per recipient. */
     const totalFees = TX_FEE_SATS;
     log.info(`payout: ${due.length} due, total owed=${totalOwed} sats, fee=${totalFees}` +
-             (queued > 0 ? ` (paying ${groups[0].address}; ${queued} more address(es) ` +
-                           'queued for later ticks)' : ''));
+             (queued > 0 ? ` (this node cannot batch across addresses, so paying ` +
+                           `${groups[0].address} now; ${queued} more address(es) follow ` +
+                           'on later ticks)' : ''));
 
     /* Do not build a transfer against a Thunder that cannot settle one.
      *
@@ -375,6 +417,11 @@ export async function runOnce(ctx, log) {
         res = await thunder.transferBatchDetailed(
             batch.map(b => ({ address: b.address, sats: b.sats })), TX_FEE_SATS);
     } catch (e) {
+        /* Only one thing produces a broadcastTxid: create_transfer signing and
+         * sending on its own. Whatever else went wrong, the node has answered
+         * the batching question, and it must never be asked again. */
+        if (e.broadcastTxid) ctx._nodeBroadcastsOnCreate = true;
+
         recordTxAttempt(db, {
             kind: 'payout', status: e.broadcastTxid ? 'broadcast' : 'failed',
             stage: e.stage || 'unknown', txid: e.broadcastTxid || null,
@@ -411,6 +458,12 @@ export async function runOnce(ctx, log) {
         log.warn(`payout: batch of ${batch.length} ${e.stage || 'transfer'} failed: ${e.message}`);
         return { attempted: due.length, paid: 0, failed: due.length, settled };
     }
+
+    /* What this transfer proved about the node, for the next tick's batching
+     * decision. `broadcastByNode` is set only on the create-and-broadcast
+     * path; an unsigned transaction that we spliced, signed and submitted
+     * leaves it undefined, and that is the node that can batch. */
+    ctx._nodeBroadcastsOnCreate = res.broadcastByNode === true;
 
     recordTxAttempt(db, {
         kind: 'payout', status: 'broadcast', stage: 'submit',
