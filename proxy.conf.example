@@ -1,6 +1,10 @@
 listen_addr = 0.0.0.0
 listen_port = 3334
 
+# Maximum concurrent stratum connections, across every listener. A connection
+# past this is closed immediately at accept. Each one costs a thread and an fd.
+max_conns = 500
+
 bitcoind_url = http://127.0.0.1:18443
 # bitcoind_user / bitcoind_pass are optional. Omit BOTH for a block-template
 # backend that doesn't require authentication; the RPC call is then made

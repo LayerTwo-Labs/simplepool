@@ -161,7 +161,10 @@ sequenceDiagram
         B-->>P: template
         alt new tip
             P->>P: rebuild stratum_job_t
-            P-->>M: mining.notify (new job, clean=true) — broadcast to all conns
+            P-->>M: mining.notify (new job, clean=TRUE) — broadcast to all conns<br/>every held job builds on a parent that is no longer the tip
+        else same tip, template ≥30s old
+            P->>P: rebuild stratum_job_t (fresher ntime, new txs)
+            P-->>M: mining.notify (new job, clean=FALSE) — broadcast to all conns<br/>the job in hand is still valid; submits against it are still accepted
         end
     end
 
@@ -205,7 +208,22 @@ Key invariants the diagram glosses over but the code enforces:
 - **vardiff doesn't invalidate the active job.** A
   `mining.set_difficulty` only relaxes/tightens the per-share check;
   the current `mining.notify` stays valid against it. We do not force
-  a re-notify on a difficulty change.
+  a re-notify on a difficulty change. Each job also carries the
+  difficulty it went out under, so a submit is judged at *that* value
+  rather than whatever the connection has drifted to since.
+- **`clean_jobs` is an instruction, not a description.** It means
+  "throw away the work you are holding", and only a tip change makes
+  that true. The periodic template refresh sends `clean_jobs=false`:
+  the job in hand still builds on the current tip, and the pool goes on
+  accepting submits against it out of an 8-deep retention ring. Sending
+  it as true on every refresh discards work in flight on every
+  connected miner ~20 times per block, which is invisible to a probe
+  that reads one notify and leaves.
+- **More than one stratum port.** A `listener` line binds an extra port
+  with its own difficulty policy, so a rented fleet and a home ASIC can
+  be served by the same pool without either getting the other's
+  difficulty. `listen_port` is unaffected, and a config naming no
+  listeners binds exactly what it always did.
 
 ### Stratum username convention
 
