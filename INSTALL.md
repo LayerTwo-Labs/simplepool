@@ -458,6 +458,11 @@ vardiff_window_sec = 30
 idle_timeout_sec            = 600    # socket that never authorized
 idle_timeout_authorized_sec = 7200   # a working miner between shares
 
+# Per-connection ceiling on mining.submit. Far above anything a correctly
+# configured miner reaches; it bounds what one badly mismatched connection
+# (a fleet on a home-miner port) can cost. 0 disables.
+max_submits_per_sec = 20000
+
 db_path = /home/simplepool/data/shares.db
 log_level = info
 ```
