@@ -1308,6 +1308,19 @@ int main(int argc, char **argv) {
     }
     bitcoind_template_free(tmpl);
 
+    /* The one thing pplns-btc needs that no other mode does, said at
+     * startup rather than discovered when the first payout fails 100 blocks
+     * later. The proxy cannot check it: the wallet belongs to the enforcer
+     * and the payout worker is a separate process. */
+    if (strcmp(cfg.pool_mode, "pplns-btc") == 0) {
+        LOG_INFO("pplns-btc: miners are paid on L1. This requires "
+                 "bip300301_enforcer running with --enable-wallet, "
+                 "pool_btc_address (%s) being an address from that wallet, "
+                 "and the payout worker started with PAYOUT_RAIL=btc. The "
+                 "pool holds no keys — the enforcer signs and broadcasts.",
+                 cfg.pool_btc_address);
+    }
+
     LOG_INFO("stratum listening on %s:%d (difficulty from %g)",
              cfg.listen_addr, cfg.listen_port, cfg.initial_diff);
     for (int i = 0; i < cfg.listener_count; ++i) {

@@ -173,7 +173,16 @@ redis_reconnect_backoff_ms = 2000
 #               decides what a stratum username IS. pplns-thunder takes
 #               Thunder addresses and pays over Thunder, exactly as
 #               pps-classic does. pplns-btc takes Bitcoin addresses and pays
-#               on L1 from the pool's wallet.
+#               on L1.
+#
+#               pplns-btc needs the bip300301_enforcer running with
+#               --enable-wallet, and pool_btc_address set to an address from
+#               that wallet (WalletService/CreateNewAddress). The pool holds
+#               no keys and builds no transactions: the coinbase pays into
+#               the enforcer's wallet, and paying miners is one RPC to
+#               WalletService/SendTransaction, which selects the inputs,
+#               signs and broadcasts. The payout worker needs PAYOUT_RAIL=btc
+#               and ENFORCER_RPC_ADDR to match — see payout/README.md.
 #
 #   pps-classic Coinbase pays a pool BTC address (pool_btc_address below)
 #               as a normal P2WPKH/P2PKH output. Miners authorize with a
