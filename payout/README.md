@@ -297,6 +297,73 @@ transaction). If it truly never landed, `DELETE` those rows and the workers are
 paid again on the next tick. Do not delete rows you have not positively shown
 to be unmined — that is how a batch gets paid twice.
 
+### Retracting a batch
+
+**Only when the distribution is wrong — never because it is slow.**
+
+A broadcast batch that has not confirmed is almost always a *correct* payout
+waiting for a Thunder block, and waiting costs nothing: accruals keep
+accumulating in `pps_credits`, so whoever came due meanwhile is paid by the
+next tick once the block lands. The loop halts and says so; the right response
+is to get a block, not to rewrite the payment.
+
+Retract only when the transaction pays the wrong people or the wrong amounts —
+the failure mode fixed in this PR, where a node that broadcasts inside
+`create_transfer` paid a whole multi-address batch to one address.
+
+**Two things to understand before doing it.**
+
+*Retracting does not cancel a BMM attempt.* `app.mine()` snapshots the mempool
+into a block body **before** requesting BMM, and connects that snapshot if the
+commitment lands:
+
+```rust
+let BlockTemplate { bribe, header, body, .. } = self.build_block_template(fee).await?;
+let bmm_txid = miner_write.attempt_bmm(bribe.to_sat(), 0, header, body).await?;
+if let Some((main_hash, header, body)) = miner_write.confirm_bmm().await? {
+    self.node.submit_block(main_hash, &header, &body).await?   // the snapshotted body
+```
+
+`remove_from_mempool` touches the node's mempool only. If a request is already
+in flight the transaction can still land afterwards. Check Thunder's log for an
+`attempt BMM: created TX` with no following `confirm BMM` line — that is a
+parked request, and it is worth waiting for it to resolve first.
+
+*You cannot pay twice.* A transfer consumes every wallet UTXO, so any rebuilt
+payout spends the same inputs and is a double-spend of the original. Only one
+can ever be in the chain. What is at risk is crediting the wrong distribution
+if the retracted one lands after you have moved on.
+
+```sh
+CLI=…/thunder_app_cli
+
+sudo systemctl stop simplepool-payout          # or it builds into the gap
+
+# 1. it must be unconfirmed: tx non-null, block_hash null
+sudo -u forknet $CLI get-transaction <txid>
+
+# 2. drop it, and prove it is gone
+sudo -u forknet $CLI remove-from-mempool <txid>
+sudo -u forknet $CLI get-transaction <txid>                     # expect null
+sudo -u forknet $CLI get-block-template | jq '.block.body.transactions|length'
+
+# 3. release the rows so the batch is rebuilt from current balances
+sqlite3 data/shares.db "DELETE FROM payouts_in_flight WHERE txid = '<txid>';"
+
+sudo systemctl start simplepool-payout
+```
+
+Nobody was credited, so nothing in `pps_credits` needs undoing — that is the
+whole point of settling on confirmation rather than on broadcast.
+
+Afterwards, watch for the retracted txid coming back. If it ever appears as a
+wallet UTXO outpoint, it won and the replacement is dead, so the ledger needs
+correcting by hand:
+
+```sh
+sudo -u forknet $CLI get-wallet-utxos | grep <old-txid>
+```
+
 ## Block-withholding audit (`audit.js`)
 
 PPS-specific fraud check. A worker can submit valid shares to collect
