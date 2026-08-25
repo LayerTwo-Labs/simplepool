@@ -1222,8 +1222,13 @@ int main(int argc, char **argv) {
             } else {
                 snprintf(who, sizeof who, "%d", cfg.listeners[i].port);
             }
-            LOG_WARN("listener port %s promises min_diff %.0f, above this "
-                     "chain's network difficulty %.2f. That floor is kept — a "
+            /* %g for both difficulties (see config.c): %.0f/%.2f collapse a
+             * forknet's 4.66e-10 to "0.00" and the port's 1e-8 to "0", which
+             * turns the one message that has to name two numbers into one
+             * that names neither. The ratios below keep %.0f — the floor is
+             * above the chain by construction, so those really are >= 1. */
+            LOG_WARN("listener port %s promises min_diff %g, above this "
+                     "chain's network difficulty %g. That floor is kept — a "
                      "marketplace measures the difficulty on the wire — so "
                      "miners on this port will discard roughly %.0f of every "
                      "%.0f blocks they solve, because they filter locally at "
