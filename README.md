@@ -164,7 +164,7 @@ sequenceDiagram
             P-->>M: mining.notify (new job, clean=TRUE) — broadcast to all conns<br/>every held job builds on a parent that is no longer the tip
         else same tip, template ≥30s old
             P->>P: rebuild stratum_job_t (fresher ntime, new txs)
-            P-->>M: mining.notify (new job, clean=FALSE) — broadcast to all conns<br/>the job in hand is still valid; submits against it are still accepted
+            P-->>M: mining.notify (new job, clean=FALSE) — broadcast to all conns<br/>the job in hand is still valid, submits against it are still accepted
         end
     end
 
