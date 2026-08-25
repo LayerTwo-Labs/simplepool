@@ -53,18 +53,28 @@ PAYOUT_DRY_RUN=1 PAYOUT_DB_PATH=../data/shares.db \
    nudge Thunder to mine and stop for this tick. Undeterminable: stop and
    log loudly (see below).
 2. `SELECT … FROM pps_credits JOIN workers WHERE accrued - paid >= min`,
-   excluding anyone with an in-flight row
-3. `thunder.balance()` — bail this tick if the reserve is short
-4. **Broadcast** everyone due in ONE transaction, and stamp its txid onto
-   their in-flight rows. Nobody is credited here.
+   excluding anyone with an in-flight row, then **group by payout address**
+   and take the largest debt
+3. `thunder.mempool()` — bail this tick if Thunder is holding anything unmined
+4. `thunder.balance()` — bail this tick if the reserve is short
+5. **Broadcast** everyone at that address in ONE transaction, and stamp its
+   txid onto their in-flight rows. Nobody is credited here.
 
-Payouts *are* batched into a single transaction. Thunder advances only when
-a mainchain block commits to it and cannot spend the change of an unconfirmed
-transaction, so one tx per worker would cost one sidechain block each and the
-queue would drain slower than it fills. The cost is failure isolation: one bad
-address fails the whole batch. That is the right trade — every recipient is an
-address the proxy validated at authorize time, and a failed batch credits
-nobody and strands nobody.
+Payouts *are* batched into a single transaction — but the unit is one payout
+**address**, not one tick's worth of workers. Thunder ≥ 0.17.1 signs and
+broadcasts inside `create_transfer`, and that RPC takes a single destination,
+so a batch spanning two addresses is paid *in full* to whichever one was
+listed first. There is no catching that from the response: by the time it
+arrives the money is on the network and in someone else's balance. So the
+batch is never built. A miner's rigs share an address and still collapse into
+one transaction, which is where the throughput was; the addresses beyond the
+first wait for ticks of their own, which costs nothing because payouts already
+serialise on Thunder's inability to spend unconfirmed change.
+
+The remaining cost is failure isolation: one bad address fails that address's
+batch. That is the right trade — every recipient is an address the proxy
+validated at authorize time, and a failed batch credits nobody and strands
+nobody.
 
 ## Three clocks, not one
 
@@ -202,6 +212,29 @@ sqlite3 data/shares.db "UPDATE payouts_in_flight SET txid = '<txid>' WHERE id = 
 
 # it never went out — release the workers to be paid again next tick
 sqlite3 data/shares.db "DELETE FROM payouts_in_flight WHERE id = <id>;"
+```
+
+**`Thunder is holding N unmined transaction(s)`.** Settlement found nothing
+outstanding, yet Thunder's mempool is not empty — so there is a transfer out
+of the pool wallet that this ledger has no record of, spending the UTXOs the
+next payout would use. Every batch built against it dies as `utxo double
+spent` at the *create* stage, which looks like a clean abort, so an unguarded
+loop retries forever and pays nobody. The gate stops that, and deliberately
+does **not** mine: a block here would confirm a transfer the pool never
+recorded.
+
+```sh
+CLI=…/thunder_app_cli
+# what is in there, and where is it going?
+sudo -u forknet $CLI get-block-template | jq '.block.body.transactions[].outputs'
+```
+
+If it is meant to go out, mine it (`$CLI mine`) and reconcile the ledger by
+hand afterwards — nobody in it is credited. If it is not, drop it and the next
+tick rebuilds the batch correctly:
+
+```sh
+sudo -u forknet $CLI remove-from-mempool <txid>
 ```
 
 **`CANNOT DETERMINE settlement`.** The loop can see neither the transaction

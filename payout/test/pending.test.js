@@ -35,8 +35,14 @@ import Database from 'better-sqlite3';
 import { runOnce } from '../lib/payout.js';
 import { pendingBatch, listStuck } from '../lib/db.js';
 
-/* Minimal schema — just the tables the payout loop touches. */
-function makeDb({ inFlight = [], owed = {} } = {}) {
+/* Minimal schema — just the tables the payout loop touches.
+ *
+ * `owed` maps worker name -> sats. By default every worker is paid to ONE
+ * address, because that is what the fixture names describe: rig1..rigN are one
+ * miner's rigs, and a miner's rigs all authenticate with the same Thunder
+ * address. Pass `addrOf` to spread them across addresses — which is a
+ * different situation entirely, and the batching tests below say why. */
+function makeDb({ inFlight = [], owed = {}, addrOf = () => 'addr1' } = {}) {
     const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sp-payout-')), 'p.db');
     const db = new Database(file);
     db.exec(`
@@ -56,7 +62,7 @@ function makeDb({ inFlight = [], owed = {} } = {}) {
     let i = 0;
     for (const [name, sats] of Object.entries(owed)) {
         i++;
-        db.prepare('INSERT INTO workers VALUES (?,?,?)').run(i, name, 'addr' + i);
+        db.prepare('INSERT INTO workers VALUES (?,?,?)').run(i, name, addrOf(name, i));
         db.prepare('INSERT INTO pps_credits VALUES (?,?,0,0)').run(i, sats);
     }
     for (const f of inFlight) {
@@ -74,9 +80,10 @@ function makeDb({ inFlight = [], owed = {} } = {}) {
  *                                           signal, independent of txState */
 function thunderStub({ txState = {}, utxoTxids = [], balance = 10n ** 12n,
                        walletOk = true } = {}) {
-    const calls = { transfers: 0, getTx: 0, utxos: 0, mines: 0 };
+    const calls = { transfers: 0, getTx: 0, utxos: 0, mines: 0, mempool: 0 };
     return {
         calls,
+        mempoolOk: true,
         /* Mutable so a test can advance the chain between ticks. */
         txState,
         utxoTxids,
@@ -93,6 +100,15 @@ function thunderStub({ txState = {}, utxoTxids = [], balance = 10n ** 12n,
                      utxos: this.utxoTxids.map(t => ({ txid: t, address: 'a', sats: 1n })) };
         },
         async mine() { calls.mines++; return { parked: true, completed: false }; },
+        /* Mutable: a test can put an untracked transaction in Thunder's
+         * mempool between ticks, which is the state that must stop the loop
+         * from building another one. */
+        mempoolTxs: 0,
+        async mempool() {
+            calls.mempool++;
+            if (!this.mempoolOk) return { ok: false, count: 0, error: 'ECONNREFUSED' };
+            return { ok: true, count: this.mempoolTxs };
+        },
         async transferBatchDetailed(recipients) {
             calls.transfers++;
             calls.lastBatch = recipients;
@@ -365,11 +381,162 @@ test('a failing mine nudge does not fail the tick', async () => {
     assert.equal(r.waiting_on, 'abc123', 'still waiting, still safe');
 });
 
+/* ---------- one transaction, one address ---------------------------------- */
+
+/* The batch that moved money to the wrong person.
+ *
+ * Thunder >= 0.17.1 signs and broadcasts inside create_transfer, and that RPC
+ * takes ONE destination — so a batch spanning addresses pays the whole total
+ * to whichever was listed first. thunder.js catches it, but only from the
+ * response, by which time the transaction is on the network. The only real
+ * defence is upstream: never build that batch. avonpool built it twice on
+ * 2026-08-24 and spent the next 24 hours failing to pay anybody.
+ */
+
+const addrsIn = thunder => new Set(thunder.calls.lastBatch.map(b => b.address));
+
+test('a batch is never built across distinct payout addresses', async () => {
+    const db = makeDb({
+        owed:   { rig1: 5_000_000, rig2: 6_000_000, other: 20_000_000 },
+        addrOf: name => (name === 'other' ? 'addrB' : 'addrA'),
+    });
+    const thunder = thunderStub();
+
+    const r = await runOnce({ db, thunder, cfg }, quietLog);
+
+    assert.equal(thunder.calls.transfers, 1);
+    assert.deepEqual([...addrsIn(thunder)], ['addrB'],
+        'one address per transaction, or the node pays it all to the first one');
+    assert.equal(r.broadcast, 1, 'only the workers at that address');
+    assert.equal(inFlightRows(db), 1, 'nobody else is reserved against this tx');
+});
+
+test('the biggest debt goes first, and the rest are not stranded', async () => {
+    const db = makeDb({
+        owed:   { rig1: 5_000_000, rig2: 6_000_000, other: 20_000_000 },
+        addrOf: name => (name === 'other' ? 'addrB' : 'addrA'),
+    });
+    const thunder = thunderStub();
+    const ctx = { db, thunder, cfg };
+
+    await runOnce(ctx, quietLog);                       /* addrB: 20M */
+    assert.deepEqual([...addrsIn(thunder)], ['addrB']);
+    thunder.txState.tx1 = { known: true, confirmed: true };
+
+    await runOnce(ctx, quietLog);                       /* settle tx1, send addrA */
+    assert.equal(thunder.calls.transfers, 2);
+    assert.deepEqual([...addrsIn(thunder)], ['addrA']);
+    assert.equal(thunder.calls.lastBatch.length, 2, 'both rigs at addrA, one tx');
+    thunder.txState.tx2 = { known: true, confirmed: true };
+
+    await runOnce(ctx, quietLog);                       /* settle tx2 */
+    assert.equal(
+        db.prepare('SELECT COUNT(*) n FROM pps_credits WHERE accrued_sats > paid_sats').get().n,
+        0, 'every address paid, just not in the same block');
+});
+
+/* ---------- do not build against a Thunder that cannot settle ------------- */
+
+test('an untracked transaction in the mempool stops the loop building another', async () => {
+    /* The avonpool outage in one assertion. Something is in Thunder's mempool
+     * that the ledger has no record of; it is spending the wallet's UTXOs, so
+     * every transfer built now dies as `utxo double spent` at the create
+     * stage — which reads as a clean abort and retries forever. */
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const thunder = thunderStub();
+    thunder.mempoolTxs = 1;
+
+    const r = await runOnce({ db, thunder, cfg }, quietLog);
+
+    assert.equal(thunder.calls.transfers, 0, 'no batch created');
+    assert.equal(r.mempool_blocked, 1);
+    assert.equal(inFlightRows(db), 0, 'and nothing reserved against one');
+    assert.equal(credited(db), 0);
+    assert.equal(thunder.calls.mines, 0,
+        'and NOT mined: a block here would confirm a transfer the pool never recorded');
+});
+
+test('it stays blocked tick after tick, then pays once the block lands', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const thunder = thunderStub();
+    thunder.mempoolTxs = 1;
+    const ctx = { db, thunder, cfg };
+
+    for (let i = 0; i < 5; i++) await runOnce(ctx, quietLog);
+    assert.equal(thunder.calls.transfers, 0, 'five ticks, zero double-spend attempts');
+
+    thunder.mempoolTxs = 0;                             /* Thunder mined */
+    const r = await runOnce(ctx, quietLog);
+    assert.equal(thunder.calls.transfers, 1, 'and it recovers on its own');
+    assert.equal(r.broadcast, 1);
+});
+
+test('an unreachable mempool probe does not block the payout', async () => {
+    /* "Cannot tell" is not "blocked". The transfer would fail safely by
+     * itself; refusing to pay because a diagnostic RPC is down would be an
+     * outage we caused. */
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const thunder = thunderStub();
+    thunder.mempoolOk = false;
+
+    const r = await runOnce({ db, thunder, cfg }, quietLog);
+
+    assert.equal(thunder.calls.transfers, 1);
+    assert.equal(r.broadcast, 1);
+});
+
+/* ---------- a failure that still broadcast is not an abort ---------------- */
+
+test('a transfer that failed WITH funds on the network keeps the batch in flight', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const thunder = thunderStub();
+    thunder.transferBatchDetailed = async (recipients) => {
+        thunder.calls.transfers++;
+        thunder.calls.lastBatch = recipients;
+        const e = new Error('transferBatch: thunder already broadcast deadbeef ...');
+        e.stage = 'submit';
+        e.broadcastTxid = 'deadbeef';
+        throw e;
+    };
+
+    const r = await runOnce({ db, thunder, cfg }, quietLog);
+
+    assert.equal(r.reason, 'broadcast-unintended');
+    assert.equal(r.waiting_on, 'deadbeef');
+    assert.equal(r.failed, 0, 'a live transaction is not a failed one');
+    assert.equal(inFlightRows(db), 1, 'the row is kept, not dropped');
+    assert.equal(pendingBatch(db).txid, 'deadbeef', 'and it is held against that txid');
+    assert.equal(credited(db), 0, 'still nobody is credited before it is mined');
+});
+
+test('and the next tick blocks on it instead of retrying into a double spend', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const thunder = thunderStub();
+    thunder.transferBatchDetailed = async (recipients) => {
+        thunder.calls.transfers++;
+        thunder.calls.lastBatch = recipients;
+        const e = new Error('already broadcast deadbeef');
+        e.stage = 'submit';
+        e.broadcastTxid = 'deadbeef';
+        throw e;
+    };
+    const ctx = { db, thunder, cfg };
+
+    await runOnce(ctx, quietLog);
+    thunder.txState.deadbeef = { known: true, confirmed: false };   /* it is in the mempool */
+
+    await runOnce(ctx, quietLog);
+    await runOnce(ctx, quietLog);
+    assert.equal(thunder.calls.transfers, 1,
+        'one attempt total — the old code made this 216 over 24 hours');
+});
+
 /* ---------- batching ------------------------------------------------------ */
 
 test('every due worker goes out in ONE transaction', async () => {
-    /* The whole point of batching: four workers, one broadcast, one
-     * sidechain block. One tx per worker would need four. */
+    /* The whole point of batching: four rigs, one broadcast, one sidechain
+     * block. One tx per worker would need four. They share an address — see
+     * the distinct-address tests below for why that is the unit. */
     const db = makeDb({ owed: { rig1: 5_000_000, rig2: 6_000_000, rig3: 7_000_000, rig4: 8_000_000 } });
     const thunder = thunderStub();
 

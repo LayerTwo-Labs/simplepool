@@ -85,6 +85,31 @@ export class ThunderClient {
         }
     }
 
+    /* How many transactions Thunder is holding but has not mined.
+     *
+     * `get_block_template` assembles the block Thunder WOULD blind-merge-mine
+     * right now, so its body is the mempool. Nothing is requested and no BMM
+     * bid is spent by asking.
+     *
+     * The payout loop uses this as a pre-flight check, and the reason it is
+     * meaningful there is that settlePending() runs first: once that reports
+     * nothing outstanding, anything still in the mempool is a transaction the
+     * ledger has no record of — and it is spending the same wallet UTXOs the
+     * next transfer would. See the gate in runOnce().
+     *
+     * Never throws. An unreachable node reports { ok: false }, which callers
+     * must read as "cannot tell", never as "blocked": refusing to pay because
+     * a diagnostic RPC is down would be an outage of its own. */
+    async mempool() {
+        try {
+            const t = await this._call('get_block_template', []);
+            const txs = t?.block?.body?.transactions;
+            return { ok: true, count: Array.isArray(txs) ? txs.length : 0 };
+        } catch (e) {
+            return { ok: false, count: 0, error: e.message };
+        }
+    }
+
     /* Pay many recipients in a single Thunder transaction.
      *
      * Thunder's create_transfer builds a one-recipient tx, and its wallet
@@ -150,11 +175,21 @@ export class ThunderClient {
         if (nodeTxid !== null) {
             const distinct = new Set(recipients.map(r => r.address));
             if (distinct.size !== 1) {
-                throw fail('submit', new Error(
+                const err = fail('submit', new Error(
                     `transferBatch: thunder already broadcast ${nodeTxid} paying the ` +
                     `full ${total} sats to ${recipients[0].address}, but this batch has ` +
                     `${distinct.size} distinct addresses. Funds are on the network -- ` +
                     `reconcile by hand (payout/README.md).`));
+                /* Hand the txid back. This is not a clean abort: a live
+                 * transaction is holding the wallet's UTXOs, and a caller that
+                 * drops its in-flight rows here has no record that anything went
+                 * out — so it retries into `utxo double spent` on every tick
+                 * from then on. avonpool did that 216 times over 24h. Keeping
+                 * the rows against this txid makes settlePending() block the
+                 * queue instead, which is the correct response to funds on the
+                 * network that we did not intend to send. */
+                err.broadcastTxid = nodeTxid;
+                throw err;
             }
             return { txid: nodeTxid, unsigned: null, signed: null,
                      recipients: recipients.length, total, broadcastByNode: true };
