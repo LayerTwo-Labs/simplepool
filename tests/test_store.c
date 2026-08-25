@@ -78,6 +78,77 @@ static double scalar_dbl(sqlite3 *db, const char *sql) {
     return v;
 }
 
+/* An existing database must survive the upgrade that adds blocks_found.status.
+ *
+ * Every other test here starts from an empty file, so store_open() only ever
+ * runs against a database it just created -- where CREATE TABLE already names
+ * every current column. A deployed pool is the opposite case: the table exists
+ * from an older schema and the new columns arrive only through MIGRATIONS_SQL.
+ * Nothing exercised that path, so a statement in the strict schema section that
+ * depends on a migrated column passes the whole suite and still fails to open a
+ * real database.
+ *
+ * The old CREATE TABLE is written out literally rather than derived from the
+ * current source, so this keeps testing the upgrade when the schema changes
+ * again. */
+static void test_open_upgrades_a_pre_status_database(void) {
+    const char *path = fresh_db_path();
+
+    sqlite3 *raw = NULL;
+    assert(sqlite3_open(path, &raw) == SQLITE_OK);
+    assert(sqlite3_exec(raw,
+        "CREATE TABLE blocks_found ("
+        "  id              INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  ts              INTEGER NOT NULL,"
+        "  height          INTEGER NOT NULL,"
+        "  hash            TEXT NOT NULL,"
+        "  finder_id       INTEGER,"
+        "  finder_address  TEXT,"
+        "  reward_sats     INTEGER,"
+        "  fee_sats        INTEGER"
+        ");"
+        "INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats)"
+        "  VALUES (1000, 900001, 'deadbeef', 312000000, 780000);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(raw);
+
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* ...and the upgrade must have happened, not merely not-crashed. */
+    sqlite3 *chk = NULL;
+    assert(sqlite3_open(path, &chk) == SQLITE_OK);
+    int has_status = 0, has_index = 0, rows = 0;
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(chk, "PRAGMA table_info(blocks_found)", -1, &st, NULL) == SQLITE_OK);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *n = (const char *)sqlite3_column_text(st, 1);
+        if (n && strcmp(n, "status") == 0) has_status = 1;
+    }
+    sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(chk, "PRAGMA index_list(blocks_found)", -1, &st, NULL) == SQLITE_OK);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *n = (const char *)sqlite3_column_text(st, 1);
+        if (n && strcmp(n, "blocks_found_status_idx") == 0) has_index = 1;
+    }
+    sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(chk, "SELECT COUNT(*) FROM blocks_found", -1, &st, NULL) == SQLITE_OK);
+    if (sqlite3_step(st) == SQLITE_ROW) rows = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(chk);
+
+    assert(has_status && "migration must add blocks_found.status");
+    assert(has_index  && "migration must create blocks_found_status_idx");
+    assert(rows == 1  && "the pre-existing block row must survive");
+
+    store_close(s);
+    printf("  ok test_open_upgrades_a_pre_status_database\n");
+}
+
 static void test_basic(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg = {0};
@@ -951,6 +1022,7 @@ int main(void) {
     test_block_candidate_status();
     test_reconcile_from_templates();
     test_block_hash_index_after_dedupe();
+    test_open_upgrades_a_pre_status_database();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;
