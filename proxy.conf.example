@@ -33,6 +33,67 @@ vardiff_min        = 1
 vardiff_max        = 1e12
 vardiff_window_sec = 30       # how often to retarget
 
+# Extra stratum ports, each with its own difficulty policy. Repeatable —
+# unlike every other key here, a second `listener` line adds a port rather
+# than replacing the first. listen_port above is always served too, on the
+# settings above.
+#
+#   port           the port to bind (required)
+#   min_diff       vardiff floor for this port, and its starting difficulty
+#   initial_diff   starting difficulty, if it should differ from min_diff
+#   max_diff       vardiff ceiling for this port
+#   label          shown in the log and on the dashboard; [A-Za-z0-9_-]
+#
+# Why a second port at all: one difficulty cannot serve both a home ASIC and
+# rented hashrate. Rented hashrate does not arrive as many small miners — a
+# marketplace aggregates a whole fleet behind one connection, and 1 PH/s at
+# difficulty 1024 is ~227 shares per SECOND down that single socket. The
+# marketplaces know this and refuse to deliver to a pool below their floor:
+# Braiins wants at least 1024 and recommends 65536, NiceHash requires 500000.
+#
+# Vardiff cannot bridge the gap. It moves by at most 4x per window, so at the
+# 30s default it takes eight windows — four minutes — to climb from 1 to
+# 65536, and the reject flood on the way there is what gets an order
+# cancelled. The miner has to arrive at the right difficulty, which is what a
+# dedicated port is for.
+#
+# listener = port=3335 min_diff=65536 label=braiins
+# listener = port=3336 min_diff=500000 label=nicehash
+#
+# IMPORTANT — a port cannot exceed the chain. Share difficulty is never
+# raised above the network difficulty, because a miner filters locally
+# against the stratum target and a harder share target would discard valid
+# blocks before the pool ever saw them. So a 500000 port on a chain sitting
+# at difficulty 1200 really serves 1200, and a marketplace measuring it will
+# read the pool as below its floor. Braiins therefore needs network
+# difficulty >= 65536 and NiceHash >= 500000 before the matching port means
+# anything. The dashboard reports this directly (the "Stratum ports can hold
+# their difficulty" health check) rather than leaving it to be discovered
+# when an order is cancelled.
+
+# Ceiling on mining.submit per second, per connection. 0 disables it.
+#
+# A connection's share rate is its hashrate divided by the difficulty it was
+# assigned, and nothing stops those from being badly mismatched — an
+# aggregated fleet pointed at a home-miner port is 1 PH/s against difficulty
+# 1, which is ~232,000 submits per second down one socket. Validating a submit
+# costs about 9 microseconds, so that one connection asks for more than two
+# cores, and every share it lands passes through the store's ring, which drops
+# events once full: work a miner was told was accepted, never credited.
+#
+# The default is far above anything a correctly configured miner reaches. With
+# vardiff on, the steady state is vardiff_target_spm — 0.2/s at the default —
+# for a connection of ANY size, because that is what vardiff converges on. The
+# only rates that come near this ceiling are transients while vardiff climbs,
+# and they only get near it when the difficulty is already badly wrong. For
+# scale, the largest plausible legitimate burst — 1 EH/s at difficulty
+# 65536, before vardiff has raised it — is about 3,500/s.
+#
+# Raise it if you pin a low difficulty for a very large miner
+# (vardiff_enabled = 0), since then a high sustained rate is the correct
+# behaviour rather than a symptom.
+max_submits_per_sec = 20000
+
 db_path = ./data/shares.db
 commit_window_ms = 100
 commit_max_shares = 100

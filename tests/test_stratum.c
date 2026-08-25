@@ -935,6 +935,272 @@ static void test_job_notified_after_a_retarget_uses_the_new_difficulty(void) {
     stratum_server_free(s);
 }
 
+/* A miner is served the difficulty of the port it dialled.
+ *
+ * One difficulty cannot serve both a home ASIC and a rented fleet: at
+ * difficulty 1024 a 1 PH/s order is ~227 shares per second down a single
+ * connection, and the marketplaces refuse to deliver below their own floor
+ * because of it. So the port carries the policy, and the connection inherits
+ * it at accept time. */
+static void test_listener_policy_sets_the_connections_difficulty(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 4,
+                          .initial_diff = 1.0,
+                          .vardiff_enabled = 1,
+                          .vardiff_target_spm = 12.0,
+                          .vardiff_min = 1.0,
+                          .vardiff_max = 1e15,
+                          .vardiff_window_sec = 30,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    /* All-zero network target: difficulty is effectively infinite, so the
+     * network clamp cannot mask what the listener asked for. */
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    /* The default port keeps the server-wide difficulty. */
+    stratum_conn_t *home = stratum_conn_new_for_test(s);
+    handshake(s, home);
+    CHECK(stratum_conn_difficulty_for_test(home) == 1.0);
+
+    /* The rental port starts at its own floor, with no ramp to get there. */
+    stratum_listener_t rental = { .port = 3335, .initial_diff = 65536.0,
+                                  .vardiff_min = 65536.0, .vardiff_max = 0.0,
+                                  .label = "braiins" };
+    stratum_conn_t *rent = stratum_conn_new_for_test(s);
+    stratum_conn_apply_listener_for_test(rent, &rental);
+    handshake(s, rent);
+    CHECK(stratum_conn_difficulty_for_test(rent) == 65536.0);
+
+    /* And the two coexist: serving the fleet did not move the home miner. */
+    CHECK(stratum_conn_difficulty_for_test(home) == 1.0);
+
+    stratum_conn_free_for_test(home);
+    stratum_conn_free_for_test(rent);
+    stratum_server_free(s);
+}
+
+/* A field the listener leaves at zero keeps the server-wide default, so a
+ * port can raise its floor without restating the whole policy. */
+static void test_listener_policy_falls_back_per_field(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                          .initial_diff = 7.0,
+                          .vardiff_enabled = 1,
+                          .vardiff_target_spm = 12.0,
+                          .vardiff_min = 3.0,
+                          .vardiff_max = 1e15,
+                          .vardiff_window_sec = 30,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    /* Only the port is set: everything else must come from the server. */
+    stratum_listener_t bare = { .port = 3336 };
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    stratum_conn_apply_listener_for_test(c, &bare);
+    handshake(s, c);
+    CHECK(stratum_conn_difficulty_for_test(c) == 7.0);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* The limit a high-difficulty port cannot escape, pinned so nobody "fixes"
+ * it later without meaning to.
+ *
+ * Share difficulty is never raised above the network difficulty: a miner
+ * filters locally against the stratum target, so a share target harder than
+ * the network target discards valid blocks before the pool sees them. A
+ * rental port on a low-difficulty chain is therefore served the chain's
+ * difficulty, not the one it was configured for -- which is exactly the
+ * condition the dashboard's listener_difficulty health check reports, because
+ * nothing else makes it visible. */
+static void test_listener_difficulty_still_clamped_to_the_network(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                          .initial_diff = 1.0,
+                          .vardiff_enabled = 1,
+                          .vardiff_target_spm = 12.0,
+                          .vardiff_min = 1.0,
+                          .vardiff_max = 1e15,
+                          .vardiff_window_sec = 30,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    /* DIFF1 network target — the whole chain is at difficulty 1. */
+    uint8_t net[32] = {0};
+    net[4] = 0xff; net[5] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_listener_t rental = { .port = 3337, .initial_diff = 500000.0,
+                                  .vardiff_min = 500000.0,
+                                  .label = "nicehash" };
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    stratum_conn_apply_listener_for_test(c, &rental);
+    handshake(s, c);
+    /* Not 500000. The chain cannot back it, and pretending otherwise costs
+     * blocks. */
+    CHECK(stratum_conn_difficulty_for_test(c) == 1.0);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* The submit ceiling.
+ *
+ * A connection's share rate is its hashrate over the difficulty it was given,
+ * and a fleet pointed at a home-miner port makes those wildly mismatched: 1
+ * PH/s against difficulty 1 is ~232,000 submits per second down one socket.
+ * Past the ceiling a submit is refused before any validation work, so the
+ * flood costs a reply rather than a coinbase render and four SHA256 passes. */
+static void test_submit_ceiling_refuses_past_the_limit(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-12,   /* any hash clears it */
+                          .max_submits_per_sec = 5,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    char *out = NULL; size_t olen = 0;
+    char msg[256];
+    /* Five land, the rest are refused — all inside one second, so they share
+     * a window. Distinct nonces, so nothing is refused as a duplicate. */
+    for (int i = 0; i < 40; ++i) {
+        snprintf(msg, sizeof msg,
+                 "{\"id\":9,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\","
+                 "\"60000000\",\"%08x\"]}", (unsigned)(i + 1));
+        stratum_handle_message(s, c, msg, &out, &olen);
+        if (i >= 5) {
+            CHECK(out != NULL && strstr(out, "submitting too fast") != NULL);
+        }
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.shares == 5);
+
+    /* One report for the whole flood, not one per refusal: reporting each
+     * would write tens of thousands of rows a second into the table that
+     * exists to account for shares. */
+    CHECK(obs.rejects == 1);
+    CHECK(strstr(obs.last_reason, "submitting too fast") != NULL);
+
+    /* ...but the ones after that first report are not lost. A flood usually
+     * ends by going quiet, well inside the reporting interval, so the tail is
+     * flushed when the connection goes away. Without this an operator sees
+     * "1 refused" for a burst of thirty-five. */
+    stratum_conn_free_for_test(c);
+    CHECK(obs.rejects == 2);
+    CHECK(strstr(obs.last_reason, "35 total") != NULL);
+
+    stratum_server_free(s);
+}
+
+/* The window rolls: a miner refused in one second is served again in the
+ * next. The ceiling throttles, it does not ban. */
+static void test_submit_ceiling_window_rolls(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-12,
+                          .max_submits_per_sec = 2,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    char *out = NULL; size_t olen = 0;
+    char msg[256];
+    unsigned nonce = 1;
+    for (int i = 0; i < 4; ++i) {
+        snprintf(msg, sizeof msg,
+                 "{\"id\":9,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\","
+                 "\"60000000\",\"%08x\"]}", nonce++);
+        stratum_handle_message(s, c, msg, &out, &olen);
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.shares == 2);
+
+    sleep_ms(1100);
+    for (int i = 0; i < 2; ++i) {
+        snprintf(msg, sizeof msg,
+                 "{\"id\":9,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\","
+                 "\"60000000\",\"%08x\"]}", nonce++);
+        stratum_handle_message(s, c, msg, &out, &olen);
+        CHECK(out != NULL && strstr(out, "submitting too fast") == NULL);
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.shares == 4);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* Zero means no ceiling, which is what every existing deployment and every
+ * other test in this file runs with. */
+static void test_submit_ceiling_zero_disables(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-12,
+                          .max_submits_per_sec = 0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    char *out = NULL; size_t olen = 0;
+    char msg[256];
+    for (int i = 0; i < 50; ++i) {
+        snprintf(msg, sizeof msg,
+                 "{\"id\":9,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\","
+                 "\"60000000\",\"%08x\"]}", (unsigned)(i + 1));
+        stratum_handle_message(s, c, msg, &out, &olen);
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.shares == 50);
+    CHECK(obs.rejects == 0);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 /* Idle-socket reaper: verify the accepted-socket setup path applies
  * SO_RCVTIMEO derived from idle_timeout_sec. We can't cheaply test the
  * "silent client gets dropped" path in a unit test — that would need a
@@ -1364,6 +1630,12 @@ int main(void) {
     test_vardiff_tracks_miner_local_floor();
     test_vardiff_still_lowers_for_a_matched_miner();
     test_vardiff_clamped_to_network_diff();
+    test_submit_ceiling_refuses_past_the_limit();
+    test_submit_ceiling_window_rolls();
+    test_submit_ceiling_zero_disables();
+    test_listener_policy_sets_the_connections_difficulty();
+    test_listener_policy_falls_back_per_field();
+    test_listener_difficulty_still_clamped_to_the_network();
     test_submit_judged_at_the_jobs_own_difficulty();
     test_job_difficulty_survives_repeated_retargets();
     test_job_notified_after_a_retarget_uses_the_new_difficulty();

@@ -204,7 +204,17 @@ void stratum_job_free(stratum_job_t *j) {
 struct stratum_server {
     stratum_cfg_t cfg;
 
-    int  listen_fd;
+    /* One entry per bound port. Each carries the difficulty policy the
+     * connections it accepts inherit, so the port a miner dials decides what
+     * difficulty it is served at. */
+    struct stratum_listener_slot {
+        stratum_server_t  *srv;
+        stratum_listener_t pol;
+        int                fd;
+        pthread_t          thr;
+        int                thr_started;
+    } listeners[STRATUM_MAX_LISTENERS];
+    int  listener_count;
     atomic_int  stop;
     atomic_int  conn_count;
     /* Seeded from the clock at startup (so values differ across restarts)
@@ -222,9 +232,6 @@ struct stratum_server {
     pthread_mutex_t share_dedupe_lock;
     uint64_t        share_dedupe[SHARE_DEDUPE_RING];
     size_t          share_dedupe_head;
-
-    pthread_t   listener_thr;
-    int         listener_started;
 
     pthread_rwlock_t job_lock;
     stratum_job_t   *current_job;          /* protected by job_lock */
@@ -245,6 +252,16 @@ struct stratum_conn {
 
     uint8_t  extranonce1[STRATUM_EXTRANONCE1_SIZE];
     double   difficulty;
+
+    /* Difficulty policy inherited from the listener this connection was
+     * accepted on, resolved once at accept time so nothing downstream has to
+     * know which port it came in on. Seeded from the server-wide defaults,
+     * which is what a test connection and the default listener both get. */
+    double   pol_initial_diff;
+    double   pol_vardiff_min;
+    double   pol_vardiff_max;
+    int      pol_port;
+    char     pol_label[32];
     int      subscribed;
     int      authorized;
     uint32_t version_mask;         /* negotiated version-rolling bits; 0 = off */
@@ -291,6 +308,22 @@ struct stratum_conn {
     pthread_mutex_t  jobdiff_lock;
     struct { char job_id[32]; double difficulty; } job_diffs[JOB_DIFF_RING];
     size_t   job_diffs_head;
+
+    /* Submit rate limiting. A fixed one-second window: cheaper than a token
+     * bucket and the burst it lets through is one window's worth, which at
+     * these magnitudes is the same protection. Measured on the monotonic
+     * clock -- these are intervals, and an NTP step must not hand a
+     * connection a fresh window or freeze it in one.
+     *
+     * rl_limited counts what has been refused since the last time we said so.
+     * Reporting every refusal would put the flood straight into the reject
+     * table -- tens of thousands of rows a second describing one condition --
+     * so the count is folded into a single periodic report instead. */
+    uint64_t rl_window_start_ms;
+    uint32_t rl_window_count;
+    uint32_t rl_limited;        /* refused since the last report */
+    uint64_t rl_limited_total;  /* refused over the connection's life */
+    uint64_t rl_reported_ms;
 
     /* Monotonic timestamp of the most recent recv() that got any bytes.
      * The conn thread checks this against cfg.idle_timeout_sec after each
@@ -705,6 +738,66 @@ static double current_net_diff(stratum_server_t *s) {
     return d;
 }
 
+/* How often a connection that is over its submit ceiling says so, rather than
+ * once per refused share. */
+#define RL_REPORT_INTERVAL_MS 10000
+
+/* Has this connection used up its submits for the current second?
+ *
+ * Called before anything expensive, so a flood costs a JSON parse and a reply
+ * instead of a coinbase render and four SHA256 passes. Returns non-zero when
+ * the submit must be refused, and counts it for the periodic report. */
+static int submit_rate_exceeded(stratum_server_t *s, stratum_conn_t *c,
+                                uint64_t now_mono) {
+    int limit = s->cfg.max_submits_per_sec;
+    if (limit <= 0) return 0;
+    if (now_mono - c->rl_window_start_ms >= 1000) {
+        c->rl_window_start_ms = now_mono;
+        c->rl_window_count = 0;
+    }
+    if (c->rl_window_count < (uint32_t)limit) {
+        c->rl_window_count++;
+        return 0;
+    }
+    c->rl_limited++;
+    c->rl_limited_total++;
+    return 1;
+}
+
+/* Say once per RL_REPORT_INTERVAL_MS that this connection is over its ceiling,
+ * carrying the count of everything refused since the last time. One line and
+ * one reject row per interval, whatever the rate -- the alternative writes the
+ * flood into the database that exists to account for shares.
+ *
+ * The message names the difficulty, because that is the actual fault: a
+ * connection only reaches this rate when what it was assigned is far below
+ * what its hashrate warrants, and vardiff is still climbing towards it. */
+static void submit_rate_report(stratum_server_t *s, stratum_conn_t *c,
+                               uint64_t now_mono) {
+    if (c->rl_limited == 0) return;
+    if (c->rl_reported_ms != 0 &&
+        now_mono - c->rl_reported_ms < RL_REPORT_INTERVAL_MS) return;
+
+    LOG_WARN("stratum: %s is over the submit ceiling of %d/s — %u submit(s) "
+             "refused since the last report, %llu on this connection. At "
+             "difficulty %g its hashrate is producing more shares than the "
+             "pool will take; vardiff is raising it",
+             c->worker_name, s->cfg.max_submits_per_sec, c->rl_limited,
+             (unsigned long long)c->rl_limited_total, c->difficulty);
+    if (s->cfg.on_reject) {
+        char msg[192];
+        snprintf(msg, sizeof msg,
+                 "submitting too fast: %u refused at over %d/s (%llu total)",
+                 c->rl_limited, s->cfg.max_submits_per_sec,
+                 (unsigned long long)c->rl_limited_total);
+        /* Wall clock here, not the monotonic value the interval is measured
+         * with: this one is a timestamp that gets stored and read back. */
+        s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(), msg);
+    }
+    c->rl_limited = 0;
+    c->rl_reported_ms = now_mono;
+}
+
 /* Record the difficulty `job_id` went out to this connection under. Called
  * from the notify path, which is the moment the agreement is struck: the
  * miner has already applied every set_difficulty we sent before this notify,
@@ -877,8 +970,10 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
     }
 
     if (new_diff != old_diff) {
-        if (new_diff < s->cfg.vardiff_min) new_diff = s->cfg.vardiff_min;
-        if (new_diff > s->cfg.vardiff_max) new_diff = s->cfg.vardiff_max;
+        if (new_diff < c->pol_vardiff_min) new_diff = c->pol_vardiff_min;
+        if (c->pol_vardiff_max > 0.0 && new_diff > c->pol_vardiff_max) {
+            new_diff = c->pol_vardiff_max;
+        }
         /* Never raise the share difficulty above the network difficulty:
          * the miner discards hashes above the stratum target locally, so a
          * share target harder than the network target throws away valid
@@ -1111,7 +1206,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
 
     sanitize_worker(worker, c->worker_name, sizeof(c->worker_name));
     c->authorized = 1;
-    if (c->difficulty <= 0) c->difficulty = s->cfg.initial_diff;
+    if (c->difficulty <= 0) c->difficulty = c->pol_initial_diff;
     /* Same clamp as vardiff: a starting difficulty above the network
      * difficulty would make the miner discard valid blocks locally. */
     double net_diff = current_net_diff(s);
@@ -1486,6 +1581,15 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         cJSON *err = make_error(24, "unauthorized");
         return emit_response(buf, len, id, NULL, err);
     }
+    /* Before the params are even looked at: past the ceiling this share is
+     * not going to be validated, so nothing beyond the reply should be spent
+     * on it. */
+    uint64_t rl_now = mono_ms();
+    if (submit_rate_exceeded(s, c, rl_now)) {
+        submit_rate_report(s, c, rl_now);
+        cJSON *err = make_error(20, "submitting too fast");
+        return emit_response(buf, len, id, NULL, err);
+    }
     if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) < 5) {
         cJSON *err = make_error(20, "bad params");
         return emit_response(buf, len, id, NULL, err);
@@ -1559,12 +1663,39 @@ int stratum_handle_message(stratum_server_t *s, stratum_conn_t *c,
 
 /* ---- conn lifecycle (test helpers + thread) --------------------------- */
 
+/* Take the listener's difficulty policy onto the connection. A field the
+ * listener left at 0 keeps the server-wide default already on the conn --
+ * that is what makes a listener able to override only min_diff, say, without
+ * having to restate everything else. */
+static void conn_apply_listener(stratum_conn_t *c,
+                                const stratum_listener_t *pol) {
+    if (!c || !pol) return;
+    if (pol->initial_diff > 0.0) c->pol_initial_diff = pol->initial_diff;
+    if (pol->vardiff_min  > 0.0) c->pol_vardiff_min  = pol->vardiff_min;
+    if (pol->vardiff_max  > 0.0) c->pol_vardiff_max  = pol->vardiff_max;
+    c->pol_port = pol->port;
+    snprintf(c->pol_label, sizeof c->pol_label, "%s", pol->label);
+    /* Before authorize the connection has no assigned difficulty yet, so
+     * seeding it here keeps a subscribe-only conn reporting its port's value
+     * rather than the default it was born with. */
+    c->difficulty = c->pol_initial_diff;
+}
+
+void stratum_conn_apply_listener_for_test(stratum_conn_t *c,
+                                          const stratum_listener_t *pol) {
+    conn_apply_listener(c, pol);
+}
+
 stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     stratum_conn_t *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->server = s;
     c->fd = -1;
-    c->difficulty = s ? s->cfg.initial_diff : 1.0;
+    c->pol_initial_diff = s ? s->cfg.initial_diff : 1.0;
+    c->pol_vardiff_min  = s ? s->cfg.vardiff_min  : 1.0;
+    c->pol_vardiff_max  = s ? s->cfg.vardiff_max  : 0.0;
+    c->pol_port         = s ? s->cfg.bind_port    : 0;
+    c->difficulty = c->pol_initial_diff;
     c->vd_window_min_achieved = HUGE_VAL;
     pthread_mutex_init(&c->write_lock, NULL);
     pthread_mutex_init(&c->jobdiff_lock, NULL);
@@ -1573,6 +1704,14 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
 
 void stratum_conn_free_for_test(stratum_conn_t *c) {
     if (!c) return;
+    /* A flood usually ends by going quiet, and the refusals since the last
+     * periodic report would otherwise die with the connection -- so the
+     * operator would see "1 refused" for a burst of nine hundred. Force the
+     * final report out before the counters go. */
+    if (c->server && c->rl_limited > 0) {
+        c->rl_reported_ms = 0;   /* bypass the interval; this is the last one */
+        submit_rate_report(c->server, c, mono_ms());
+    }
     conn_clear_coinbase(c);
     pthread_mutex_destroy(&c->write_lock);
     pthread_mutex_destroy(&c->jobdiff_lock);
@@ -1775,11 +1914,12 @@ done:
 }
 
 static void *listener_thread(void *arg) {
-    stratum_server_t *s = arg;
+    struct stratum_listener_slot *ls = arg;
+    stratum_server_t *s = ls->srv;
     while (!atomic_load(&s->stop)) {
         struct sockaddr_in cli;
         socklen_t cl = sizeof(cli);
-        int fd = accept(s->listen_fd, (struct sockaddr *)&cli, &cl);
+        int fd = accept(ls->fd, (struct sockaddr *)&cli, &cl);
         if (fd < 0) {
             if (errno == EINTR) continue;
             if (atomic_load(&s->stop)) break;
@@ -1799,6 +1939,9 @@ static void *listener_thread(void *arg) {
         stratum_conn_t *c = stratum_conn_new_for_test(s);
         if (!c) { close(fd); continue; }
         c->fd = fd;
+        /* The port decides the difficulty. Everything after this point reads
+         * the policy off the connection and never looks at the listener. */
+        conn_apply_listener(c, &ls->pol);
         atomic_fetch_add(&s->conn_count, 1);
         conn_register(s, c);
         if (pthread_create(&c->thr, NULL, conn_thread, c) != 0) {
@@ -1832,33 +1975,63 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     atomic_init(&s->conn_count, 0);
     atomic_init(&s->extranonce1_seq, (unsigned)now_ms());
 
-    s->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (s->listen_fd < 0) { free(s); return -1; }
-    int one = 1;
-    setsockopt(s->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)cfg->bind_port);
-    if (cfg->bind_addr[0] == '\0' || strcmp(cfg->bind_addr, "0.0.0.0") == 0) {
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    } else {
-        if (inet_pton(AF_INET, cfg->bind_addr, &addr.sin_addr) != 1) {
-            close(s->listen_fd); free(s); return -1;
+    /* Listener 0 is always bind_port on the server-wide defaults, so a config
+     * naming no extra listeners binds exactly what it always did. The rest
+     * come from cfg.listeners, each overriding the difficulty policy for the
+     * connections it accepts. */
+    s->listeners[0].srv = s;
+    s->listeners[0].pol.port = cfg->bind_port;
+    s->listener_count = 1;
+    for (int i = 0; i < cfg->listener_count &&
+                    s->listener_count < STRATUM_MAX_LISTENERS; ++i) {
+        if (cfg->listeners[i].port <= 0) continue;
+        s->listeners[s->listener_count].srv = s;
+        s->listeners[s->listener_count].pol = cfg->listeners[i];
+        s->listener_count++;
+    }
+
+    for (int i = 0; i < s->listener_count; ++i) {
+        struct stratum_listener_slot *ls = &s->listeners[i];
+        ls->fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (ls->fd < 0) goto bind_failed;
+        int one = 1;
+        setsockopt(ls->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in addr = {0};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t)ls->pol.port);
+        if (cfg->bind_addr[0] == '\0' || strcmp(cfg->bind_addr, "0.0.0.0") == 0) {
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        } else {
+            if (inet_pton(AF_INET, cfg->bind_addr, &addr.sin_addr) != 1) {
+                goto bind_failed;
+            }
         }
+        if (bind(ls->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            LOG_ERROR("stratum bind %s:%d: %s", cfg->bind_addr, ls->pol.port,
+                      strerror(errno));
+            goto bind_failed;
+        }
+        if (listen(ls->fd, 64) < 0) goto bind_failed;
+        if (pthread_create(&ls->thr, NULL, listener_thread, ls) != 0) {
+            goto bind_failed;
+        }
+        ls->thr_started = 1;
     }
-    if (bind(s->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        LOG_ERROR("stratum bind %s:%d: %s", cfg->bind_addr, cfg->bind_port, strerror(errno));
-        close(s->listen_fd); free(s); return -1;
-    }
-    if (listen(s->listen_fd, 64) < 0) {
-        close(s->listen_fd); free(s); return -1;
-    }
-    if (pthread_create(&s->listener_thr, NULL, listener_thread, s) != 0) {
-        close(s->listen_fd); free(s); return -1;
-    }
-    s->listener_started = 1;
     *out = s;
     return 0;
+
+    /* A pool that came up on some of its ports is worse than one that did not
+     * come up: the operator sees a running process and a marketplace sees a
+     * refused connection. Tear down whatever bound and fail the start. */
+bind_failed:
+    atomic_store(&s->stop, 1);
+    for (int i = 0; i < s->listener_count; ++i) {
+        struct stratum_listener_slot *ls = &s->listeners[i];
+        if (ls->fd >= 0) { shutdown(ls->fd, SHUT_RDWR); close(ls->fd); ls->fd = -1; }
+        if (ls->thr_started) { pthread_join(ls->thr, NULL); ls->thr_started = 0; }
+    }
+    free(s);
+    return -1;
 }
 
 void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job) {
@@ -1889,14 +2062,17 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job) {
 void stratum_server_stop(stratum_server_t *s) {
     if (!s) return;
     atomic_store(&s->stop, 1);
-    if (s->listen_fd >= 0) {
-        shutdown(s->listen_fd, SHUT_RDWR);
-        close(s->listen_fd);
-        s->listen_fd = -1;
-    }
-    if (s->listener_started) {
-        pthread_join(s->listener_thr, NULL);
-        s->listener_started = 0;
+    for (int i = 0; i < s->listener_count; ++i) {
+        struct stratum_listener_slot *ls = &s->listeners[i];
+        if (ls->fd >= 0) {
+            shutdown(ls->fd, SHUT_RDWR);
+            close(ls->fd);
+            ls->fd = -1;
+        }
+        if (ls->thr_started) {
+            pthread_join(ls->thr, NULL);
+            ls->thr_started = 0;
+        }
     }
 }
 

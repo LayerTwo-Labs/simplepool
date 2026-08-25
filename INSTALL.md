@@ -260,7 +260,10 @@ What it does (idempotent — re-run after every code change):
    right `USER` / `ROOT` substitutions, install to
    `/etc/systemd/system/`, `enable --now` each.
 7. Drop the nginx vhost from `deploy/nginx/` into `sites-available`
-   and enable it, open ports 80 / 443 / 3334 via `ufw` if active.
+   and enable it, open ports 80 / 443 / 3334 via `ufw` if active —
+   plus any extra stratum ports declared with `listener` lines in
+   `proxy.conf`. The installer reads those back from the finished
+   config and opens them too; if you add one later, open it yourself.
 
 After that runs cleanly, jump to **Part D** (configuring `proxy.conf`
 for your chosen mode) — everything else is already up.
@@ -672,6 +675,18 @@ Install-time trouble usually falls into one of these:
   Thunder unit; if running by hand, sleep 2s.
 - **`config error: 'pool_btc_address' is required when pool_mode=pps-classic`** —
   self-explanatory; set it.
+- **The pool logs `stratum listening on 0.0.0.0:3335` but miners are
+  refused** — the port is bound and the firewall is dropping it. Nothing
+  in the pool's log can tell you this, because from the pool's side
+  everything worked. Adding a `listener` to `proxy.conf` does not open a
+  port in `ufw`:
+  ```sh
+  sudo ufw allow 3335/tcp
+  sudo simplepoolctl doctor     # checks every configured port, and ufw
+  ```
+  `doctor` reports listening and allowed separately for each port, which
+  is the distinction that matters: a marketplace measuring a firewalled
+  port reads the pool as down.
 - **`stratum bind 0.0.0.0:3334: Address already in use`** — an old
   simplepool is still running. Match it by **exact process name**,
   not by pattern (a `pkill -f simplepool` from an SSH session will

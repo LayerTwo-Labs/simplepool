@@ -3,12 +3,25 @@
 
 #include <stddef.h>
 
+#include "stratum.h"   /* stratum_listener_t, STRATUM_MAX_LISTENERS */
+
 typedef struct {
     /* listener */
     char listen_addr[64];
     int  listen_port;
     int  max_conns;
     double initial_diff;
+
+    /* Extra stratum ports beyond listen_port, each with its own difficulty
+     * policy — see `listener` in proxy.conf.example. The point is serving a
+     * home ASIC and a rented fleet from the same pool without either one
+     * getting the other's difficulty. */
+    stratum_listener_t listeners[STRATUM_MAX_LISTENERS];
+    int  listener_count;
+
+    /* Per-connection ceiling on mining.submit per second. 0 disables.
+     * See stratum.h for why it sits where it does. */
+    int  max_submits_per_sec;
 
     /* vardiff — auto-adjust each connection's difficulty to keep the
      * share rate near `target_spm` shares/minute. Set vardiff_enabled = 0

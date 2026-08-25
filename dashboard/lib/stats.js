@@ -386,12 +386,12 @@ export function worker(handle, name, windowSec = 86400) {
 function poolIdentity(d) {
     const blank = {
         network: null, network_source: null, coinbase_tag: null,
-        operator_address: null, pool_btc_address: null,
+        operator_address: null, pool_btc_address: null, listeners: null,
     };
     try {
         const r = d.prepare(`
             SELECT network, network_source, coinbase_tag,
-                   operator_address, pool_btc_address
+                   operator_address, pool_btc_address, listeners
               FROM pool_meta WHERE id = 1
         `).get();
         if (!r) return blank;
@@ -404,10 +404,34 @@ function poolIdentity(d) {
             coinbase_tag:     or_(r.coinbase_tag),
             operator_address: or_(r.operator_address),
             pool_btc_address: or_(r.pool_btc_address),
+            listeners:        parseListeners(r.listeners),
         };
     } catch {
         return blank;   /* DB predating the identity columns */
     }
+}
+
+/* The proxy publishes its stratum ports as a JSON array. Anything malformed
+ * reads as "not published" rather than taking the banner down — a pool that
+ * cannot describe its ports still has to serve its pages.
+ *
+ * Returns null when there is nothing trustworthy to show, never [] — the
+ * banner distinguishes "the proxy has not told us" from "there are no
+ * ports", and only the first is a state this pool can actually be in. */
+function parseListeners(raw) {
+    if (!raw) return null;
+    let arr;
+    try { arr = JSON.parse(raw); } catch { return null; }
+    if (!Array.isArray(arr)) return null;
+    const out = arr
+        .filter(l => l && Number.isFinite(Number(l.port)) && Number(l.port) > 0)
+        .map(l => ({
+            port:         Number(l.port),
+            label:        (typeof l.label === 'string' && l.label) ? l.label : null,
+            min_diff:     Number.isFinite(Number(l.min_diff))     ? Number(l.min_diff)     : null,
+            initial_diff: Number.isFinite(Number(l.initial_diff)) ? Number(l.initial_diff) : null,
+        }));
+    return out.length ? out : null;
 }
 
 export function poolMeta(handle) {

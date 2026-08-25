@@ -606,11 +606,13 @@ footer .wrap > p { max-width: 46rem; }
       <span class="who">pool</span>
       <h4>Two comparisons, one hash</h4>
       <p>
-        The resulting hash is compared against the connection's <strong>worker
-        target</strong> and against the <strong>network target</strong>. Above the
-        worker target it is rejected as <code>low difficulty</code> and logged in
-        <code>rejects</code>. Below it, a row lands in <code>shares</code>. Below
-        the network target as well, it is <em>also</em> a block.
+        The resulting hash is compared against the <strong>worker target</strong>
+        — the difficulty <em>this job</em> went out under, not whatever the
+        connection has drifted to since — and against the <strong>network
+        target</strong>. Above the worker target it is rejected as
+        <code>low difficulty</code> and logged in <code>rejects</code>. Below it,
+        a row lands in <code>shares</code>. Below the network target as well, it
+        is <em>also</em> a block.
       </p>
     </li>
     <li>
@@ -810,6 +812,102 @@ difficulty    = (0xffff × 2^208) / (0x03e7fc18 × 2^204)
     The dashboard's hashrate column uses exactly this formula over a rolling
     window (24 h by default), which is why it is an estimate with visible
     variance rather than a reading off your ASIC.
+  </p>
+
+  <h3>A submit is judged at its own job's difficulty</h3>
+  <p>
+    A <code>mining.set_difficulty</code> takes effect on the <em>next</em> job the
+    miner is notified of, not the one already in its hands. So every share for a
+    job the miner already holds was mined against the difficulty <em>that job</em>
+    went out under, and on a slow chain those keep arriving long after the
+    retarget that changed the connection.
+  </p>
+  <p>
+    The pool records the difficulty each job was notified under, per connection,
+    and judges the submit against that. A share is credited at the difficulty it
+    was judged under — never at one it did not actually meet.
+  </p>
+  <div class="note">
+    <span class="label">Why not just remember the previous value</span>
+    <p>
+      Because vardiff can retarget more than once while a miner still holds one
+      job, and a single remembered value is gone after the second. Judging
+      against the job itself needs no time limit either: a job the retention
+      ring has dropped cannot be submitted against at all, so the job's own
+      lifetime is the bound.
+    </p>
+  </div>
+
+  <h3>One difficulty cannot serve everyone</h3>
+  <p>
+    A connection's share rate is its hashrate divided by the difficulty it was
+    assigned. For a home ASIC that wants to be low enough to report regularly.
+    For rented hashrate it cannot be: a marketplace aggregates a whole fleet
+    behind a <em>single</em> connection, so 1 PH/s at difficulty 1024 is about
+    <strong>227 shares per second</strong> down one socket. The marketplaces know
+    this and refuse to deliver below their own floor — Braiins wants at least
+    1024 and recommends 65536, NiceHash requires 500000.
+  </p>
+  <p>
+    Vardiff cannot bridge that gap. It moves by at most 4× per window, so
+    climbing from 1 to 65536 takes eight windows — four minutes at the default —
+    and the reject flood on the way there is what gets a rented order cancelled.
+    The miner has to <em>arrive</em> at the right difficulty, which is what a
+    second port is for:
+  </p>
+  <pre><code>listener = port=3335 min_diff=65536 label=braiins
+listener = port=3336 min_diff=500000 label=nicehash</code></pre>
+  <p>
+    Each listener binds its own port and every connection accepted there starts
+    at that difficulty and never vardiffs below it, while <code>listen_port</code>
+    keeps serving home miners exactly as before. The pool publishes the list, and
+    the dashboard's identity strip names each port with what it is for — nothing
+    about a stratum URL tells a miner which one suits its hardware.
+  </p>
+
+  <div class="warnbox">
+    <span class="label">A port cannot exceed the chain</span>
+    <p>
+      Share difficulty is never raised above the <em>network</em> difficulty,
+      because a miner filters locally against the stratum target: a share target
+      harder than the network target would make it discard valid blocks before
+      the pool ever saw them. A port configured for 500000 on a chain sitting at
+      1200 therefore serves 1200 — correctly, and silently.
+    </p>
+    <p>
+      So Braiins needs network difficulty ≥ 65536 and NiceHash ≥ 500000 before
+      the matching port means anything at all. On mainnet this never comes up;
+      on a young forknet it is the whole question. The dashboard reports the gap
+      directly — the <em>“Stratum ports can hold their difficulty”</em> health
+      check names both numbers — rather than leaving it to be discovered when an
+      order is cancelled.
+    </p>
+  </div>
+
+  <h3>The ceiling on submissions</h3>
+  <p>
+    A port is a convention, not an enforcement: nothing stops a fleet arriving on
+    the home-miner port anyway, and 1 PH/s against difficulty 1 is roughly
+    <strong>232,000 submits per second</strong> on one connection. Validating one
+    costs about 9 microseconds, so that single connection would ask for more than
+    two cores — and every share it landed would pass through the write ring,
+    which drops events once full. Work a miner was told was accepted, and that no
+    query can afterwards see.
+  </p>
+  <p>
+    <code>max_submits_per_sec</code> (default 20000, per connection) bounds it.
+    Past the ceiling a submit is refused before its parameters are even read, so
+    a flood costs a reply rather than a full validation, and nothing reaches the
+    ledger. Refusing is also the honest answer: the miner learns its difficulty is
+    wrong, where accepting the work and then losing it in a full ring would tell
+    it everything is fine.
+  </p>
+  <p>
+    The default sits far above anything a correctly configured miner reaches.
+    With vardiff on, the steady state is <code>vardiff_target_spm</code> — 0.2/s
+    at the default — for a connection of <em>any</em> size, because that is what
+    vardiff converges on. The largest plausible honest burst, a 1 EH/s order at
+    difficulty 65536 before vardiff has climbed, is about 3,500/s.
   </p>
 
   <h3>Vardiff</h3>
@@ -1284,13 +1382,13 @@ SELECT (SELECT COALESCE(SUM(reward_sats),0) + COALESCE(SUM(fee_sats),0)
         <tr><td><code>shares</code></td><td>proxy</td>
             <td>one row per accepted share: worker, timestamp, difficulty, hash, <code>is_block</code>, and in pps-classic <code>credited_sats</code> + <code>rate_used</code></td></tr>
         <tr><td><code>rejects</code></td><td>proxy</td>
-            <td>one row per rejected submission with the reason — bad address, stale job, low difficulty</td></tr>
+            <td>one row per rejected submission with the reason — bad address, stale job, low difficulty, wrong extranonce2 size. A connection past the submit ceiling is recorded periodically with a count, not once per refusal, so a flood cannot bury the ledger it shares a table with</td></tr>
         <tr><td><code>blocks_found</code></td><td>proxy</td>
             <td>height, hash, finder, finder address, <code>reward_sats</code>, <code>fee_sats</code></td></tr>
         <tr><td><code>rate_history</code></td><td>proxy</td>
             <td>every PPS rate published, with the template inputs it was derived from — the basis of audit check 2</td></tr>
         <tr><td><code>pool_meta</code></td><td>proxy</td>
-            <td>the effective rate and network difficulty. The dashboard reads the rate from here rather than from its own config, so an audit can never disagree with the process that did the crediting</td></tr>
+            <td>the effective rate, the network difficulty, and the stratum ports the pool listens on with the difficulty policy of each. The dashboard reads all of it from here rather than from its own config, so an audit can never disagree with the process that did the crediting — and the port list it shows miners is the one the proxy actually bound</td></tr>
         <tr><td><code>templates</code></td><td>proxy</td>
             <td>one row per materially distinct block template, pruned by <code>templates_retention_days</code></td></tr>
         <tr><td><code>node_status</code></td><td>proxy</td>
@@ -1349,6 +1447,37 @@ Password  (anything — it is discarded)</code></pre>
     pool does for you.
   </p>
 
+  <h3>Which port</h3>
+  <p>
+    A pool may serve more than one, each at a different starting difficulty. The
+    dashboard's identity strip lists them with what each is for, because nothing
+    about the URL says which suits what you are pointing at it:
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>You are connecting</th><th>Use</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>One ASIC, or a few on a home network</td>
+            <td>the default port</td>
+            <td>Low starting difficulty, so shares report regularly and vardiff settles quickly.</td></tr>
+        <tr><td>A rented order, or a proxy aggregating a fleet</td>
+            <td>a high-difficulty port</td>
+            <td>The whole fleet's hashrate arrives on one connection. At a home-miner difficulty that is hundreds of shares per second down a single socket, which ends in a reject flood and a cancelled order.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Before sending a rented order, check what the pool advertises — a marketplace
+    router has to slice <code>extranonce2</code> per machine, and blocks the
+    target if the field is too narrow to do it:
+  </p>
+  <pre><code>(echo '{"id":1,"method":"mining.subscribe","params":[]}'; sleep 1) \
+  | nc pool.example.com 3334 | head -1 | jq -r '.result[2]'</code></pre>
+  <p>
+    The answer must be 7 or higher. simplepool advertises <strong>8</strong>, on
+    every port.
+  </p>
+
   <h3>If a connection is refused</h3>
   <div class="tablewrap">
     <table>
@@ -1360,6 +1489,10 @@ Password  (anything — it is discarded)</code></pre>
             <td>Normal in small numbers. Persistent means the rig is ignoring <code>mining.set_difficulty</code>.</td></tr>
         <tr><td>Shares rejected as <code>stale share</code></td>
             <td>The job expired — a new tip arrived. Expected around block boundaries.</td></tr>
+        <tr><td>Shares rejected as <code>wrong extranonce2 size</code></td>
+            <td>The miner ignored the width from <code>mining.subscribe</code>. Not cosmetic — that width is baked into the coinbase, so a submission of any other size describes a transaction that could never become a block.</td></tr>
+        <tr><td>Shares rejected as <code>submitting too fast</code></td>
+            <td>The connection is past <code>max_submits_per_sec</code>. Almost always a fleet on a port whose difficulty is far too low for it — move it to a high-difficulty port. The pool reports this periodically with a count rather than once per refusal.</td></tr>
         <tr><td>Connects, no work</td>
             <td>The pool has no template: its <code>bitcoind</code> is unreachable or still syncing.</td></tr>
       </tbody>
@@ -1391,6 +1524,10 @@ Password  (anything — it is discarded)</code></pre>
             <td>Leave it unset. See the warning in <a href="#pps">section 8</a>.</td></tr>
         <tr><td><code>listen_addr</code> / <code>listen_port</code></td><td><code>0.0.0.0</code> / <code>3334</code></td>
             <td>Where stratum listens.</td></tr>
+        <tr><td><code>listener</code></td><td><em>none</em></td>
+            <td>An extra port with its own difficulty policy — <code>port=</code>, <code>min_diff=</code>, <code>initial_diff=</code>, <code>max_diff=</code>, <code>label=</code>. Repeatable, unlike every other key here: each line adds a port. See <a href="#difficulty">section 6</a>. Remember to open it in the firewall.</td></tr>
+        <tr><td><code>max_submits_per_sec</code></td><td><code>20000</code></td>
+            <td>Per-connection ceiling on <code>mining.submit</code>; <code>0</code> disables it. Bounds what one badly matched connection can cost. Raise it only if you pin a low difficulty for a very large miner.</td></tr>
         <tr><td><code>bitcoind_url</code></td><td>—</td>
             <td>JSON-RPC endpoint for <code>getblocktemplate</code> / <code>submitblock</code>.</td></tr>
         <tr><td><code>bitcoind_user</code> / <code>bitcoind_pass</code></td><td>—</td>
@@ -1515,6 +1652,21 @@ sudo simplepoolctl uninstall    # --purge also deletes the ledger</code></pre>
     <li>
       <strong>Solo mode is solo.</strong> If your rig doesn't find the block, you
       earn nothing for that height. That is the design, not a shortfall.
+    </li>
+    <li>
+      <strong>It cannot serve a difficulty its chain cannot back.</strong> Share
+      difficulty is clamped to the network difficulty, because a miner filters
+      locally and a harder share target would make it discard valid blocks. So a
+      hashrate marketplace whose floor sits above the chain's own difficulty
+      cannot be served at all until the chain catches up — no port setting
+      changes that. The dashboard says so plainly rather than letting it be found
+      out when an order is cancelled.
+    </li>
+    <li>
+      <strong>The submit ceiling bounds a flood, it does not end one.</strong> A
+      mismatched connection is refused cheaply instead of validated, but it is
+      still connected and still sending. What ends it is vardiff climbing to a
+      difficulty that fits, which takes minutes.
     </li>
   </ul>
 </section>

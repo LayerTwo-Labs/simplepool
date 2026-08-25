@@ -964,9 +964,44 @@ int main(int argc, char **argv) {
                  network, network_src, cfg.pool_mode, cfg.fee_bps,
                  cfg.coinbase_tag, cfg.operator_address,
                  pps ? " pool_btc=" : "", pps ? cfg.pool_btc_address : "");
+        /* Publish the ports so the dashboard can tell a miner which one to
+         * dial. Labels are constrained to [A-Za-z0-9_-] at config parse time,
+         * so this needs no escaping. */
+        /* Sized for STRATUM_MAX_LISTENERS + the default at their widest: a
+         * 31-char label and two %.10g doubles is ~117 bytes an entry. It fits
+         * with room to spare, and the check below means a future limit that
+         * outgrows it says so instead of quietly publishing a shorter list
+         * than the pool actually serves. */
+        char lj[4096];
+        size_t lo = 0;
+        int dropped = 0;
+        lo += (size_t)snprintf(lj + lo, sizeof lj - lo,
+                               "[{\"port\":%d,\"label\":\"\",\"min_diff\":%.10g,"
+                               "\"initial_diff\":%.10g}",
+                               cfg.listen_port, cfg.vardiff_min,
+                               cfg.initial_diff);
+        for (int i = 0; i < cfg.listener_count; ++i) {
+            const stratum_listener_t *l = &cfg.listeners[i];
+            char one[256];
+            int n = snprintf(one, sizeof one,
+                             ",{\"port\":%d,\"label\":\"%s\","
+                             "\"min_diff\":%.10g,\"initial_diff\":%.10g}",
+                             l->port, l->label,
+                             l->vardiff_min > 0 ? l->vardiff_min : cfg.vardiff_min,
+                             l->initial_diff > 0 ? l->initial_diff : cfg.initial_diff);
+            if (n < 0 || lo + (size_t)n >= sizeof lj - 2) { dropped++; continue; }
+            memcpy(lj + lo, one, (size_t)n);
+            lo += (size_t)n;
+        }
+        lj[lo++] = ']';
+        lj[lo] = '\0';
+        if (dropped) {
+            LOG_WARN("pool identity: %d listener(s) did not fit the published "
+                     "port list — the dashboard will not show them", dropped);
+        }
         store_record_pool_identity(store, network, network_src,
                                    cfg.coinbase_tag, cfg.operator_address,
-                                   pps ? cfg.pool_btc_address : NULL);
+                                   pps ? cfg.pool_btc_address : NULL, lj);
     }
 
     /* Broadcast (optional). */
@@ -1075,6 +1110,11 @@ int main(int argc, char **argv) {
     stcfg.vardiff_max        = cfg.vardiff_max;
     stcfg.vardiff_window_sec = cfg.vardiff_window_sec;
     stcfg.idle_timeout_sec   = cfg.idle_timeout_sec;
+    stcfg.max_submits_per_sec = cfg.max_submits_per_sec;
+    stcfg.listener_count     = cfg.listener_count;
+    for (int i = 0; i < cfg.listener_count; ++i) {
+        stcfg.listeners[i] = cfg.listeners[i];
+    }
 
     /* PPS. pool_mode=pps-classic takes Thunder-address usernames, pays every
      * coinbase into the pool's BTC wallet, and accrues per-share credits. */
@@ -1122,7 +1162,16 @@ int main(int argc, char **argv) {
     stratum_server_set_job(srv, initial_job);
     bitcoind_template_free(tmpl);
 
-    LOG_INFO("stratum listening on %s:%d", cfg.listen_addr, cfg.listen_port);
+    LOG_INFO("stratum listening on %s:%d (difficulty from %g)",
+             cfg.listen_addr, cfg.listen_port, cfg.initial_diff);
+    for (int i = 0; i < cfg.listener_count; ++i) {
+        const stratum_listener_t *l = &cfg.listeners[i];
+        LOG_INFO("stratum listening on %s:%d%s%s (difficulty from %g, floor %g)",
+                 cfg.listen_addr, l->port,
+                 l->label[0] ? " — " : "", l->label[0] ? l->label : "",
+                 l->initial_diff > 0 ? l->initial_diff : cfg.initial_diff,
+                 l->vardiff_min > 0 ? l->vardiff_min : cfg.vardiff_min);
+    }
 
     /* Signals. */
     struct sigaction sa;

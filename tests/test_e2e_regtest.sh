@@ -124,12 +124,15 @@ pick_port REGTEST_ENFORCER_RPC_PORT
 pick_port REGTEST_ENFORCER_GRPC_PORT
 pick_port POOL_PORT
 pick_port INT_POOL_PORT
+pick_port RENTAL_A_PORT
+pick_port RENTAL_B_PORT
 export REGTEST_BITCOIND_RPC_PORT REGTEST_BITCOIND_ZMQ_PORT \
        REGTEST_ENFORCER_RPC_PORT REGTEST_ENFORCER_GRPC_PORT
 export ENFORCER_URL="http://127.0.0.1:$REGTEST_ENFORCER_GRPC_PORT"
 echo "  bitcoind=$REGTEST_BITCOIND_RPC_PORT zmq=$REGTEST_BITCOIND_ZMQ_PORT" \
      "enforcer=$REGTEST_ENFORCER_RPC_PORT/$REGTEST_ENFORCER_GRPC_PORT" \
-     "pool=$POOL_PORT smoke-pool=$INT_POOL_PORT"
+     "pool=$POOL_PORT smoke-pool=$INT_POOL_PORT" \
+     "rental=$RENTAL_A_PORT/$RENTAL_B_PORT"
 
 stage "wipe e2e data dir (fresh chain every run)"
 # Chain state must not leak between runs: a pre-activated sidechain or
@@ -180,6 +183,19 @@ pps_sats_per_diff = 10000000000
 initial_diff = 0.0000001
 vardiff_enabled = 0
 
+# Two more ports, to prove a `listener` line becomes a real bound socket
+# serving its own difficulty. Both are set BELOW the regtest network
+# difficulty (~4.66e-10) on purpose: share difficulty is clamped to the
+# chain, so anything above it would come back clamped and all three ports
+# would look identical — which would make this assert nothing.
+listener = port=${RENTAL_A_PORT} min_diff=1e-10 label=rental-a
+listener = port=${RENTAL_B_PORT} min_diff=3e-10 label=rental-b
+
+# Low enough that a flood trips it immediately. cpuminer.js only submits
+# when it beats the NETWORK target — about one submit per run — so this
+# cannot interfere with the block-mining stage above.
+max_submits_per_sec = 100
+
 db_path = ${POOL_DB}
 log_level = debug
 EOF
@@ -205,6 +221,70 @@ stage "assert pps-classic coinbase shape on the new tip"
 POOL_BTC_ADDRESS="$POOL_BTC_ADDR" OPERATOR_ADDRESS="$OPERATOR_ADDR" \
     "$ROOT/scripts/regtest/inspect-coinbase.sh"
 
+stage "assert every stratum port serves its own difficulty"
+# The unit tests cover the policy itself. What only a running pool can show
+# is the wiring: that a `listener` line became a bound socket, and that the
+# port a miner dials decides what it is handed.
+probe() { node "$ROOT/scripts/regtest/stratum-probe.js" --port "$1" --timeout 30; }
+
+# The rental difficulties above are only meaningful while they sit below the
+# chain's, because share difficulty is clamped to the network. Check that
+# rather than assume it: if regtest ever moves, this should say so plainly
+# instead of failing as a difficulty mismatch nobody can explain. WAL means
+# the live DB reads fine while the pool is running.
+NET_DIFF=$(sqlite3 "$POOL_DB" "SELECT COALESCE(network_difficulty,0) FROM pool_meta WHERE id = 1")
+echo "  network difficulty=$NET_DIFF"
+awk -v d="$NET_DIFF" 'BEGIN { exit !(d > 3e-10) }' || {
+    echo "FAIL: network difficulty $NET_DIFF is not above the 3e-10 this" >&2
+    echo "      stage configures — the clamp would flatten every port to the" >&2
+    echo "      same value and the assertions below would prove nothing." >&2
+    echo "      Lower the listener min_diff values in this script." >&2
+    exit 1
+}
+
+PROBE_D=$(probe "$POOL_PORT")
+PROBE_A=$(probe "$RENTAL_A_PORT")
+PROBE_B=$(probe "$RENTAL_B_PORT")
+echo "  default  $PROBE_D"
+echo "  rental-a $PROBE_A"
+echo "  rental-b $PROBE_B"
+
+# The gate the marketplaces actually check, on every port.
+for p in "$PROBE_D" "$PROBE_A" "$PROBE_B"; do
+    echo "$p" | jq -e '.extranonce2_size >= 7' >/dev/null || {
+        echo "FAIL: a port advertises extranonce2_size below 7" >&2; exit 1; }
+done
+
+# Each rental port serves what it was configured for, not the default and
+# not each other. Ranges rather than equality: these are doubles that have
+# been through JSON twice.
+echo "$PROBE_A" | jq -e '.difficulty > 0.9e-10 and .difficulty < 1.1e-10' >/dev/null || {
+    echo "FAIL: rental-a did not serve its configured difficulty" >&2; exit 1; }
+echo "$PROBE_B" | jq -e '.difficulty > 2.9e-10 and .difficulty < 3.1e-10' >/dev/null || {
+    echo "FAIL: rental-b did not serve its configured difficulty" >&2; exit 1; }
+DIFF_A=$(echo "$PROBE_A" | jq -r '.difficulty')
+DIFF_B=$(echo "$PROBE_B" | jq -r '.difficulty')
+[ "$DIFF_A" != "$DIFF_B" ] || {
+    echo "FAIL: both rental ports served the same difficulty" >&2; exit 1; }
+
+stage "assert the submit ceiling refuses a flood"
+# Against a job id that does not exist. The ceiling is checked before a
+# submit's params are read, so a refused one never reaches validation either
+# way — but the ones UNDER the ceiling do, and here the share target is
+# clamped to a network difficulty so low that roughly one hash in two beats
+# it. Flooding the live job would not measure the ceiling, it would mine
+# fifty blocks.
+FLOOD=$(node "$ROOT/scripts/regtest/stratum-probe.js" \
+        --port "$POOL_PORT" --flood 600 --job-id nosuchjob --timeout 60)
+echo "  $FLOOD"
+echo "$FLOOD" | jq -e '.refused_too_fast > 100' >/dev/null || {
+    echo "FAIL: the submit ceiling did not refuse a 600-submit flood" >&2; exit 1; }
+
+# Throttled, not banned, and not fatal: the pool still serves after it.
+PROBE_AFTER=$(probe "$RENTAL_A_PORT")
+echo "$PROBE_AFTER" | jq -e '.difficulty > 0' >/dev/null || {
+    echo "FAIL: pool stopped serving after the flood" >&2; exit 1; }
+
 stage "assert pool DB recorded the accepted share"
 # give the batched writer a moment, then stop the pool cleanly to flush
 sleep 1
@@ -220,5 +300,26 @@ echo "workers=$WORKERS shares=$SHARES blocks_found=$BLOCKS pps_credits=$CREDITS"
 [ "$SHARES"  -ge 1 ] || { echo "FAIL: no accepted shares" >&2; exit 1; }
 [ "$BLOCKS"  -ge 1 ] || { echo "FAIL: no blocks_found row" >&2; exit 1; }
 [ "$CREDITS" -ge 1 ] || { echo "FAIL: no pps credit accrued" >&2; exit 1; }
+
+stage "assert the proxy published its ports"
+# The dashboard reads the DB and nothing else, so an unpublished port list
+# is a banner that cannot tell a miner which port to use.
+LISTENERS=$(sqlite3 "$POOL_DB" "SELECT COALESCE(listeners,'') FROM pool_meta WHERE id = 1")
+echo "  listeners=$LISTENERS"
+echo "$LISTENERS" | jq -e 'length == 3' >/dev/null || {
+    echo "FAIL: pool_meta.listeners does not describe all three ports" >&2; exit 1; }
+echo "$LISTENERS" | jq -e 'map(select(.label == "rental-a")) | length == 1' >/dev/null || {
+    echo "FAIL: labelled listener missing from pool_meta.listeners" >&2; exit 1; }
+
+stage "assert the flood was reported once, not once per refusal"
+# Reporting each refusal would put the flood into the table that exists to
+# account for shares — hundreds of rows describing one condition. The
+# report is periodic, plus a final flush when the connection goes, so a
+# 500-refusal burst is a couple of rows.
+RL_ROWS=$(sqlite3 "$POOL_DB" "SELECT count(*) FROM rejects WHERE reason LIKE 'submitting too fast%'")
+echo "  rate-limit reject rows=$RL_ROWS"
+[ "$RL_ROWS" -ge 1 ] || { echo "FAIL: the flood was never reported" >&2; exit 1; }
+[ "$RL_ROWS" -le 5 ] || {
+    echo "FAIL: $RL_ROWS rows for one flood — reporting is not aggregated" >&2; exit 1; }
 
 stage "PASS"

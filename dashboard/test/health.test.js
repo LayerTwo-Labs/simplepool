@@ -300,7 +300,7 @@ test('a DB missing a table degrades to unavailable, not to healthy', () => {
     db.exec('DROP TABLE payouts_in_flight');
     const h = health(db);
     assert.ok(h.unavailable.some(c => c.id === 'payout_ambiguous'));
-    assert.equal(h.checks.length, 10, 'every check still reported');
+    assert.equal(h.checks.length, 11, 'every check still reported');
 });
 
 test('no DB handle is not healthy', () => {
@@ -344,4 +344,75 @@ test('the banner is silent on a healthy pool', async () => {
 test('the banner renders before the first pass without throwing', async () => {
     const html = await render('partial/health-banner.ejs', { health: null });
     assert.equal(html.trim(), '');
+});
+
+/* A high-difficulty port that the chain cannot actually back.
+ *
+ * The pool clamps share difficulty to the network difficulty — raising it
+ * above would make miners discard valid blocks locally — and the clamp is
+ * silent. So an operator can configure a rental port for 500000, have it
+ * quietly serve 1200, and learn about it only when the marketplace measures
+ * the difficulty it was given and cancels the order. Nothing else in the
+ * dashboard can see this, which is the bar for being in this banner. */
+const RENTAL_PORTS = JSON.stringify([
+    { port: 3334, label: '',         min_diff: 1,      initial_diff: 1 },
+    { port: 3335, label: 'nicehash', min_diff: 500000, initial_diff: 500000 },
+]);
+
+test('a port configured above the network difficulty is reported', () => {
+    const db = makeDb();
+    db.prepare('UPDATE pool_meta SET network_difficulty = 1200, listeners = ?')
+      .run(RENTAL_PORTS);
+    const h = health(db);
+    const c = h.checks.find(x => x.id === 'listener_difficulty');
+    assert.equal(c.ok, false);
+    assert.match(c.detail, /3335/);
+    assert.match(c.detail, /nicehash/);
+    /* Both numbers, because the gap is the actionable part: one of them has
+     * to move, and which one is the operator's call. */
+    assert.match(c.detail, /500000/);
+    assert.match(c.detail, /1200/);
+});
+
+test('a port the chain can back is not a finding', () => {
+    const db = makeDb();
+    db.prepare('UPDATE pool_meta SET network_difficulty = 5e9, listeners = ?')
+      .run(RENTAL_PORTS);
+    const c = health(db).checks.find(x => x.id === 'listener_difficulty');
+    assert.equal(c.ok, true);
+});
+
+test('an ordinary low-difficulty port is never a finding', () => {
+    /* A home-miner port sitting far under the network difficulty is the
+     * normal case for every pool that has ever run. Reporting it would make
+     * the banner meaningless. */
+    const db = makeDb();
+    const only = JSON.stringify([{ port: 3334, label: '', min_diff: 1, initial_diff: 1 }]);
+    db.prepare('UPDATE pool_meta SET network_difficulty = 111157.455, listeners = ?')
+      .run(only);
+    const c = health(db).checks.find(x => x.id === 'listener_difficulty');
+    assert.equal(c.ok, true);
+});
+
+test('a proxy that has not published its ports is not a finding', () => {
+    const db = makeDb();
+    db.prepare('UPDATE pool_meta SET listeners = NULL').run();
+    const c = health(db).checks.find(x => x.id === 'listener_difficulty');
+    assert.equal(c.ok, true);
+    assert.match(c.detail, /no ports published/);
+});
+
+test('a port floored above the chain is reported even if it starts low', () => {
+    /* initial_diff=1 with min_diff=500000: the miner connects at a difficulty
+     * that looks perfectly normal, then vardiff tries to climb to the floor
+     * and is clamped. The port still cannot hold what it was configured for,
+     * and this shape is harder to debug than the obvious one, not easier. */
+    const db = makeDb();
+    db.prepare('UPDATE pool_meta SET network_difficulty = 1200, listeners = ?')
+      .run(JSON.stringify([
+          { port: 3336, label: 'nicehash', min_diff: 500000, initial_diff: 1 },
+      ]));
+    const c = health(db).checks.find(x => x.id === 'listener_difficulty');
+    assert.equal(c.ok, false);
+    assert.match(c.detail, /500000/);
 });
