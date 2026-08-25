@@ -9,6 +9,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -2300,7 +2301,62 @@ static void test_authorized_miner_gets_the_long_idle_budget(void) {
     stratum_server_free(s2);
 }
 
+/* A failed bind must not close the process's standard input.
+ *
+ * The listener slots live in a calloc'd stratum_server, so every slot's fd
+ * starts at 0 -- a perfectly valid descriptor number, and on a normal process
+ * it is stdin. The bind_failed teardown walks i < listener_count and closes
+ * every slot whose fd is >= 0, but listener_count is set BEFORE the bind loop
+ * runs. So when a bind fails partway, every slot the loop never reached is
+ * still holding fd 0, and the teardown shuts down and closes descriptor 0.
+ *
+ * Three listeners are the minimum that shows it: slot 0 binds, slot 1 fails,
+ * and slot 2 -- untouched, fd still 0 -- is what gets closed.
+ *
+ * The symptom in production is not a crash. It is a pool that failed to start
+ * for an understandable reason (a port already in use) and, on the way out,
+ * quietly closed stdin for whatever runs next in the same process image. */
+static void test_failed_bind_does_not_close_stdin(void) {
+    /* Occupy a port so a listener bound to it is guaranteed to fail. */
+    int squatter = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(squatter >= 0);
+    if (squatter < 0) return;
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;                       /* let the kernel choose */
+    if (bind(squatter, (struct sockaddr *)&a, sizeof a) < 0 ||
+        listen(squatter, 1) < 0) {
+        close(squatter);
+        CHECK(0 && "could not set up an occupied port");
+        return;
+    }
+    socklen_t alen = sizeof a;
+    CHECK(getsockname(squatter, (struct sockaddr *)&a, &alen) == 0);
+    int taken = ntohs(a.sin_port);
+
+    /* stdin must be open going in, or the test proves nothing. */
+    CHECK(fcntl(0, F_GETFD) != -1);
+
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 4, .initial_diff = 1.0 };
+    snprintf(cfg.bind_addr, sizeof cfg.bind_addr, "127.0.0.1");
+    cfg.listeners[0].port = taken;        /* fails: already in use */
+    cfg.listeners[1].port = taken + 1;    /* never reached; fd still 0 */
+    cfg.listener_count = 2;
+
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) < 0);   /* the start must fail */
+    CHECK(s == NULL);
+
+    /* The point of the test: the failure must not have taken stdin with it. */
+    CHECK(fcntl(0, F_GETFD) != -1);
+
+    close(squatter);
+    if (g_fail == 0) printf("ok: a failed bind leaves stdin alone\n");
+}
+
 int main(void) {
+    test_failed_bind_does_not_close_stdin();
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
     test_submit_unknown_job();
