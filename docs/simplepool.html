@@ -606,6 +606,15 @@ footer .wrap > p { max-width: 46rem; }
         extranonces, recomputes the merkle root, rebuilds the 80-byte header, and
         double-SHA256s it itself.
       </p>
+      <p>
+        Three things are checked before that work is spent: the
+        <code>extranonce2</code> is the width the pool advertised, the
+        <code>ntime</code> is inside the window the chain would accept (see
+        <a href="#nonce">Rolling ntime</a>), and the connection is under
+        its submit ceiling. Each of those describes a header that could never
+        become a block, so validating one is effort spent to reach the same
+        answer more slowly.
+      </p>
     </li>
     <li>
       <span class="who">pool</span>
@@ -745,6 +754,36 @@ footer .wrap > p { max-width: 46rem; }
     invalid.
   </p>
 
+  <h3>Rolling ntime</h3>
+  <p>
+    A miner may also advance the header's <code>ntime</code> while it holds a
+    job, which multiplies its space again for free. Nothing has to be
+    negotiated for this: the pool takes the timestamp the miner submits, puts
+    it in the header verbatim, and treats every distinct value as a distinct
+    share.
+  </p>
+  <p>
+    It is bounded, though loosely, and the bound exists for the chain's sake
+    rather than the pool's. Consensus refuses a block whose timestamp is more
+    than two hours ahead of network-adjusted time — but such a header still
+    hashes, still clears a share target, and still looks like perfectly good
+    work here. Without a check the pool would credit it, and if it happened to
+    beat the network target, assemble a block that <code>submitblock</code>
+    then throws out: a solved block lost with nothing but a warning in the log
+    to show for it.
+  </p>
+  <p>
+    So a submitted <code>ntime</code> must fall within
+    <strong>−600 s to +7200 s</strong> of the value its own job went out with.
+    Measuring from the job rather than the wall clock keeps that conservative:
+    a job only gets older while the miner holds it, so anything inside this
+    window is inside the consensus window too. The backward tolerance is there
+    because a stratum proxy that rewrites the field, or a rig with a skewed
+    clock, can land slightly behind — that is honest work and rejecting it
+    would cost the miner shares. Both ends are deliberately loose. This is here
+    to catch a broken client, not to police timestamps.
+  </p>
+
   <h3>Two rigs, one address</h3>
   <p>
     Authorizing as <code>bc1q….basement</code> and <code>bc1q….garage</code>
@@ -817,6 +856,27 @@ difficulty    = (0xffff × 2^208) / (0x03e7fc18 × 2^204)
     The dashboard's hashrate column uses exactly this formula over a rolling
     window (24 h by default), which is why it is an estimate with visible
     variance rather than a reading off your ASIC.
+  </p>
+  <p>
+    One refinement: the divisor is the span the shares actually cover — first
+    share in the window to now — not the nominal width of the window. Dividing
+    by time nothing was mined in reports a rate nobody ran at, and it goes
+    wrong at exactly the moment someone is most likely to be looking. A pool
+    eleven hours old reads half its true rate against a 24 h window. A rig ten
+    minutes into a rented contract reads <sup>1</sup>⁄<sub>144</sub> of what it
+    is doing, so the arrival an operator most wants to see is the one the
+    leaderboard flattens into noise. Both heal on their own as the window
+    fills, which is why it survived so long: by the time anyone doubts the
+    number, it is right again.
+  </p>
+  <p>
+    The span is clamped at both ends. Never longer than the nominal window — a
+    share selected by <code>ts &gt;= now − windowSec</code> cannot be older than
+    it. Never shorter than a minute, because the span of a single share a few
+    seconds old tends to zero and would turn one lucky submit into a gigahash
+    spike. With no shares at all it falls back to the nominal window, so an
+    idle pool divides zero by 24 h and reports zero rather than a clamped
+    fraction of nothing.
   </p>
 
   <h3>A submit is judged at its own job's difficulty</h3>
@@ -1188,6 +1248,39 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
     fails the whole batch. That is an acceptable trade here, because every
     recipient is an address the proxy already validated at authorize time, and a
     failed batch credits nobody and strands nobody — the next run simply retries.
+
+  <div class="warnbox">
+    <span class="label">A batch is only built when the node can settle one</span>
+    <p>
+      Thunder ≥ 0.17.1 signs and broadcasts <em>inside</em>
+      <code>create_transfer</code>, and that RPC takes one destination. A batch
+      spanning several addresses is therefore paid, in full, to whichever
+      address happened to be listed first. Refusing the result afterwards does
+      not help: by then the money is on the network and in someone else's
+      balance.
+    </p>
+    <p>
+      This is not hypothetical. It fired twice on 2026-08-24 — 72,598,492 and
+      82,735,787 sats, each aimed at one address out of two. The second
+      broadcast did the lasting damage: the failure was treated as an ordinary
+      abort, the in-flight rows were dropped, and the ledger kept no record of a
+      live transaction that was sitting in the mempool holding the wallet's only
+      UTXO. Every later tick built a fresh batch against those same inputs and
+      died at the create stage with <code>utxo double spent</code>, which looks
+      like a clean abort. 216 identical failures over 24 hours, 0.88 BTC owed,
+      nobody paid.
+    </p>
+    <p>
+      So the payout worker now <strong>learns what the node can do rather than
+      assuming</strong>. A transfer that comes back <em>unsigned</em> proves
+      <code>create_transfer</code> handed back something to splice, and from
+      then on every due worker goes out together. A node that broadcast on
+      create has answered the other way and is never asked again. Unproven is
+      treated as restrictive — one address per transaction — because the cost of
+      guessing wrong is somebody else's balance, and every probe of the question
+      is itself a real transfer.
+    </p>
+  </div>
   </p>
 
   <h3>Three clocks, not one</h3>
@@ -1273,6 +1366,25 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
     rows are reported by <code>listStuck()</code> at every start and left for an
     operator to resolve, because the two possibilities demand opposite actions
     and nothing on the machine can tell them apart.
+  </p>
+  <p>
+    While any such row exists the tick <strong>halts entirely</strong> — not
+    just for the workers named in it. That distinction is the second hole the
+    incident above went through. A row still carrying <code>txid = ''</code> is
+    invisible to the settlement path, and excluding only its own workers left
+    every <em>other</em> worker free to start a second payout while a transfer
+    may already be live on those UTXOs. Thunder picks inputs without excluding
+    what its own mempool has spent, so one of the two ends up live and
+    untracked, which is precisely the state that cost a day of payouts.
+  </p>
+  <p>
+    Halting costs nothing. Accruals keep accumulating in
+    <code>pps_credits</code>, so whoever came due meanwhile is paid on the next
+    tick once the block lands. Which is also why a broadcast batch that has not
+    confirmed should almost never be retracted: it is usually a
+    <em>correct</em> payout waiting for a Thunder block, and the right response
+    is to get a block, not to rewrite the payment. Retract only when the
+    transaction pays the wrong people or the wrong amounts.
   </p>
 </section>
 
@@ -1405,7 +1517,7 @@ SELECT (SELECT COALESCE(SUM(reward_sats),0) + COALESCE(SUM(fee_sats),0)
         <tr><td><code>rate_history</code></td><td>proxy</td>
             <td>every PPS rate published, with the template inputs it was derived from — the basis of audit check 2</td></tr>
         <tr><td><code>pool_meta</code></td><td>proxy</td>
-            <td>the effective rate, the network difficulty, and the stratum ports the pool listens on with the difficulty policy of each. The dashboard reads all of it from here rather than from its own config, so an audit can never disagree with the process that did the crediting — and the port list it shows miners is the one the proxy actually bound</td></tr>
+            <td>the effective rate, the network difficulty, and the stratum ports the pool listens on with the difficulty policy of each — including <code>promised_min_diff</code>, recorded separately from the rate-loop bound so the dashboard can tell a port <em>holding</em> a floor (and losing blocks for it) from one quietly serving less than it advertises. Those need opposite advice, so one number could not express both. The dashboard reads all of it from here rather than from its own config, so an audit can never disagree with the process that did the crediting — and the port list it shows miners is the one the proxy actually bound</td></tr>
         <tr><td><code>templates</code></td><td>proxy</td>
             <td>one row per materially distinct block template, pruned by <code>templates_retention_days</code></td></tr>
         <tr><td><code>node_status</code></td><td>proxy</td>
@@ -1494,6 +1606,13 @@ Password  (anything — it is discarded)</code></pre>
     The answer must be 7 or higher. simplepool advertises <strong>8</strong>, on
     every port.
   </p>
+  <p>
+    A port configured with <code>min_diff</code> holds that difficulty even
+    where the chain's own is lower, which is what makes it measurable by a
+    marketplace — and what makes it cost blocks. See
+    <a href="#difficulty">A port above the chain costs blocks</a> before
+    advertising one on a low-difficulty chain.
+  </p>
 
   <h3>If a connection is refused</h3>
   <div class="tablewrap">
@@ -1508,10 +1627,40 @@ Password  (anything — it is discarded)</code></pre>
             <td>The job expired — a new tip arrived. Expected around block boundaries.</td></tr>
         <tr><td>Shares rejected as <code>wrong extranonce2 size</code></td>
             <td>The miner ignored the width from <code>mining.subscribe</code>. Not cosmetic — that width is baked into the coinbase, so a submission of any other size describes a transaction that could never become a block.</td></tr>
+        <tr><td>Shares rejected as <code>ntime out of range</code></td>
+            <td>The rig rolled <code>ntime</code> more than 7200 s past — or 600 s behind — the value its job went out with. That header is outside what consensus would accept, so a block built on it would be refused by the node. Usually a badly wrong clock on the rig.</td></tr>
         <tr><td>Shares rejected as <code>submitting too fast</code></td>
             <td>The connection is past <code>max_submits_per_sec</code>. Almost always a fleet on a port whose difficulty is far too low for it — move it to a high-difficulty port. The pool reports this periodically with a count rather than once per refusal.</td></tr>
         <tr><td>Connects, no work</td>
             <td>The pool has no template: its <code>bitcoind</code> is unreachable or still syncing.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>What will <em>not</em> disconnect you</h3>
+  <p>
+    A rejected share is a rejected share. None of the reasons above closes the
+    connection, and several things that look like protocol violations are
+    tolerated on purpose, because a pool that hangs up mid-session — no error,
+    no reason — is indistinguishable from one that drops hashrate at random,
+    and that is what gets a pool blacklisted.
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>The pool receives</th><th>What happens</th></tr></thead>
+      <tbody>
+        <tr><td>A JSON-RPC <em>response</em> object (no <code>method</code>)</td>
+            <td>Ignored, connection untouched. It is a reply to a request this pool never made — firmware and stratum proxies do emit them, and there is nothing wrong with the client for sending one.</td></tr>
+        <tr><td>A blank line</td>
+            <td>Ignored. The pool asks a miner nothing between shares, so this is the only keepalive available to it.</td></tr>
+        <tr><td>A method the pool doesn't implement</td>
+            <td>Answered with an error. Naming an unimplemented method still proves the client speaks stratum.</td></tr>
+        <tr><td>Malformed JSON</td>
+            <td>Answered with an error. Eight <em>consecutive</em> unusable lines closes the connection — a client that cannot manage one intelligible request is not a miner, but it gets cut on evidence rather than on suspicion, and any valid request resets the count.</td></tr>
+        <tr><td>Nothing at all, for hours</td>
+            <td>Fine once authorized. Silence between shares is a working miner's resting state, so an authorized connection gets <code>idle_timeout_authorized_sec</code> (2 h) rather than the 10 minutes a socket that never authorized gets. TCP keepalive still reaps a peer that has actually gone.</td></tr>
+        <tr><td>16 KB with no newline</td>
+            <td>Closed, with the reason logged. Every stratum request is orders of magnitude smaller, so the peer is not framing lines at all and there is no resync point to skip to.</td></tr>
       </tbody>
     </table>
   </div>
