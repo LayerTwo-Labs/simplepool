@@ -171,7 +171,7 @@ static void test_authorize_triggers_setdiff_notify(void) {
 
     /* Provide a job so notify can be sent. */
     uint8_t net[32]; memset(net, 0xff, 32);
-    stratum_server_set_job(s, make_test_job("0001", net));
+    stratum_server_set_job(s, make_test_job("0001", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -243,7 +243,7 @@ static void test_submit_share_and_dedupe(void) {
 
     /* Network target = all zeros -> never a block. */
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -297,7 +297,7 @@ static void test_submit_rejects_wrong_extranonce2_size(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -418,7 +418,7 @@ static void test_block_wins_over_low_difficulty(void) {
         &out, &olen); free(out); out=NULL; olen=0;
 
     uint8_t net[32]; memset(net, 0xff, 32);
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     int rc = stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
@@ -555,7 +555,7 @@ static void test_vardiff_tracks_miner_local_floor(void) {
     /* All-zero network target: nothing is ever a block, so acceptance comes
      * only from the share-difficulty path. */
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     handshake(s, c);
@@ -637,7 +637,7 @@ static void test_vardiff_still_lowers_for_a_matched_miner(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     handshake(s, c);
@@ -707,7 +707,7 @@ static void test_vardiff_clamped_to_network_diff(void) {
     /* DIFF1 target = difficulty 1.0. */
     uint8_t net[32] = {0};
     net[4] = 0xff; net[5] = 0xff;
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -755,7 +755,7 @@ static void test_submit_judged_at_the_jobs_own_difficulty(void) {
     /* All-zero network target: nothing is ever a block, so acceptance can
      * only come from the share-difficulty path. */
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -819,7 +819,7 @@ static void test_job_difficulty_survives_repeated_retargets(void) {
     /* All-zero network target: nothing is ever a block, so acceptance can
      * only come from the share-difficulty path. */
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -890,7 +890,7 @@ static void test_job_notified_after_a_retarget_uses_the_new_difficulty(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -914,7 +914,7 @@ static void test_job_notified_after_a_retarget_uses_the_new_difficulty(void) {
      * broadcast path walks the server's live-connection list, which a test
      * connection is not on. The notify records J2 against the 1e12 now in
      * force, which is exactly what a real miner would be told. */
-    stratum_server_set_job(s, make_test_job("J2", net));
+    stratum_server_set_job(s, make_test_job("J2", net), 1);
     stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.authorize\","
          "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
@@ -960,7 +960,7 @@ static void test_listener_policy_sets_the_connections_difficulty(void) {
     /* All-zero network target: difficulty is effectively infinite, so the
      * network clamp cannot mask what the listener asked for. */
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     /* The default port keeps the server-wide difficulty. */
     stratum_conn_t *home = stratum_conn_new_for_test(s);
@@ -1002,7 +1002,7 @@ static void test_listener_policy_falls_back_per_field(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     /* Only the port is set: everything else must come from the server. */
     stratum_listener_t bare = { .port = 3336 };
@@ -1015,16 +1015,18 @@ static void test_listener_policy_falls_back_per_field(void) {
     stratum_server_free(s);
 }
 
-/* The limit a high-difficulty port cannot escape, pinned so nobody "fixes"
- * it later without meaning to.
+/* A port that set only vardiff_min asked the rate loop to stay above a
+ * number. It did not promise anyone that difficulty, so the network ceiling
+ * still wins.
  *
- * Share difficulty is never raised above the network difficulty: a miner
- * filters locally against the stratum target, so a share target harder than
- * the network target discards valid blocks before the pool sees them. A
- * rental port on a low-difficulty chain is therefore served the chain's
- * difficulty, not the one it was configured for -- which is exactly the
- * condition the dashboard's listener_difficulty health check reports, because
- * nothing else makes it visible. */
+ * Share difficulty is not raised above the network difficulty by default: a
+ * miner filters locally against the stratum target, so a share target harder
+ * than the network target discards valid blocks before the pool sees them. A
+ * port that genuinely needs the floor kept says min_diff, and pays for it in
+ * exactly those discarded blocks -- see
+ * test_promised_min_diff_survives_the_network_clamp. Everything else keeps
+ * the old behaviour, which is what makes that trade affordable. The
+ * dashboard's listener_difficulty health check reports either case. */
 static void test_listener_difficulty_still_clamped_to_the_network(void) {
     obs_t obs = {0};
     stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
@@ -1043,7 +1045,7 @@ static void test_listener_difficulty_still_clamped_to_the_network(void) {
     /* DIFF1 network target — the whole chain is at difficulty 1. */
     uint8_t net[32] = {0};
     net[4] = 0xff; net[5] = 0xff;
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_listener_t rental = { .port = 3337, .initial_diff = 500000.0,
                                   .vardiff_min = 500000.0,
@@ -1078,7 +1080,7 @@ static void test_submit_ceiling_refuses_past_the_limit(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     handshake(s, c);
@@ -1131,7 +1133,7 @@ static void test_submit_ceiling_window_rolls(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     handshake(s, c);
@@ -1179,7 +1181,7 @@ static void test_submit_ceiling_zero_disables(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     handshake(s, c);
@@ -1311,7 +1313,7 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -1330,7 +1332,7 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     free(out); out=NULL; olen=0;
 
     /* Same template, new id. Identical header -> identical hash. */
-    stratum_server_set_job(s, make_test_job("J2", net));
+    stratum_server_set_job(s, make_test_job("J2", net), 1);
     stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
         "\"params\":[\"w\",\"J2\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
@@ -1371,7 +1373,7 @@ static void test_rejected_candidate_is_not_a_block(void) {
         &out, &olen); free(out); out=NULL; olen=0;
 
     uint8_t net[32]; memset(net, 0xff, 32);
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     int rc = stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
@@ -1414,7 +1416,7 @@ static void test_accepted_candidate_reports_accepted(void) {
         &out, &olen); free(out); out=NULL; olen=0;
 
     uint8_t net[32]; memset(net, 0xff, 32);
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
@@ -1452,7 +1454,7 @@ static void test_job_survives_retirement_while_held(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32]; memset(net, 0xff, 32);
-    stratum_server_set_job(s, make_test_job("HELD", net));
+    stratum_server_set_job(s, make_test_job("HELD", net), 1);
 
     /* What handle_submit does: take the job, then do slow work with it. */
     stratum_job_t *held = stratum_job_find_for_test(s, "HELD");
@@ -1465,7 +1467,7 @@ static void test_job_survives_retirement_while_held(void) {
     for (int i = 0; i < 24; ++i) {
         char jid[16];
         snprintf(jid, sizeof jid, "J%d", i);
-        stratum_server_set_job(s, make_test_job(jid, net));
+        stratum_server_set_job(s, make_test_job(jid, net), 1);
     }
 
     /* It is gone from the lookup — correct, a later submit for it is stale. */
@@ -1494,7 +1496,7 @@ static void test_held_job_is_freed_on_release(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32]; memset(net, 0xff, 32);
-    stratum_server_set_job(s, make_test_job("A", net));
+    stratum_server_set_job(s, make_test_job("A", net), 1);
     stratum_job_t *held = stratum_job_find_for_test(s, "A");
     CHECK(held != NULL);
     stratum_job_free(held);        /* holder done; server still owns one */
@@ -1543,7 +1545,7 @@ static void test_gated_pps_refuses_authorize_and_submits(void) {
     free(out); out=NULL; olen=0;
 
     uint8_t net[32]; memset(net, 0xff, 32);
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
     gate = 1;
     stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
@@ -1618,6 +1620,435 @@ static void test_solo_is_never_gated(void) {
     stratum_server_free(s);
 }
 
+
+/* ---------------------------------------------------------------------- */
+/* Rented-hashrate compatibility                                           */
+/* ---------------------------------------------------------------------- */
+
+/* Pull the clean_jobs flag (params[8]) out of a mining.notify line.
+ * Returns 1/0, or -1 if there is no notify in the buffer. */
+static int notify_clean_flag(const char *buf, size_t len) {
+    char *copy = malloc(len + 1);
+    if (!copy) return -1;
+    memcpy(copy, buf, len);
+    copy[len] = '\0';
+    int result = -1;
+    for (char *line = strtok(copy, "\n"); line; line = strtok(NULL, "\n")) {
+        if (!strstr(line, "mining.notify")) continue;
+        cJSON *msg = cJSON_Parse(line);
+        if (!msg) continue;
+        cJSON *params = cJSON_GetObjectItem(msg, "params");
+        if (cJSON_IsArray(params) && cJSON_GetArraySize(params) == 9) {
+            cJSON *clean = cJSON_GetArrayItem(params, 8);
+            if (cJSON_IsBool(clean)) result = cJSON_IsTrue(clean) ? 1 : 0;
+        }
+        cJSON_Delete(msg);
+        break;
+    }
+    free(copy);
+    return result;
+}
+
+/* clean_jobs is an instruction to throw work away, so it may only be sent
+ * when the work is genuinely dead — a new tip. The periodic template refresh
+ * (a fresher ntime, newly arrived transactions) leaves the miner's job
+ * perfectly mineable, and flagging it clean discards hashrate in flight on
+ * every connected miner, roughly twenty times per block on a 10-minute chain.
+ *
+ * This reads the flag off a real socket rather than off the handler, because
+ * the bug lived in the broadcast path and not in the handler: a probe that
+ * connects, reads its first notify and leaves never sees a second broadcast
+ * at all, which is exactly why this was invisible to probing while miners'
+ * logs showed it. */
+static void test_clean_jobs_only_on_a_new_tip(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 4, .initial_diff = 1.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    stratum_conn_attach_for_test(s, c, sv[0]);
+
+    char rx[8192];
+
+    /* Periodic refresh: same tip, new template. The miner keeps its work. */
+    stratum_server_set_job(s, make_test_job("J2", net), 0);
+    ssize_t n = read(sv[1], rx, sizeof rx);
+    CHECK(n > 0);
+    CHECK(n > 0 && notify_clean_flag(rx, (size_t)n) == 0);
+
+    /* New tip: every job in every miner's hands builds on a parent that is no
+     * longer the tip, so this one really does mean start over. */
+    stratum_server_set_job(s, make_test_job("J3", net), 1);
+    n = read(sv[1], rx, sizeof rx);
+    CHECK(n > 0);
+    CHECK(n > 0 && notify_clean_flag(rx, (size_t)n) == 1);
+
+    /* The refresh did not cost the miner its old job either: the pool still
+     * takes submits against it out of the recent ring. */
+    stratum_job_t *held = stratum_job_find_for_test(s, "J2");
+    CHECK(held != NULL);
+    if (held) stratum_job_free(held);
+
+    stratum_conn_detach_for_test(s, c);
+    close(sv[0]); close(sv[1]);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* The counterpart. A port that says min_diff is making a promise a
+ * marketplace will measure on the wire, so that floor is kept even where the
+ * chain is easier -- and the miner then discards blocks it solved, which is
+ * the price of the port being usable at all. */
+static void test_promised_min_diff_survives_the_network_clamp(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                          .initial_diff = 1.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    /* DIFF1 network target: the whole chain sits at difficulty 1, three
+     * orders of magnitude under what the rental port advertises. */
+    uint8_t net[32] = {0};
+    net[4] = 0xff; net[5] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_listener_t rental = { .port = 3335, .initial_diff = 65536.0,
+                                  .vardiff_min = 65536.0,
+                                  .min_diff = 65536.0,
+                                  .label = "braiins" };
+    stratum_conn_t *rent = stratum_conn_new_for_test(s);
+    stratum_conn_apply_listener_for_test(rent, &rental);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, rent, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, rent,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}", &out, &olen);
+    CHECK(stratum_conn_difficulty_for_test(rent) == 65536.0);
+    /* And the fleet is told so on its first set_difficulty, not after four
+     * minutes of vardiff climbing -- which is the window in which an order
+     * gets cancelled. */
+    CHECK(set_diff_value(out) == 65536.0);
+    free(out);
+
+    /* The home port on the same pool and the same chain is untouched: it
+     * promised nothing, so it still gets the chain's own difficulty and keeps
+     * every block it finds. */
+    stratum_conn_t *home = stratum_conn_new_for_test(s);
+    handshake(s, home);
+    CHECK(stratum_conn_difficulty_for_test(home) == 1.0);
+
+    stratum_conn_free_for_test(rent);
+    stratum_conn_free_for_test(home);
+    stratum_server_free(s);
+}
+
+/* Run one connection through a window that leaves the rate loop wanting a
+ * lower difficulty, and report where it ended up. Everything is scaled down
+ * by ~2^30 from the real numbers so a share costs thousands of hashes rather
+ * than trillions; the logic is all ratios, so the path exercised is the same
+ * one 1024 would take. */
+static double vardiff_after_a_slow_window(double promised_min_diff,
+                                          int *emitted_setdiff) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-6,
+                          .vardiff_enabled = 1,
+                          .vardiff_target_spm = 6000.0,
+                          .vardiff_min = 1e-12,
+                          .vardiff_max = 1e15,
+                          .vardiff_window_sec = 1,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};   /* nothing is ever a block */
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    if (promised_min_diff > 0.0) {
+        stratum_listener_t rental = { .port = 3335,
+                                      .initial_diff = 1e-6,
+                                      .vardiff_min = 1e-12,
+                                      .min_diff = promised_min_diff,
+                                      .label = "rental" };
+        stratum_conn_apply_listener_for_test(c, &rental);
+    }
+    handshake(s, c);
+
+    uint32_t n1 = 0, n2 = 0;
+    double a1 = mine_nonce(s, c, "J1", "deadbeefcafebabe", 1e-6, HUGE_VAL, 1, &n1);
+    double a2 = mine_nonce(s, c, "J1", "deadbeefcafebabe", 1e-6, HUGE_VAL,
+                           n1 + 1, &n2);
+    CHECK(a1 > 0.0 && a2 > 0.0);
+    if (a1 <= 0.0 || a2 <= 0.0) {
+        stratum_conn_free_for_test(c); stratum_server_free(s); return -1.0;
+    }
+
+    char *out = NULL; size_t olen = 0;
+    submit_nonce(s, c, "deadbeefcafebabe", n1, &out, &olen);
+    free(out); out = NULL; olen = 0;
+
+    /* Two shares in ~1.1s against a 6000/min target: the rate loop sees a
+     * miner running two orders of magnitude slow and wants to cut. */
+    sleep_ms(1100);
+    submit_nonce(s, c, "deadbeefcafebabe", n2, &out, &olen);
+    CHECK(obs.shares == 2);
+    CHECK(obs.rejects == 0);
+    *emitted_setdiff = set_diff_value(out) > 0.0;
+    free(out);
+
+    double got = stratum_conn_difficulty_for_test(c);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    return got;
+}
+
+/* Vardiff is the other way a connection ends up under the floor: authorize
+ * gets it right and then the rate loop walks it straight back down. */
+static void test_vardiff_cannot_retarget_below_a_promised_floor(void) {
+    int emitted = -1;
+    /* A port promising nothing: the rate loop cuts by its 4x step, as it
+     * always has. */
+    double unfloored = vardiff_after_a_slow_window(0.0, &emitted);
+    CHECK(unfloored > 0.0);
+    CHECK(unfloored < 1e-6);
+    CHECK(emitted == 1);
+
+    /* A port promising the starting difficulty: the same window produces the
+     * same proposal, the floor overrides it, and — since nothing moved — the
+     * miner is not sent a pointless set_difficulty either. */
+    emitted = -1;
+    double floored = vardiff_after_a_slow_window(1e-6, &emitted);
+    CHECK(floored == 1e-6);
+    CHECK(emitted == 0);
+}
+
+/* A submit whose ntime differs from the job's is the normal case, not an
+ * error: ntime rolling is how a miner extends its search space without
+ * touching extranonce2. */
+static void test_ntime_rolling_is_accepted(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-12,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    /* job ntime is 0x60000000. Roll an hour forward, both boundaries, and a
+     * little backward (a proxy or a skewed rig clock lands there). */
+    static const char *ok_ntimes[] = {
+        "60000e10",  /* +3600 */
+        "60001c20",  /* +7200, the forward boundary */
+        "5ffffda8",  /* -600, the backward boundary */
+        "60000000",  /* the job's own value */
+    };
+    char *out = NULL; size_t olen = 0;
+    for (size_t i = 0; i < sizeof ok_ntimes / sizeof ok_ntimes[0]; ++i) {
+        char msg[256];
+        snprintf(msg, sizeof msg,
+                 "{\"id\":3,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"%s\",\"0000000%zu\"]}",
+                 ok_ntimes[i], i);
+        int rc = stratum_handle_message(s, c, msg, &out, &olen);
+        CHECK(rc == 0);
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.shares == 4);
+    CHECK(obs.rejects == 0);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* Past the consensus window the header still hashes and still looks like a
+ * fine share, but the chain will not take a block built on it. Accepting it
+ * means crediting work that can never pay, and — if it beats the network
+ * target — assembling a block the node throws out, which is how a solved
+ * block vanishes leaving only a submitblock warning. */
+static void test_ntime_outside_the_window_is_rejected(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-12,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    static const char *bad_ntimes[] = {
+        "60001c21",  /* +7201, one second past the forward bound */
+        "5ffffda7",  /* -601, one second past the backward bound */
+        "ffffffff",  /* a miner rolling into 2106 */
+    };
+    char *out = NULL; size_t olen = 0;
+    for (size_t i = 0; i < sizeof bad_ntimes / sizeof bad_ntimes[0]; ++i) {
+        char msg[256];
+        snprintf(msg, sizeof msg,
+                 "{\"id\":3,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"%s\",\"0000000%zu\"]}",
+                 bad_ntimes[i], i);
+        int rc = stratum_handle_message(s, c, msg, &out, &olen);
+        /* Rejected, but the connection stays: this is a bad share, not a bad
+         * client. */
+        CHECK(rc == 0);
+        CHECK(strstr(out, "\"error\"") != NULL);
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.shares == 0);
+    CHECK(obs.rejects == 3);
+    CHECK(strstr(obs.last_reason, "ntime") != NULL);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* A JSON-RPC response carries no "method", and the handler used to read that
+ * as a protocol violation and hang up. Firmware and stratum proxies do send
+ * them, so that was a pool dropping a working miner mid-session with no error
+ * and no reason — indistinguishable, from the miner's side, from a pool that
+ * drops hashrate at random. */
+static void test_a_jsonrpc_response_does_not_close_the_connection(void) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0 };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+
+    char *out = NULL; size_t olen = 0;
+    for (int i = 0; i < 50; ++i) {
+        int rc = stratum_handle_message(s, c,
+            "{\"id\":1,\"result\":true,\"error\":null}", &out, &olen);
+        CHECK(rc == 0);
+        CHECK(out == NULL);   /* nothing to answer, so answer nothing */
+    }
+
+    /* A blank line is the only keepalive a miner has — the pool asks it
+     * nothing between shares — so it is not an error either. */
+    CHECK(stratum_handle_message(s, c, "", &out, &olen) == 0);
+    CHECK(stratum_handle_message(s, c, "   \r", &out, &olen) == 0);
+    CHECK(out == NULL);
+
+    /* And an unimplemented method is answered, not punished. */
+    int rc = stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.suggest_difficulty\",\"params\":[512]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(out != NULL && strstr(out, "\"error\"") != NULL);
+    free(out);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* Tolerance is not a licence to spew. A client that never manages a single
+ * intelligible request is not a miner, and the streak counter is what lets
+ * the pool cut it on evidence rather than on the first stray byte. */
+static void test_persistent_garbage_still_closes_the_connection(void) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0 };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+
+    char *out = NULL; size_t olen = 0;
+    int closed_at = -1;
+    for (int i = 1; i <= 20; ++i) {
+        int rc = stratum_handle_message(s, c, "}{ not json", &out, &olen);
+        free(out); out = NULL; olen = 0;
+        if (rc < 0) { closed_at = i; break; }
+    }
+    CHECK(closed_at == 8);
+
+    /* One good request in between clears the record: a miner that hiccups
+     * once an hour must never accumulate its way to a disconnect. */
+    stratum_conn_t *c2 = stratum_conn_new_for_test(s);
+    for (int round = 0; round < 5; ++round) {
+        for (int i = 0; i < 7; ++i) {
+            CHECK(stratum_handle_message(s, c2, "}{ not json", &out, &olen) == 0);
+            free(out); out = NULL; olen = 0;
+        }
+        CHECK(stratum_handle_message(s, c2,
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+            &out, &olen) == 0);
+        free(out); out = NULL; olen = 0;
+    }
+
+    stratum_conn_free_for_test(c);
+    stratum_conn_free_for_test(c2);
+    stratum_server_free(s);
+}
+
+/* An authorized miner with nothing to say is the normal resting state, not an
+ * idle connection: the pool solicits nothing between shares, so a small rig
+ * that has not cleared its assigned difficulty yet sends no bytes at all.
+ * Reaping that on the unauthorized budget disconnects working hashrate. */
+static void test_authorized_miner_gets_the_long_idle_budget(void) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0 };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    /* Still a stranger: it has told us nothing and costs an fd for nothing. */
+    CHECK(stratum_conn_idle_budget_for_test(s, c) == 600);
+
+    handshake(s, c);
+    CHECK(stratum_conn_authorized_for_test(c) == 1);
+    CHECK(stratum_conn_idle_budget_for_test(s, c) == 7200);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+
+    /* Negative means "never reap a working miner" and must not be confused
+     * with unset, which means "use the default". Folding one into the other
+     * would silently reap on the 600s budget the operator was disabling. */
+    stratum_cfg_t off = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .idle_timeout_authorized_sec = -1 };
+    snprintf(off.bind_addr, sizeof(off.bind_addr), "127.0.0.1");
+    stratum_server_t *s2 = NULL;
+    stratum_server_start(&off, &s2);
+    uint8_t net2[32]; memset(net2, 0xff, 32);
+    stratum_server_set_job(s2, make_test_job("J1", net2), 1);
+    stratum_conn_t *c2 = stratum_conn_new_for_test(s2);
+    CHECK(stratum_conn_idle_budget_for_test(s2, c2) == 600);
+    handshake(s2, c2);
+    CHECK(stratum_conn_idle_budget_for_test(s2, c2) == 0);
+    stratum_conn_free_for_test(c2);
+    stratum_server_free(s2);
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -1650,6 +2081,14 @@ int main(void) {
     test_gated_pps_refuses_authorize_and_submits();
     test_gate_can_be_disabled();
     test_solo_is_never_gated();
+    test_clean_jobs_only_on_a_new_tip();
+    test_promised_min_diff_survives_the_network_clamp();
+    test_vardiff_cannot_retarget_below_a_promised_floor();
+    test_ntime_rolling_is_accepted();
+    test_ntime_outside_the_window_is_rejected();
+    test_a_jsonrpc_response_does_not_close_the_connection();
+    test_persistent_garbage_still_closes_the_connection();
+    test_authorized_miner_gets_the_long_idle_budget();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

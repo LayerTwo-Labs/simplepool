@@ -353,7 +353,14 @@ test('the banner renders before the first pass without throwing', async () => {
  * silent. So an operator can configure a rental port for 500000, have it
  * quietly serve 1200, and learn about it only when the marketplace measures
  * the difficulty it was given and cancels the order. Nothing else in the
- * dashboard can see this, which is the bar for being in this banner. */
+ * dashboard can see this, which is the bar for being in this banner.
+ *
+ * A port that says min_diff on its listener line opts OUT of that clamp: the
+ * pool holds the promised difficulty and the miner discards blocks instead.
+ * Both states are findings and both are here, because the advice is opposite
+ * — one port is being served less than it advertises, the other is paying
+ * for what it advertises in lost blocks. promised_min_diff is what separates
+ * them; a port without it behaves as it always did. */
 const RENTAL_PORTS = JSON.stringify([
     { port: 3334, label: '',         min_diff: 1,      initial_diff: 1 },
     { port: 3335, label: 'nicehash', min_diff: 500000, initial_diff: 500000 },
@@ -400,6 +407,77 @@ test('a proxy that has not published its ports is not a finding', () => {
     const c = health(db).checks.find(x => x.id === 'listener_difficulty');
     assert.equal(c.ok, true);
     assert.match(c.detail, /no ports published/);
+});
+
+test('a port that promised min_diff is reported as holding it, and what that costs', () => {
+    /* promised_min_diff > network difficulty: the pool is NOT clamping this
+     * one down, so the port works and the blocks are what pay for it. The
+     * finding has to say that rather than the opposite. */
+    const db = makeDb();
+    db.prepare('UPDATE pool_meta SET network_difficulty = 1200, listeners = ?')
+      .run(JSON.stringify([
+          { port: 3334, label: '', min_diff: 1, promised_min_diff: 0, initial_diff: 1 },
+          { port: 3335, label: 'braiins', min_diff: 65536,
+            promised_min_diff: 65536, initial_diff: 65536 },
+      ]));
+    const c = health(db).checks.find(x => x.id === 'listener_difficulty');
+    assert.equal(c.ok, false);
+    assert.match(c.detail, /3335/);
+    assert.match(c.detail, /braiins/);
+    assert.match(c.detail, /holding it/);
+    /* 65536 / 1200 = 54.6 -> discards ~54 of every 55. */
+    assert.match(c.detail, /discard/);
+    assert.match(c.detail, /55/);
+    /* And emphatically NOT the "served 1200 instead" story, which is what
+     * this port is the exception to. */
+    assert.doesNotMatch(c.detail, /served 1200 instead/);
+});
+
+test('a promised floor the chain can back is not a finding', () => {
+    const db = makeDb();
+    db.prepare('UPDATE pool_meta SET network_difficulty = 5e9, listeners = ?')
+      .run(JSON.stringify([
+          { port: 3335, label: 'braiins', min_diff: 65536,
+            promised_min_diff: 65536, initial_diff: 65536 },
+      ]));
+    const c = health(db).checks.find(x => x.id === 'listener_difficulty');
+    assert.equal(c.ok, true);
+});
+
+test('the promised-floor finding wins over the merely-configured one', () => {
+    /* Both shapes present at once. The port losing blocks is the one the
+     * operator needs to see, so it is the one named. */
+    const db = makeDb();
+    db.prepare('UPDATE pool_meta SET network_difficulty = 1200, listeners = ?')
+      .run(JSON.stringify([
+          { port: 3336, label: 'nicehash', min_diff: 500000,
+            promised_min_diff: 0, initial_diff: 500000 },
+          { port: 3335, label: 'braiins', min_diff: 65536,
+            promised_min_diff: 65536, initial_diff: 65536 },
+      ]));
+    const c = health(db).checks.find(x => x.id === 'listener_difficulty');
+    assert.equal(c.ok, false);
+    assert.match(c.detail, /3335/);
+    assert.match(c.detail, /holding it/);
+});
+
+test('a forknet-scale difficulty is printed, not rounded away to zero', () => {
+    /* A difficulty is not necessarily >= 1. The regtest/forknet numbers are
+     * ~1e-10, and toFixed(0) turns every one of them into "0" — a banner
+     * naming the wrong number is worse than no banner, and it is exactly the
+     * chain where a floor above the network difficulty actually happens. */
+    const db = makeDb();
+    db.prepare('UPDATE pool_meta SET network_difficulty = 4.6565e-10, listeners = ?')
+      .run(JSON.stringify([
+          { port: 3335, label: 'rental-c', min_diff: 1e-8,
+            promised_min_diff: 1e-8, initial_diff: 1e-8 },
+      ]));
+    const c = health(db).checks.find(x => x.id === 'listener_difficulty');
+    assert.equal(c.ok, false);
+    assert.match(c.detail, /1e-8/);
+    assert.match(c.detail, /4\.66e-10/);
+    assert.doesNotMatch(c.detail, /min_diff 0\b/);
+    assert.doesNotMatch(c.detail, /is only 0\b/);
 });
 
 test('a port floored above the chain is reported even if it starts low', () => {

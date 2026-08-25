@@ -118,6 +118,15 @@ typedef struct {
     double initial_diff;
     double vardiff_min;
     double vardiff_max;
+    /* The floor this port promises, set only when the operator wrote
+     * min_diff=. Unlike vardiff_min — which merely bounds the rate loop, and
+     * which the network-difficulty ceiling overrides — this one is kept even
+     * when the chain's own difficulty is lower, because a marketplace
+     * measures the difficulty on the wire and cancels an order that comes in
+     * under what the port advertised. Left 0 by any listener that did not ask
+     * for one, which is how the default port and every low-difficulty chain
+     * keep their existing behaviour. See clamp_assigned_difficulty. */
+    double min_diff;
     /* Free-form, for logs and for the dashboard to tell miners which port to
      * point which machine at. Empty for the default listener. */
     char   label[32];
@@ -178,6 +187,10 @@ typedef struct {
      * against half-open TCPs from crashed miners and misconfigured clients
      * that connect but never authenticate. 0 disables (legacy). Default 600. */
     int    idle_timeout_sec;
+    /* The same, for a connection that has authorized — a working miner with
+     * nothing to say is not an idle one. 0 applies the 7200 default; negative
+     * never reaps an authorized miner. See config.h. */
+    int    idle_timeout_authorized_sec;
 
     /* Ceiling on mining.submit per second, per connection. 0 disables.
      *
@@ -214,8 +227,25 @@ typedef struct {
 typedef struct stratum_server stratum_server_t;
 
 int  stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out);
-/* Atomically swap the current job. Takes ownership of new_job. */
-void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job);
+/* Atomically swap the current job and notify every authorized connection.
+ * Takes ownership of new_job.
+ *
+ * clean_jobs is the flag sent in the mining.notify, and it is a instruction to
+ * the miner, not a description of the job: true means "throw away the work you
+ * are holding and restart". That is only true when the chain moved — a new
+ * tip makes every job in the miner's hands unmineable. It is emphatically not
+ * true of the periodic template refresh, which exists to pick up new
+ * transactions and a fresher ntime; the old job is still perfectly valid
+ * there, and the pool keeps accepting submits against it out of the recent
+ * ring either way.
+ *
+ * Sending clean_jobs=true on every refresh discards work in flight on every
+ * connected miner, several times per block. It costs the miner real hashrate,
+ * it is invisible to a probe that connects for a few seconds and reads one
+ * notify, and it is one of the behaviours rented-hashrate marketplaces
+ * delist pools for. Pass 1 only on a tip change. */
+void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
+                            int clean_jobs);
 void stratum_server_stop(stratum_server_t *s);
 void stratum_server_free(stratum_server_t *s);
 
@@ -252,6 +282,19 @@ const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);
 const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c);
 int         stratum_conn_authorized_for_test(const stratum_conn_t *c);
 int         stratum_conn_subscribed_for_test(const stratum_conn_t *c);
+
+/* Put a test connection on the server's broadcast list with a real fd (one
+ * end of a socketpair), so a test can read exactly what
+ * stratum_server_set_job writes to a connected miner. Detach before freeing
+ * the connection. */
+void stratum_conn_attach_for_test(stratum_server_t *s, stratum_conn_t *c,
+                                  int fd);
+void stratum_conn_detach_for_test(stratum_server_t *s, stratum_conn_t *c);
+
+/* Seconds of silence this connection is allowed before the reaper closes it.
+ * Differs by whether it has authorized; 0 means never reaped. */
+int stratum_conn_idle_budget_for_test(const stratum_server_t *s,
+                                      const stratum_conn_t *c);
 
 /* Apply the same socket options the listener applies to every accepted
  * connection: TCP_NODELAY, SO_KEEPALIVE + TCP_KEEP{IDLE,INTVL,CNT}, and

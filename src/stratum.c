@@ -260,6 +260,12 @@ struct stratum_conn {
     double   pol_initial_diff;
     double   pol_vardiff_min;
     double   pol_vardiff_max;
+    /* The floor this port *promises*, as distinct from pol_vardiff_min, which
+     * merely bounds the rate loop. Only a listener that spelled out min_diff
+     * carries one; everything else leaves it 0 and is clamped exactly as it
+     * always was. That separation is what makes the floor affordable — see
+     * clamp_assigned_difficulty. */
+    double   pol_min_diff;
     int      pol_port;
     char     pol_label[32];
     int      subscribed;
@@ -329,6 +335,13 @@ struct stratum_conn {
      * The conn thread checks this against cfg.idle_timeout_sec after each
      * SO_RCVTIMEO wake-up so silent connections are reaped. */
     uint64_t last_activity_ms;
+
+    /* Consecutive lines this connection sent that were not a request we
+     * could act on. Reset by any line we could. A single one is noise to
+     * answer and forget (see stratum_handle_message); a run of them is a
+     * client that will never say anything useful, and only then is dropping
+     * it the right call. */
+    unsigned malformed_streak;
 
     pthread_mutex_t write_lock;
 
@@ -798,6 +811,43 @@ static void submit_rate_report(stratum_server_t *s, stratum_conn_t *c,
     c->rl_reported_ms = now_mono;
 }
 
+/* The difficulty actually assignable to a connection: the network ceiling
+ * first, then this port's floor, and the floor wins.
+ *
+ * Both bounds are real and on a low-difficulty chain they contradict each
+ * other, so the order is a decision rather than an accident:
+ *
+ *   - The ceiling exists because the miner filters locally at whatever we
+ *     assign. A share target harder than the network target means the miner
+ *     throws away valid blocks before we ever see them.
+ *   - The floor exists because a marketplace aggregates a whole fleet behind
+ *     one connection. Braiins requires 1024 minimum, NiceHash 500000, and
+ *     both measure what they were actually handed. A port that promises a
+ *     floor and quietly serves less has its order cancelled.
+ *
+ * The listener commit chose the ceiling and reported the mismatch — a health
+ * check naming both numbers. Reporting is necessary but it is not sufficient:
+ * the marketplace is not reading our dashboard, it is measuring the
+ * difficulty on the wire. So where a port states a floor, that floor is now
+ * kept.
+ *
+ * Which is affordable precisely because the floor is per-port and opt-in. A
+ * listener that never said min_diff carries none, so `listen_port` and every
+ * regtest and forknet config behave exactly as they did — ceiling wins, no
+ * floor, no blocks discarded. Only a port explicitly sold as a rental port
+ * makes the trade, and on that port the trade is the point: above the
+ * chain's own difficulty the miner filters out blocks it solved, which is
+ * the cost of being reachable by the fleet at all. main.c warns at startup
+ * for any port whose floor the chain cannot back. */
+static double clamp_assigned_difficulty(stratum_server_t *s,
+                                        const stratum_conn_t *c, double diff) {
+    double net_diff = current_net_diff(s);
+    if (net_diff > 0.0 && diff > net_diff) diff = net_diff;
+    if (c->pol_min_diff > 0.0 && diff < c->pol_min_diff) diff = c->pol_min_diff;
+    if (diff <= 0.0) diff = 1.0;
+    return diff;
+}
+
 /* Record the difficulty `job_id` went out to this connection under. Called
  * from the notify path, which is the moment the agreement is struck: the
  * miner has already applied every set_difficulty we sent before this notify,
@@ -850,6 +900,27 @@ static double conn_job_difficulty(stratum_conn_t *c, const char *job_id) {
 #define VD_FLOOR_MIN_SAMPLES 5
 #define VD_FLOOR_TRIGGER     4.0
 #define VD_FLOOR_BACKOFF     0.95
+
+/* How far a miner may roll ntime away from the value its job went out with.
+ *
+ * Forward: consensus refuses a block whose timestamp is more than two hours
+ * ahead of network-adjusted time, so anything past that hashes fine, passes
+ * every check the pool makes, and is then thrown out by the node at
+ * submitblock — a block lost silently. Measuring from job->ntime rather than
+ * from the wall clock keeps the bound conservative: the job only gets older
+ * while the miner holds it, so a value inside this window is inside the
+ * consensus window too.
+ *
+ * Backward: miners roll ntime forward, but a stratum proxy that rewrites the
+ * field, or a rig with a skewed clock, can land slightly behind. That is
+ * honest work and rejecting it would cost the miner shares, so allow a small
+ * amount of it. Both bounds are deliberately loose — this exists to catch a
+ * broken client, not to police timestamps. */
+#define NTIME_MAX_FORWARD_ROLL   7200
+#define NTIME_MAX_BACKWARD_ROLL  600
+
+/* Consecutive unusable lines tolerated before the connection is dropped. */
+#define MAX_MALFORMED_STREAK 8
 
 /* Vardiff: every cfg.vardiff_window_sec, look at how many shares the
  * connection submitted in that window and rescale its difficulty so the
@@ -969,21 +1040,20 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
         }
     }
 
-    if (new_diff != old_diff) {
-        if (new_diff < c->pol_vardiff_min) new_diff = c->pol_vardiff_min;
-        if (c->pol_vardiff_max > 0.0 && new_diff > c->pol_vardiff_max) {
-            new_diff = c->pol_vardiff_max;
-        }
-        /* Never raise the share difficulty above the network difficulty:
-         * the miner discards hashes above the stratum target locally, so a
-         * share target harder than the network target throws away valid
-         * blocks before the pool ever sees them. This clamp wins over
-         * vardiff_min/max — it bites on low-difficulty networks where an
-         * ASIC's vardiff otherwise climbs orders of magnitude past the
-         * chain difficulty. */
-        double net_diff = current_net_diff(s);
-        if (net_diff > 0.0 && new_diff > net_diff) new_diff = net_diff;
+    /* Bound the proposal against this port's policy, then apply the network
+     * ceiling and the port's floor.
+     *
+     * Unconditionally, not only when the rate loop moved the number: the
+     * bounds themselves move. current_net_diff tracks the chain, so a
+     * connection sitting at a difficulty that was legal when it authorized
+     * can fall outside the window later without its own share rate changing
+     * at all. Clamping only on a proposed change left those pinned wherever
+     * they happened to be. */
+    if (new_diff < c->pol_vardiff_min) new_diff = c->pol_vardiff_min;
+    if (c->pol_vardiff_max > 0.0 && new_diff > c->pol_vardiff_max) {
+        new_diff = c->pol_vardiff_max;
     }
+    new_diff = clamp_assigned_difficulty(s, c, new_diff);
 
     double window_floor = c->vd_window_min_achieved;
 
@@ -1207,10 +1277,11 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     sanitize_worker(worker, c->worker_name, sizeof(c->worker_name));
     c->authorized = 1;
     if (c->difficulty <= 0) c->difficulty = c->pol_initial_diff;
-    /* Same clamp as vardiff: a starting difficulty above the network
-     * difficulty would make the miner discard valid blocks locally. */
-    double net_diff = current_net_diff(s);
-    if (net_diff > 0.0 && c->difficulty > net_diff) c->difficulty = net_diff;
+    /* Same ceiling and floor vardiff applies, so the very first
+     * set_difficulty a miner sees already obeys both — which is the whole
+     * point on a rental port, where the fleet has to arrive already at the
+     * floor rather than wait four minutes for vardiff to climb to it. */
+    c->difficulty = clamp_assigned_difficulty(s, c, c->difficulty);
     /* Arm vardiff window for this connection. */
     c->vd_window_start_ms = now_ms();
     c->vd_window_shares = 0;
@@ -1351,6 +1422,35 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     if (parse_u32_hex(ntime, &ntime_v) != 0 || parse_u32_hex(nonce, &nonce_v) != 0) {
         cJSON *err = make_error(20, "bad ntime/nonce hex");
         return emit_response(buf, len, id, NULL, err);
+    }
+
+    /* ntime rolling is supported and this is the only thing bounding it: the
+     * submitted timestamp goes into the header verbatim, and every distinct
+     * value is a distinct share (the dedupe key above includes ntime). What
+     * the bound catches is a value the *chain* will not take — see
+     * NTIME_MAX_FORWARD_ROLL. Without it such a submit is credited as a
+     * share, and if it happens to beat the network target the pool assembles
+     * a block the node then refuses, which is how a found block disappears
+     * with nothing but a submitblock warning to show for it.
+     *
+     * Signed 64-bit arithmetic on purpose: job->ntime + 7200 overflows a
+     * uint32 in 2106, and the backward comparison underflows it today. */
+    {
+        int64_t nt   = (int64_t)ntime_v;
+        int64_t base = (int64_t)job->ntime;
+        if (nt > base + NTIME_MAX_FORWARD_ROLL ||
+            nt < base - NTIME_MAX_BACKWARD_ROLL) {
+            LOG_WARN("stratum: reject from worker '%s' - Reason: ntime %08x is "
+                     "%lld s from the job's %08x (allowed -%d..+%d)",
+                     c->worker_name, ntime_v, (long long)(nt - base),
+                     job->ntime, NTIME_MAX_BACKWARD_ROLL, NTIME_MAX_FORWARD_ROLL);
+            if (s->cfg.on_reject) {
+                s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                                 "ntime out of range");
+            }
+            cJSON *err = make_error(20, "ntime out of range");
+            return emit_response(buf, len, id, NULL, err);
+        }
     }
 
     size_t en2_len = 0;
@@ -1630,20 +1730,67 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     return rc;
 }
 
+/* One line we could not act on. Answer it and stay connected; only a run of
+ * them is grounds for hanging up.
+ *
+ * Dropping the socket on the first unusable line was the old behaviour and it
+ * was too sharp in a way that bit real miners: it fired on any message with no
+ * `method` string, which includes an ordinary JSON-RPC *response* object.
+ * Firmware and stratum proxies do emit those, and a pool that answers one by
+ * closing the connection mid-session — no error, no reason — looks exactly
+ * like a pool that drops hashrate at random. Marketplaces blacklist for that.
+ *
+ * The streak counter is what keeps this from being a licence to spew: a
+ * client that genuinely cannot speak the protocol still gets cut, just after
+ * evidence rather than on suspicion. */
+static int protocol_noise(stratum_conn_t *c, const char *what,
+                          char **buf, size_t *len)
+{
+    if (++c->malformed_streak >= MAX_MALFORMED_STREAK) {
+        LOG_WARN("stratum: closing fd=%d worker='%s' after %u consecutive "
+                 "unusable lines (last: %s)",
+                 c->fd, c->worker_name[0] ? c->worker_name : "(unauthorized)",
+                 c->malformed_streak, what);
+        return -1;
+    }
+    cJSON *err = make_error(20, what);
+    return emit_response(buf, len, NULL, NULL, err);
+}
+
 int stratum_handle_message(stratum_server_t *s, stratum_conn_t *c,
                            const char *line, char **out_buf, size_t *out_len)
 {
     if (!line) return -1;
     if (strlen(line) > MAX_LINE_BYTES) return -1;
-    cJSON *root = cJSON_Parse(line);
-    if (!root) return -1;
+
+    /* A blank line is not a protocol error. Some clients send one to keep the
+     * TCP warm, and the pool solicits nothing between shares, so this is the
+     * only keepalive available to them. */
+    const char *p = line;
+    while (*p == ' ' || *p == '\t' || *p == '\r') p++;
+    if (*p == '\0') return 0;
+
+    cJSON *root = cJSON_Parse(p);
+    if (!root) return protocol_noise(c, "malformed JSON", out_buf, out_len);
     cJSON *id     = cJSON_GetObjectItemCaseSensitive(root, "id");
     cJSON *method = cJSON_GetObjectItemCaseSensitive(root, "method");
     cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
     if (!cJSON_IsString(method)) {
+        /* A reply to something, addressed to a request this pool never made.
+         * Nothing to do with it, and nothing wrong with the client for
+         * sending it — swallow it and leave the connection alone. */
+        int is_response = cJSON_GetObjectItemCaseSensitive(root, "result") ||
+                          cJSON_GetObjectItemCaseSensitive(root, "error");
         cJSON_Delete(root);
-        return -1;
+        if (is_response) {
+            c->malformed_streak = 0;
+            return 0;
+        }
+        return protocol_noise(c, "missing method", out_buf, out_len);
     }
+    /* A request we can dispatch, even one naming a method we do not
+     * implement, proves the client speaks stratum. */
+    c->malformed_streak = 0;
     int rc = 0;
     if (strcmp(method->valuestring, "mining.configure") == 0) {
         rc = handle_configure(s, c, id, params, out_buf, out_len);
@@ -1673,6 +1820,7 @@ static void conn_apply_listener(stratum_conn_t *c,
     if (pol->initial_diff > 0.0) c->pol_initial_diff = pol->initial_diff;
     if (pol->vardiff_min  > 0.0) c->pol_vardiff_min  = pol->vardiff_min;
     if (pol->vardiff_max  > 0.0) c->pol_vardiff_max  = pol->vardiff_max;
+    c->pol_min_diff = pol->min_diff;   /* 0 unless the port promised one */
     c->pol_port = pol->port;
     snprintf(c->pol_label, sizeof c->pol_label, "%s", pol->label);
     /* Before authorize the connection has no assigned difficulty yet, so
@@ -1694,6 +1842,7 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     c->pol_initial_diff = s ? s->cfg.initial_diff : 1.0;
     c->pol_vardiff_min  = s ? s->cfg.vardiff_min  : 1.0;
     c->pol_vardiff_max  = s ? s->cfg.vardiff_max  : 0.0;
+    c->pol_min_diff     = 0.0;   /* the default listener promises no floor */
     c->pol_port         = s ? s->cfg.bind_port    : 0;
     c->difficulty = c->pol_initial_diff;
     c->vd_window_min_achieved = HUGE_VAL;
@@ -1847,6 +1996,53 @@ static void conn_unregister(stratum_server_t *s, stratum_conn_t *c) {
     pthread_mutex_unlock(&s->conns_lock);
 }
 
+/* Seconds of silence this connection is allowed before it is reaped.
+ *
+ * Two budgets, because the two states are not the same risk. An unauthorized
+ * socket has told us nothing and costs an fd for nothing, so the short budget
+ * applies. An authorized miner that has sent nothing is, far more often, a
+ * small rig that has not cleared its assigned difficulty yet — and since the
+ * pool never asks a miner anything, having nothing to say is the normal
+ * resting state between shares. Reaping that at ten minutes disconnects
+ * working hashrate, which is the behaviour marketplaces delist pools for.
+ * TCP keepalive (2 min idle, 3x30s probes) already handles a socket whose
+ * peer is actually gone, so the long budget only has to catch a peer that
+ * answers keepalives while doing nothing. */
+static int conn_idle_budget_sec(const stratum_server_t *s,
+                                const stratum_conn_t *c)
+{
+    if (!c->authorized) return s->cfg.idle_timeout_sec;
+    /* stratum_server_start has already turned an unset (0) value into the
+     * default, so anything <= 0 here is the operator explicitly asking that a
+     * working miner never be reaped. */
+    if (s->cfg.idle_timeout_authorized_sec <= 0) return 0;
+    return s->cfg.idle_timeout_authorized_sec;
+}
+
+/* Test hooks for the broadcast path. stratum_conn_new_for_test hands back a
+ * connection the server does not know about — good enough for the handler
+ * tests, which drive it directly, but stratum_server_set_job only walks
+ * registered connections with a live fd. Give a test one of those and the
+ * bytes a real miner would receive can be read off the other end of a
+ * socketpair, which is the only way to pin what the notify actually says. */
+void stratum_conn_attach_for_test(stratum_server_t *s, stratum_conn_t *c,
+                                  int fd) {
+    if (!s || !c) return;
+    c->fd = fd;
+    conn_register(s, c);
+}
+
+void stratum_conn_detach_for_test(stratum_server_t *s, stratum_conn_t *c) {
+    if (!s || !c) return;
+    conn_unregister(s, c);
+    c->fd = -1;
+}
+
+int stratum_conn_idle_budget_for_test(const stratum_server_t *s,
+                                      const stratum_conn_t *c) {
+    return conn_idle_budget_sec(s, c);
+}
+
 static void *conn_thread(void *arg) {
     stratum_conn_t *c = arg;
     stratum_server_t *s = c->server;
@@ -1854,12 +2050,8 @@ static void *conn_thread(void *arg) {
     size_t blen = 0;
 
     /* Seed activity tracking at connect time — a client that never sends
-     * a single byte is still governed by cfg.idle_timeout_sec. */
+     * a single byte is still governed by the idle budget. */
     c->last_activity_ms = mono_ms();
-    const uint64_t idle_timeout_ms =
-        s->cfg.idle_timeout_sec > 0
-            ? (uint64_t)s->cfg.idle_timeout_sec * 1000u
-            : 0;
 
     while (!atomic_load(&s->stop)) {
         ssize_t n = recv(c->fd, buf + blen, sizeof(buf) - 1 - blen, 0);
@@ -1867,11 +2059,14 @@ static void *conn_thread(void *arg) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 /* SO_RCVTIMEO wake. Drop iff we've been silent past the
-                 * configured budget. Otherwise loop and try again. */
-                if (idle_timeout_ms > 0 &&
-                    mono_ms() - c->last_activity_ms > idle_timeout_ms) {
-                    LOG_INFO("stratum: idle timeout after %us — closing fd=%d worker='%s'",
-                             s->cfg.idle_timeout_sec, c->fd,
+                 * budget that applies to this connection *now* — read fresh
+                 * each time because authorizing moves it. Otherwise loop. */
+                int budget_sec = conn_idle_budget_sec(s, c);
+                if (budget_sec > 0 &&
+                    mono_ms() - c->last_activity_ms >
+                        (uint64_t)budget_sec * 1000u) {
+                    LOG_INFO("stratum: idle timeout after %ds — closing fd=%d worker='%s'",
+                             budget_sec, c->fd,
                              c->worker_name[0] ? c->worker_name : "(unauthorized)");
                     goto done;
                 }
@@ -1886,7 +2081,19 @@ static void *conn_thread(void *arg) {
         for (;;) {
             char *nl = memchr(buf, '\n', blen);
             if (!nl) {
-                if (blen >= MAX_LINE_BYTES) { goto done; } /* oversize */
+                if (blen >= MAX_LINE_BYTES) {
+                    /* No newline in a full buffer. Every stratum request is
+                     * two orders of magnitude smaller than this, so the peer
+                     * is not framing lines at all and there is no resync
+                     * point to skip to. Say why before hanging up — an
+                     * unexplained close is the thing that looks arbitrary. */
+                    LOG_WARN("stratum: closing fd=%d worker='%s' — %d bytes "
+                             "with no newline (client is not framing requests)",
+                             c->fd,
+                             c->worker_name[0] ? c->worker_name : "(unauthorized)",
+                             MAX_LINE_BYTES);
+                    goto done;
+                }
                 break;
             }
             *nl = '\0';
@@ -1930,7 +2137,14 @@ static void *listener_thread(void *arg) {
             close(fd);
             continue;
         }
-        if (conn_socket_setup(fd, s->cfg.idle_timeout_sec) < 0) {
+        /* The recv timeout only paces the reaper's wake-ups, so it has to be
+         * armed whenever *either* budget is live — an operator who disabled
+         * the unauthorized timeout but left the authorized one on would
+         * otherwise block in recv() forever and never check it. */
+        int poll_budget = s->cfg.idle_timeout_sec > 0
+                              ? s->cfg.idle_timeout_sec
+                              : s->cfg.idle_timeout_authorized_sec;
+        if (conn_socket_setup(fd, poll_budget) < 0) {
             LOG_WARN("stratum: socket setup failed for accepted fd: %s",
                      strerror(errno));
             close(fd);
@@ -1964,9 +2178,13 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     s->cfg = *cfg;
     if (s->cfg.max_conns <= 0) s->cfg.max_conns = 500;
     if (s->cfg.initial_diff <= 0) s->cfg.initial_diff = 1.0;
-    /* Negative → explicit disable. 0 → apply default (10 min). Positive kept. */
+    /* Negative → explicit disable. 0 → apply default. Positive kept. */
     if (s->cfg.idle_timeout_sec == 0) s->cfg.idle_timeout_sec = 600;
     else if (s->cfg.idle_timeout_sec < 0) s->cfg.idle_timeout_sec = 0;
+    /* Negative is kept as-is rather than folded to 0: for this field 0 means
+     * "unset, use the default" and negative means "never reap an authorized
+     * miner", and conn_idle_budget_sec has to be able to tell them apart. */
+    if (s->cfg.idle_timeout_authorized_sec == 0) s->cfg.idle_timeout_authorized_sec = 7200;
     pthread_rwlock_init(&s->job_lock, NULL);
     pthread_mutex_init(&s->recent_lock, NULL);
     pthread_mutex_init(&s->conns_lock, NULL);
@@ -2034,7 +2252,8 @@ bind_failed:
     return -1;
 }
 
-void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job) {
+void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
+                            int clean_jobs) {
     if (!s || !new_job) return;
     pthread_rwlock_wrlock(&s->job_lock);
     stratum_job_t *old = s->current_job;
@@ -2042,13 +2261,16 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job) {
     pthread_rwlock_unlock(&s->job_lock);
     if (old) retire_job(s, old);
 
-    /* broadcast notify with clean_jobs=true. Each conn renders its own
-     * coinbase against the new job (paying its miner address). */
+    /* Broadcast the new job. Each conn renders its own coinbase against it
+     * (paying its miner address). clean_jobs is passed through from the
+     * caller rather than assumed: only a tip change invalidates the work a
+     * miner is holding, and telling it otherwise on every template refresh
+     * throws that work away for nothing. See stratum.h. */
     pthread_mutex_lock(&s->conns_lock);
     for (stratum_conn_t *c = s->conns_head; c; c = c->next) {
         if (!c->subscribed || c->fd < 0 || !c->authorized) continue;
         char *out = NULL; size_t olen = 0;
-        send_current_notify(s, c, &out, &olen, 1);
+        send_current_notify(s, c, &out, &olen, clean_jobs ? 1 : 0);
         if (out) {
             pthread_mutex_lock(&c->write_lock);
             write_all(c->fd, out, olen);

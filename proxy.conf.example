@@ -26,6 +26,10 @@ coinbase_tag = /simplepool/
 # vardiff — auto-adjust each connection's difficulty to keep the share
 # rate near `target_spm` shares/minute. Set vardiff_enabled = 0 to pin
 # every connection to initial_diff (legacy behaviour).
+#
+# These are the settings for listen_port, which is the port home miners are
+# pointed at. Rented hashrate does not belong here — give it its own listener
+# below, with its own floor.
 initial_diff       = 1
 vardiff_enabled    = 1
 vardiff_target_spm = 12       # ~1 share every 5 seconds per connection
@@ -60,16 +64,24 @@ vardiff_window_sec = 30       # how often to retarget
 # listener = port=3335 min_diff=65536 label=braiins
 # listener = port=3336 min_diff=500000 label=nicehash
 #
-# IMPORTANT — a port cannot exceed the chain. Share difficulty is never
-# raised above the network difficulty, because a miner filters locally
-# against the stratum target and a harder share target would discard valid
-# blocks before the pool ever saw them. So a 500000 port on a chain sitting
-# at difficulty 1200 really serves 1200, and a marketplace measuring it will
-# read the pool as below its floor. Braiins therefore needs network
-# difficulty >= 65536 and NiceHash >= 500000 before the matching port means
-# anything. The dashboard reports this directly (the "Stratum ports can hold
-# their difficulty" health check) rather than leaving it to be discovered
-# when an order is cancelled.
+# IMPORTANT — min_diff is KEPT even when the chain is easier than it, and
+# that costs blocks. Share difficulty is otherwise capped at the network
+# difficulty, because a miner filters locally against the stratum target and
+# a harder share target makes it discard valid blocks before the pool ever
+# sees them. min_diff overrides that cap, on purpose: a marketplace measures
+# the difficulty on the wire, so a 500000 port that quietly served 1200 would
+# have its order cancelled and the pool would never learn why.
+#
+# The trade is therefore explicit and confined to the ports that ask for it.
+# On a 500000 port over a chain at 1200, miners discard roughly 416 of every
+# 417 blocks they solve. simplepool warns at startup for every listener in
+# that position, and the dashboard reports it too (the "Stratum ports can
+# hold their difficulty" health check). If keeping every block matters more
+# to you than serving rented hashrate on that port, drop its min_diff — the
+# cap then applies as it always has.
+#
+# listen_port and any listener without a min_diff are untouched by all of
+# this: no floor, cap as before.
 
 # Ceiling on mining.submit per second, per connection. 0 disables it.
 #
@@ -93,6 +105,26 @@ vardiff_window_sec = 30       # how often to retarget
 # (vardiff_enabled = 0), since then a high sustained rate is the correct
 # behaviour rather than a symptom.
 max_submits_per_sec = 20000
+
+# Idle-connection reaper, in seconds. Two budgets, because the two states are
+# not the same risk:
+#
+#   idle_timeout_sec            a socket that has not authorized. It has told
+#                               us nothing and costs an fd for nothing.
+#   idle_timeout_authorized_sec a miner that HAS authorized. Having nothing to
+#                               say is its normal resting state — the pool
+#                               asks it nothing between shares — so a small
+#                               rig that has not cleared its assigned
+#                               difficulty yet is silent but perfectly
+#                               healthy. Reaping it on the short budget
+#                               disconnects working hashrate, which is one of
+#                               the behaviours marketplaces delist pools for.
+#
+# TCP keepalive (2 min idle + 3x30s probes) already reaps a socket whose peer
+# is genuinely gone, so the long budget only has to catch a peer answering
+# keepalives while doing no work. Negative disables either one.
+idle_timeout_sec            = 600
+idle_timeout_authorized_sec = 7200
 
 db_path = ./data/shares.db
 commit_window_ms = 100

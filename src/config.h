@@ -10,6 +10,9 @@ typedef struct {
     char listen_addr[64];
     int  listen_port;
     int  max_conns;
+    /* Still 1: the difficulty policy lives on the listener now, so a config
+     * naming no listeners behaves exactly as it always did. A rental port
+     * sets its own via `listener = port=3335 min_diff=65536`. */
     double initial_diff;
 
     /* Extra stratum ports beyond listen_port, each with its own difficulty
@@ -37,6 +40,20 @@ typedef struct {
      * crashed miners and clients that connect but never authenticate.
      * Set to a negative value to disable entirely; 0 uses the default. */
     int    idle_timeout_sec;      /* default 600 (10 min) */
+
+    /* The same reaper, but for a connection that has authorized. It is a
+     * separate (much longer) budget because the two cases are not the same
+     * risk: an unauthorized socket is a squatter and costs an fd for nothing,
+     * whereas an authorized miner that has sent nothing is usually just a
+     * small rig that has not found a share at its assigned difficulty yet.
+     * The pool never solicits anything from a miner, so a healthy ASIC has no
+     * reason to speak between shares — reaping it at 10 minutes disconnects
+     * working hashrate, which is exactly the behaviour marketplaces blacklist
+     * pools for. TCP keepalive (2 min idle + 3x30s probes) already reaps a
+     * genuinely dead socket in ~3.5 min, so this only needs to catch a peer
+     * that is answering keepalives while doing no work.
+     * Negative disables; 0 uses the default. */
+    int    idle_timeout_authorized_sec;  /* default 7200 (2 h) */
 
     /* bitcoind */
     char bitcoind_url[512];
