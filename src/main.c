@@ -738,11 +738,25 @@ static void *tip_watcher(void *arg) {
             broadcast_node_tip(s->bcast, t->height - 1, t->prev_hash_hex, now_s);
         }
 
-        int need_rebuild = 0;
+        /* Two different reasons to rebuild, and they are not interchangeable.
+         *
+         * A tip change invalidates every job in every miner's hands: they all
+         * build on a parent that is no longer the tip. That is the one case
+         * where the miner must throw its work away, and the one case that
+         * carries clean_jobs = true.
+         *
+         * The periodic refresh is housekeeping — a fresher ntime and whatever
+         * transactions arrived meanwhile. The job the miner already holds is
+         * still valid, still builds on the current tip, and the pool goes on
+         * accepting submits against it out of the recent ring. Flagging it
+         * clean would discard work in flight on every connected miner roughly
+         * twenty times per block, for nothing. */
+        int need_rebuild = 0, new_tip = 0;
         pthread_mutex_lock(&s->lock);
         if (t->height != s->last_height ||
             strcmp(t->prev_hash_hex, s->last_prev_hash) != 0) {
             need_rebuild = 1;
+            new_tip = 1;
         } else if (now_ms() - s->last_built_ms > 30000) {
             /* Periodic refresh for new ntime + included txs. */
             need_rebuild = 1;
@@ -762,7 +776,7 @@ static void *tip_watcher(void *arg) {
                 bitcoind_template_free(t);
                 continue;
             }
-            stratum_server_set_job(s->srv, job);
+            stratum_server_set_job(s->srv, job, new_tip);
             /* Difficulty and block value move with the template, so the
              * rate has to move with it too. */
             refresh_pps_rate(s, t);
@@ -772,8 +786,9 @@ static void *tip_watcher(void *arg) {
                      t->prev_hash_hex);
             s->last_built_ms = now_ms();
             pthread_mutex_unlock(&s->lock);
-            LOG_INFO("new job: height=%d prev=%.16s... txs=%zu",
-                     t->height, t->prev_hash_hex, t->tx_count);
+            LOG_INFO("new job: height=%d prev=%.16s... txs=%zu clean_jobs=%s",
+                     t->height, t->prev_hash_hex, t->tx_count,
+                     new_tip ? "true (new tip)" : "false (refresh)");
         }
         if (t->longpollid) {
             if (lpid[0] == '\0') {
@@ -968,16 +983,26 @@ int main(int argc, char **argv) {
          * dial. Labels are constrained to [A-Za-z0-9_-] at config parse time,
          * so this needs no escaping. */
         /* Sized for STRATUM_MAX_LISTENERS + the default at their widest: a
-         * 31-char label and two %.10g doubles is ~117 bytes an entry. It fits
+         * 31-char label and three %.10g doubles is ~150 bytes an entry. It fits
          * with room to spare, and the check below means a future limit that
          * outgrows it says so instead of quietly publishing a shorter list
          * than the pool actually serves. */
         char lj[4096];
         size_t lo = 0;
         int dropped = 0;
+        /* promised_min_diff is published alongside min_diff because the two
+         * now behave differently and the dashboard has to be able to tell
+         * them apart: min_diff is the rate-loop bound, which the network
+         * difficulty still overrides, while promised_min_diff is kept even
+         * when the chain is easier. A port over the chain on the first is
+         * quietly served less than it asked for; a port over the chain on
+         * the second gets what it asked for and discards blocks paying for
+         * it. Those are opposite findings and need opposite advice.
+         *
+         * listen_port never promises one. */
         lo += (size_t)snprintf(lj + lo, sizeof lj - lo,
                                "[{\"port\":%d,\"label\":\"\",\"min_diff\":%.10g,"
-                               "\"initial_diff\":%.10g}",
+                               "\"promised_min_diff\":0,\"initial_diff\":%.10g}",
                                cfg.listen_port, cfg.vardiff_min,
                                cfg.initial_diff);
         for (int i = 0; i < cfg.listener_count; ++i) {
@@ -985,9 +1010,11 @@ int main(int argc, char **argv) {
             char one[256];
             int n = snprintf(one, sizeof one,
                              ",{\"port\":%d,\"label\":\"%s\","
-                             "\"min_diff\":%.10g,\"initial_diff\":%.10g}",
+                             "\"min_diff\":%.10g,\"promised_min_diff\":%.10g,"
+                             "\"initial_diff\":%.10g}",
                              l->port, l->label,
                              l->vardiff_min > 0 ? l->vardiff_min : cfg.vardiff_min,
+                             l->min_diff,
                              l->initial_diff > 0 ? l->initial_diff : cfg.initial_diff);
             if (n < 0 || lo + (size_t)n >= sizeof lj - 2) { dropped++; continue; }
             memcpy(lj + lo, one, (size_t)n);
@@ -1110,6 +1137,7 @@ int main(int argc, char **argv) {
     stcfg.vardiff_max        = cfg.vardiff_max;
     stcfg.vardiff_window_sec = cfg.vardiff_window_sec;
     stcfg.idle_timeout_sec   = cfg.idle_timeout_sec;
+    stcfg.idle_timeout_authorized_sec = cfg.idle_timeout_authorized_sec;
     stcfg.max_submits_per_sec = cfg.max_submits_per_sec;
     stcfg.listener_count     = cfg.listener_count;
     for (int i = 0; i < cfg.listener_count; ++i) {
@@ -1159,7 +1187,53 @@ int main(int argc, char **argv) {
         return 7;
     }
     sctx.srv = srv;
-    stratum_server_set_job(srv, initial_job);
+    /* First job of the process: nobody is connected yet, so the flag reaches
+     * no one, but a new tip is what it describes. */
+    stratum_server_set_job(srv, initial_job, 1);
+
+    /* A port's promised floor and the chain can disagree, and the floor wins
+     * (see clamp_assigned_difficulty). When it does, every miner on that port
+     * filters locally at a target harder than the network's, so it discards
+     * blocks it solved rather than sending them — roughly (floor / network
+     * difficulty) of them. That is the deliberate price of being reachable by
+     * a rented fleet, and it is confined to the ports that asked for it, but
+     * it is not a price to pay silently.
+     *
+     * The dashboard health check reports the same mismatch. This says it at
+     * startup as well, because the operator who just changed the config is
+     * looking at the log, not the dashboard. */
+    if (cfg.listener_count > 0) {
+        uint8_t net_target_be[32] = {0};
+        if (tmpl->target_hex[0] != '\0' && strlen(tmpl->target_hex) == 64) {
+            if (hex_to_bytes_display(tmpl->target_hex, net_target_be, 32) < 0)
+                nbits_to_target(tmpl->bits, net_target_be);
+        } else {
+            nbits_to_target(tmpl->bits, net_target_be);
+        }
+        double net_diff = target_to_diff(net_target_be);
+        for (int i = 0; i < cfg.listener_count; ++i) {
+            double floor_diff = cfg.listeners[i].min_diff;
+            if (floor_diff <= 0.0 || net_diff <= 0.0) continue;
+            if (floor_diff <= net_diff) continue;
+            char who[64];
+            if (cfg.listeners[i].label[0]) {
+                snprintf(who, sizeof who, "%d (%s)",
+                         cfg.listeners[i].port, cfg.listeners[i].label);
+            } else {
+                snprintf(who, sizeof who, "%d", cfg.listeners[i].port);
+            }
+            LOG_WARN("listener port %s promises min_diff %.0f, above this "
+                     "chain's network difficulty %.2f. That floor is kept — a "
+                     "marketplace measures the difficulty on the wire — so "
+                     "miners on this port will discard roughly %.0f of every "
+                     "%.0f blocks they solve, because they filter locally at "
+                     "the difficulty the pool assigns. Drop min_diff on this "
+                     "port if keeping every block matters more than serving "
+                     "rented hashrate on it.",
+                     who, floor_diff, net_diff,
+                     floor_diff / net_diff - 1.0, floor_diff / net_diff);
+        }
+    }
     bitcoind_template_free(tmpl);
 
     LOG_INFO("stratum listening on %s:%d (difficulty from %g)",

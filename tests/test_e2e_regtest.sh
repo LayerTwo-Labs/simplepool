@@ -179,7 +179,13 @@ pool_btc_address = ${POOL_BTC_ADDR}
 pps_sats_per_diff = 10000000000
 
 # Clamped down to the network difficulty at connect time, so any nonce
-# that finds a block also passes the share check (see cpuminer.js)
+# that finds a block also passes the share check (see cpuminer.js).
+#
+#
+# No `listener` line here, so no port promises a floor and the clamp applies
+# as it always has. A rental listener's min_diff WOULD override it, which is
+# why a regtest config must not declare one: a single-CPU miner on a chain at
+# difficulty 4.66e-10 is exactly the case that floor is not meant for.
 initial_diff = 0.0000001
 vardiff_enabled = 0
 

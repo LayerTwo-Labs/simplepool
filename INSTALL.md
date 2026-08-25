@@ -450,6 +450,14 @@ vardiff_min        = 1
 vardiff_max        = 1e12
 vardiff_window_sec = 30
 
+# Rented hashrate needs its own port and its own floor. min_diff is kept even
+# where the chain is easier, which costs blocks on that port — see
+# proxy.conf.example.
+# listener = port=3335 min_diff=65536 label=braiins
+
+idle_timeout_sec            = 600    # socket that never authorized
+idle_timeout_authorized_sec = 7200   # a working miner between shares
+
 db_path = /home/simplepool/data/shares.db
 log_level = info
 ```

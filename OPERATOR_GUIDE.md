@@ -368,29 +368,41 @@ sudo simplepoolctl doctor
 The dashboard's identity strip then lists every port with what it is for,
 so miners can pick without asking you.
 
-### Check the chain can actually back it
+### Check what the chain costs you
 
-**A port cannot exceed the chain.** Share difficulty is never raised above
-the network difficulty, because a miner filters locally against the
-stratum target — a harder share target throws away valid blocks before
-the pool ever sees them. So a 500000 port on a chain sitting at difficulty
-1200 really serves 1200, the marketplace measures what it was given, and
-the order is cancelled.
+Share difficulty is normally capped at the network difficulty, because a
+miner filters locally against the stratum target — a harder share target
+throws away valid blocks before the pool ever sees them.
 
-That means Braiins needs network difficulty **>= 65536** and NiceHash
-**>= 500000** before the matching port means anything. On mainnet this is
-never a concern. On a young forknet it is the whole question.
+**`min_diff` overrides that cap, on purpose.** Without the override a 500000
+port on a chain at difficulty 1200 really serves 1200, the marketplace
+measures what it was given, and the order is cancelled with nothing in your
+logs explaining it. So a port that states `min_diff` gets that difficulty
+held for it.
 
-You do not have to work it out by hand: the dashboard runs a **"Stratum
-ports can hold their difficulty"** health check and puts the gap in the
-banner —
+**What you pay is blocks.** Miners on that port filter at the promised
+difficulty, so they discard solutions the chain would have accepted —
+roughly `min_diff / network_difficulty` of them. At 500000 over 1200 that is
+about 416 of every 417. Nothing else on the pool is affected: `listen_port`
+and any listener without a `min_diff` are capped exactly as before.
+
+You do not have to work either half out by hand. The pool warns at startup
+for every port in this position, and the dashboard runs a **"Stratum ports
+can hold their difficulty"** health check that distinguishes the two cases —
+
+> port 3335 (braiins) promises min_diff 65536 and the pool is holding it,
+> but network difficulty is only 1200. Miners there ... discard roughly 53
+> of every 55 blocks they solve
+
+versus, for a port that set no `min_diff`:
 
 > port 3336 (nicehash) is configured for difficulty 500000 but network
 > difficulty is only 1200, so miners there are served 1200 instead
 
-If you see that, either wait for the chain to retarget or drop the port's
-`min_diff` to something the chain supports — and know that a marketplace
-with a floor above it cannot be served at all until the chain catches up.
+The first is a bill; decide whether the rented hashrate is worth it, or drop
+that port's `min_diff`. The second is a port that will not satisfy the
+marketplace at all — add `min_diff` if you want it held, or wait for the
+chain to retarget.
 
 ### Before you tell them to send an order
 

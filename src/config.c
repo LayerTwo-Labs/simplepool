@@ -23,6 +23,11 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     snprintf(cfg->listen_addr, sizeof cfg->listen_addr, "%s", "0.0.0.0");
     cfg->listen_port  = 3334;
     cfg->max_conns    = 500;
+    /* Still 1, and deliberately: the port carries the difficulty policy now,
+     * so a config that names no listeners binds precisely what it always did.
+     * A marketplace-grade starting difficulty belongs on a rental listener
+     * (`listener = port=3335 min_diff=65536`), not on the port home miners
+     * are already pointed at. */
     cfg->initial_diff = 1.0;
     /* Far above any correctly configured miner and far below what one
      * mismatched connection can otherwise cost. See proxy.conf.example. */
@@ -53,6 +58,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->vardiff_max        = 1e12;
     cfg->vardiff_window_sec = 30;
     cfg->idle_timeout_sec   = 600;    /* 10 min silent recv → reap */
+    cfg->idle_timeout_authorized_sec = 7200;  /* 2 h once a miner is working */
 
     cfg->redis_url[0] = '\0';
     cfg->redis_publish_timeout_ms   = 200;
@@ -149,6 +155,10 @@ static int parse_listener(const char *v, stratum_listener_t *out,
         }
     }
     out->vardiff_min  = min_diff;
+    /* Recorded separately from vardiff_min so the server can tell "this port
+     * promised a floor" from "this port inherited the server-wide rate-loop
+     * bound". Only the former survives the network-difficulty ceiling. */
+    out->min_diff     = min_diff;
     out->initial_diff = initial > 0.0 ? initial : min_diff;
     if (out->vardiff_max > 0.0 && out->initial_diff > out->vardiff_max) {
         set_err(errbuf, errlen,
@@ -239,6 +249,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "vardiff_max")               == 0) cfg->vardiff_max = atof(v);
         else if (strcmp(k, "vardiff_window_sec")        == 0) cfg->vardiff_window_sec = atoi(v);
         else if (strcmp(k, "idle_timeout_sec")          == 0) cfg->idle_timeout_sec = atoi(v);
+        else if (strcmp(k, "idle_timeout_authorized_sec") == 0) cfg->idle_timeout_authorized_sec = atoi(v);
         else if (strcmp(k, "db_path")                   == 0) copy_str(cfg->db_path, sizeof cfg->db_path, v);
         else if (strcmp(k, "commit_window_ms")          == 0) cfg->commit_window_ms = atoi(v);
         else if (strcmp(k, "commit_max_shares")         == 0) cfg->commit_max_shares = atoi(v);
@@ -355,6 +366,20 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                         cfg->listeners[i].port);
                 return -12;
             }
+        }
+    }
+    /* A rental port whose floor is under the marketplace threshold is legal —
+     * an operator may have a private customer with other requirements — but
+     * it is the setting that gets a public port refused, so name it rather
+     * than let it pass unremarked. Braiins wants 1024 minimum and 65536
+     * recommended; NiceHash wants 500000. */
+    for (int i = 0; i < cfg->listener_count; ++i) {
+        if (cfg->listeners[i].min_diff > 0.0 &&
+            cfg->listeners[i].min_diff < 1024.0) {
+            LOG_WARN("config: listener port %d promises min_diff %.0f, below "
+                     "the 1024 floor rented-hashrate marketplaces require; a "
+                     "port advertised for rental at this level can be refused",
+                     cfg->listeners[i].port, cfg->listeners[i].min_diff);
         }
     }
     return 0;

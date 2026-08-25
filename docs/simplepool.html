@@ -585,9 +585,14 @@ footer .wrap > p { max-width: 46rem; }
       <h4>Tip watcher</h4>
       <p>
         A background thread re-fetches <code>getblocktemplate</code> every
-        <code>bitcoind_poll_interval_ms</code> (default 30 s). On a new tip the
-        job is rebuilt and broadcast to every connection with
-        <code>clean_jobs = true</code>.
+        <code>bitcoind_poll_interval_ms</code> (default 30 s). The job is
+        rebuilt on a new tip, and also on a timer to pick up a fresher ntime
+        and newly arrived transactions. Only the tip change carries
+        <code>clean_jobs = true</code>: it is an instruction to throw away work
+        in flight, and it is true only when the chain has moved under the
+        miner. The periodic refresh sends <code>clean_jobs = false</code>, and
+        the pool goes on accepting submits against the older job out of its
+        retention ring.
       </p>
     </li>
     <li>
@@ -866,21 +871,30 @@ listener = port=3336 min_diff=500000 label=nicehash</code></pre>
   </p>
 
   <div class="warnbox">
-    <span class="label">A port cannot exceed the chain</span>
+    <span class="label">A port above the chain costs blocks</span>
     <p>
-      Share difficulty is never raised above the <em>network</em> difficulty,
-      because a miner filters locally against the stratum target: a share target
-      harder than the network target would make it discard valid blocks before
-      the pool ever saw them. A port configured for 500000 on a chain sitting at
-      1200 therefore serves 1200 — correctly, and silently.
+      By default share difficulty is never raised above the <em>network</em>
+      difficulty, because a miner filters locally against the stratum target: a
+      share target harder than the network target makes it discard valid blocks
+      before the pool ever sees them. A port configured for 500000 on a chain
+      sitting at 1200 therefore serves 1200 — correctly, and silently.
     </p>
     <p>
-      So Braiins needs network difficulty ≥ 65536 and NiceHash ≥ 500000 before
-      the matching port means anything at all. On mainnet this never comes up;
-      on a young forknet it is the whole question. The dashboard reports the gap
-      directly — the <em>“Stratum ports can hold their difficulty”</em> health
-      check names both numbers — rather than leaving it to be discovered when an
-      order is cancelled.
+      Silently is the problem. A marketplace measures the difficulty it was
+      actually handed, not the one the port advertises, and cancels the order
+      without the pool ever learning why. So a listener may state
+      <code>min_diff</code>, and that floor is <em>kept</em>: the port serves
+      what it promised even where the chain is easier.
+    </p>
+    <p>
+      What pays for it is blocks. At 500000 over a chain at 1200 the miners on
+      that port discard roughly 416 of every 417 solutions they find. That is a
+      real trade and it is confined to the ports that ask for it — a listener
+      without <code>min_diff</code>, and <code>listen_port</code> itself, are
+      clamped exactly as before. The pool warns at startup for every port in
+      that position and the dashboard reports it too: the <em>“Stratum ports
+      can hold their difficulty”</em> health check names both numbers, and says
+      which of the two things is happening.
     </p>
   </div>
 
@@ -922,8 +936,11 @@ listener = port=3336 min_diff=500000 label=nicehash</code></pre>
         <tr><td><code>vardiff_enabled</code></td><td>1</td><td>0 pins every connection to <code>initial_diff</code></td></tr>
         <tr><td><code>vardiff_target_spm</code></td><td>12</td><td>target shares per minute per connection</td></tr>
         <tr><td><code>vardiff_window_sec</code></td><td>30</td><td>how often to retarget</td></tr>
-        <tr><td><code>vardiff_min</code> / <code>vardiff_max</code></td><td>1 / 1e12</td><td>clamps</td></tr>
-        <tr><td><code>initial_diff</code></td><td>1</td><td>what a connection starts at</td></tr>
+        <tr><td><code>vardiff_min</code> / <code>vardiff_max</code></td><td>1 / 1e12</td><td>clamps for <code>listen_port</code>; a <code>listener</code> overrides them per port</td></tr>
+        <tr><td><code>initial_diff</code></td><td>1</td><td>what a connection on <code>listen_port</code> starts at</td></tr>
+        <tr><td><code>listener</code> … <code>min_diff</code></td><td>unset</td><td>the floor that port <em>promises</em>. Unlike <code>vardiff_min</code> it is kept even where the network difficulty is lower, because a marketplace measures the difficulty on the wire and cancels an order that arrives under what the port advertised. The cost is that miners on that port discard blocks they solved; the pool warns at startup and the dashboard health check reports it. A port that sets no <code>min_diff</code> — including <code>listen_port</code> — is clamped to the network difficulty exactly as before.</td></tr>
+        <tr><td><code>idle_timeout_sec</code></td><td>600</td><td>reap a socket that has not authorized</td></tr>
+        <tr><td><code>idle_timeout_authorized_sec</code></td><td>7200</td><td>reap an authorized miner. Much longer on purpose: silence between shares is a working miner's normal state, not an idle connection.</td></tr>
       </tbody>
     </table>
   </div>
@@ -1654,13 +1671,16 @@ sudo simplepoolctl uninstall    # --purge also deletes the ledger</code></pre>
       earn nothing for that height. That is the design, not a shortfall.
     </li>
     <li>
-      <strong>It cannot serve a difficulty its chain cannot back.</strong> Share
-      difficulty is clamped to the network difficulty, because a miner filters
-      locally and a harder share target would make it discard valid blocks. So a
-      hashrate marketplace whose floor sits above the chain's own difficulty
-      cannot be served at all until the chain catches up — no port setting
-      changes that. The dashboard says so plainly rather than letting it be found
-      out when an order is cancelled.
+      <strong>Serving a difficulty its chain cannot back costs blocks.</strong>
+      Share difficulty is clamped to the network difficulty by default, because
+      a miner filters locally and a harder share target makes it discard valid
+      blocks. A rental port can override that clamp with <code>min_diff</code>
+      — it has to, since a marketplace measures the wire — but it buys
+      reachability with the blocks those miners then throw away. Until the chain
+      catches up, serving a marketplace whose floor sits above it is a choice
+      with a price, not a free setting. The pool warns at startup and the
+      dashboard says so plainly, rather than letting either half be found out
+      when an order is cancelled.
     </li>
     <li>
       <strong>The submit ceiling bounds a flood, it does not end one.</strong> A

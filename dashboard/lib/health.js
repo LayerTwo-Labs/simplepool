@@ -223,6 +223,41 @@ export function health(handle) {
          * that looks fine. */
         const asks = l => Math.max(Number(l?.initial_diff || 0),
                                    Number(l?.min_diff || 0));
+        const promised = l => Number(l?.promised_min_diff || 0);
+
+        /* Two findings, not one, and they point opposite ways.
+         *
+         * A port that PROMISED a floor (min_diff on its listener line) keeps
+         * it: the pool serves that difficulty even though the chain is
+         * easier, because a marketplace measures the wire and cancels an
+         * order that comes in under what the port advertised. The port works;
+         * what it costs is blocks, since the miner filters locally at the
+         * assigned difficulty and throws away solutions the chain would have
+         * taken. That is a deliberate trade and the operator should see its
+         * size, so report it first — it is the one losing money.
+         *
+         * A port merely CONFIGURED high (initial_diff or vardiff_min, no
+         * promise) is clamped down to the chain and quietly serves less than
+         * it says. Nothing is lost, but rented hashrate pointed at it will
+         * read the pool as below its floor. */
+        const kept = ls.filter(l => promised(l) > actual);
+        if (kept.length > 0) {
+            const worst = kept.reduce((a, b) => (promised(a) > promised(b) ? a : b));
+            const ratio = promised(worst) / actual;
+            return {
+                ok: false,
+                value: kept.length,
+                detail: `port ${worst.port}${worst.label ? ` (${worst.label})` : ''} ` +
+                        `promises min_diff ${promised(worst).toFixed(0)} and the ` +
+                        `pool is holding it, but network difficulty is only ` +
+                        `${actual.toFixed(0)}. Miners there filter locally at the ` +
+                        `promised difficulty, so they discard roughly ` +
+                        `${(ratio - 1).toFixed(0)} of every ${ratio.toFixed(0)} ` +
+                        `blocks they solve. Drop min_diff on this port if keeping ` +
+                        `every block matters more than serving rented hashrate on it`,
+            };
+        }
+
         const over = ls.filter(l => asks(l) > actual);
         if (over.length === 0) {
             return { ok: true, value: ls.length, detail: null };
@@ -235,10 +270,10 @@ export function health(handle) {
                     `is configured for difficulty ` +
                     `${asks(worst).toFixed(0)} but network ` +
                     `difficulty is only ${actual.toFixed(0)}, so miners there ` +
-                    `are served ${actual.toFixed(0)} instead — raising it ` +
-                    `above the chain would discard valid blocks. Rented ` +
-                    `hashrate measuring this port will read it as below its ` +
-                    `floor`,
+                    `are served ${actual.toFixed(0)} instead. It sets no ` +
+                    `min_diff, so nothing is holding the difficulty up — ` +
+                    `rented hashrate measuring this port will read it as ` +
+                    `below its floor`,
         };
     }));
 
