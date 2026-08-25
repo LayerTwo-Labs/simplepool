@@ -1001,6 +1001,11 @@ listener = port=3336 min_diff=500000 label=nicehash</code></pre>
         <tr><td><code>listener</code> … <code>min_diff</code></td><td>unset</td><td>the floor that port <em>promises</em>. Unlike <code>vardiff_min</code> it is kept even where the network difficulty is lower, because a marketplace measures the difficulty on the wire and cancels an order that arrives under what the port advertised. The cost is that miners on that port discard blocks they solved; the pool warns at startup and the dashboard health check reports it. A port that sets no <code>min_diff</code> — including <code>listen_port</code> — is clamped to the network difficulty exactly as before.</td></tr>
         <tr><td><code>idle_timeout_sec</code></td><td>600</td><td>reap a socket that has not authorized</td></tr>
         <tr><td><code>idle_timeout_authorized_sec</code></td><td>7200</td><td>reap an authorized miner. Much longer on purpose: silence between shares is a working miner's normal state, not an idle connection.</td></tr>
+        <tr><td><code>max_conns</code></td><td>500</td><td>concurrent stratum connections across every listener; past it, accept closes immediately. Each one costs a thread and an fd.</td></tr>
+        <tr><td><code>pps_min_network_difficulty</code></td><td>0</td><td>pps-classic only. Below this network difficulty nothing accrues — see <a href="#pps">When fair value stops being fair</a>. 0 disables the check, which is only safe on a chain whose difficulty is already calibrated.</td></tr>
+        <tr><td><code>pps_refuse_shares_below_min</code></td><td>1</td><td>while accrual is suspended, refuse authorize and reject submits rather than accepting work that will not be credited. Turn off only if the miners are yours.</td></tr>
+        <tr><td><code>block_interval_sec</code></td><td>600</td><td>target seconds between blocks. Feeds both the difficulty floor and the automatic issuance ceiling. Change it only for a chain that genuinely retargets to a different interval.</td></tr>
+        <tr><td><code>redis_publish_timeout_ms</code> / <code>redis_reconnect_backoff_ms</code></td><td>200 / 2000</td><td>bounds on the optional Redis broadcast. SQLite stays the source of truth, so a slow or absent Redis costs a timeout and nothing else.</td></tr>
       </tbody>
     </table>
   </div>
@@ -1150,6 +1155,78 @@ credit_per_share = floor(difficulty × rate)   # truncated to whole sats</code><
       <code>fee_bps</code> — and it cannot track difficulty. The proxy logs the
       fee your pinned value actually implies and warns when that disagrees with
       <code>fee_bps</code> by more than 25 bps. Leave it commented out.
+    </p>
+  </div>
+
+  <h3>When fair value stops being fair</h3>
+  <p>
+    The derived rate is a share's expected value, and that is only correct
+    while the pool's solutions can actually become blocks. A chain accepts one
+    block per interval however fast work arrives at it. So once the pool's own
+    difficulty throughput exceeds a block's worth per interval, the formula is
+    pricing shares against blocks that will never be minted — and it overstates
+    by exactly that ratio.
+  </p>
+  <p>
+    This is not a rounding error. A 40 TH/s pool on a forknet that began at
+    difficulty 1 accrued <strong>15,561,471 BTC</strong> of liability in under
+    four hours, against 943.60 BTC it had actually mined. Nothing was paid out
+    only because the payout worker had not run yet.
+  </p>
+  <p>
+    Two guards cover it, and they cover each other:
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Guard</th><th>What it is</th><th>Blind spot</th></tr></thead>
+      <tbody>
+        <tr><td><code>pps_min_network_difficulty</code></td>
+            <td>The operator's floor. Below this network difficulty nothing accrues at all. Works from the very first share.</td>
+            <td>Has to be set, and set correctly — it is 0 by default.</td></tr>
+        <tr><td>The issuance ceiling</td>
+            <td>Automatic, no configuration. Caps the rate at what the chain can actually mint, measured against the pool's observed difficulty per second.</td>
+            <td>Needs a hashrate measurement, so it cannot cover the first minute after a restart.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Set the floor to the difficulty at which <em>your pool alone</em> would find
+    one block per interval:
+  </p>
+  <pre><code>pps_min_network_difficulty = hashrate_H/s * block_interval_sec / 2^32
+
+  10 TH/s  →  ~1,400,000        100 TH/s →  ~14,000,000
+  40 TH/s  →  ~5,600,000          1 PH/s  →  ~140,000,000</code></pre>
+  <p>
+    That is a <em>floor</em>, not a target: you share the chain with everyone
+    else mining it, so the genuinely safe difficulty is higher. Leaving it at 0
+    is only safe on a chain whose difficulty is already calibrated — mainnet,
+    testnet, signet. On a young forknet during its difficulty ramp, 0 is how a
+    pool accrues millions of BTC of liability in minutes.
+  </p>
+
+  <div class="warnbox">
+    <span class="label">While the gate is closed, miners are turned away</span>
+    <p>
+      Accrual being suspended is not a quiet state. With
+      <code>pps_refuse_shares_below_min</code> on (the default),
+      <code>mining.authorize</code> is refused and submits are rejected, with
+      this reason:
+    </p>
+    <pre><code>pool is not crediting shares right now: network difficulty is
+below the minimum this pool will pay PPS at. Point your miner
+elsewhere until it retargets.</code></pre>
+    <p>
+      That is deliberate. The alternative — accepting work and crediting
+      nothing — is a miner mining for free without being told, which is worse
+      than being refused, because from the miner's side it is indistinguishable
+      from working. Turn it off only if the miners are yours and you know they
+      are working for nothing.
+    </p>
+    <p>
+      The gate applies to <strong>pps-classic only</strong>. Solo has no
+      accrual to suspend — it pays each miner from their own coinbase — so the
+      gate never touches it, whatever the chain's difficulty is doing.
     </p>
   </div>
 

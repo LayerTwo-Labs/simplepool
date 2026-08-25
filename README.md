@@ -54,7 +54,12 @@ This repository ships **both modes**, selected by `pool_mode` in
 - **`pool_mode = pps-classic`** — every accepted block's coinbase pays a
   single pool-owned BTC wallet (`pool_btc_address`) as a normal output.
   Each accepted share credits the miner's `pps_credits.accrued_sats` at
-  the configured `pps_sats_per_diff` rate; the operator batches the
+  a rate the proxy **derives from each block template** — the block's
+  own value over the network difficulty, net of `fee_bps` — so the
+  price of a share tracks the chain instead of going stale.
+  (`pps_sats_per_diff` exists to pin that rate and should be left
+  unset: a pinned value silently bypasses `fee_bps` and cannot follow a
+  retarget.) The operator batches the
   accumulated BTC into the pool's Thunder reserve from the admin
   dashboard, and a separate payout service (not in this binary) issues
   Thunder transactions to drain those credits to miners. Stratum
@@ -422,6 +427,10 @@ operator_address = bc1q...   # required: recipient of the fee_bps cut
 fee_bps          = 100       # 100 = 1%; valid range 0..1000 (max 10%)
 coinbase_tag     = /simplepool/ # short string baked into the coinbase scriptSig
 ```
+
+These are the keys you have to think about; every key the proxy accepts
+is documented inline in [`proxy.conf.example`](proxy.conf.example),
+which is the reference rather than this list.
 
 `fee_bps = 0` disables the fee output (single-payout coinbase, all to
 the miner). If the computed fee would be below the relay dust threshold
