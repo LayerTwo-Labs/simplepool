@@ -126,13 +126,14 @@ pick_port POOL_PORT
 pick_port INT_POOL_PORT
 pick_port RENTAL_A_PORT
 pick_port RENTAL_B_PORT
+pick_port RENTAL_C_PORT
 export REGTEST_BITCOIND_RPC_PORT REGTEST_BITCOIND_ZMQ_PORT \
        REGTEST_ENFORCER_RPC_PORT REGTEST_ENFORCER_GRPC_PORT
 export ENFORCER_URL="http://127.0.0.1:$REGTEST_ENFORCER_GRPC_PORT"
 echo "  bitcoind=$REGTEST_BITCOIND_RPC_PORT zmq=$REGTEST_BITCOIND_ZMQ_PORT" \
      "enforcer=$REGTEST_ENFORCER_RPC_PORT/$REGTEST_ENFORCER_GRPC_PORT" \
      "pool=$POOL_PORT smoke-pool=$INT_POOL_PORT" \
-     "rental=$RENTAL_A_PORT/$RENTAL_B_PORT"
+     "rental=$RENTAL_A_PORT/$RENTAL_B_PORT/$RENTAL_C_PORT"
 
 stage "wipe e2e data dir (fresh chain every run)"
 # Chain state must not leak between runs: a pre-activated sidechain or
@@ -181,11 +182,9 @@ pps_sats_per_diff = 10000000000
 # Clamped down to the network difficulty at connect time, so any nonce
 # that finds a block also passes the share check (see cpuminer.js).
 #
-#
-# No `listener` line here, so no port promises a floor and the clamp applies
-# as it always has. A rental listener's min_diff WOULD override it, which is
-# why a regtest config must not declare one: a single-CPU miner on a chain at
-# difficulty 4.66e-10 is exactly the case that floor is not meant for.
+# listen_port declares no min_diff, so nothing overrides that clamp here and
+# CPU mining stays possible. Only the rental listeners below promise a floor,
+# and cpuminer.js never dials those.
 initial_diff = 0.0000001
 vardiff_enabled = 0
 
@@ -196,6 +195,16 @@ vardiff_enabled = 0
 # would look identical — which would make this assert nothing.
 listener = port=${RENTAL_A_PORT} min_diff=1e-10 label=rental-a
 listener = port=${RENTAL_B_PORT} min_diff=3e-10 label=rental-b
+
+# And one ABOVE the chain's own difficulty, which is the case min_diff exists
+# for. Everything else about a rental port can be demonstrated below the
+# clamp; this is the one thing that cannot, because it IS the clamp being
+# overridden. A marketplace measures the difficulty on the wire, so a port
+# that promised 1e-8 has to serve 1e-8 even on a chain sitting at 4.66e-10 --
+# the alternative is an order cancelled for a reason nothing here records.
+# Nothing mines this port, so the blocks that trade costs are not at stake in
+# this run.
+listener = port=${RENTAL_C_PORT} min_diff=1e-8 label=rental-c
 
 # Low enough that a flood trips it immediately. cpuminer.js only submits
 # when it beats the NETWORK target — about one submit per run — so this
@@ -233,30 +242,36 @@ stage "assert every stratum port serves its own difficulty"
 # port a miner dials decides what it is handed.
 probe() { node "$ROOT/scripts/regtest/stratum-probe.js" --port "$1" --timeout 30; }
 
-# The rental difficulties above are only meaningful while they sit below the
-# chain's, because share difficulty is clamped to the network. Check that
-# rather than assume it: if regtest ever moves, this should say so plainly
-# instead of failing as a difficulty mismatch nobody can explain. WAL means
-# the live DB reads fine while the pool is running.
+# rental-a and rental-b are only meaningful while they sit below the chain's
+# difficulty: they are there to show that a port serves ITS OWN number, and
+# picking values under the ceiling keeps that separable from the floor. (The
+# floor itself is rental-c's job, above.) Check the assumption rather than
+# trust it: if regtest ever moves, this should say so plainly instead of
+# failing as a difficulty mismatch nobody can explain. WAL means the live DB
+# reads fine while the pool is running.
 NET_DIFF=$(sqlite3 "$POOL_DB" "SELECT COALESCE(network_difficulty,0) FROM pool_meta WHERE id = 1")
 echo "  network difficulty=$NET_DIFF"
 awk -v d="$NET_DIFF" 'BEGIN { exit !(d > 3e-10) }' || {
-    echo "FAIL: network difficulty $NET_DIFF is not above the 3e-10 this" >&2
-    echo "      stage configures — the clamp would flatten every port to the" >&2
-    echo "      same value and the assertions below would prove nothing." >&2
-    echo "      Lower the listener min_diff values in this script." >&2
+    echo "FAIL: network difficulty $NET_DIFF is not above the 3e-10 that" >&2
+    echo "      rental-a and rental-b configure — they would then be holding" >&2
+    echo "      floors rather than sitting under the ceiling, which is" >&2
+    echo "      rental-c's job, and this stage would prove it twice and the" >&2
+    echo "      clamp not at all." >&2
+    echo "      Lower the rental-a/rental-b min_diff values in this script." >&2
     exit 1
 }
 
 PROBE_D=$(probe "$POOL_PORT")
 PROBE_A=$(probe "$RENTAL_A_PORT")
 PROBE_B=$(probe "$RENTAL_B_PORT")
+PROBE_C=$(probe "$RENTAL_C_PORT")
 echo "  default  $PROBE_D"
 echo "  rental-a $PROBE_A"
 echo "  rental-b $PROBE_B"
+echo "  rental-c $PROBE_C"
 
 # The gate the marketplaces actually check, on every port.
-for p in "$PROBE_D" "$PROBE_A" "$PROBE_B"; do
+for p in "$PROBE_D" "$PROBE_A" "$PROBE_B" "$PROBE_C"; do
     echo "$p" | jq -e '.extranonce2_size >= 7' >/dev/null || {
         echo "FAIL: a port advertises extranonce2_size below 7" >&2; exit 1; }
 done
@@ -272,6 +287,22 @@ DIFF_A=$(echo "$PROBE_A" | jq -r '.difficulty')
 DIFF_B=$(echo "$PROBE_B" | jq -r '.difficulty')
 [ "$DIFF_A" != "$DIFF_B" ] || {
     echo "FAIL: both rental ports served the same difficulty" >&2; exit 1; }
+
+# rental-c promised a floor above the chain, and gets it. This is the single
+# assertion that a probe pointed at a rental port reads what the port
+# advertises rather than what the chain can back -- which is the whole reason
+# a marketplace can be served at all. Clamped, it would come back at
+# NET_DIFF (~4.66e-10) instead, four orders of magnitude down.
+echo "$PROBE_C" | jq -e '.difficulty > 0.9e-8 and .difficulty < 1.1e-8' >/dev/null || {
+    echo "FAIL: rental-c did not hold its promised min_diff above the" >&2
+    echo "      network difficulty — it served $(echo "$PROBE_C" | jq -r .difficulty)" >&2
+    exit 1; }
+
+# And the default port, which promised nothing, is still clamped down to the
+# chain. Both behaviours in one run: the floor is opt-in, not global.
+echo "$PROBE_D" | jq -e ".difficulty <= ($NET_DIFF * 1.01)" >/dev/null || {
+    echo "FAIL: the default port was not clamped to the network difficulty" >&2
+    exit 1; }
 
 stage "assert the submit ceiling refuses a flood"
 # Against a job id that does not exist. The ceiling is checked before a
@@ -312,8 +343,15 @@ stage "assert the proxy published its ports"
 # is a banner that cannot tell a miner which port to use.
 LISTENERS=$(sqlite3 "$POOL_DB" "SELECT COALESCE(listeners,'') FROM pool_meta WHERE id = 1")
 echo "  listeners=$LISTENERS"
-echo "$LISTENERS" | jq -e 'length == 3' >/dev/null || {
-    echo "FAIL: pool_meta.listeners does not describe all three ports" >&2; exit 1; }
+echo "$LISTENERS" | jq -e 'length == 4' >/dev/null || {
+    echo "FAIL: pool_meta.listeners does not describe all four ports" >&2; exit 1; }
+# promised_min_diff is what lets the dashboard tell "holding a floor and
+# losing blocks" from "quietly serving less than advertised". They need
+# opposite advice, so publishing only one number cannot express both.
+echo "$LISTENERS" | jq -e 'map(select(.label == "rental-c" and .promised_min_diff > 0)) | length == 1' >/dev/null || {
+    echo "FAIL: pool_meta.listeners does not record the promised floor" >&2; exit 1; }
+echo "$LISTENERS" | jq -e 'map(select(.port == '"$POOL_PORT"' and .promised_min_diff == 0)) | length == 1' >/dev/null || {
+    echo "FAIL: the default port is published as promising a floor" >&2; exit 1; }
 echo "$LISTENERS" | jq -e 'map(select(.label == "rental-a")) | length == 1' >/dev/null || {
     echo "FAIL: labelled listener missing from pool_meta.listeners" >&2; exit 1; }
 

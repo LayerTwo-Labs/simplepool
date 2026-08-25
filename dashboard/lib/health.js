@@ -224,6 +224,11 @@ export function health(handle) {
         const asks = l => Math.max(Number(l?.initial_diff || 0),
                                    Number(l?.min_diff || 0));
         const promised = l => Number(l?.promised_min_diff || 0);
+        /* A difficulty is not necessarily >= 1 — on a forknet these are
+         * values like 3e-10, and toFixed(0) renders every one as "0". Print
+         * whole numbers plainly and small ones in the exponent form they are
+         * actually configured with. */
+        const fmt = x => (x >= 1 ? x.toFixed(0) : String(Number(x.toPrecision(3))));
 
         /* Two findings, not one, and they point opposite ways.
          *
@@ -248,9 +253,9 @@ export function health(handle) {
                 ok: false,
                 value: kept.length,
                 detail: `port ${worst.port}${worst.label ? ` (${worst.label})` : ''} ` +
-                        `promises min_diff ${promised(worst).toFixed(0)} and the ` +
+                        `promises min_diff ${fmt(promised(worst))} and the ` +
                         `pool is holding it, but network difficulty is only ` +
-                        `${actual.toFixed(0)}. Miners there filter locally at the ` +
+                        `${fmt(actual)}. Miners there filter locally at the ` +
                         `promised difficulty, so they discard roughly ` +
                         `${(ratio - 1).toFixed(0)} of every ${ratio.toFixed(0)} ` +
                         `blocks they solve. Drop min_diff on this port if keeping ` +
@@ -268,9 +273,9 @@ export function health(handle) {
             value: over.length,
             detail: `port ${worst.port}${worst.label ? ` (${worst.label})` : ''} ` +
                     `is configured for difficulty ` +
-                    `${asks(worst).toFixed(0)} but network ` +
-                    `difficulty is only ${actual.toFixed(0)}, so miners there ` +
-                    `are served ${actual.toFixed(0)} instead. It sets no ` +
+                    `${fmt(asks(worst))} but network ` +
+                    `difficulty is only ${fmt(actual)}, so miners there ` +
+                    `are served ${fmt(actual)} instead. It sets no ` +
                     `min_diff, so nothing is holding the difficulty up — ` +
                     `rented hashrate measuring this port will read it as ` +
                     `below its floor`,

@@ -376,7 +376,12 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
     for (int i = 0; i < cfg->listener_count; ++i) {
         if (cfg->listeners[i].min_diff > 0.0 &&
             cfg->listeners[i].min_diff < 1024.0) {
-            LOG_WARN("config: listener port %d promises min_diff %.0f, below "
+            /* %g, not %.0f: a difficulty is not necessarily >= 1. On a
+             * forknet these are values like 3e-10, and %.0f renders every
+             * one of them as "0" — a warning naming the wrong number is
+             * worse than no warning. Matches how config.c prints difficulty
+             * everywhere else. */
+            LOG_WARN("config: listener port %d promises min_diff %g, below "
                      "the 1024 floor rented-hashrate marketplaces require; a "
                      "port advertised for rental at this level can be refused",
                      cfg->listeners[i].port, cfg->listeners[i].min_diff);

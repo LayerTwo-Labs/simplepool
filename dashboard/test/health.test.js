@@ -461,6 +461,25 @@ test('the promised-floor finding wins over the merely-configured one', () => {
     assert.match(c.detail, /holding it/);
 });
 
+test('a forknet-scale difficulty is printed, not rounded away to zero', () => {
+    /* A difficulty is not necessarily >= 1. The regtest/forknet numbers are
+     * ~1e-10, and toFixed(0) turns every one of them into "0" — a banner
+     * naming the wrong number is worse than no banner, and it is exactly the
+     * chain where a floor above the network difficulty actually happens. */
+    const db = makeDb();
+    db.prepare('UPDATE pool_meta SET network_difficulty = 4.6565e-10, listeners = ?')
+      .run(JSON.stringify([
+          { port: 3335, label: 'rental-c', min_diff: 1e-8,
+            promised_min_diff: 1e-8, initial_diff: 1e-8 },
+      ]));
+    const c = health(db).checks.find(x => x.id === 'listener_difficulty');
+    assert.equal(c.ok, false);
+    assert.match(c.detail, /1e-8/);
+    assert.match(c.detail, /4\.66e-10/);
+    assert.doesNotMatch(c.detail, /min_diff 0\b/);
+    assert.doesNotMatch(c.detail, /is only 0\b/);
+});
+
 test('a port floored above the chain is reported even if it starts low', () => {
     /* initial_diff=1 with min_diff=500000: the miner connects at a difficulty
      * that looks perfectly normal, then vardiff tries to climb to the floor
