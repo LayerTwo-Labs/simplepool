@@ -247,9 +247,6 @@ struct stratum_server {
 struct stratum_conn {
     stratum_server_t *server;
     int fd;                  /* -1 in tests */
-    pthread_t thr;
-    int thr_started;
-
     uint8_t  extranonce1[STRATUM_EXTRANONCE1_SIZE];
     double   difficulty;
 
@@ -2158,15 +2155,31 @@ static void *listener_thread(void *arg) {
         conn_apply_listener(c, &ls->pol);
         atomic_fetch_add(&s->conn_count, 1);
         conn_register(s, c);
-        if (pthread_create(&c->thr, NULL, conn_thread, c) != 0) {
+        /* Detached, into a local handle. The moment this thread starts it
+         * owns `c` and frees it when the connection ends — which, for a peer
+         * that has already gone away, can happen before pthread_create() has
+         * even returned here. Touching `c` after this point, including its own
+         * thread handle, is a use-after-free. Nothing reads the handle later,
+         * so there is nothing to keep. */
+        pthread_attr_t attr;
+        if (pthread_attr_init(&attr) != 0) {
             conn_unregister(s, c);
             atomic_fetch_sub(&s->conn_count, 1);
             close(fd);
             stratum_conn_free_for_test(c);
             continue;
         }
-        pthread_detach(c->thr);
-        c->thr_started = 1;
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_t tid;
+        int prc = pthread_create(&tid, &attr, conn_thread, c);
+        pthread_attr_destroy(&attr);
+        if (prc != 0) {
+            conn_unregister(s, c);
+            atomic_fetch_sub(&s->conn_count, 1);
+            close(fd);
+            stratum_conn_free_for_test(c);
+            continue;
+        }
     }
     return NULL;
 }

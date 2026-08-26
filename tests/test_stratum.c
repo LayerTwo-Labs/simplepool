@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -341,6 +343,73 @@ static void test_submit_rejects_wrong_extranonce2_size(void) {
     free(out);
 
     stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* Accepting a connection whose peer has already gone away.
+ *
+ * listener_thread hands the new connection to a thread and then does a little
+ * bookkeeping on it. That thread owns the connection and frees it when the
+ * connection ends — so if the peer is already gone, it can finish before the
+ * bookkeeping runs, and the bookkeeping then lands on freed memory. One of the
+ * two touches is a write, which corrupts the allocator's own structures rather
+ * than merely reading rubbish, so the damage usually surfaces later and
+ * somewhere unrelated.
+ *
+ * Connecting and closing immediately, many times over, is the shape that hits
+ * it. Under -fsanitize=address this is reported at the touch; without a
+ * sanitizer it must simply not crash. */
+#define CHURN_ROUNDS 300
+
+static void test_accept_churn_peer_gone(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = NULL;
+    int port = 0;
+
+    /* Any free high port. Bind failure is an environment problem, not a test
+     * failure, so try a few and skip if the sandbox forbids listening. */
+    for (int p = 39331; p < 39341 && !s; ++p) {
+        stratum_cfg_t cfg = { .bind_port = p, .max_conns = CHURN_ROUNDS + 16,
+                               .initial_diff = 1.0,
+                               .ctx = &obs, .on_share = on_share,
+                               .on_reject = on_reject, .on_block = on_block };
+        snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+        if (stratum_server_start(&cfg, &s) == 0 && s) { port = p; break; }
+        s = NULL;
+    }
+    if (!s) {
+        fprintf(stderr, "SKIP accept-churn: could not bind a local port\n");
+        return;
+    }
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    int connected = 0;
+    for (int i = 0; i < CHURN_ROUNDS; ++i) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) continue;
+        if (connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0) {
+            connected++;
+            /* Abort rather than close politely: RST tears the connection down
+             * at once, so the server's thread reaches its teardown as early as
+             * possible — which is the whole point. */
+            struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+            setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+        }
+        close(fd);
+    }
+
+    /* Precondition: connections actually had to be established, or the accept
+     * path this test exists to exercise was never entered. */
+    CHECK(connected > 0);
+
+    /* Let the accept and teardown threads finish while the server is still up,
+     * so anything they corrupt is attributed here rather than at exit. */
+    sleep_ms(300);
     stratum_server_free(s);
 }
 
@@ -2055,6 +2124,7 @@ int main(void) {
     test_submit_unknown_job();
     test_submit_share_and_dedupe();
     test_submit_rejects_wrong_extranonce2_size();
+    test_accept_churn_peer_gone();
     test_authorize_rejects_non_address();
     test_authorize_address_with_label();
     test_block_wins_over_low_difficulty();
