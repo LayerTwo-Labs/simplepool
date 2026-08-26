@@ -61,6 +61,10 @@
  * above it so the entry is still there when the submit arrives. */
 #define JOB_DIFF_RING  16
 
+/* Upper bound on a single send() to a miner. Only reached by a peer that has
+ * stopped reading; a healthy miner drains these in microseconds. */
+#define SEND_TIMEOUT_SEC 10
+
 /* BIP320 reserved version-rolling bits (ASICBoost). Advertised in
  * mining.configure; only these block-header version bits may be rolled by a
  * miner, and a per-connection mask (this ANDed with the client's request) is
@@ -274,7 +278,21 @@ struct stratum_conn {
     /* Per-connection coinbase, rendered against the current job using
      * payout_address (miner) + cfg.operator_address (fee). Refreshed any
      * time we hand out a new notify for a job id we haven't rendered
-     * coinbase for yet. */
+     * coinbase for yet.
+     *
+     * cb_lock guards cb1/cb2/cb_for_job_id. conn_render_coinbase frees and
+     * replaces those buffers, and both the connection's own thread (on
+     * submit) and the thread swapping jobs (on broadcast) reach it for the
+     * same connection. The render and every read of what it produced must sit
+     * in one critical section: split them and the broadcast is free to release
+     * the buffers a submit is still copying.
+     *
+     * Innermost lock — never acquire another while holding it.
+     *
+     * One write is deliberately NOT under it: conn_clear_coinbase, on the way
+     * out. See its comment — the exclusivity there comes from conns_lock, and
+     * it has to, because the mutex is destroyed two lines later. */
+    pthread_mutex_t cb_lock;
     uint8_t *cb1;
     size_t   cb1_len;
     uint8_t *cb2;
@@ -345,6 +363,19 @@ struct stratum_conn {
     struct stratum_conn *next;  /* server->conns_head linked list */
 };
 
+/* Frees the rendered coinbase WITHOUT taking cb_lock, which is safe only
+ * because of where it is called from, so check that before moving it.
+ *
+ * Its one caller runs after conn_unregister has unlinked the connection under
+ * conns_lock — and conns_lock is held by the job broadcast for its entire
+ * traversal. So a broadcast already walking the list has finished and released
+ * it before unregister could acquire it, and no later broadcast can reach this
+ * connection at all. The connection belongs to this thread alone by then.
+ *
+ * That exclusivity is required regardless: the mutexes are destroyed
+ * immediately after, and destroying one another thread could still take is
+ * undefined however carefully this function locked. Taking cb_lock here would
+ * therefore buy the appearance of safety rather than safety. */
 static void conn_clear_coinbase(stratum_conn_t *c) {
     free(c->cb1); c->cb1 = NULL; c->cb1_len = 0;
     free(c->cb2); c->cb2 = NULL; c->cb2_len = 0;
@@ -602,7 +633,10 @@ static cJSON *make_notify_params(const stratum_job_t *j,
 
 /* Render a fresh coinbase for `c` against `job` using c->payout_address
  * and the server's operator_address / fee_bps / coinbase_tag. Caches into
- * c->cb1/cb2 keyed by job->job_id. Returns 0 ok, negative on error. */
+ * c->cb1/cb2 keyed by job->job_id. Returns 0 ok, negative on error.
+ *
+ * Caller must hold c->cb_lock, and must keep holding it for as long as it
+ * reads the cb1/cb2 this leaves behind. */
 static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                 const stratum_job_t *job) {
     if (!c->authorized || c->payout_address[0] == '\0') return -1;
@@ -1082,16 +1116,24 @@ static void send_current_notify(stratum_server_t *s, stratum_conn_t *c,
                                 char **buf, size_t *len, int clean) {
     pthread_rwlock_rdlock(&s->job_lock);
     stratum_job_t *cur = s->current_job;
-    if (cur && conn_render_coinbase(s, c, cur) == 0) {
-        cJSON *p = make_notify_params(cur, c->cb1, c->cb1_len,
-                                      c->cb2, c->cb2_len, clean);
-        if (p) {
-            emit_notification(buf, len, "mining.notify", p);
-            /* Only once the notify is really going out: an unsent job is one
-             * the miner cannot submit against, and recording it would put a
-             * stale difficulty in the ring under a live id. */
-            conn_record_job_difficulty(c, cur->job_id, c->difficulty);
+    cJSON *p = NULL;
+    if (cur) {
+        /* Render and serialize under cb_lock: make_notify_params copies the
+         * buffers into JSON, so once it returns the params no longer alias
+         * cb1/cb2 and the lock can go. */
+        pthread_mutex_lock(&c->cb_lock);
+        if (conn_render_coinbase(s, c, cur) == 0) {
+            p = make_notify_params(cur, c->cb1, c->cb1_len,
+                                   c->cb2, c->cb2_len, clean);
         }
+        pthread_mutex_unlock(&c->cb_lock);
+    }
+    if (p) {
+        emit_notification(buf, len, "mining.notify", p);
+        /* Only once the notify is really going out: an unsent job is one
+         * the miner cannot submit against, and recording it would put a
+         * stale difficulty in the ring under a live id. */
+        conn_record_job_difficulty(c, cur->job_id, c->difficulty);
     }
     pthread_rwlock_unlock(&s->job_lock);
 }
@@ -1482,7 +1524,9 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     /* Render this connection's coinbase for `job` if not cached. The
      * cache is keyed on job_id; submits against an older job retired into
      * the recent ring will rebuild on demand. */
+    pthread_mutex_lock(&c->cb_lock);
     if (conn_render_coinbase(s, c, job) < 0) {
+        pthread_mutex_unlock(&c->cb_lock);
         free(en2_bytes);
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
@@ -1492,16 +1536,24 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         return emit_response(buf, len, id, NULL, err);
     }
 
-    /* coinbase = cb1 || ex1 || ex2 || cb2 */
+    /* coinbase = cb1 || ex1 || ex2 || cb2, still under cb_lock: the job-swap
+     * thread re-renders this connection's coinbase on every broadcast, and
+     * dropping the lock between the render above and these copies is exactly
+     * the window where it frees the buffers being read. */
     size_t en1_len = sizeof c->extranonce1;
     size_t cb_len = c->cb1_len + en1_len + en2_len + c->cb2_len;
     uint8_t *cb = malloc(cb_len);
-    if (!cb) { free(en2_bytes); return -1; }
+    if (!cb) {
+        pthread_mutex_unlock(&c->cb_lock);
+        free(en2_bytes);
+        return -1;
+    }
     size_t off = 0;
     memcpy(cb + off, c->cb1, c->cb1_len);        off += c->cb1_len;
     memcpy(cb + off, c->extranonce1, en1_len);   off += en1_len;
     memcpy(cb + off, en2_bytes, en2_len);        off += en2_len;
-    memcpy(cb + off, c->cb2, c->cb2_len);   off += c->cb2_len;
+    memcpy(cb + off, c->cb2, c->cb2_len);        off += c->cb2_len;
+    pthread_mutex_unlock(&c->cb_lock);
     free(en2_bytes);
 
     uint8_t cb_txid_le[32];
@@ -1845,6 +1897,7 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     c->vd_window_min_achieved = HUGE_VAL;
     pthread_mutex_init(&c->write_lock, NULL);
     pthread_mutex_init(&c->jobdiff_lock, NULL);
+    pthread_mutex_init(&c->cb_lock, NULL);
     return c;
 }
 
@@ -1861,6 +1914,7 @@ void stratum_conn_free_for_test(stratum_conn_t *c) {
     conn_clear_coinbase(c);
     pthread_mutex_destroy(&c->write_lock);
     pthread_mutex_destroy(&c->jobdiff_lock);
+    pthread_mutex_destroy(&c->cb_lock);
     free(c);
 }
 
@@ -1889,6 +1943,7 @@ int stratum_conn_coinbase_for_test(stratum_server_t *s, stratum_conn_t *c,
     int rc = -1;
     pthread_rwlock_rdlock(&s->job_lock);
     stratum_job_t *j = s->current_job;
+    pthread_mutex_lock(&c->cb_lock);
     if (j && strcmp(j->job_id, job_id) == 0 &&
         conn_render_coinbase(s, c, j) == 0) {
         *cb1 = c->cb1; *cb1_len = c->cb1_len;
@@ -1896,6 +1951,7 @@ int stratum_conn_coinbase_for_test(stratum_server_t *s, stratum_conn_t *c,
         *en1 = c->extranonce1;
         rc = 0;
     }
+    pthread_mutex_unlock(&c->cb_lock);
     pthread_rwlock_unlock(&s->job_lock);
     return rc;
 }
@@ -1923,7 +1979,15 @@ static int write_all(int fd, const char *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
         ssize_t n = send(fd, buf + off, len - off, 0);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            /* EAGAIN/EWOULDBLOCK here is SO_SNDTIMEO firing: the peer has
+             * stopped reading and its socket buffer is full. Treat it as a
+             * write failure rather than retrying — the caller drops the
+             * connection, which is what keeps one stalled miner from holding
+             * up a broadcast that runs under conns_lock. */
+            return -1;
+        }
         off += (size_t)n;
     }
     return 0;
@@ -1959,6 +2023,17 @@ static int conn_socket_setup(int fd, int idle_timeout_sec) {
     (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
 #endif
 
+    /* Bound every write. Without this, send() to a miner that has stopped
+     * reading blocks until TCP gives up minutes later — and because job
+     * broadcast writes to each connection while holding conns_lock, one such
+     * miner freezes notifies for every other miner on the pool. */
+    {
+        struct timeval sndtv = { .tv_sec = SEND_TIMEOUT_SEC, .tv_usec = 0 };
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sndtv, sizeof(sndtv)) < 0) {
+            return -1;
+        }
+    }
+
     if (idle_timeout_sec > 0) {
         /* Poll interval: min(idle_timeout, 30s). Longer wastes the tail
          * of the timeout; shorter costs one recv wake per fd per interval
@@ -1981,6 +2056,18 @@ static void conn_register(stratum_server_t *s, stratum_conn_t *c) {
     c->next = s->conns_head;
     s->conns_head = c;
     pthread_mutex_unlock(&s->conns_lock);
+}
+
+/* Link `c` into the live-connection list with `fd`, so stratum_server_set_job
+ * renders and broadcasts to it. A test connection is otherwise invisible to
+ * that path (fd < 0 is skipped), and the concurrency between the job-swap
+ * thread and a submitting connection cannot be reached at all. The caller
+ * keeps ownership of the fd. */
+void stratum_conn_register_for_test(stratum_server_t *s, stratum_conn_t *c,
+                                    int fd) {
+    if (!s || !c) return;
+    c->fd = fd;
+    conn_register(s, c);
 }
 
 static void conn_unregister(stratum_server_t *s, stratum_conn_t *c) {
@@ -2110,8 +2197,14 @@ static void *conn_thread(void *arg) {
         }
     }
 done:
-    close(c->fd);
+    /* Unlink before closing, not after. While the connection is still on
+     * s->conns the job-broadcast thread may write to c->fd; once the fd is
+     * closed its number is free for accept() to hand straight back out, so a
+     * notify meant for the departing miner lands in whichever connection
+     * inherited the number. The listener's own error path already had this
+     * order. */
     conn_unregister(s, c);
+    close(c->fd);
     atomic_fetch_sub(&s->conn_count, 1);
     stratum_conn_free_for_test(c);
     return NULL;
@@ -2286,8 +2379,14 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
         send_current_notify(s, c, &out, &olen, clean_jobs ? 1 : 0);
         if (out) {
             pthread_mutex_lock(&c->write_lock);
-            write_all(c->fd, out, olen);
+            int wrc = write_all(c->fd, out, olen);
             pthread_mutex_unlock(&c->write_lock);
+            if (wrc < 0) {
+                /* Timed out or errored. Wake its own thread and let that run
+                 * the normal teardown — unregistering it here would free a
+                 * connection this loop is still walking. */
+                shutdown(c->fd, SHUT_RDWR);
+            }
             free(out);
         }
     }
@@ -2299,14 +2398,20 @@ void stratum_server_stop(stratum_server_t *s) {
     atomic_store(&s->stop, 1);
     for (int i = 0; i < s->listener_count; ++i) {
         struct stratum_listener_slot *ls = &s->listeners[i];
+        /* shutdown() is what breaks the listener out of accept(); the close
+         * has to wait until that thread has actually exited. Closing first
+         * frees the fd number while the listener may still be in accept() on
+         * it, so a concurrently-opened fd can land on the same number. */
         if (ls->fd >= 0) {
             shutdown(ls->fd, SHUT_RDWR);
-            close(ls->fd);
-            ls->fd = -1;
         }
         if (ls->thr_started) {
             pthread_join(ls->thr, NULL);
             ls->thr_started = 0;
+        }
+        if (ls->fd >= 0) {
+            close(ls->fd);
+            ls->fd = -1;
         }
     }
 }
