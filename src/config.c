@@ -65,6 +65,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->redis_reconnect_backoff_ms = 2000;
 
     snprintf(cfg->pool_mode, sizeof cfg->pool_mode, "%s", "solo");
+    cfg->pplns_window_diff_multiple = 2.0;
     cfg->pool_btc_address[0] = '\0';
     cfg->pps_sats_per_diff = 0.0;
     cfg->pps_min_network_difficulty = 0.0;
@@ -259,6 +260,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "redis_reconnect_backoff_ms")== 0) cfg->redis_reconnect_backoff_ms = atoi(v);
         else if (strcmp(k, "pool_mode")                 == 0) copy_str(cfg->pool_mode, sizeof cfg->pool_mode, v);
         else if (strcmp(k, "pool_btc_address")          == 0) copy_str(cfg->pool_btc_address, sizeof cfg->pool_btc_address, v);
+        else if (strcmp(k, "pplns_window_diff_multiple") == 0) cfg->pplns_window_diff_multiple = atof(v);
         else if (strcmp(k, "pps_sats_per_diff")         == 0) cfg->pps_sats_per_diff = atof(v);
         else if (strcmp(k, "pps_min_network_difficulty") == 0) cfg->pps_min_network_difficulty = atof(v);
         else if (strcmp(k, "block_interval_sec")        == 0) cfg->block_interval_sec = atoi(v);
@@ -305,12 +307,51 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                 "that mode stranded the block reward. Use 'pps-classic'.");
         return -5;
     }
-    if (strcmp(cfg->pool_mode, "solo")        != 0 &&
-        strcmp(cfg->pool_mode, "pps-classic") != 0) {
+    if (strcmp(cfg->pool_mode, "pplns") == 0) {
         set_err(errbuf, errlen,
-                "config: 'pool_mode' must be 'solo' or 'pps-classic', got '%s'",
+                "config: 'pool_mode = pplns' does not say which rail pays. "
+                "Use 'pplns-thunder' or 'pplns-btc' — an operator runs one or "
+                "the other, and the rail decides what a stratum username is");
+        return -5;
+    }
+    int mode_pplns = strcmp(cfg->pool_mode, "pplns-thunder") == 0 ||
+                     strcmp(cfg->pool_mode, "pplns-btc")     == 0;
+    if (strcmp(cfg->pool_mode, "solo")        != 0 &&
+        strcmp(cfg->pool_mode, "pps-classic") != 0 &&
+        !mode_pplns) {
+        set_err(errbuf, errlen,
+                "config: 'pool_mode' must be 'solo', 'pps-classic', "
+                "'pplns-thunder' or 'pplns-btc', got '%s'",
                 cfg->pool_mode);
         return -5;
+    }
+    if (mode_pplns) {
+        /* Same custody shape as pps-classic: the coinbase pays the pool, and
+         * the payout worker distributes. Without an address every rendered
+         * coinbase would fail at runtime instead of here. */
+        if (cfg->pool_btc_address[0] == '\0') {
+            set_err(errbuf, errlen,
+                    "config: 'pool_btc_address' is required when pool_mode=%s",
+                    cfg->pool_mode);
+            return -9;
+        }
+        if (!(cfg->pplns_window_diff_multiple > 0.0)) {
+            set_err(errbuf, errlen,
+                    "config: 'pplns_window_diff_multiple' must be > 0, got %g",
+                    cfg->pplns_window_diff_multiple);
+            return -13;
+        }
+        /* A window shorter than a block's expected work pays a block out
+         * across less work than it took to find, which rewards whoever
+         * happened to be connected at the moment rather than the work that
+         * actually produced it — and is precisely the hopping incentive
+         * PPLNS exists to remove. */
+        if (cfg->pplns_window_diff_multiple < 1.0) {
+            LOG_WARN("config: pplns_window_diff_multiple = %g is below 1.0 — "
+                     "the window covers less work than a block is expected to "
+                     "take, which rewards pool hopping",
+                     cfg->pplns_window_diff_multiple);
+        }
     }
     if (strcmp(cfg->pool_mode, "pps-classic") == 0) {
         /* pps_sats_per_diff is no longer required: unset means the rate is

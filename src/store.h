@@ -115,7 +115,48 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
                        const char *hash, const char *finder_name,
                        const char *finder_address,
                        int64_t reward_sats, int64_t fee_sats,
-                       int status, const char *submit_error);
+                       int status, const char *submit_error,
+                       double pplns_window_diff);
+
+/* Distribute every matured, confirmed, not-yet-distributed block across the
+ * PPLNS window that produced it. Returns the number of blocks distributed,
+ * or negative on error.
+ *
+ * Three gates decide what is eligible, and all three matter:
+ *
+ *   status = 'confirmed'   the chain took it. A candidate submitblock refused,
+ *                          or one reorged out, pays nothing.
+ *   confirmations >= maturity_confs
+ *                          a coinbase output is unspendable until 100 blocks
+ *                          deep. Crediting before that creates a balance the
+ *                          pool cannot fund, which is the reserve requirement
+ *                          PPLNS exists to avoid, reintroduced through the
+ *                          back door. Waiting also makes orphan reversal moot:
+ *                          100 confirmations deep, there is nothing to undo.
+ *   pplns_distributed = 0  crediting is additive, so a second pass over the
+ *                          same block doubles balances and leaves no trace in
+ *                          the numbers themselves.
+ *
+ * The window walks shares backwards from the block's own share, accumulating
+ * difficulty until it reaches the block row's pplns_window_diff. Each worker
+ * is credited
+ *
+ *     (reward_sats + fee_sats) * (1 - fee_bps/10000) * worker_diff / window_diff
+ *
+ * Transaction fees are included deliberately: unlike pure PPS, PPLNS shares
+ * what the block actually earned rather than a subsidy-only estimate.
+ *
+ * A young pool whose entire history is shorter than the window pays the full
+ * reward across whatever work exists, rather than scaling down. Scaling down
+ * would be arithmetically tidier but leaves an undistributed remainder with
+ * nowhere honest to go — it is the miners' block, and there is no third party
+ * with a claim on the difference.
+ *
+ * Each block is distributed in one transaction: every credit for that block
+ * lands, or none does and the latch stays clear so the next pass retries. */
+int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
+                           int *out_blocks, int *out_workers,
+                           char *errbuf, size_t errlen);
 
 /* Record an accepted share with the miner's payout_address so the worker
  * row can be tagged. payout_address may be NULL (legacy/tests). The

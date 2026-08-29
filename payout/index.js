@@ -19,6 +19,7 @@
 import { loadConfig }   from './lib/config.js';
 import { openDb }       from './lib/db.js';
 import { ThunderClient } from './lib/thunder.js';
+import { EnforcerWalletClient } from './lib/enforcer-wallet.js';
 import { startLoop, reportStuck, humanMs } from './lib/payout.js';
 import { startAdminHttp } from './lib/admin-http.js';
 
@@ -39,11 +40,27 @@ log.info(`  payout run every ${humanMs(cfg.intervalMs)} ` +
 log.info(`  min_sats=${cfg.minSats} max_per_tick=${cfg.maxPerTick}`);
 
 const db      = openDb(cfg.dbPath);
-const thunder = new ThunderClient({
-    url:  cfg.rpcUrl,
-    user: cfg.rpcUser,
-    pass: cfg.rpcPass,
-});
+
+/* The two rails present the same interface — balance, transferBatchDetailed,
+ * getTransaction, walletUtxos — so the payout loop below never branches on
+ * which one it is driving. Everything that makes a payout safe (the
+ * write-ahead row, one transaction per batch, credit only on confirmation)
+ * is rail-independent and is written once. */
+const thunder = cfg.rail === 'btc'
+    ? new EnforcerWalletClient({
+        addr:            cfg.enforcerAddr,
+        feeRateSatPerVb: cfg.feeRateSatPerVb,
+        passphrase:      cfg.walletPassphrase,
+      })
+    : new ThunderClient({
+        url:  cfg.rpcUrl,
+        user: cfg.rpcUser,
+        pass: cfg.rpcPass,
+      });
+log.info(cfg.rail === 'btc'
+    ? `  rail=btc (L1 via enforcer wallet at ${cfg.enforcerAddr}, ` +
+      `fee ${cfg.feeRateSatPerVb} sat/vB)`
+    : `  rail=thunder (${cfg.rpcUrl})`);
 
 /* Surface any in-flight rows older than 5 minutes — they're a crashed
  * payout that needs manual reconciliation. We never auto-resolve them

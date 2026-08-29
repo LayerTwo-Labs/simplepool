@@ -482,7 +482,10 @@ static int buf_append_json_line(char **buf, size_t *len, cJSON *obj) {
 /* Is PPS accrual currently suspended? While it is, work handed to this pool
  * earns nothing, so the pool says so rather than banking it silently. */
 static int pps_gated(const stratum_server_t *s) {
-    return s->cfg.pps_enabled && s->cfg.pps_refuse_shares_below_min &&
+    /* Keyed on pps_accrues, not on the gate pointer: main.c installs that
+     * pointer for every mode, so testing it would suspend solo and PPLNS —
+     * modes that never accrued anything to suspend. */
+    return s->cfg.pps_accrues && s->cfg.pps_refuse_shares_below_min &&
            s->cfg.pps_gate &&
            atomic_load_explicit(s->cfg.pps_gate, memory_order_relaxed) != 0;
 }
@@ -615,7 +618,7 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
     coinbase_parts_t parts = {0};
     char err[256] = {0};
     int rc;
-    if (s->cfg.pps_enabled) {
+    if (s->cfg.coinbase_pays_pool) {
         /* PPS-classic: every miner's coinbase is identical, paying the
          * pool's BTC wallet for the net-of-fee reward and the operator
          * address for the fee. The operator later moves accumulated BTC
@@ -1235,7 +1238,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     c->payout_address[addr_len] = '\0';
 
     char    derr[128] = {0};
-    if (s->cfg.pps_enabled) {
+    if (s->cfg.username_is_thunder) {
         /* Thunder address: 20-byte hash160 in plain base58. The
          * 's<n>_<base58>_<hex6>' deposit-format wrapper is rejected (see
          * thunder.c). We don't need the decoded bytes here — the coinbase

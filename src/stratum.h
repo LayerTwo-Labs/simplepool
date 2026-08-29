@@ -146,14 +146,14 @@ typedef struct {
     stratum_listener_t listeners[STRATUM_MAX_LISTENERS];
     int    listener_count;
     /* Coinbase split — in solo mode each connection's coinbase pays the
-     * miner directly. In PPS mode (pps_enabled=1) every coinbase instead
-     * pays the single pool-owned pool_btc_address. In both modes
+     * miner directly. When the reward is pooled (coinbase_pays_pool=1) every
+     * coinbase instead pays the single pool-owned pool_btc_address. In both
      * (value * fee_bps / 10000) goes to operator_address as a BTC fee. */
     char   operator_address[128];
     int    fee_bps;
     char   coinbase_tag[64];
 
-    /* PPS (pool_mode=pps-classic). When pps_enabled = 1:
+    /* Pooled modes (pps-classic, pplns-*). When coinbase_pays_pool = 1:
      *  - mining.authorize accepts Thunder addresses (base58 of 20-byte hash)
      *  - the share observer's payout_address argument is the miner's
      *    Thunder address (for PPS accrual), not a Bitcoin address.
@@ -162,7 +162,28 @@ typedef struct {
      *    fee. Deposits into Thunder happen off-band via the admin
      *    dashboard, not in the coinbase.
      */
-    int     pps_enabled;
+    /* Two independent facts that pool_mode used to conflate under a single
+     * "is this PPS" flag. They are independent because pplns-btc is the mode
+     * that separates them: it pools the reward like PPS, so the coinbase pays
+     * the pool, while paying out over L1 like solo, so the username is a
+     * Bitcoin address.
+     *
+     *   mode           coinbase pays   username
+     *   solo           the miner       bitcoin
+     *   pps-classic    the pool        thunder
+     *   pplns-thunder  the pool        thunder
+     *   pplns-btc      the pool        bitcoin
+     */
+    int     coinbase_pays_pool;
+    int     username_is_thunder;
+
+    /* Does this mode price a share when it arrives? Only pps-classic does.
+     * It is what the accrual gate suspends, so the gate must key on this and
+     * not on the gate pointer — main.c installs that pointer for every mode,
+     * and a mode with no per-share price has no accrual to suspend. Both
+     * PPLNS rails value a share only in hindsight, out of a block that was
+     * actually found, so there is nothing to misprice and nothing to gate. */
+    int     pps_accrues;
     char    pool_btc_address[128];   /* pps-classic: coinbase spendable output */
 
     /* Points at the proxy's PPS accrual gate — non-zero while network
