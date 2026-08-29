@@ -1000,7 +1000,7 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
         c->vd_window_start_ms = now;
         c->vd_window_shares = 0;
         c->vd_window_min_achieved = HUGE_VAL;
-    c->vd_window_max_assigned = 0.0;
+        c->vd_window_max_assigned = 0.0;
         return;
     }
     uint64_t elapsed_ms = now - c->vd_window_start_ms;
@@ -1948,6 +1948,14 @@ int stratum_conn_authorized_for_test(const stratum_conn_t *c) {
 }
 int stratum_conn_subscribed_for_test(const stratum_conn_t *c) {
     return c ? c->subscribed : 0;
+}
+
+void stratum_conn_rearm_vardiff_for_test(stratum_conn_t *c) {
+    if (!c) return;
+    c->vd_window_start_ms = now_ms();
+    c->vd_window_shares = 0;
+    c->vd_window_min_achieved = HUGE_VAL;
+    c->vd_window_max_assigned = 0.0;
 }
 
 /* ---- real connection thread ------------------------------------------ */
