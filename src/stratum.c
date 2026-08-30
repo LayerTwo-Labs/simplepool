@@ -2340,6 +2340,14 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     atomic_init(&s->conn_count, 0);
     atomic_init(&s->extranonce1_seq, (unsigned)now_ms());
 
+    /* Every slot's fd starts at -1, not the 0 calloc leaves behind. The
+     * bind_failed teardown closes each slot whose fd is >= 0 up to
+     * listener_count -- and listener_count is set before the bind loop runs,
+     * so a bind that fails partway leaves later slots untouched and still
+     * reading 0. Closing those would close descriptor 0: the process's stdin,
+     * on the way out of an otherwise ordinary startup failure. */
+    for (int i = 0; i < STRATUM_MAX_LISTENERS; ++i) s->listeners[i].fd = -1;
+
     /* Listener 0 is always bind_port on the server-wide defaults, so a config
      * naming no extra listeners binds exactly what it always did. The rest
      * come from cfg.listeners, each overriding the difficulty policy for the
