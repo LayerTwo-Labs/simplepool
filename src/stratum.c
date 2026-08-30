@@ -53,13 +53,40 @@
 /* Matches store.c's REASON_MAX so a submitblock reason survives the trip to
  * the DB intact rather than being truncated twice. */
 #define REASON_TEXT_MAX   128
-#define RECENT_JOBS    8
-#define RECENT_JOB_TTL_MS 60000
+/* How many retired jobs stay solvable, on top of the current one.
+ *
+ * These two constants must be read TOGETHER. The effective grace is
+ *
+ *     min(RECENT_JOB_TTL_MS, RECENT_JOBS x job cadence)
+ *
+ * and before this change the TTL always won: 8 slots at the default 30s
+ * cadence is 240s of capacity, but the TTL expired everything at 60s, so the
+ * ring never bound and its slots were dead capacity. "8 jobs x 30s = 4
+ * minutes" is the obvious arithmetic and it was wrong by 4x.
+ *
+ * The 60s window is strict. ckpool's equivalent cap is 600s, so a miner whose
+ * work arrives a little late -- a proxy, rented hashrate, anything with a hop
+ * in front of it -- is fine there and rejected here. */
+#define RECENT_JOBS    16
+/* ⚠️ The sweep is LAZY: retire_job() is its only caller and runs only when a
+ * new job is pushed, so the real grace is this value PLUS the time to the next
+ * job, and is unbounded if job production stalls. */
+#define RECENT_JOB_TTL_MS 300000
+/* Tie the two together so raising one without the other fails the build: the
+ * ring must be deep enough to still hold a job the TTL considers live, or the
+ * ring silently becomes the real window again.
+ * ⚠️ 30000 is bitcoind_poll_interval_ms's DEFAULT, not a law -- the cadence is
+ * configurable, so this checks the shipped configuration, not every one. */
+_Static_assert((uint64_t)RECENT_JOBS * 30000u >= RECENT_JOB_TTL_MS,
+               "retention ring too shallow for RECENT_JOB_TTL_MS at the default "
+               "job cadence: raise RECENT_JOBS or lower the TTL");
 /* Per-connection record of the difficulty each job went out under. Only jobs
  * find_job() can still resolve are ever submitted against -- the current one
- * plus RECENT_JOBS retired -- so anything past that is unreachable. Sized
- * above it so the entry is still there when the submit arrives. */
-#define JOB_DIFF_RING  16
+ * plus RECENT_JOBS retired -- so anything past that is unreachable. Derived
+ * from RECENT_JOBS, not a literal: it was 16 against a ring of 8, and raising
+ * the ring alone would have left the oldest solvable job with no difficulty
+ * entry, judging a correct submit at the wrong difficulty. */
+#define JOB_DIFF_RING  ((RECENT_JOBS + 1) * 2)
 
 /* Upper bound on a single send() to a miner. Only reached by a peer that has
  * stopped reading; a healthy miner drains these in microseconds. */
