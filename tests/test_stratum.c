@@ -1716,7 +1716,13 @@ static void test_job_survives_retirement_while_held(void) {
 
     /* Meanwhile the tip watcher churns through enough templates to push HELD
      * out of the retention ring entirely and free it. */
-    for (int i = 0; i < 24; ++i) {
+    /* ⚠️ Must exceed RECENT_JOBS, which lives in stratum.c and is not visible
+     * here -- so this count cannot be derived and has to be kept ahead of it by
+     * hand. It was 24 against a ring of 8; the ring is now 16. If it ever drops
+     * below the ring size, HELD stays findable, `gone == NULL` fails, and had
+     * the assertion been written the other way the test would have passed while
+     * exercising nothing. */
+    for (int i = 0; i < 64; ++i) {
         char jid[16];
         snprintf(jid, sizeof jid, "J%d", i);
         stratum_server_set_job(s, make_test_job(jid, net), 1);
