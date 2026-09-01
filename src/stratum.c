@@ -2290,7 +2290,12 @@ static void *listener_thread(void *arg) {
     struct stratum_listener_slot *ls = arg;
     stratum_server_t *s = ls->srv;
     while (!atomic_load(&s->stop)) {
-        struct sockaddr_in cli;
+        /* sockaddr_storage, not sockaddr_in: on an IPv6 or dual-stack listener
+         * accept() writes a sockaddr_in6, which does not fit an IPv4 struct.
+         * Passing the smaller one would have the kernel truncate the address
+         * silently — the connection is still accepted, so nothing here would
+         * ever look wrong. */
+        struct sockaddr_storage cli;
         socklen_t cl = sizeof(cli);
         int fd = accept(ls->fd, (struct sockaddr *)&cli, &cl);
         if (fd < 0) {
@@ -2400,21 +2405,67 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
 
     for (int i = 0; i < s->listener_count; ++i) {
         struct stratum_listener_slot *ls = &s->listeners[i];
-        ls->fd = socket(AF_INET, SOCK_STREAM, 0);
+        /* listen_addr selects the address family.
+         *
+         *   "" or "0.0.0.0"  -> IPv4 only, exactly as before
+         *   "::"             -> dual-stack: IPv6 and IPv4 both reach the pool
+         *   IPv4 literal     -> that IPv4 address only
+         *   IPv6 literal     -> that IPv6 address only (V6ONLY on)
+         *
+         * ⚠️ "0.0.0.0" deliberately does NOT become dual-stack, even though
+         * overloading it would deliver the fix to every existing deployment for
+         * free. Installing a new binary must not change listening behaviour
+         * nobody asked it to change. Setting listen_addr = :: turns it on, and
+         * the revert is one config line with no rebuild. */
+        int family = AF_INET, dual_stack = 0;
+        struct in6_addr v6;
+        const char *ba = cfg->bind_addr;
+        if (ba[0] == '\0' || strcmp(ba, "0.0.0.0") == 0) {
+            family = AF_INET;
+        } else if (strcmp(ba, "::") == 0) {
+            family = AF_INET6; dual_stack = 1; v6 = in6addr_any;
+        } else if (inet_pton(AF_INET6, ba, &v6) == 1) {
+            family = AF_INET6;
+        }
+
+        ls->fd = socket(family, SOCK_STREAM, 0);
         if (ls->fd < 0) goto bind_failed;
         int one = 1;
         setsockopt(ls->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        struct sockaddr_in addr = {0};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons((uint16_t)ls->pol.port);
-        if (cfg->bind_addr[0] == '\0' || strcmp(cfg->bind_addr, "0.0.0.0") == 0) {
-            addr.sin_addr.s_addr = htonl(INADDR_ANY);
-        } else {
-            if (inet_pton(AF_INET, cfg->bind_addr, &addr.sin_addr) != 1) {
+
+        if (family == AF_INET6) {
+            /* Set explicitly in BOTH directions rather than inherited. The
+             * default comes from net.ipv6.bindv6only, so leaving it alone makes
+             * the pool's listening behaviour depend on a host setting nobody
+             * records with the deployment. */
+            int v6only = dual_stack ? 0 : 1;
+            if (setsockopt(ls->fd, IPPROTO_IPV6, IPV6_V6ONLY,
+                           &v6only, sizeof(v6only)) < 0) {
+                LOG_ERROR("stratum: IPV6_V6ONLY=%d: %s", v6only, strerror(errno));
                 goto bind_failed;
             }
         }
-        if (bind(ls->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+
+        struct sockaddr_storage ss = {0};
+        socklen_t sslen;
+        if (family == AF_INET6) {
+            struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
+            a6->sin6_family = AF_INET6;
+            a6->sin6_port   = htons((uint16_t)ls->pol.port);
+            a6->sin6_addr   = v6;
+            sslen = sizeof(*a6);
+        } else {
+            struct sockaddr_in *a4 = (struct sockaddr_in *)&ss;
+            a4->sin_family = AF_INET;
+            a4->sin_port   = htons((uint16_t)ls->pol.port);
+            if (ba[0] == '\0' || strcmp(ba, "0.0.0.0") == 0) {
+                a4->sin_addr.s_addr = htonl(INADDR_ANY);
+            } else if (inet_pton(AF_INET, ba, &a4->sin_addr) != 1) {
+                goto bind_failed;
+            }
+            sslen = sizeof(*a4);
+        }
+        if (bind(ls->fd, (struct sockaddr *)&ss, sslen) < 0) {
             LOG_ERROR("stratum bind %s:%d: %s", cfg->bind_addr, ls->pol.port,
                       strerror(errno));
             goto bind_failed;

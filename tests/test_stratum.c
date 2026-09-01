@@ -2361,6 +2361,105 @@ static void test_failed_bind_does_not_close_stdin(void) {
     if (g_fail == 0) printf("ok: a failed bind leaves stdin alone\n");
 }
 
+
+/* ---- dual-stack listener ------------------------------------------------ */
+
+/* Connect to a started server over a chosen family and return the fd, or -1.
+ * Real sockets on purpose: what is under test is which families bind() and
+ * accept() actually serve, and stratum_conn_new_for_test never goes through
+ * accept() at all. */
+static int dial(int family, int port) {
+    int fd = socket(family, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_storage ss;
+    socklen_t len;
+    memset(&ss, 0, sizeof ss);
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *a = (struct sockaddr_in6 *)(void *)&ss;
+        a->sin6_family = AF_INET6;
+        a->sin6_port = htons((uint16_t)port);
+        a->sin6_addr = in6addr_loopback;
+        len = sizeof(*a);
+    } else {
+        struct sockaddr_in *a = (struct sockaddr_in *)(void *)&ss;
+        a->sin_family = AF_INET;
+        a->sin_port = htons((uint16_t)port);
+        a->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        len = sizeof(*a);
+    }
+    if (connect(fd, (struct sockaddr *)&ss, len) < 0) { close(fd); return -1; }
+    return fd;
+}
+
+/* Walks a small port range rather than insisting on one number. A fixed port
+ * makes this kind of test flaky: a back-to-back run can find the previous
+ * process's socket still lingering, and the bind then fails for a reason that
+ * has nothing to do with the code under test. Writes the port actually bound
+ * back through *port. */
+static stratum_server_t *start_on(const char *addr, int *port) {
+    for (int p = *port; p < *port + 20; p++) {
+        stratum_cfg_t cfg = { .bind_port = p, .max_conns = 8,
+                              .initial_diff = 1.0, .vardiff_enabled = 0 };
+        snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "%s", addr);
+        stratum_server_t *s = NULL;
+        if (stratum_server_start(&cfg, &s) != 0) continue;
+        uint8_t net[32]; memset(net, 0xff, sizeof net);
+        stratum_server_set_job(s, make_test_job("J1", net), 1);
+        *port = p;
+        return s;
+    }
+    return NULL;
+}
+
+/* The point of the change: with listen_addr = "::" an IPv6 client connects. */
+static void test_dual_stack_accepts_ipv6(void) {
+    int port = 39334;
+    stratum_server_t *s = start_on("::", &port);
+    if (!s) { printf("ok: dual-stack v6 skipped (no IPv6 on this host)\n"); return; }
+    int fd = dial(AF_INET6, port);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        sleep_ms(150);
+        close(fd);
+        sleep_ms(150);
+    }
+    stratum_server_free(s);
+    printf("ok: a dual-stack listener accepts an IPv6 client\n");
+}
+
+/* ...and IPv4 clients must keep working on the same socket, or turning this on
+ * would silently strand every existing miner. */
+static void test_dual_stack_still_accepts_ipv4(void) {
+    int port = 39364;
+    stratum_server_t *s = start_on("::", &port);
+    if (!s) { printf("ok: dual-stack v4 skipped (no IPv6 on this host)\n"); return; }
+    int fd = dial(AF_INET, port);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        sleep_ms(150);
+        close(fd);
+        sleep_ms(150);
+    }
+    stratum_server_free(s);
+    printf("ok: a dual-stack listener still accepts an IPv4 client\n");
+}
+
+/* 🔴 The gate, and the reason the other two mean anything. The default must not
+ * have changed: on "0.0.0.0" an IPv6 client is still refused. Without this an
+ * accepted-everywhere result would be equally consistent with the config gate
+ * having been ignored and every deployment silently becoming dual-stack. */
+static void test_ipv4_default_still_refuses_ipv6(void) {
+    int port = 39394;
+    stratum_server_t *s = start_on("0.0.0.0", &port);
+    CHECK(s != NULL);
+    if (!s) return;
+    int fd = dial(AF_INET6, port);
+    CHECK(fd < 0);
+    if (fd >= 0) close(fd);
+    stratum_server_free(s);
+    printf("ok: the IPv4 default still refuses an IPv6 client\n");
+}
+
 int main(void) {
     test_failed_bind_does_not_close_stdin();
     test_subscribe();
@@ -2404,6 +2503,9 @@ int main(void) {
     test_a_jsonrpc_response_does_not_close_the_connection();
     test_persistent_garbage_still_closes_the_connection();
     test_authorized_miner_gets_the_long_idle_budget();
+    test_dual_stack_accepts_ipv6();
+    test_dual_stack_still_accepts_ipv4();
+    test_ipv4_default_still_refuses_ipv6();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
