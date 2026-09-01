@@ -2460,7 +2460,131 @@ static void test_ipv4_default_still_refuses_ipv6(void) {
     printf("ok: the IPv4 default still refuses an IPv6 client\n");
 }
 
+
+/* ---- miner-requested difficulty ---------------------------------------- */
+
+static stratum_server_t *dr_server(obs_t *obs, double max_suggested) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                          .initial_diff = 1000.0,
+                          .vardiff_enabled = 1,
+                          .vardiff_target_spm = 12,
+                          .vardiff_min = 1.0,
+                          .vardiff_max = 1e12,
+                          .vardiff_window_sec = 30,
+                          .max_suggested_diff = max_suggested,
+                          .ctx = obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    if (stratum_server_start(&cfg, &s) != 0) return NULL;
+    uint8_t net[32] = {0}; net[7] = 0xff; net[8] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    return s;
+}
+
+/* Authorize with `pw` and return the difficulty the server announced. */
+static double dr_authorize(stratum_server_t *s, stratum_conn_t *c, const char *pw) {
+    char *out = NULL; size_t olen = 0; char msg[256];
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out = NULL; olen = 0;
+    snprintf(msg, sizeof msg,
+             "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" TEST_ADDR "\",\"%s\"]}", pw);
+    stratum_handle_message(s, c, msg, &out, &olen);
+    double d = stratum_conn_difficulty_for_test(c);
+    free(out);
+    return d;
+}
+
+/* The point of the feature: a request RAISES the connection. */
+static void test_password_diff_raises(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = dr_server(&obs, 1e9);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(dr_authorize(s, c, "x,d=50000") == 50000.0);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: d= in the password raises the connection's difficulty\n");
+}
+
+/* ⛔ A FLOOR, NOT A PIN. Asking for LESS than the pool assigned must not lower
+ * it — that is the denial-of-service the floor semantics exist to prevent, and
+ * it is the assertion most likely to be broken by a well-meaning change. */
+static void test_password_diff_never_lowers(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = dr_server(&obs, 1e9);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(dr_authorize(s, c, "d=1") == 1000.0);   /* initial_diff, not 1 */
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: a request below the assigned difficulty does not lower it\n");
+}
+
+static void test_request_is_capped(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = dr_server(&obs, 20000.0);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(dr_authorize(s, c, "d=999999999") == 20000.0);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: a request above max_suggested_diff is capped\n");
+}
+
+/* 🔴 <= 0 DISABLES, it does not uncap. The negative control for the two tests
+ * above: without it, "capped at 20000" and "feature switched off" would be
+ * indistinguishable from a single passing assertion. */
+static void test_zero_cap_disables_requests(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = dr_server(&obs, 0.0);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(dr_authorize(s, c, "d=50000") == 1000.0);   /* untouched */
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: max_suggested_diff <= 0 disables requests rather than uncapping\n");
+}
+
+/* `id=7` is not a difficulty request. Token-boundary matching, not substring. */
+static void test_password_diff_token_boundary(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = dr_server(&obs, 1e9);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *a = stratum_conn_new_for_test(s);
+    stratum_conn_t *b = stratum_conn_new_for_test(s);
+    CHECK(dr_authorize(s, a, "id=7") == 1000.0);
+    CHECK(dr_authorize(s, b, "x;d=7000") == 7000.0);
+    stratum_conn_free_for_test(a); stratum_conn_free_for_test(b);
+    stratum_server_free(s);
+    printf("ok: d= is matched at a token boundary, so id=7 is not a request\n");
+}
+
+/* mining.suggest_difficulty is the formal channel and must reach the same
+ * place, including when it arrives BEFORE authorize. */
+static void test_suggest_difficulty_before_authorize(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = dr_server(&obs, 1e9);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.suggest_difficulty\",\"params\":[25000]}",
+        &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.authorize\",\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen);
+    CHECK(stratum_conn_difficulty_for_test(c) == 25000.0);
+    free(out);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: suggest_difficulty before authorize survives to the first job\n");
+}
+
 int main(void) {
+    test_password_diff_raises();
+    test_password_diff_never_lowers();
+    test_request_is_capped();
+    test_zero_cap_disables_requests();
+    test_password_diff_token_boundary();
+    test_suggest_difficulty_before_authorize();
     test_failed_bind_does_not_close_stdin();
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
