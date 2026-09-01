@@ -281,6 +281,27 @@ struct stratum_conn {
     uint8_t  extranonce1[STRATUM_EXTRANONCE1_SIZE];
     double   difficulty;
 
+    /* Difficulty this miner asked for, via the stratum password `d=<n>` or
+     * mining.suggest_difficulty. 0 = none requested.
+     *
+     * ⚠️ This is a FLOOR, never a pin. Vardiff may raise the connection above
+     * it and the network-difficulty clamp still wins over it, but nothing
+     * lowers the connection below it.
+     *
+     * A pin would be a denial-of-service hole: `d=1` from a 400 TH/s miner is
+     * ~93,000 shares/sec aimed at the share pipeline. As a floor the same
+     * request is inert — max(1, whatever vardiff chose) is just vardiff's
+     * answer — while a miner asking to go HIGHER, which is the real request,
+     * gets exactly what it asked for.
+     *
+     * Why a miner needs this at all: vardiff tunes each CONNECTION toward
+     * vardiff_target_spm, but a proxied fleet spreads one rig over many
+     * connections, so the rig sees target_spm x N. At a uniform difficulty the
+     * rig's total share rate is H/(D*2^32) — the connection count cancels — so
+     * letting the miner name D is the one lever that works regardless of how
+     * its hashrate is split. */
+    double   requested_min_diff;
+
     /* Difficulty policy inherited from the listener this connection was
      * accepted on, resolved once at accept time so nothing downstream has to
      * know which port it came in on. Seeded from the server-wide defaults,
@@ -1131,6 +1152,13 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
      * can fall outside the window later without its own share rate changing
      * at all. Clamping only on a proposed change left those pinned wherever
      * they happened to be. */
+    /* A miner-requested difficulty is a floor: vardiff may raise this
+     * connection above it, never below. Without this the request lasts exactly
+     * one window — vardiff sees a rate under target (which is the POINT of a
+     * higher difficulty) and drags it straight back down. */
+    if (c->requested_min_diff > 0.0 && new_diff < c->requested_min_diff) {
+        new_diff = c->requested_min_diff;
+    }
     if (new_diff < c->pol_vardiff_min) new_diff = c->pol_vardiff_min;
     if (c->pol_vardiff_max > 0.0 && new_diff > c->pol_vardiff_max) {
         new_diff = c->pol_vardiff_max;
@@ -1285,12 +1313,129 @@ static int handle_configure(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     return emit_response(buf, len, id, result, NULL);
 }
 
+/* Pull a difficulty request out of a stratum password field.
+ *
+ * The near-universal convention is `d=<number>`, optionally among other comma-
+ * or semicolon-separated tokens (`x`, `d=4657000`, ...). cgminer, bosminer,
+ * Vnish and LuxOS all let the operator set this field, which is why it is the
+ * request channel with the widest reach.
+ *
+ * Returns 0 and writes *out on success, -1 if the field carries no usable
+ * `d=` token. */
+static int parse_password_diff(const char *pw, double *out) {
+    if (!pw || !out) return -1;
+    for (const char *p = pw; *p; ++p) {
+        /* Match `d=` only at a token boundary, so "id=7" is not a request. */
+        if ((p != pw) && p[-1] != ',' && p[-1] != ';' && p[-1] != ' ') continue;
+        if (p[0] != 'd' || p[1] != '=') continue;
+        char *end = NULL;
+        double v = strtod(p + 2, &end);
+        if (end == p + 2) return -1;              /* `d=` with no number */
+        if (!(v > 0.0) || v != v) return -1;      /* <= 0, or NaN */
+        *out = v;
+        return 0;
+    }
+    return -1;
+}
+
+/* Apply a miner's requested difficulty as a floor on this connection.
+ * Clamped to cfg.max_suggested_diff, then to the network difficulty — a share
+ * target harder than the network target makes the miner discard valid blocks
+ * locally before the pool ever sees them. */
+static void apply_requested_diff(stratum_server_t *s, stratum_conn_t *c,
+                                 double req) {
+    if (!(req > 0.0)) return;
+    /* <= 0 disables miner requests entirely. It still LOGS what was asked for,
+     * so an operator who has the feature switched off can measure how many
+     * miners already send `d=` out of habit from other pools before letting it
+     * change anything. Measure, then enable. */
+    if (s->cfg.max_suggested_diff <= 0.0) {
+        LOG_INFO("stratum: %s requested difficulty %.0f — requests DISABLED "
+                 "(max_suggested_diff <= 0), ignoring",
+                 c->worker_name[0] ? c->worker_name : "(unauthorized)", req);
+        return;
+    }
+    if (req > s->cfg.max_suggested_diff) {
+        LOG_INFO("stratum: %s requested difficulty %.0f above the cap %.0f — "
+                 "using the cap",
+                 c->worker_name[0] ? c->worker_name : "(unauthorized)",
+                 req, s->cfg.max_suggested_diff);
+        req = s->cfg.max_suggested_diff;
+    }
+    req = clamp_assigned_difficulty(s, c, req);
+    /* clamp_assigned_difficulty applies the network ceiling and this port's
+     * promised floor, but NOT its vardiff ceiling — so apply that here too.
+     * Without it a request above pol_vardiff_max is served immediately and only
+     * pulled back at the first retarget, leaving a whole vardiff window where
+     * the listener's stated ceiling is exceeded. */
+    if (c->pol_vardiff_max > 0.0 && req > c->pol_vardiff_max) {
+        req = c->pol_vardiff_max;
+    }
+    c->requested_min_diff = req;
+    if (c->difficulty < req) c->difficulty = req;
+}
+
+/* mining.suggest_difficulty: params[0] is the difficulty the miner wants.
+ * The formal stratum way to ask; `d=` in the password is the same request from
+ * firmware that cannot send this. Either may arrive before or after authorize,
+ * so this only records and applies — authorize re-applies it.
+ *
+ * No response is defined for this method, but answering `true` to a request
+ * carrying an id is harmless and keeps strict clients happy. */
+static int handle_suggest_difficulty(stratum_server_t *s, stratum_conn_t *c,
+                                     cJSON *id, cJSON *params,
+                                     char **buf, size_t *len) {
+    double req = 0.0;
+    if (cJSON_IsArray(params) && cJSON_GetArraySize(params) >= 1) {
+        cJSON *d = cJSON_GetArrayItem(params, 0);
+        if (cJSON_IsNumber(d)) req = d->valuedouble;
+    }
+    if (!(req > 0.0)) {
+        cJSON *err = make_error(20, "bad params");
+        return emit_response(buf, len, id, NULL, err);
+    }
+    /* No lock, matching the convention already in this file rather than
+     * asserting a stronger one: c->difficulty has a SINGLE writer — the
+     * connection's own thread, which is the thread handling this message.
+     * ⚠️ It is not unshared: the broadcast thread reads it unsynchronized in
+     * conn_record_job_difficulty when notifying a job. That read races the
+     * existing vardiff write exactly as it races these, so locking here alone
+     * would guard nothing. Anyone adding a broadcast-side WRITE breaks the
+     * single-writer property this relies on. */
+    double before = c->difficulty;
+    apply_requested_diff(s, c, req);
+    double after = c->difficulty;
+    /* ⛔ Only when a floor was actually set. With requests disabled
+     * apply_requested_diff has already logged why it ignored this, and a second
+     * line reading "-> floor 0" would claim the floor was set to zero — false,
+     * and the most alarming thing this subsystem could say. */
+    if (c->requested_min_diff > 0.0) {
+        LOG_INFO("stratum: %s suggested difficulty %.0f -> floor %.0f",
+                 c->worker_name[0] ? c->worker_name : "(unauthorized)",
+                 req, c->requested_min_diff);
+    }
+    /* Only tell an ALREADY-authorized miner; before authorize it has no job
+     * yet, and authorize emits the difficulty itself. */
+    if (c->authorized && after != before) send_set_difficulty(buf, len, after);
+    if (id) emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
+    return 0;
+}
+
 static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                             cJSON *params, char **buf, size_t *len) {
     const char *worker = NULL;
+    double pw_diff = 0.0;
     if (cJSON_IsArray(params) && cJSON_GetArraySize(params) >= 1) {
         cJSON *w = cJSON_GetArrayItem(params, 0);
         if (cJSON_IsString(w)) worker = w->valuestring;
+        /* params[1] is the password — the `d=<n>` request channel. */
+        if (cJSON_GetArraySize(params) >= 2) {
+            cJSON *p = cJSON_GetArrayItem(params, 1);
+            if (cJSON_IsString(p)) {
+                double v;
+                if (parse_password_diff(p->valuestring, &v) == 0) pw_diff = v;
+            }
+        }
     }
     if (!worker) {
         cJSON *err = make_error(24, "missing worker name");
@@ -1368,6 +1513,17 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     sanitize_worker(worker, c->worker_name, sizeof(c->worker_name));
     c->authorized = 1;
     if (c->difficulty <= 0) c->difficulty = c->pol_initial_diff;
+    /* A request may have arrived either way round: mining.suggest_difficulty
+     * before authorize, or `d=` in this very message. Apply whichever we have,
+     * preferring the password since it is part of the request being handled. */
+    {
+        double req = pw_diff > 0.0 ? pw_diff : c->requested_min_diff;
+        if (req > 0.0) {
+            apply_requested_diff(s, c, req);
+            LOG_INFO("stratum: %s requested difficulty %.0f (floor)",
+                     c->worker_name, c->requested_min_diff);
+        }
+    }
     /* Same ceiling and floor vardiff applies, so the very first
      * set_difficulty a miner sees already obeys both — which is the whole
      * point on a rental port, where the fleet has to arrive already at the
@@ -1912,6 +2068,8 @@ int stratum_handle_message(stratum_server_t *s, stratum_conn_t *c,
         rc = handle_configure(s, c, id, params, out_buf, out_len);
     } else if (strcmp(method->valuestring, "mining.subscribe") == 0) {
         rc = handle_subscribe(s, c, id, out_buf, out_len);
+    } else if (strcmp(method->valuestring, "mining.suggest_difficulty") == 0) {
+        rc = handle_suggest_difficulty(s, c, id, params, out_buf, out_len);
     } else if (strcmp(method->valuestring, "mining.authorize") == 0) {
         rc = handle_authorize(s, c, id, params, out_buf, out_len);
     } else if (strcmp(method->valuestring, "mining.submit") == 0) {
