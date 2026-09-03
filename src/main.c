@@ -1066,9 +1066,11 @@ int main(int argc, char **argv) {
         bcast = NULL;
     }
 
-    /* Initial template + job. */
+    /* Initial template + job. Same client as the ping and the tip watcher:
+     * a live template can take longer than the 10s general-purpose client
+     * allows (see the ping above), and exiting 5 here is the same flap. */
     bitcoind_template_t *tmpl = NULL;
-    if (bitcoind_get_block_template(&btc, &tmpl, err, sizeof err) < 0) {
+    if (bitcoind_get_block_template(&btc_lp, &tmpl, err, sizeof err) < 0) {
         fprintf(stderr, "initial GBT failed: %s\n", err);
         store_close(store);
         bitcoind_client_free(&btc);
