@@ -953,11 +953,21 @@ int main(int argc, char **argv) {
     /* The ping is a getblockchaininfo sanity check. Some block-template
      * backends that accept unauthenticated JSON-RPC don't implement it, so
      * skip the ping when no credentials are configured — the initial
-     * getblocktemplate below still validates connectivity. */
+     * getblocktemplate below still validates connectivity.
+     *
+     * It goes through the long-poll client, not the 10s general-purpose one:
+     * on a backend without getblockchaininfo (the CUSF enforcer) the ping
+     * falls back to a full getblocktemplate, and that response is a multi-MB
+     * template that takes longer than 10s once the mempool fills (10.5–13.5s
+     * measured live on alphanet). With the short client the pool exits 3 at
+     * startup — "bitcoind ping failed: curl: Timeout was reached" — and a
+     * relaunch loop just flaps until a template happens to come back fast.
+     * The tip watcher already fetches every template with this client. */
     if (cfg.bitcoind_user[0] != '\0' || cfg.bitcoind_pass[0] != '\0') {
-        if (bitcoind_ping(&btc, err, sizeof err) < 0) {
+        if (bitcoind_ping(&btc_lp, err, sizeof err) < 0) {
             fprintf(stderr, "bitcoind ping failed: %s\n", err);
             bitcoind_client_free(&btc);
+            bitcoind_client_free(&btc_lp);
             return 3;
         }
         LOG_INFO("bitcoind ping ok");
