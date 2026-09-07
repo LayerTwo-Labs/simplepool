@@ -11,17 +11,29 @@ tracks:
   Thunder node. There's a one-shot deploy script; this doc also
   walks through what it does step by step so you can do it by hand.
 
-The doc is mode-agnostic where possible; where mode matters, the two
+The doc is mode-agnostic where possible; where mode matters, the four
 possibilities are called out clearly:
 
 - **`pool_mode = solo`**    — miners paid direct in the coinbase.
-  Simplest. No drivechain, no Thunder, no PPS accrual.
+  Simplest. No drivechain, no Thunder, no accrual.
 - **`pool_mode = pps-classic`** — traditional coinbase paying a pool
   BTC address, operator-driven Thunder deposits from the admin
   dashboard. This is the mode you want for a Thunder-paying PPS pool.
+  Needs an operator reserve big enough to absorb variance.
   See [CLASSIC_PAYOUTS.md](CLASSIC_PAYOUTS.md).
+- **`pool_mode = pplns-thunder`** — pooled like PPS, but a block is
+  divided among the shares that produced it once it matures, so there
+  is no reserve to fund. Paid over Thunder; usernames are Thunder
+  addresses, and the payout worker is the same one.
+- **`pool_mode = pplns-btc`** — the same accounting, paid on Bitcoin L1
+  through the enforcer's own wallet. Usernames are Bitcoin addresses.
+  No Thunder node anywhere in the stack.
 
-(A third mode, `pool_mode = pps`, put the drivechain deposit directly in
+If you cannot fund a PPS reserve, one of the `pplns-*` modes is the
+pooled mode you can actually run: the pool never owes more than it has
+just been paid.
+
+(A fifth mode, `pool_mode = pps`, put the drivechain deposit directly in
 the coinbase. The enforcer never credited it, so it has been removed —
 `CLASSIC_PAYOUTS.md` has the evidence.)
 
@@ -393,7 +405,10 @@ simplepool talks to. Port `:50051` is the gRPC surface for
 sidechain management (used by the deposit runbook in
 [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md)).
 
-### Thunder (needed for `pool_mode=pps-classic` payouts)
+### Thunder (needed for `pool_mode=pps-classic` and `pplns-thunder` payouts)
+
+Not needed for `pplns-btc`, which pays on the mainchain and has no
+sidechain in it at all.
 
 Prebuilt: <https://releases.drivechain.info/L2-S9-Thunder-latest-aarch64-apple-darwin.zip>
 (no x86_64 Linux prebuilt as of this doc — build from source at
@@ -476,11 +491,46 @@ Miner username: `<their BTC address>[.<rig_label>]`. Password ignored.
 pool_mode = pps-classic
 pool_btc_address = bc1q...       # pool wallet; ideally an enforcer-owned
                                  # address (see OPERATOR_GUIDE.md open items)
-pps_sats_per_diff = 1000
 ```
 
 Miner username: `<their Thunder address>[.<rig_label>]`. Startup logs
 `pool_mode=pps-classic: pool_btc_address=…`.
+
+Do **not** set `pps_sats_per_diff`. The proxy derives the rate from each
+block template — the block's own value over the network difficulty, net
+of `fee_bps` — so it tracks the chain. A pinned value silently bypasses
+`fee_bps` and cannot follow a retarget; it exists as an escape hatch, not
+as a setting to fill in.
+
+### PPLNS modes
+
+```
+# ... same as solo, plus:
+pool_mode = pplns-thunder        # or: pplns-btc
+pool_btc_address = bc1q...       # the coinbase pays the pool, as in pps-classic
+pplns_window_diff_multiple = 2.0 # optional; this is the default
+```
+
+`pool_mode = pplns` on its own is refused — it does not say which rail
+pays, and the rail decides what a stratum username is:
+
+| mode | miner username |
+| --- | --- |
+| `pplns-thunder` | `<their Thunder address>[.<rig_label>]` |
+| `pplns-btc` | `<their Bitcoin address>[.<rig_label>]` |
+
+Nothing is credited when a share arrives. A block that reaches **100
+confirmations** is split across the shares that produced it, pro rata by
+difficulty, over a window of `pplns_window_diff_multiple` × the current
+network difficulty. The credits land in the same `pps_credits` table the
+PPS payout worker already drains.
+
+`pplns-btc` additionally needs `bip300301_enforcer` running with
+`--enable-wallet`, `pool_btc_address` set to an address **from that
+wallet**, and the payout worker started with `PAYOUT_RAIL=btc` (Part F).
+The proxy logs all three at startup, because otherwise the first sign of
+a misconfiguration is a payout failing 100 blocks after the block was
+found.
 
 ### Optional: Redis broadcast
 
@@ -559,10 +609,19 @@ on every request.
 
 ---
 
-## Part F — payout worker (PPS modes only)
+## Part F — payout worker (every mode except solo)
 
-The payout worker drains `pps_credits.accrued_sats - paid_sats` by
-issuing Thunder transactions. Deploy as a systemd service:
+The payout worker drains `pps_credits.accrued_sats - paid_sats`. One
+worker, two rails, selected by `PAYOUT_RAIL`:
+
+| `pool_mode` | `PAYOUT_RAIL` | how it pays |
+| --- | --- | --- |
+| `pps-classic` | `thunder` (default) | Thunder transactions from the pool reserve |
+| `pplns-thunder` | `thunder` (default) | the same |
+| `pplns-btc` | `btc` | Bitcoin L1, via `WalletService/SendTransaction` on the enforcer |
+
+The rail must match `pool_mode`: it is the same choice, and getting it
+wrong means the worker cannot pay anyone. Deploy as a systemd service:
 
 ```sh
 # assumes deploy/systemd/simplepool-payout.service was already installed
@@ -571,6 +630,16 @@ sudo mkdir -p /etc/systemd/system/simplepool-payout.service.d
 sudo tee /etc/systemd/system/simplepool-payout.service.d/local.conf <<'CONF'
 [Service]
 Environment=THUNDER_FROM_ADDRESS=<same as the dashboard's POOL_THUNDER_RESERVE_ADDRESS>
+#
+# For pool_mode=pplns-btc, drop the Thunder line above and use these two
+# instead — the Thunder variables are then never read:
+# Environment=PAYOUT_RAIL=btc
+# Environment=ENFORCER_RPC_ADDR=127.0.0.1:50051
+# Environment=PAYOUT_FEE_RATE_SAT_VB=5
+# The enforcer computes the fee from the transaction it actually builds,
+# so this is a rate, not an amount, and there is no local estimator to
+# drift out of date.
+#
 # Below have defaults; override if you want:
 # Environment=PAYOUT_MIN_SATS=10000
 # Payout runs are a daily batch (24h). The settle clock is separate on
@@ -586,7 +655,8 @@ sudo systemctl enable --now simplepool-payout.service
 sudo journalctl -u simplepool-payout.service -f
 ```
 
-The worker is idle when the Thunder reserve has no funds — it logs
+The worker is idle when the paying wallet has no funds — the Thunder
+reserve, or the enforcer wallet on `PAYOUT_RAIL=btc`. It logs
 `payout: reserve short — available=0 needed=N` and skips harmlessly,
 retrying on the 5-minute retry clock rather than the daily one. See the deposit runbook in
 [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md) for how to actually fund it.
@@ -616,7 +686,7 @@ Start everything:
 ```sh
 sudo systemctl enable --now simplepool.service
 sudo systemctl enable --now simplepool-dashboard.service
-sudo systemctl enable --now simplepool-payout.service   # PPS modes only
+sudo systemctl enable --now simplepool-payout.service   # every mode but solo
 sudo systemctl status simplepool simplepool-dashboard simplepool-payout
 ```
 
@@ -686,6 +756,13 @@ Install-time trouble usually falls into one of these:
   was ready. If you're using systemd, add
   `After=bip300301-enforcer.service` and `Requires=` to your
   Thunder unit; if running by hand, sleep 2s.
+- **`config error: 'pool_mode = pplns' does not say which rail pays`** —
+  use `pplns-thunder` or `pplns-btc`. A pool runs one or the other, and
+  the rail decides what a stratum username is.
+- **`config error: 'pplns_window_diff_multiple' must be > 0`** — it is a
+  multiple of the network difficulty; 2.0 is the default. Below 1.0 the
+  proxy warns rather than refuses: a block would then pay out across less
+  work than it took to find, which rewards pool hopping.
 - **`config error: 'pool_btc_address' is required when pool_mode=pps-classic`** —
   self-explanatory; set it.
 - **The pool logs `stratum listening on 0.0.0.0:3335` but miners are

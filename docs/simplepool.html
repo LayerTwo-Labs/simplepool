@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>simplepool — how it works</title>
-<meta name="description" content="simplepool: a single-binary C11 stratum server for Bitcoin. How solo mode and pps-classic mode work, end to end — shares, difficulty, the coinbase, PPS credit, Thunder payouts, and how to audit every number.">
+<meta name="description" content="simplepool: a single-binary C11 stratum server for Bitcoin. How solo, pps-classic and the two pplns modes work, end to end — shares, difficulty, the coinbase, share credit, Thunder and L1 payouts, and how to audit every number.">
 <style>
 /* ---------------------------------------------------------------------------
    One file, no build step, no network. Everything below is deliberately
@@ -24,6 +24,8 @@
   --solo-bg:   #fdf5e9;
   --pps:       #4338ca;
   --pps-bg:    #eeecfb;
+  --pplns:     #0f766e;
+  --pplns-bg:  #e6f4f1;
   --warn:      #b91c1c;
   --warn-bg:   #fdeceb;
   --ok:        #15803d;
@@ -44,6 +46,8 @@
     --solo-bg:   #2a2117;
     --pps:       #a5a0f5;
     --pps-bg:    #1e1d33;
+    --pplns:     #5eb3a6;
+    --pplns-bg:  #162926;
     --warn:      #f2837c;
     --warn-bg:   #2c1a19;
     --ok:        #6ee7a4;
@@ -158,9 +162,11 @@ pre code { background: none; border: 0; padding: 0; font-size: inherit; }
 .mode-card { border-top: 3px solid var(--rule-firm); }
 .mode-card.solo { border-top-color: var(--solo); }
 .mode-card.pps  { border-top-color: var(--pps); }
+.mode-card.pplns { border-top-color: var(--pplns); }
 .mode-card h3 { margin-top: .25rem; display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; }
 .mode-card.solo h3 code { color: var(--solo); background: var(--solo-bg); border-color: transparent; }
 .mode-card.pps  h3 code { color: var(--pps);  background: var(--pps-bg);  border-color: transparent; }
+.mode-card.pplns h3 code { color: var(--pplns); background: var(--pplns-bg); border-color: transparent; }
 .mode-card .tagline { font-size: .8125rem; color: var(--fg-faint); font-weight: 400; }
 .mode-card dl { margin: 1rem 0 0; display: grid; grid-template-columns: 9rem 1fr; gap: .45rem 1rem; font-size: .875rem; }
 .mode-card dt { color: var(--fg-faint); }
@@ -261,10 +267,14 @@ footer .wrap > p { max-width: 46rem; }
     <p class="lede">
       A single-binary stratum server in pure C11. It hands work to your ASICs,
       checks every submission itself, submits found blocks, and records the whole
-      thing in a SQLite file you are allowed to read. It runs in two modes —
-      <strong>solo</strong>, where the miner who finds a block is paid in that
-      block's own coinbase, and <strong>pps-classic</strong>, where every accepted
-      share earns a fixed, derivable amount paid out over Thunder.
+      thing in a SQLite file you are allowed to read. It runs in four modes,
+      which differ in who carries the variance — <strong>solo</strong>, where the
+      miner who finds a block is paid in that block's own coinbase;
+      <strong>pps-classic</strong>, where every accepted share earns a fixed,
+      derivable amount and the operator absorbs the difference out of a reserve;
+      and <strong>pplns-thunder</strong> / <strong>pplns-btc</strong>, where a
+      matured block is divided among the shares that produced it, so the pool
+      never owes more than it has just been paid.
     </p>
     <div class="badges">
       <span class="badge">C11 · no runtime dependencies beyond libc, sqlite3, libcurl, hiredis</span>
@@ -282,7 +292,7 @@ footer .wrap > p { max-width: 46rem; }
   <div class="toc-title">Contents</div>
   <ol>
     <li><a href="#what">What it is</a></li>
-    <li><a href="#modes">The two modes</a></li>
+    <li><a href="#modes">The four modes</a></li>
     <li><a href="#stack">The stack</a></li>
     <li><a href="#lifecycle">Life of a share</a></li>
     <li><a href="#nonce">Dividing the search space</a></li>
@@ -359,11 +369,11 @@ footer .wrap > p { max-width: 46rem; }
 
 <!-- ========================================================= 2. the modes == -->
 <section id="modes">
-  <h2>The two modes</h2>
+  <h2>The four modes</h2>
   <p class="section-sub">
     One config key — <code>pool_mode</code> — decides the shape of the coinbase,
-    what a stratum username must be, and whether any off-chain accounting
-    happens at all.
+    what a stratum username must be, when any off-chain balance moves, and
+    therefore who is exposed when the pool has a bad month.
   </p>
 
   <div class="grid-2">
@@ -403,30 +413,106 @@ footer .wrap > p { max-width: 46rem; }
         <dt>Needs</dt><dd><code>bitcoind</code>, the enforcer, a Thunder node</dd>
       </dl>
     </div>
+
+    <div class="card mode-card pplns">
+      <h3><code>pool_mode = pplns-thunder</code></h3>
+      <p>
+        Every block's coinbase pays a pool-owned BTC wallet, as in
+        <code>pps-classic</code> — but nothing is credited when a share arrives.
+        A block that has matured 100 blocks deep is divided among the shares
+        that produced it, and each miner is credited its proportion of the
+        reward <em>plus the fees</em>, net of the operator fee.
+      </p>
+      <dl>
+        <dt>Stratum username</dt><dd>a bare base58 Thunder address</dd>
+        <dt>Who gets paid</dt><dd>everyone in the window of a block actually found</dd>
+        <dt>When</dt><dd>on maturity, then the same daily payout batch</dd>
+        <dt>Variance</dt><dd>the miners'</dd>
+        <dt>Shares are</dt><dd>a claim on blocks the pool finds</dd>
+        <dt>Needs</dt><dd><code>bitcoind</code>, the enforcer, a Thunder node</dd>
+      </dl>
+    </div>
+
+    <div class="card mode-card pplns">
+      <h3><code>pool_mode = pplns-btc</code></h3>
+      <p>
+        The same accounting, paid on the mainchain instead. There is no
+        sidechain in it at all: the payout worker asks the enforcer's own
+        wallet to send, so the pool holds no keys and builds no transactions.
+      </p>
+      <dl>
+        <dt>Stratum username</dt><dd>your Bitcoin address, <code>bc1q…</code> or base58</dd>
+        <dt>Who gets paid</dt><dd>everyone in the window of a block actually found</dd>
+        <dt>When</dt><dd>on maturity, then the same daily payout batch</dd>
+        <dt>Variance</dt><dd>the miners'</dd>
+        <dt>Shares are</dt><dd>a claim on blocks the pool finds</dd>
+        <dt>Needs</dt><dd><code>bitcoind</code>, and the enforcer with <code>--enable-wallet</code></dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="note">
+    <span class="label">Why a fourth mode at all</span>
+    <p>
+      PPS prices a share the moment it arrives, whether or not it ever becomes
+      a block. Somebody has to fund the gap between what has been promised and
+      what has been mined, and that somebody is the operator — who therefore
+      needs a reserve measured in block rewards, and who is ruined by a long
+      enough run of bad luck. That is a real barrier: a pool that cannot fund
+      the reserve cannot honestly run PPS.
+    </p>
+    <p>
+      PPLNS removes it by never promising anything in advance. A block is
+      divided among the work that produced it, so <strong>the pool never owes
+      more than it has just been paid</strong>. There is no reserve to size and
+      operator ruin is not a failure mode. The miners carry the variance
+      instead — which is the trade, stated plainly, and the reason the operator
+      fee is normally set lower here: there is no risk premium to charge for.
+    </p>
   </div>
 
   <div class="tablewrap">
     <table>
-      <thead><tr><th>&nbsp;</th><th>solo</th><th>pps-classic</th></tr></thead>
+      <thead><tr><th>&nbsp;</th><th>solo</th><th>pps-classic</th><th>pplns-thunder</th><th>pplns-btc</th></tr></thead>
       <tbody>
         <tr><td>Coinbase outputs</td>
             <td>miner's address + operator fee</td>
-            <td><code>pool_btc_address</code> + operator fee</td></tr>
+            <td><code>pool_btc_address</code> + operator fee</td>
+            <td colspan="2"><code>pool_btc_address</code> + operator fee</td></tr>
         <tr><td>Per-connection coinbase</td>
             <td>yes — each miner's <code>cb1</code>/<code>cb2</code> pay <em>that</em> miner</td>
-            <td>no — every miner's coinbase pays the pool</td></tr>
-        <tr><td>Off-chain accounting</td><td>none</td><td><code>pps_credits</code></td></tr>
-        <tr><td>Pool custodies BTC</td><td>never</td><td>yes, between mining and deposit</td></tr>
-        <tr><td>Payout asset</td><td>BTC, on the mainchain</td><td>BTC on Thunder, a BIP300 sidechain</td></tr>
-        <tr><td>Payout worker</td><td>not installed</td><td><code>simplepool-payout.service</code></td></tr>
-        <tr><td>Miner's income</td><td>lumpy and rare, but complete</td><td>smooth and proportional</td></tr>
-        <tr><td>Who eats bad luck</td><td>the miner</td><td>the pool operator</td></tr>
+            <td>no — every miner's coinbase pays the pool</td>
+            <td colspan="2">no — every miner's coinbase pays the pool</td></tr>
+        <tr><td>Stratum username</td><td>Bitcoin address</td><td>Thunder address</td>
+            <td>Thunder address</td><td>Bitcoin address</td></tr>
+        <tr><td>Off-chain accounting</td><td>none</td><td><code>pps_credits</code></td>
+            <td colspan="2"><code>pps_credits</code>, same table</td></tr>
+        <tr><td>When a balance moves</td><td>never — the coinbase is the payment</td>
+            <td>as each share arrives</td>
+            <td colspan="2">when a block matures, 100 deep</td></tr>
+        <tr><td>Paid for work that found nothing</td><td>no</td><td>yes</td>
+            <td colspan="2">no</td></tr>
+        <tr><td>Transaction fees shared</td><td>yes, to the finder</td><td>no — subsidy-derived rate</td>
+            <td colspan="2">yes, to the window</td></tr>
+        <tr><td>Pool custodies BTC</td><td>never</td><td>yes, between mining and deposit</td>
+            <td>yes, between mining and deposit</td><td>yes, in the enforcer wallet</td></tr>
+        <tr><td>Operator reserve needed</td><td>none</td><td>yes — measured in block rewards</td>
+            <td colspan="2">none</td></tr>
+        <tr><td>Payout asset</td><td>BTC, on the mainchain</td><td>BTC on Thunder, a BIP300 sidechain</td>
+            <td>BTC on Thunder</td><td>BTC, on the mainchain</td></tr>
+        <tr><td>Payout worker</td><td>not installed</td><td><code>simplepool-payout.service</code></td>
+            <td><code>simplepool-payout.service</code></td>
+            <td>same, with <code>PAYOUT_RAIL=btc</code></td></tr>
+        <tr><td>Miner's income</td><td>lumpy and rare, but complete</td><td>smooth and proportional</td>
+            <td colspan="2">proportional, but only when the pool finds a block</td></tr>
+        <tr><td>Who eats bad luck</td><td>the miner</td><td>the pool operator</td>
+            <td colspan="2">the miners, together</td></tr>
       </tbody>
     </table>
   </div>
 
   <div class="warnbox">
-    <span class="label">A third mode existed and was removed</span>
+    <span class="label">A fifth mode existed and was removed</span>
     <p>
       <code>pool_mode = pps</code> put a BIP300 drivechain deposit directly in
       each coinbase, so the pool would never custody BTC at all. It does not
@@ -542,7 +628,7 @@ footer .wrap > p { max-width: 46rem; }
 <section id="lifecycle">
   <h2>Life of a share</h2>
   <p class="section-sub">
-    From plugging in an ASIC to a row in the ledger. Identical in both modes
+    From plugging in an ASIC to a row in the ledger. Identical in every mode
     except where noted.
   </p>
 
@@ -563,7 +649,8 @@ footer .wrap > p { max-width: 46rem; }
       <h4><code>mining.authorize "&lt;address&gt;[.&lt;rig&gt;]"</code></h4>
       <p>
         The username is parsed as an address and validated on the spot —
-        bech32 or base58check in solo mode, bare base58 Thunder in pps-classic.
+        bech32 or base58check where the rail is Bitcoin (solo, pplns-btc), bare
+        base58 Thunder where it is Thunder (pps-classic, pplns-thunder).
         An invalid address is rejected with a clear error and written to the
         <code>rejects</code> table rather than silently accepted. The password is
         discarded.
@@ -1756,7 +1843,13 @@ Password  (anything — it is discarded)</code></pre>
       <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
       <tbody>
         <tr><td><code>pool_mode</code></td><td><code>solo</code></td>
-            <td><code>solo</code> or <code>pps-classic</code>. Decides the coinbase shape and what a username must be.</td></tr>
+            <td><code>solo</code>, <code>pps-classic</code>, <code>pplns-thunder</code> or <code>pplns-btc</code>.
+                Decides the coinbase shape, what a username must be, and when a balance moves.
+                Bare <code>pplns</code> is refused: it does not say which rail pays.</td></tr>
+        <tr><td><code>pplns_window_diff_multiple</code></td><td><code>2.0</code></td>
+            <td>PPLNS only. Window size as a multiple of the CURRENT network difficulty, so it
+                self-scales across retargets. Must be &gt; 0; below 1.0 a block pays out across
+                less work than it took to find, which rewards pool hopping, and the proxy warns.</td></tr>
         <tr><td><code>operator_address</code></td><td>—</td>
             <td><strong>Required.</strong> Receives the <code>fee_bps</code> cut. The proxy refuses to start without it.</td></tr>
         <tr><td><code>fee_bps</code></td><td><code>100</code></td>
