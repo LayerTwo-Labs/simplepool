@@ -156,6 +156,123 @@ static void test_open_upgrades_a_pre_status_database(void) {
     printf("  ok test_open_upgrades_a_pre_status_database\n");
 }
 
+/* schema.sql and the schema store.c creates must describe the same database.
+ *
+ * Both are real initialisation paths, not one canonical source and one copy.
+ * scripts/deploy-to-server.sh seeds data/shares.db from schema.sql, so does
+ * tests/test_payout_regtest.sh, the dashboard tests build their fixtures from
+ * it, and INSTALL.md and README.md both tell operators to. store.c builds the
+ * other one, for a pool that starts with no database at all.
+ *
+ * They drift silently. A column added to store.c's CREATE and its migrations
+ * but not to schema.sql leaves a deploy-seeded pool with a table the proxy
+ * only repairs on its next start -- and any tool reading that database before
+ * then, or never opening it through store.c at all, sees the old shape. That
+ * is exactly what happened to the two pplns columns.
+ *
+ * Comparing the column sets rather than the DDL text keeps this from failing
+ * on formatting, comments, or constraints the two express differently, while
+ * still catching the thing that actually breaks: a column on one side and not
+ * the other. */
+static int cmp_str(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* "table:col,col;table:col,col;" with tables and columns both sorted, so the
+ * comparison does not depend on declaration order. */
+static void canonical_schema(sqlite3 *db, char *out, size_t cap) {
+    out[0] = '\0';
+    size_t used = 0;
+    sqlite3_stmt *tq = NULL;
+    assert(sqlite3_prepare_v2(db,
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "  AND name NOT LIKE 'sqlite_%' ORDER BY name", -1, &tq, NULL) == SQLITE_OK);
+    while (sqlite3_step(tq) == SQLITE_ROW) {
+        const char *tbl = (const char *)sqlite3_column_text(tq, 0);
+        if (!tbl) continue;
+        char cols[64][64];
+        char *colp[64];
+        int nc = 0;
+        char q[256];
+        snprintf(q, sizeof q, "PRAGMA table_info(%s)", tbl);
+        sqlite3_stmt *cq = NULL;
+        assert(sqlite3_prepare_v2(db, q, -1, &cq, NULL) == SQLITE_OK);
+        while (nc < 64 && sqlite3_step(cq) == SQLITE_ROW) {
+            const char *cn = (const char *)sqlite3_column_text(cq, 1);
+            if (!cn) continue;
+            snprintf(cols[nc], sizeof cols[nc], "%s", cn);
+            colp[nc] = cols[nc];
+            nc++;
+        }
+        sqlite3_finalize(cq);
+        qsort(colp, (size_t)nc, sizeof colp[0], cmp_str);
+        used += (size_t)snprintf(out + used, cap - used, "%s:", tbl);
+        for (int i = 0; i < nc && used < cap; ++i)
+            used += (size_t)snprintf(out + used, cap - used, "%s%s",
+                                     colp[i], i + 1 < nc ? "," : "");
+        if (used < cap) used += (size_t)snprintf(out + used, cap - used, ";\n");
+    }
+    sqlite3_finalize(tq);
+}
+
+static void test_schema_sql_matches_store_schema(void) {
+    /* make runs the suites from the repo root; try one level up too so a
+     * direct ./build/test_store from tests/ still works. Never silently skip:
+     * a skipped parity check is how the drift got here in the first place. */
+    const char *candidates[] = { "schema.sql", "../schema.sql" };
+    FILE *f = NULL;
+    for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; ++i) {
+        f = fopen(candidates[i], "rb");
+        if (f) break;
+    }
+    assert(f && "schema.sql not found - run the suite from the repo root");
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    assert(len > 0);
+    char *sql = malloc((size_t)len + 1);
+    assert(sql);
+    assert(fread(sql, 1, (size_t)len, f) == (size_t)len);
+    sql[len] = '\0';
+    fclose(f);
+
+    /* One database from schema.sql... */
+    const char *path_a = fresh_db_path();
+    sqlite3 *a = NULL;
+    assert(sqlite3_open(path_a, &a) == SQLITE_OK);
+    char *errm = NULL;
+    int rc = sqlite3_exec(a, sql, NULL, NULL, &errm);
+    assert(rc == SQLITE_OK && "schema.sql must apply cleanly");
+    sqlite3_free(errm);
+    free(sql);
+
+    /* ...and one from store_open, which is what a fresh pool gets. */
+    const char *path_b = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path_b);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    sqlite3 *b = NULL;
+    assert(sqlite3_open(path_b, &b) == SQLITE_OK);
+
+    char sa[8192], sb[8192];
+    canonical_schema(a, sa, sizeof sa);
+    canonical_schema(b, sb, sizeof sb);
+    if (strcmp(sa, sb) != 0) {
+        fprintf(stderr, "schema.sql and store.c disagree.\n"
+                        "--- schema.sql ---\n%s\n--- store.c ---\n%s\n", sa, sb);
+    }
+    assert(strcmp(sa, sb) == 0 &&
+           "schema.sql and store.c must create the same columns");
+
+    sqlite3_close(a);
+    sqlite3_close(b);
+    store_close(s);
+    printf("  ok test_schema_sql_matches_store_schema\n");
+}
+
 static void test_basic(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg = {0};
@@ -1108,6 +1225,80 @@ static void test_pplns_distributes_the_window(void) {
     printf("  ok test_pplns_distributes_the_window\n");
 }
 
+/* Two matured blocks settled by a single pass.
+ *
+ * Every other pplns test distributes exactly one block per call, which never
+ * exercises the loop's second iteration. That iteration is where the shape of
+ * store_pplns_distribute matters: the outer SELECT over blocks_found is still
+ * stepping while the body opens a transaction, UPDATEs the very table that
+ * SELECT is reading, and commits it. If committing mid-iteration were refused,
+ * or if marking a row changed what the open cursor still had to return, the
+ * first block would settle and the second would be skipped or double-paid --
+ * and with crediting additive, double-paying is the failure that cannot be
+ * undone by running again. */
+static void test_pplns_distributes_two_blocks_in_one_pass(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Block one's window: alice, 50 difficulty. */
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "alice", "addr_a",
+                                       1000ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_record_share_addr(s, "alice", "addr_a", 1100, 0.0,
+                                   1, "blk_one", 0, 0.0) == 0);
+    /* Block two's window: bob, 50 difficulty, entirely after block one's. */
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "bob", "addr_b",
+                                       2000ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_record_share_addr(s, "bob", "addr_b", 2100, 0.0,
+                                   1, "blk_two", 0, 0.0) == 0);
+
+    assert(store_record_block(s, 1100, 800300, "blk_one", "alice", "addr_a",
+                              100000, 0, STORE_BLOCK_PENDING, NULL, 50.0) == 0);
+    assert(store_record_block(s, 2100, 800301, "blk_two", "bob", "addr_b",
+                              100000, 0, STORE_BLOCK_PENDING, NULL, 50.0) == 0);
+    assert(store_flush(s) == 0);
+
+    assert(store_set_block_status(s, "blk_one", STORE_BLOCK_CONFIRMED,
+                                  100, "node") == 0);
+    assert(store_set_block_status(s, "blk_two", STORE_BLOCK_CONFIRMED,
+                                  100, "node") == 0);
+
+    /* Both, in one call. */
+    int blocks = 0, workers = 0;
+    char err[256] = {0};
+    assert(store_pplns_distribute(s, 100, 0, &blocks, &workers, err, sizeof err) == 2);
+    assert(blocks == 2);
+    assert(workers == 2);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT accrued_sats FROM pps_credits WHERE worker_id ="
+                          " (SELECT id FROM workers WHERE name='alice')") == 100000);
+    assert(scalar_i64(db, "SELECT accrued_sats FROM pps_credits WHERE worker_id ="
+                          " (SELECT id FROM workers WHERE name='bob')") == 100000);
+    /* Both latched, so a second pass is a no-op rather than a second payment. */
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM blocks_found"
+                          " WHERE pplns_distributed = 1") == 2);
+    assert(store_pplns_distribute(s, 100, 0, &blocks, &workers, NULL, 0) == 0);
+    assert(blocks == 0);
+    assert(scalar_i64(db, "SELECT SUM(accrued_sats) FROM pps_credits") == 200000);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pplns_distributes_two_blocks_in_one_pass\n");
+}
+
 /* The operator fee comes off the top, exactly as in solo and PPS. */
 static void test_pplns_takes_the_operator_fee(void) {
     const char *path = fresh_db_path();
@@ -1161,6 +1352,8 @@ int main(void) {
     test_open_upgrades_a_pre_status_database();
     test_pplns_distributes_the_window();
     test_pplns_takes_the_operator_fee();
+    test_pplns_distributes_two_blocks_in_one_pass();
+    test_schema_sql_matches_store_schema();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;
