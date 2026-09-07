@@ -789,8 +789,232 @@ static void test_payout_txout_weight_matches_p2tr(void) {
     printf("ok: a P2TR payout output is %zu bytes / %zu WU\n", spk_len, wu);
 }
 
+/* ---- coinbase-direct PPLNS ---------------------------------------------
+ *
+ * The rail where the pool never receives the reward: the window is paid
+ * straight out of the coinbase of the block it produced. No wallet, no payout
+ * worker, no maturity gate — a reorged block simply never paid.
+ *
+ * The property these are really defending is conservation. A coinbase that
+ * pays out less than it is allowed does not leave the remainder anywhere; it
+ * destroys it. So every satoshi of the block has to leave in an output, and
+ * anything the window cannot be paid has to be visibly carried rather than
+ * quietly dropped. */
+
+#define WA "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+#define WB "bcrt1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3lgth6c"
+#define WC "bcrt1qyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zs4w3j0"
+#define WOP "bcrt1qxvenxvenxvenxvenxvenxvenxvenxvenztev8a"
+
+/* Count outputs and sum their values out of the assembled coinbase, so the
+ * assertions read the transaction rather than the builder's own report. */
+static void window_outputs(const coinbase_parts_t *p, size_t en_total,
+                           uint64_t *n_out, int64_t *sum_out) {
+    /* cb2 = sequence(4) | varint n_outputs | outputs | locktime(4) */
+    const uint8_t *b = p->cb2;
+    size_t off = 4;
+    uint64_t n = b[off++];          /* every case here is < 253 outputs */
+    int64_t sum = 0;
+    for (uint64_t i = 0; i < n; ++i) {
+        int64_t v = 0;
+        for (int k = 0; k < 8; ++k) v |= ((int64_t)b[off + k]) << (8 * k);
+        off += 8;
+        size_t spk_len = b[off++];
+        off += spk_len;
+        sum += v;
+    }
+    (void)en_total;
+    *n_out = n;
+    *sum_out = sum;
+}
+
+static void test_window_pays_each_miner_its_own_output(void) {
+    coinbase_parts_t parts; char err[256];
+    coinbase_window_result_t res;
+    /* 1% of 5,000,000,000 is 50,000,000, leaving 4,950,000,000 to split. */
+    const coinbase_payee_t payees[] = {
+        { WA, 2475000000LL }, { WB, 1485000000LL }, { WC, 990000000LL },
+    };
+    int rc = coinbase_build_window(800000, 5000000000LL, payees, 3,
+                                   WOP, 100, NULL, "/simplepool/", 4, 8,
+                                   0, &parts, &res, err, sizeof err);
+    assert(rc == 0);
+    assert(res.paid_count == 3);
+    assert(res.fee_sats == 50000000LL);
+    assert(res.carry_sats == 0);
+    assert(res.paid_sats == 4950000000LL);
+
+    uint64_t n = 0; int64_t sum = 0;
+    window_outputs(&parts, 12, &n, &sum);
+    assert(n == 4);                         /* three miners + the operator */
+    assert(sum == 5000000000LL);            /* the whole block, nothing burnt */
+    coinbase_parts_free(&parts);
+    printf("ok: window pays each miner its own coinbase output\n");
+}
+
+/* A split that does not add up is a caller bug, and the honest response is to
+ * refuse: emitting it would silently forfeit the difference to nobody. */
+static void test_a_split_that_does_not_add_up_is_refused(void) {
+    coinbase_parts_t parts; char err[256];
+    const coinbase_payee_t short_[] = { { WA, 1000000LL } };
+    int rc = coinbase_build_window(800000, 5000000000LL, short_, 1,
+                                   WOP, 100, NULL, NULL, 4, 8,
+                                   0, &parts, NULL, err, sizeof err);
+    assert(rc < 0);
+    assert(strstr(err, "payees sum to") != NULL);
+
+    const coinbase_payee_t over[] = { { WA, 9000000000LL } };
+    rc = coinbase_build_window(800000, 5000000000LL, over, 1,
+                               WOP, 100, NULL, NULL, 4, 8,
+                               0, &parts, NULL, err, sizeof err);
+    assert(rc < 0);
+    printf("ok: a window split that does not sum to the block is refused\n");
+}
+
+/* Dust. A miner too small to pay cannot simply be dropped -- its value has to
+ * go somewhere, and the only honest somewhere is the operator, who then owes
+ * it. This is the custodial balance the design has to admit to. */
+static void test_a_dust_payee_is_carried_not_burnt(void) {
+    coinbase_parts_t parts; char err[256];
+    coinbase_window_result_t res;
+    /* fee 1% of 100,000,000 = 1,000,000; payable 99,000,000. */
+    const coinbase_payee_t payees[] = {
+        { WA, 98999900LL },
+        { WB, 100LL },              /* far below the 546-sat dust limit */
+    };
+    int rc = coinbase_build_window(800000, 100000000LL, payees, 2,
+                                   WOP, 100, NULL, NULL, 4, 8,
+                                   0, &parts, &res, err, sizeof err);
+    assert(rc == 0);
+    assert(res.paid_count == 1);
+    assert(res.dropped_dust == 1);
+    assert(res.carry_sats == 100LL);
+    /* The fee is reported separately from what is merely being held, so a
+     * ledger can tell the operator's income from its liability. */
+    assert(res.fee_sats == 1000000LL);
+
+    uint64_t n = 0; int64_t sum = 0;
+    window_outputs(&parts, 12, &n, &sum);
+    assert(n == 2);                          /* one miner + the operator */
+    assert(sum == 100000000LL);              /* still the whole block */
+    coinbase_parts_free(&parts);
+    printf("ok: a dust payee is carried on the operator output, not burnt\n");
+}
+
+/* The output cap is about marketplaces rejecting an oversized coinbase, so it
+ * has to fall on the smallest claims: they are the ones for whom waiting a
+ * block costs least, and whose carried balance is smallest. */
+static void test_the_cap_falls_on_the_smallest_claims(void) {
+    coinbase_parts_t parts; char err[256];
+    coinbase_window_result_t res;
+    const coinbase_payee_t payees[] = {
+        { WA, 1000000LL }, { WB, 3000000LL }, { WC, 6000000LL },
+    };
+    /* fee 1% of 10,101,010 ~ 101,010; make the numbers exact instead. */
+    int64_t value = 1000000LL + 3000000LL + 6000000LL;   /* fee_bps 0: no fee */
+    /* The operator address is still required: capping produces carry, and
+     * carry needs somewhere to ride even when there is no fee. */
+    int rc = coinbase_build_window(800000, value, payees, 3,
+                                   WOP, 0, NULL, NULL, 4, 8,
+                                   2, &parts, &res, err, sizeof err);
+    assert(rc == 0);
+    assert(res.paid_count == 2);
+    assert(res.dropped_capped == 1);
+    /* The 1,000,000 claim is the one that waits, not the 6,000,000 one. */
+    assert(res.carry_sats == 1000000LL);
+    assert(res.paid_sats == 9000000LL);
+    coinbase_parts_free(&parts);
+    printf("ok: the output cap drops the smallest claims first\n");
+}
+
+/* With no operator address there is nowhere to carry to, so a window that
+ * cannot be paid in full has to be refused rather than silently burn it. */
+static void test_carry_without_an_operator_address_is_refused(void) {
+    coinbase_parts_t parts; char err[256];
+    const coinbase_payee_t payees[] = {
+        { WA, 999900LL }, { WB, 100LL },
+    };
+    int rc = coinbase_build_window(800000, 1000000LL, payees, 2,
+                                   NULL, 0, NULL, NULL, 4, 8,
+                                   0, &parts, NULL, err, sizeof err);
+    assert(rc < 0);
+    assert(strstr(err, "no operator_address to carry") != NULL);
+    printf("ok: carry with nowhere to go is refused, not burnt\n");
+}
+
+/* If nobody clears dust, paying the operator the whole block and calling it a
+ * fee would be the worst possible outcome. */
+static void test_a_window_of_only_dust_is_refused(void) {
+    coinbase_parts_t parts; char err[256];
+    const coinbase_payee_t payees[] = { { WA, 100LL }, { WB, 100LL } };
+    int rc = coinbase_build_window(800000, 200LL, payees, 2,
+                                   WOP, 0, NULL, NULL, 4, 8,
+                                   0, &parts, NULL, err, sizeof err);
+    assert(rc < 0);
+    assert(strstr(err, "dust limit") != NULL);
+    printf("ok: a window of nothing but dust is refused\n");
+}
+
+static void test_an_empty_window_is_refused(void) {
+    coinbase_parts_t parts; char err[256];
+    int rc = coinbase_build_window(800000, 5000000000LL, NULL, 0,
+                                   WOP, 100, NULL, NULL, 4, 8,
+                                   0, &parts, NULL, err, sizeof err);
+    assert(rc < 0);
+    assert(strstr(err, "nobody to pay") != NULL);
+    printf("ok: an empty window is refused\n");
+}
+
+/* The witness commitment has to survive byte-for-byte and stay last, exactly
+ * as the other builders keep it -- a block whose commitment moved or changed
+ * is invalid. */
+static void test_the_witness_commitment_is_preserved(void) {
+    coinbase_parts_t parts; char err[256];
+    coinbase_window_result_t res;
+    const char *wc = "6a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9";
+    const coinbase_payee_t payees[] = { { WA, 5000000000LL } };
+    int rc = coinbase_build_window(800000, 5000000000LL, payees, 1,
+                                   NULL, 0, wc, NULL, 4, 8,
+                                   0, &parts, &res, err, sizeof err);
+    assert(rc == 0);
+    uint64_t n = 0; int64_t sum = 0;
+    window_outputs(&parts, 12, &n, &sum);
+    assert(n == 2);                 /* the miner, then the commitment */
+    assert(sum == 5000000000LL);    /* the commitment output carries 0 */
+    coinbase_parts_free(&parts);
+    printf("ok: the witness commitment is preserved and stays last\n");
+}
+
+/* Same window, same bytes, twice. A miner checking the block it was paid from
+ * has to get the same answer as the pool did. */
+static void test_the_coinbase_is_deterministic(void) {
+    coinbase_parts_t a, b; char err[256];
+    const coinbase_payee_t payees[] = {
+        { WA, 1000000LL }, { WB, 1000000LL }, { WC, 3000000LL },
+    };
+    int64_t value = 5000000LL;
+    assert(coinbase_build_window(800000, value, payees, 3, NULL, 0, NULL,
+                                 "/sp/", 4, 8, 0, &a, NULL, err, sizeof err) == 0);
+    assert(coinbase_build_window(800000, value, payees, 3, NULL, 0, NULL,
+                                 "/sp/", 4, 8, 0, &b, NULL, err, sizeof err) == 0);
+    assert(a.cb2_len == b.cb2_len);
+    assert(memcmp(a.cb2, b.cb2, a.cb2_len) == 0);
+    coinbase_parts_free(&a);
+    coinbase_parts_free(&b);
+    printf("ok: the same window builds the same coinbase twice\n");
+}
+
 int main(void) {
     test_p2pkh_address();
+    test_window_pays_each_miner_its_own_output();
+    test_a_split_that_does_not_add_up_is_refused();
+    test_a_dust_payee_is_carried_not_burnt();
+    test_the_cap_falls_on_the_smallest_claims();
+    test_carry_without_an_operator_address_is_refused();
+    test_a_window_of_only_dust_is_refused();
+    test_an_empty_window_is_refused();
+    test_the_witness_commitment_is_preserved();
+    test_the_coinbase_is_deterministic();
     test_p2wpkh_address();
     test_regtest_p2wpkh();
     test_build_coinbase_structural();

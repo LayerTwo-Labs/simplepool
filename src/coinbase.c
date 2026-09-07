@@ -712,6 +712,253 @@ static int rd_u64(const uint8_t *buf, size_t len, size_t *off, uint64_t *val) {
     return 0;
 }
 
+/* ---------- coinbase-direct PPLNS ---------- */
+
+/* Sort helper: largest claim first, ties broken by original position so the
+ * output order is deterministic for a given window. A stable, reproducible
+ * coinbase matters -- a miner checking the block it was paid from should get
+ * the same answer twice. */
+typedef struct { size_t idx; int64_t sats; } payee_rank_t;
+
+static int payee_rank_cmp(const void *a, const void *b) {
+    const payee_rank_t *x = a, *y = b;
+    if (x->sats != y->sats) return x->sats > y->sats ? -1 : 1;
+    return x->idx < y->idx ? -1 : (x->idx > y->idx ? 1 : 0);
+}
+
+int coinbase_build_window(uint32_t height, int64_t value_sats,
+                          const coinbase_payee_t *payees, size_t n_payees,
+                          const char *operator_address, int fee_bps,
+                          const char *witness_commitment_hex,
+                          const char *coinbase_tag,
+                          size_t extranonce1_size, size_t extranonce2_size,
+                          size_t max_payout_outputs,
+                          coinbase_parts_t *out,
+                          coinbase_window_result_t *res,
+                          char *errbuf, size_t errlen) {
+    coinbase_window_result_t r = {0};
+    if (res) *res = r;
+    if (!out || (!payees && n_payees > 0)) {
+        set_err(errbuf, errlen, "null arg");
+        return -1;
+    }
+    out->cb1 = NULL; out->cb1_len = 0;
+    out->cb2 = NULL; out->cb2_len = 0;
+    if (n_payees == 0) {
+        set_err(errbuf, errlen, "window is empty: nobody to pay");
+        return -1;
+    }
+    if (value_sats <= 0) {
+        set_err(errbuf, errlen, "value_sats must be positive");
+        return -1;
+    }
+    if (max_payout_outputs == 0) max_payout_outputs = COINBASE_MAX_PAYOUT_OUTPUTS;
+
+    /* The operator fee, on the same terms as every other builder: off the
+     * top, dropped entirely if it would be dust. */
+    int64_t fee_sats = 0;
+    uint8_t operator_spk[64];
+    size_t  operator_spk_len = 0;
+    int     has_operator = 0;
+    if (operator_address && operator_address[0] && fee_bps > 0) {
+        int64_t f = (value_sats * (int64_t)fee_bps) / 10000;
+        if (f >= COINBASE_DUST_SATS) {
+            if (coinbase_address_to_script(operator_address, operator_spk,
+                                           sizeof operator_spk,
+                                           &operator_spk_len,
+                                           errbuf, errlen) < 0) {
+                return -1;
+            }
+            fee_sats = f;
+            has_operator = 1;
+        }
+    }
+
+    /* The caller's split must account for the whole payable amount. A
+     * shortfall here would be forfeited to nobody -- a coinbase paying out
+     * less than it may simply destroys the difference -- so it is a caller
+     * bug, not something to paper over. */
+    int64_t payable = value_sats - fee_sats;
+    int64_t claimed = 0;
+    for (size_t i = 0; i < n_payees; ++i) {
+        if (!payees[i].address || !payees[i].address[0]) {
+            set_err(errbuf, errlen, "payee %zu has no address", i);
+            return -1;
+        }
+        if (payees[i].sats < 0) {
+            set_err(errbuf, errlen, "payee %zu has a negative amount", i);
+            return -1;
+        }
+        claimed += payees[i].sats;
+    }
+    if (claimed != payable) {
+        set_err(errbuf, errlen,
+                "payees sum to %lld but the block pays %lld after a %lld fee",
+                (long long)claimed, (long long)payable, (long long)fee_sats);
+        return -1;
+    }
+
+    payee_rank_t *rank = calloc(n_payees, sizeof *rank);
+    if (!rank) { set_err(errbuf, errlen, "oom"); return -1; }
+    for (size_t i = 0; i < n_payees; ++i) {
+        rank[i].idx = i;
+        rank[i].sats = payees[i].sats;
+    }
+    qsort(rank, n_payees, sizeof *rank, payee_rank_cmp);
+
+    /* Resolve and emit, largest first, until the cap or the dust limit stops
+     * us. Everything not paid becomes carry. */
+    bbuf_t outs;
+    bbuf_init(&outs);
+    uint64_t n_outputs = 0;
+    int64_t  carry = 0;
+
+    for (size_t k = 0; k < n_payees; ++k) {
+        const coinbase_payee_t *pe = &payees[rank[k].idx];
+        if (pe->sats < COINBASE_DUST_SATS) {
+            r.dropped_dust++;
+            carry += pe->sats;
+            continue;
+        }
+        if (r.paid_count >= max_payout_outputs) {
+            r.dropped_capped++;
+            carry += pe->sats;
+            continue;
+        }
+        uint8_t spk[64];
+        size_t  spk_len = 0;
+        if (coinbase_address_to_script(pe->address, spk, sizeof spk,
+                                       &spk_len, errbuf, errlen) < 0) {
+            bbuf_free(&outs); free(rank);
+            return -1;
+        }
+        if (bbuf_push_u64_le(&outs, (uint64_t)pe->sats) < 0) goto oom;
+        if (bbuf_push_varint(&outs, spk_len) < 0) goto oom;
+        if (bbuf_push(&outs, spk, spk_len) < 0) goto oom;
+        n_outputs++;
+        r.paid_count++;
+        r.paid_sats += pe->sats;
+    }
+    free(rank);
+    rank = NULL;
+
+    /* Nobody cleared the dust limit. Refusing beats emitting a coinbase that
+     * pays the operator the entire block and calls it a fee. */
+    if (r.paid_count == 0) {
+        bbuf_free(&outs);
+        set_err(errbuf, errlen,
+                "no payee in the window clears the %d-sat dust limit",
+                COINBASE_DUST_SATS);
+        return -1;
+    }
+
+    /* The carry rides on the operator output, because it has to ride
+     * somewhere: value not paid out is value destroyed. The operator now
+     * holds it and owes it -- see coinbase_window_result_t. */
+    int64_t operator_out = fee_sats + carry;
+    if (operator_out > 0 && !has_operator) {
+        if (!operator_address || !operator_address[0]) {
+            bbuf_free(&outs);
+            set_err(errbuf, errlen,
+                    "%lld sats could not be paid to the window and there is no "
+                    "operator_address to carry them", (long long)operator_out);
+            return -1;
+        }
+        if (coinbase_address_to_script(operator_address, operator_spk,
+                                       sizeof operator_spk, &operator_spk_len,
+                                       errbuf, errlen) < 0) {
+            bbuf_free(&outs);
+            return -1;
+        }
+        has_operator = 1;
+    }
+    if (has_operator && operator_out > 0) {
+        if (bbuf_push_u64_le(&outs, (uint64_t)operator_out) < 0) goto oom;
+        if (bbuf_push_varint(&outs, operator_spk_len) < 0) goto oom;
+        if (bbuf_push(&outs, operator_spk, operator_spk_len) < 0) goto oom;
+        n_outputs++;
+    }
+
+    /* Witness commitment, byte-for-byte, last. */
+    uint8_t wc_buf[256];
+    size_t  wc_len = 0;
+    if (witness_commitment_hex && *witness_commitment_hex) {
+        if (hex_decode(witness_commitment_hex, wc_buf, sizeof wc_buf, &wc_len) < 0) {
+            bbuf_free(&outs);
+            set_err(errbuf, errlen, "bad witness commitment hex");
+            return -1;
+        }
+        if (bbuf_push_u64_le(&outs, 0) < 0) goto oom;
+        if (bbuf_push_varint(&outs, wc_len) < 0) goto oom;
+        if (bbuf_push(&outs, wc_buf, wc_len) < 0) goto oom;
+        n_outputs++;
+    }
+
+    /* Every satoshi is accounted for, or the block burns the difference. */
+    if (r.paid_sats + operator_out != value_sats) {
+        bbuf_free(&outs);
+        set_err(errbuf, errlen,
+                "internal: outputs sum to %lld, block pays %lld",
+                (long long)(r.paid_sats + operator_out), (long long)value_sats);
+        return -1;
+    }
+
+    /* scriptSig, exactly as coinbase_build_split lays it out. */
+    uint8_t height_push[8];
+    size_t  height_push_len = bip34_height_push(height, height_push);
+    uint8_t tag_push[80];
+    size_t  tag_push_len = 0;
+    if (coinbase_tag && *coinbase_tag) {
+        size_t tlen = strlen(coinbase_tag);
+        if (tlen > 75) tlen = 75;
+        tag_push[0] = (uint8_t)tlen;
+        memcpy(tag_push + 1, coinbase_tag, tlen);
+        tag_push_len = tlen + 1;
+    }
+    size_t en_total = extranonce1_size + extranonce2_size;
+    size_t script_sig_len = height_push_len + tag_push_len + en_total;
+    if (script_sig_len < 2 || script_sig_len > 100) {
+        bbuf_free(&outs);
+        set_err(errbuf, errlen, "coinbase scriptSig length %zu out of range "
+                "(height %zu + tag %zu + extranonce %zu)",
+                script_sig_len, height_push_len, tag_push_len, en_total);
+        return -1;
+    }
+
+    bbuf_t c1, c2;
+    bbuf_init(&c1);
+    bbuf_init(&c2);
+    /* version, input count, prevout (null), scriptSig len, height, tag */
+    if (bbuf_push_u32_le(&c1, 2) < 0) goto oom2;
+    if (bbuf_push_varint(&c1, 1) < 0) goto oom2;
+    for (int i = 0; i < 32; ++i) if (bbuf_push_u8(&c1, 0) < 0) goto oom2;
+    if (bbuf_push_u32_le(&c1, 0xffffffffu) < 0) goto oom2;
+    if (bbuf_push_varint(&c1, script_sig_len) < 0) goto oom2;
+    if (bbuf_push(&c1, height_push, height_push_len) < 0) goto oom2;
+    if (tag_push_len && bbuf_push(&c1, tag_push, tag_push_len) < 0) goto oom2;
+    /* cb2: sequence, outputs, locktime */
+    if (bbuf_push_u32_le(&c2, 0xffffffffu) < 0) goto oom2;
+    if (bbuf_push_varint(&c2, n_outputs) < 0) goto oom2;
+    if (bbuf_push(&c2, outs.data, outs.len) < 0) goto oom2;
+    if (bbuf_push_u32_le(&c2, 0) < 0) goto oom2;
+
+    bbuf_free(&outs);
+    out->cb1 = c1.data; out->cb1_len = c1.len;
+    out->cb2 = c2.data; out->cb2_len = c2.len;
+    r.fee_sats = fee_sats;
+    r.carry_sats = carry;
+    if (res) *res = r;
+    return 0;
+
+oom2:
+    bbuf_free(&c1); bbuf_free(&c2);
+oom:
+    bbuf_free(&outs);
+    free(rank);
+    set_err(errbuf, errlen, "oom");
+    return -1;
+}
+
 int coinbase_build_from_template(const char *coinbase_tx_hex,
                                  const char *miner_address,
                                  const char *operator_address,

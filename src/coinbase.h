@@ -48,6 +48,72 @@ int coinbase_build_split(uint32_t height, int64_t value_sats,
                          int64_t *out_miner_sats, int64_t *out_fee_sats,
                          char *errbuf, size_t errlen);
 
+/* ---- coinbase-direct PPLNS ---------------------------------------------
+ *
+ * One miner's claim on this block's coinbase. */
+typedef struct {
+    const char *address;   /* L1 destination, as authorized on stratum */
+    int64_t     sats;      /* what the window entitles this miner to */
+} coinbase_payee_t;
+
+/* What the builder actually managed to pay, and what it could not.
+ *
+ * `carry_sats` is the honest part. A payee below the dust limit, or past the
+ * output cap, cannot be paid in THIS coinbase — but its value cannot simply
+ * vanish either: a coinbase that pays out less than it is allowed forfeits
+ * the difference to nobody. So the shortfall is added to the operator output
+ * and reported here, which means the pool is holding it and owes it.
+ *
+ * That is the cost the design has to own: coinbase-direct removes custody for
+ * everyone the block can pay, and replaces it with a small, bounded,
+ * disclosable balance for everyone it cannot. It is not "zero custody"; it is
+ * custody proportional to dust, and the number is right here rather than
+ * implied. */
+typedef struct {
+    size_t  paid_count;        /* payees given an output */
+    int64_t paid_sats;         /* summed across those outputs */
+    size_t  dropped_dust;      /* payees below COINBASE_DUST_SATS */
+    size_t  dropped_capped;    /* payees past max_payout_outputs */
+    int64_t carry_sats;        /* owed to the dropped, paid to the operator */
+    int64_t fee_sats;          /* the operator's actual fee, excluding carry */
+} coinbase_window_result_t;
+
+/* A practical ceiling on payout outputs, not a consensus one.
+ *
+ * Consensus bounds the coinbase by block weight; at ~31 bytes per P2WPKH
+ * output even a thousand payees is a low single-digit percentage of the
+ * budget. The real constraint is that some rented-hashrate marketplaces
+ * verify a coinbase and reject one they consider oversized, and a delisting
+ * costs more than paying a few small miners a block later. */
+#define COINBASE_MAX_PAYOUT_OUTPUTS 200
+
+/* Build cb1/cb2 paying the PPLNS window DIRECTLY, one output per miner.
+ *
+ * The point of the mode: the pool never receives the reward, so there is no
+ * wallet, no payout worker, no write-ahead row and no credit-on-confirmation.
+ * A reorged block simply never paid, which is also why this rail needs no
+ * maturity gate — there is no credit to claw back.
+ *
+ * `payees` must sum to exactly (value_sats - fee), where fee is the same
+ * fee_bps split every other builder applies. A caller whose arithmetic does
+ * not add up is refused rather than silently underpaying the block.
+ *
+ * Payees are paid largest first, so the cap and the dust limit fall on the
+ * smallest claims — the ones for whom waiting a block costs least, and whose
+ * carried balance is smallest.
+ *
+ * Returns 0 ok, negative on error (errbuf populated). `res` may be NULL. */
+int coinbase_build_window(uint32_t height, int64_t value_sats,
+                          const coinbase_payee_t *payees, size_t n_payees,
+                          const char *operator_address, int fee_bps,
+                          const char *witness_commitment_hex,
+                          const char *coinbase_tag,
+                          size_t extranonce1_size, size_t extranonce2_size,
+                          size_t max_payout_outputs,
+                          coinbase_parts_t *out,
+                          coinbase_window_result_t *res,
+                          char *errbuf, size_t errlen);
+
 /* Build coinbase1/coinbase2 halves from a server-provided coinbase
  * transaction (BIP22 "coinbasetxn", e.g. from the CUSF enforcer), rather
  * than constructing the coinbase from scratch.
