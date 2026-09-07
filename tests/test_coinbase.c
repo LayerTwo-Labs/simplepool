@@ -1004,8 +1004,133 @@ static void test_the_coinbase_is_deterministic(void) {
     printf("ok: the same window builds the same coinbase twice\n");
 }
 
+/* Assemble cb1 + extranonce + cb2 and tally the outputs, the same way the
+ * single-payee template test walks the bytes. Reads the transaction rather
+ * than trusting the builder's own report. */
+static void parts_outputs(const coinbase_parts_t *parts, size_t en_total,
+                          int *spendable, int *op_returns, int64_t *sum) {
+    size_t total = parts->cb1_len + en_total + parts->cb2_len;
+    uint8_t *tx = (uint8_t *)malloc(total);
+    assert(tx);
+    memcpy(tx, parts->cb1, parts->cb1_len);
+    memset(tx + parts->cb1_len, 0xaa, en_total);
+    memcpy(tx + parts->cb1_len + en_total, parts->cb2, parts->cb2_len);
+
+    size_t off = 4;                      /* version */
+    uint64_t n = 0;
+    assert(read_varint(tx, total, &off, &n) == 0 && n == 1);
+    off += 32 + 4;                       /* prevout */
+    uint64_t ss = 0;
+    assert(read_varint(tx, total, &off, &ss) == 0);
+    off += ss + 4;                       /* scriptSig + sequence */
+    uint64_t outs = 0;
+    assert(read_varint(tx, total, &off, &outs) == 0);
+
+    *spendable = 0; *op_returns = 0; *sum = 0;
+    for (uint64_t i = 0; i < outs; ++i) {
+        int64_t v = 0;
+        for (int k = 0; k < 8; ++k) v |= ((int64_t)tx[off + k]) << (8 * k);
+        off += 8;
+        uint64_t spk_len = 0;
+        assert(read_varint(tx, total, &off, &spk_len) == 0);
+        if (spk_len > 0 && tx[off] == 0x6a) (*op_returns)++;
+        else { (*spendable)++; *sum += v; }
+        off += spk_len;
+    }
+    free(tx);
+}
+
+/* The drivechain path: a window paid straight out of an enforcer-served
+ * coinbase, with the BIP300/301 commitments preserved around it.
+ *
+ * This is the one a real pool needs. Every simplepool deployment mines on a
+ * template the enforcer builds, so a rail that only works against plain
+ * bitcoind is a rail that does not work. */
+static void test_window_from_template_preserves_commitments(void) {
+    coinbase_parts_t parts; char err[256] = {0};
+    coinbase_window_result_t res;
+    int has_witness = -1;
+
+    /* What the template pays, learned from the single-payee builder so the
+     * split below is exact without hardcoding the fixture's reward. */
+    coinbase_parts_t probe; int64_t reward = 0, unused = 0;
+    assert(coinbase_build_from_template(ENF_COINBASE_HEX, ENF_ADDR, NULL, 0,
+                                        NULL, 4, 4, &probe, NULL, &reward,
+                                        &unused, err, sizeof err) == 0);
+    coinbase_parts_free(&probe);
+    assert(reward > 0);
+
+    /* Two miners, 60/40, no operator fee so the arithmetic is exact. */
+    int64_t a = (reward * 6) / 10;
+    const coinbase_payee_t payees[] = { { WA, a }, { WB, reward - a } };
+    int rc = coinbase_build_window_from_template(
+        ENF_COINBASE_HEX, payees, 2, NULL, 0, "/x/", 4, 4, 0,
+        &parts, &has_witness, &res, err, sizeof err);
+    if (rc != 0) fprintf(stderr, "window_from_template err: %s\n", err);
+    assert(rc == 0);
+    assert(res.paid_count == 2);
+    assert(res.carry_sats == 0);
+    assert(res.paid_sats == reward);
+
+    /* The enforcer's own outputs must survive: one spendable output was
+     * replaced by two, and every OP_RETURN it carried is still there. */
+    int base_spendable = 0, base_op_returns = 0;
+    assert(coinbase_count_outputs(ENF_COINBASE_HEX, &base_spendable,
+                                  &base_op_returns) == 0);
+    assert(base_spendable == 1);
+
+    int spendable = 0, op_returns = 0;
+    int64_t sum = 0;
+    parts_outputs(&parts, 8, &spendable, &op_returns, &sum);
+    assert(spendable == 2);                 /* one output became two miners */
+    assert(op_returns == base_op_returns);  /* every commitment survived */
+    assert(sum == reward);                  /* and the whole reward left */
+    coinbase_parts_free(&parts);
+    printf("ok: window from template pays N miners and keeps the commitments\n");
+}
+
+/* The two builders must divide a window identically. They share a resolver
+ * precisely so that a drivechain pool and a plain-bitcoind pool cannot pay
+ * the same miners different amounts. */
+static void test_both_window_builders_split_identically(void) {
+    char err[256] = {0};
+    coinbase_parts_t p1, p2;
+    coinbase_window_result_t r1, r2;
+
+    coinbase_parts_t probe; int64_t reward = 0, unused = 0;
+    assert(coinbase_build_from_template(ENF_COINBASE_HEX, ENF_ADDR, NULL, 0,
+                                        NULL, 4, 4, &probe, NULL, &reward,
+                                        &unused, err, sizeof err) == 0);
+    coinbase_parts_free(&probe);
+
+    /* Three claims, one of them dust, so dust and carry are exercised too.
+     * They must sum to the payable amount, i.e. net of the 1% fee. */
+    int64_t fee = (reward * 100) / 10000;
+    int64_t payable = reward - fee;
+    const coinbase_payee_t payees[] = {
+        { WA, payable - 40000 - 100 }, { WB, 40000 }, { WC, 100 },
+    };
+    assert(coinbase_build_window(800000, reward, payees, 3, WOP, 100, NULL,
+                                 "/x/", 4, 4, 0, &p1, &r1, err, sizeof err) == 0);
+    assert(coinbase_build_window_from_template(ENF_COINBASE_HEX, payees, 3,
+                                               WOP, 100, "/x/", 4, 4, 0,
+                                               &p2, NULL, &r2, err, sizeof err) == 0);
+    assert(r1.paid_count   == r2.paid_count);
+    assert(r1.paid_sats    == r2.paid_sats);
+    assert(r1.fee_sats     == r2.fee_sats);
+    assert(r1.carry_sats   == r2.carry_sats);
+    assert(r1.dropped_dust == r2.dropped_dust);
+    assert(r1.dropped_dust == 1);
+    assert(r1.carry_sats   >= 100);
+    coinbase_parts_free(&p1);
+    coinbase_parts_free(&p2);
+    printf("ok: both window builders split a window identically\n");
+}
+
 int main(void) {
     test_p2pkh_address();
+    test_both_window_builders_split_identically();
+    test_window_from_template_preserves_commitments();
     test_window_pays_each_miner_its_own_output();
     test_a_split_that_does_not_add_up_is_refused();
     test_a_dust_payee_is_carried_not_burnt();

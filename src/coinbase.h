@@ -156,6 +156,35 @@ void coinbase_parts_free(coinbase_parts_t *p);
  * enforcer (plus the mandatory BIP300/301 commitments), which is what tells an
  * observer whether a sidechain can be merge-mined into these blocks.
  * Returns 0 ok, negative on malformed input. */
+/* coinbase_build_window(), but replacing the single spendable output of a
+ * server-provided coinbasetxn instead of building one from scratch.
+ *
+ * This is the drivechain path, and it is the one a real pool needs: when the
+ * CUSF enforcer serves the template, its coinbase already carries the
+ * BIP300/301 commitment OP_RETURNs and the witness commitment, and those are
+ * preserved byte-for-byte and in order exactly as
+ * coinbase_build_from_template() does. Only the reward output is replaced --
+ * by the whole window rather than by one miner.
+ *
+ * The splitting rules are SHARED with coinbase_build_window() rather than
+ * reimplemented, so a pool mining a drivechain template and one mining plain
+ * bitcoind cannot divide the same window differently.
+ *
+ * Returns 0 ok, negative on error. `res` and `out_has_witness` may be NULL. */
+int coinbase_build_window_from_template(const char *coinbase_tx_hex,
+                                        const coinbase_payee_t *payees,
+                                        size_t n_payees,
+                                        const char *operator_address,
+                                        int fee_bps,
+                                        const char *coinbase_tag,
+                                        size_t extranonce1_size,
+                                        size_t extranonce2_size,
+                                        size_t max_payout_outputs,
+                                        coinbase_parts_t *out,
+                                        int *out_has_witness,
+                                        coinbase_window_result_t *res,
+                                        char *errbuf, size_t errlen);
+
 int coinbase_count_outputs(const char *tx_hex, int *spendable_out,
                            int *op_return_out);
 
