@@ -500,7 +500,19 @@ export function poolMeta(handle) {
             /* An override whose implied fee has drifted from fee_bps is the
              * failure this table exists to expose. */
             fee_drift_bps: Number(r.effective_fee_bps || 0) - Number(r.fee_bps || 0),
-            accrues: (r.pool_mode || 'solo') === 'pps-classic',
+            /* Does a balance build up in pps_credits between payouts?
+             *
+             * True of PPS and of both PPLNS modes -- they share the table and
+             * the payout worker that drains it. Only solo accrues nothing,
+             * because its coinbase pays the finder directly.
+             *
+             * It is deliberately not "is there a rate": PPS prices a share the
+             * moment it arrives, PPLNS values it in hindsight out of a block
+             * actually found, and only the former leaves rate_used on the row.
+             * rate_source and rate_sats_per_diff above are the PPS-only facts;
+             * this one is about whether the pool owes anyone anything. */
+            accrues: ['pps-classic', 'pplns-thunder', 'pplns-btc']
+                        .includes(r.pool_mode || 'solo'),
         };
     } catch {
         return null;   /* pre-pool_meta DB */

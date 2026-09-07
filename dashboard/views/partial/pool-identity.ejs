@@ -38,6 +38,15 @@
             <label>mode</label>
             <% if (_mode === 'pps-classic') { %>
                 <strong title="Every accepted share is credited at a fixed rate per unit of difficulty, whether or not it becomes a block. Blocks pay the pool's own BTC wallet."><%= _mode %></strong>
+            <% } else if (_mode === 'pplns-thunder' || _mode === 'pplns-btc') { %>
+                <%# Not solo and not PPS, and saying either would be a lie about
+                    where the money is. Blocks pay the pool wallet, as in PPS —
+                    but nothing is credited when a share arrives. A matured
+                    block is split across the shares that produced it, so the
+                    miners carry the variance and the pool never owes more than
+                    it has just been paid. The two modes differ only in the rail
+                    the balance is finally paid over. %>
+                <strong title="Nothing is credited when a share arrives. Each block, once it has matured 100 blocks deep, is split across the shares that produced it — so what you earn depends on blocks the pool actually found. Blocks pay the pool's own BTC wallet, and balances are paid out over <%= _mode === 'pplns-btc' ? 'Bitcoin L1' : 'Thunder' %>."><%= _mode %></strong>
             <% } else if (_mode) { %>
                 <strong title="Each block's coinbase pays the miner who found it, directly. No share credit accrues between blocks."><%= _mode %></strong>
             <% } else { %>
