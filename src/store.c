@@ -1793,8 +1793,18 @@ int store_record_template(store_t *s, const store_template_t *t) {
 
     /* Trim history on the way out. Driven off the template's own timestamp
      * rather than wall-clock time so a replay or a test is deterministic.
-     * Nothing but the dashboard reads this table, so a dropped row costs
-     * visibility and nothing else — the ledger lives in shares/rate_history. */
+     *
+     * ⚠️ This table is NOT display-only, whatever it once was. On a backend
+     * that serves no getblockhash — which is every enforcer, and therefore
+     * the production configuration — store_reconcile_blocks_from_templates()
+     * confirms a block by finding the template at height+1 whose prev_hash is
+     * that block. Trim that row and the block stops being confirmable: its
+     * confirmations freeze wherever they were, and under pplns a block frozen
+     * short of maturity is never distributed and its miners are never paid.
+     *
+     * The default retention is 30 days against a ~17-hour maturity, so there
+     * is a wide margin — but it is a margin, not an absence of coupling, and
+     * anyone tuning templates_retention_days down needs to know that. */
     int keep_days = s->templates_retention_days;
     if (keep_days > 0) {
         static const char *Q_TRIM = "DELETE FROM templates WHERE ts < ?";
