@@ -32,6 +32,22 @@ function safeNumber(v, what) {
 }
 
 export class EnforcerWalletClient {
+    /* Every due worker goes out in one transaction, whatever their addresses.
+     *
+     * payout.js otherwise has to LEARN this, from what a previous transfer
+     * turned out to do, and treats a node it has not yet proven as one that
+     * cannot batch -- because for Thunder the answer genuinely varies, and
+     * guessing wrong spends somebody else's balance. There is nothing to
+     * learn here: WalletService/SendTransaction takes a destinations map, so
+     * paying many addresses at once is the shape of the call itself.
+     *
+     * Left to be learned, the first tick of every process pays one address
+     * and defers the rest. run-once.mjs is one process per tick, so under
+     * cron that is EVERY tick: one address per run, a separate fee each, and
+     * a pool with fifty miner addresses taking fifty daily ticks to pay
+     * everyone once. */
+    batchesAcrossAddresses = true;
+
     /* feeRateSatPerVb is passed straight through to the enforcer, which does
      * the fee arithmetic. There is no local estimator to drift out of date. */
     constructor({ addr, feeRateSatPerVb = 5, passphrase = null, timeoutMs = 30_000 }) {

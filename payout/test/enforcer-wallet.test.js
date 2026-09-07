@@ -224,3 +224,32 @@ test('an unconfirmed change output is not evidence of settlement', async () => {
     assert.equal(w.ok, true);
     assert.deepEqual(w.utxos.map(u => u.txid), ['mined']);
 });
+
+test('the L1 client declares that it batches across addresses', async () => {
+    /* payout.js otherwise learns this from what a previous transfer did, and
+     * treats an unproven node as one that cannot batch -- so the first tick of
+     * every process pays one address and defers the rest. run-once.mjs is one
+     * process per tick, so under cron every tick is a first tick: one address
+     * per run, a separate fee each.
+     *
+     * There is nothing to learn. SendTransaction takes a destinations map;
+     * paying many addresses at once is the shape of the call. */
+    const c = new EnforcerWalletClient({ addr: 'x' });
+    assert.equal(c.batchesAcrossAddresses, true);
+});
+
+test('one SendTransaction carries every address in the batch', async () => {
+    /* And the shared address is summed into a single destination rather than
+     * one entry overwriting the other. */
+    const c = new EnforcerWalletClient({ addr: 'x' });
+    const calls = stub(c, { SendTransaction: { txid: { hex: 'deadbeef' } } });
+    const res = await c.transferBatchDetailed([
+        { address: 'addr_a', sats: 250000n },
+        { address: 'addr_b', sats: 180000n },
+        { address: 'addr_b', sats: 120000n },
+    ]);
+    const sends = calls.filter(x => x.method === 'SendTransaction');
+    assert.equal(sends.length, 1, 'one transaction for the whole batch');
+    assert.deepEqual(sends[0].body.destinations, { addr_a: 250000, addr_b: 300000 });
+    assert.equal(res.txid, 'deadbeef');
+});

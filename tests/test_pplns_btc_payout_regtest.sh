@@ -22,16 +22,24 @@
 #
 #   1. a tick BROADCASTS and credits nobody. paid means mined, not sent, so
 #      a transaction that exists is not yet a payment.
-#   2. a tick before confirmation neither credits nor re-broadcasts. This is
+#   2. all three due workers leave in ONE transaction, and the two sharing a
+#      payout address get ONE output carrying the SUM of both debts. Read off
+#      the wire before it is mined.
+#   3. a tick before confirmation neither credits nor re-broadcasts. This is
 #      the double-spend guard: the batch stays in flight and the tick blocks
 #      on it.
-#   3. one L1 block later a tick SETTLES, the ledger row appears, paid_sats
-#      moves exactly once, and the in-flight row is gone.
-#   4. the worker's address actually holds the sats on chain, read straight
+#   4. one L1 block later a tick SETTLES, a ledger row appears per worker
+#      against the one txid, each rig is credited its OWN debt, and the
+#      in-flight rows are gone.
+#   5. the miners' addresses actually hold the sats on chain, read straight
 #      out of the UTXO set rather than from anything the worker wrote.
 #
-# (4) is the assertion that cannot be faked by a bookkeeping bug: every
+# (5) is the assertion that cannot be faked by a bookkeeping bug: every
 # other check reads a database the payout worker itself wrote.
+#
+# Three workers rather than one because a single recipient never builds a
+# multi-destination transaction, which is what every real pool sends, and
+# never exercises the address merge at all.
 #
 # No Thunder here -- pplns-btc pays on L1 and never touches a sidechain, so
 # the stack is bitcoind plus a wallet-enabled enforcer and nothing else.
@@ -53,11 +61,21 @@ RPC="$ROOT/scripts/enforcer-rpc.sh"
 PAYOUT_DB="/tmp/simplepool-btcpay-e2e.db"
 # Mining sink; any valid regtest address works.
 JUNK_ADDR="bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
-# Where the miner is paid. Deliberately NOT an enforcer-wallet address: the
+# Where the miners are paid. Deliberately NOT enforcer-wallet addresses: the
 # point is that the money leaves the pool's wallet and arrives somewhere the
 # pool does not control, which an address the wallet owns could not show.
-WORKER_ADDR="bcrt1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3lgth6c"
-OWED_SATS=250000
+#
+# Two addresses, three workers: rig2 authorizes with the same address as
+# rig1, which is ordinary (one miner, two machines) and is the case the
+# destinations map has to merge rather than overwrite.
+ADDR_A="bcrt1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3lgth6c"
+ADDR_B="bcrt1qyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zs4w3j0"
+OWED_A=250000
+OWED_B1=180000
+OWED_B2=120000
+# Distinct per worker and distinct in sum, so no assertion below can pass by
+# coincidence: 180000+120000 = 300000, which is neither operand.
+OWED_SATS=$((OWED_A + OWED_B1 + OWED_B2))
 
 PICKED=""
 pick_port() {
@@ -146,16 +164,37 @@ echo "  height=$(cli getblockcount) enforcer confirmed balance=$BAL sats"
 [ "${BAL:-0}" -gt "$OWED_SATS" ] || {
     echo "FAIL: enforcer wallet has $BAL sats, needs more than $OWED_SATS" >&2; exit 1; }
 
-stage "seed pool DB: one worker owed $OWED_SATS sats, payable on L1"
+stage "seed pool DB: three workers, two of them sharing one payout address"
+# The production-normal case, and the one the single-recipient run could not
+# reach. Two things only a multi-recipient batch can show:
+#
+#   1. every due worker leaves in ONE transaction, not one each. A payout per
+#      worker is a fee per worker, and it breaks the one-tx-per-batch
+#      invariant the whole at-most-once design rests on.
+#   2. two rigs authorized with the SAME payout address are SUMMED. The
+#      destinations map is keyed by address, so an assignment instead of a
+#      sum pays that miner once for two debts while the ledger marks both
+#      settled -- a shortfall that balances perfectly on the pool's side and
+#      is visible only to the miner. groupByAddress in payout.js merges them
+#      and the client sums again; this proves the pair against a real wallet
+#      rather than against a stub.
 rm -f "$PAYOUT_DB" "$PAYOUT_DB-wal" "$PAYOUT_DB-shm"
 NOW="$(date +%s)"
 sqlite3 "$PAYOUT_DB" < "$ROOT/schema.sql"
 sqlite3 "$PAYOUT_DB" "
-    INSERT INTO workers (name, first_seen, last_seen, payout_address)
-    VALUES ('${WORKER_ADDR}.rig1', $NOW, $NOW, '$WORKER_ADDR');
-    INSERT INTO pps_credits (worker_id, accrued_sats, paid_sats, last_updated)
-    VALUES (1, $OWED_SATS, 0, $NOW);
+    INSERT INTO workers (id, name, first_seen, last_seen, payout_address) VALUES
+      (1, '${ADDR_A}.rig1', $NOW, $NOW, '$ADDR_A'),
+      (2, '${ADDR_B}.rig1', $NOW, $NOW, '$ADDR_B'),
+      (3, '${ADDR_B}.rig2', $NOW, $NOW, '$ADDR_B');
+    INSERT INTO pps_credits (worker_id, accrued_sats, paid_sats, last_updated) VALUES
+      (1, $OWED_A,  0, $NOW),
+      (2, $OWED_B1, 0, $NOW),
+      (3, $OWED_B2, 0, $NOW);
 "
+echo "  worker 1 -> $ADDR_A  $OWED_A sats"
+echo "  worker 2 -> $ADDR_B  $OWED_B1 sats"
+echo "  worker 3 -> $ADDR_B  $OWED_B2 sats  (same address as worker 2)"
+echo "  expected on chain: $OWED_A at A, $((OWED_B1 + OWED_B2)) at B"
 
 # PAYOUT_RAIL=btc is what selects this client, and with it the enforcer
 # variables become the required set and the Thunder ones are not read at
@@ -170,45 +209,65 @@ run_tick() {
     node "$ROOT/payout/run-once.mjs"
 }
 
-paid_sats()  { sqlite3 "$PAYOUT_DB" "SELECT paid_sats FROM pps_credits WHERE worker_id = 1"; }
+paid_of()    { sqlite3 "$PAYOUT_DB" "SELECT paid_sats FROM pps_credits WHERE worker_id = $1"; }
+paid_total() { sqlite3 "$PAYOUT_DB" "SELECT COALESCE(SUM(paid_sats),0) FROM pps_credits"; }
 ledger_n()   { sqlite3 "$PAYOUT_DB" "SELECT count(*) FROM payouts"; }
 inflight_n() { sqlite3 "$PAYOUT_DB" "SELECT count(*) FROM payouts_in_flight"; }
+# Sats currently unspent at an address, straight out of the chain's UTXO set.
+utxo_sats()  { cli scantxoutset start '["addr('"$1"')"]' \
+               | jq -r '[.unspents[].amount] | add // 0 | . * 100000000 | round'; }
 
 stage "payout tick 1: broadcast only"
 RESULT="$(run_tick)" || { echo "FAIL: payout tick reported failures: $RESULT" >&2; exit 1; }
 echo "  tick result: $RESULT"
-[ "$(jq -r .broadcast <<< "$RESULT")" = "1" ] || {
-    echo "FAIL: expected exactly 1 broadcast worker" >&2; exit 1; }
-# paid means mined, not sent. A transaction that merely exists is not a
-# payment, and crediting here is how a pool pays twice for one debt.
+[ "$(jq -r .broadcast <<< "$RESULT")" = "3" ] || {
+    echo "FAIL: expected 3 broadcast workers, got $(jq -r .broadcast <<< "$RESULT")" >&2; exit 1; }
+# paid means mined, not sent. A transaction that exists is not yet a payment.
 [ "$(jq -r .paid <<< "$RESULT")" = "0" ] || {
     echo "FAIL: a broadcast must not report a paid worker" >&2; exit 1; }
 
-stage "assert the broadcast credited nobody"
-TXID="$(sqlite3 "$PAYOUT_DB" "SELECT txid FROM payouts_in_flight WHERE worker_id = 1")"
-echo "  txid=$TXID paid_sats=$(paid_sats) ledger_rows=$(ledger_n) in_flight=$(inflight_n)"
+stage "assert all three left in ONE transaction"
+TXIDS="$(sqlite3 "$PAYOUT_DB" "SELECT DISTINCT txid FROM payouts_in_flight")"
+TXID="$(head -1 <<< "$TXIDS")"
+echo "  in_flight=$(inflight_n) distinct txids=$(wc -l <<< "$TXIDS" | tr -d ' ') txid=$TXID"
+[ "$(inflight_n)" = "3" ] || { echo "FAIL: expected 3 in-flight rows" >&2; exit 1; }
+[ "$(wc -l <<< "$TXIDS" | tr -d ' ')" = "1" ] || {
+    echo "FAIL: the batch went out as more than one transaction:" >&2
+    echo "$TXIDS" >&2; exit 1; }
 [ "${#TXID}" -eq 64 ]     || { echo "FAIL: bad in-flight txid '$TXID'" >&2; exit 1; }
-[ "$(paid_sats)" = "0" ]  || { echo "FAIL: paid_sats moved on a broadcast" >&2; exit 1; }
+[ "$(paid_total)" = "0" ] || { echo "FAIL: paid_sats moved on a broadcast" >&2; exit 1; }
 [ "$(ledger_n)" = "0" ]   || { echo "FAIL: payouts ledger written before confirmation" >&2; exit 1; }
-[ "$(inflight_n)" = "1" ] || { echo "FAIL: batch must stay in flight until mined" >&2; exit 1; }
 
-stage "assert bitcoind holds the tx, unconfirmed"
-# Straight from the node's mempool, not from the enforcer that sent it.
-cli getrawtransaction "$TXID" true > /dev/null 2>&1 || {
-    echo "FAIL: bitcoind does not know $TXID — it was never broadcast" >&2
-    cli getrawmempool >&2 || true
+stage "assert the transaction pays each address once, at the summed amount"
+# Read straight off the wire, before it is mined: two miner outputs, not
+# three. Three would mean the shared address was written twice; one at the
+# wrong value would mean it was overwritten rather than summed.
+RAW="$(cli getrawtransaction "$TXID" true)"
+A_OUT="$(jq -r --arg a "$ADDR_A" '[.vout[] | select(.scriptPubKey.address == $a) | .value * 100000000 | round] | add // 0' <<< "$RAW")"
+B_OUT="$(jq -r --arg b "$ADDR_B" '[.vout[] | select(.scriptPubKey.address == $b) | .value * 100000000 | round] | add // 0' <<< "$RAW")"
+B_N="$(jq -r --arg b "$ADDR_B" '[.vout[] | select(.scriptPubKey.address == $b)] | length' <<< "$RAW")"
+echo "  outputs: A=$A_OUT sats  B=$B_OUT sats across $B_N output(s)"
+[ "$A_OUT" = "$OWED_A" ] || {
+    echo "FAIL: worker A output is $A_OUT, expected $OWED_A" >&2; exit 1; }
+[ "$B_OUT" = "$((OWED_B1 + OWED_B2))" ] || {
+    echo "FAIL: the shared address got $B_OUT, expected $((OWED_B1 + OWED_B2))." >&2
+    echo "      Two rigs on one address must be SUMMED, not overwritten — this" >&2
+    echo "      is the shortfall that balances on the pool's side and is" >&2
+    echo "      visible only to the miner." >&2
     exit 1; }
-cli getrawtransaction "$TXID" true | jq -e '.blockhash == null' > /dev/null || {
+[ "$B_N" = "1" ] || {
+    echo "FAIL: the shared address appears in $B_N outputs; the destinations" >&2
+    echo "      map should have merged them into one" >&2; exit 1; }
+jq -e '.blockhash == null' <<< "$RAW" > /dev/null || {
     echo "FAIL: $TXID is already confirmed; the sequence below tests nothing" >&2; exit 1; }
-echo "  bitcoind has $TXID in its mempool, unconfirmed"
 
 stage "a tick before confirmation must not credit or re-broadcast"
 RESULT="$(run_tick)" || { echo "FAIL: payout tick reported failures: $RESULT" >&2; exit 1; }
 echo "  tick result: $RESULT"
 [ "$(jq -r .waiting_on <<< "$RESULT")" = "$TXID" ] || {
     echo "FAIL: expected the tick to wait on $TXID" >&2; exit 1; }
-[ "$(paid_sats)" = "0" ]  || { echo "FAIL: credited before the tx was mined" >&2; exit 1; }
-[ "$(inflight_n)" = "1" ] || { echo "FAIL: batch left flight before confirming" >&2; exit 1; }
+[ "$(paid_total)" = "0" ] || { echo "FAIL: credited before the tx was mined" >&2; exit 1; }
+[ "$(inflight_n)" = "3" ] || { echo "FAIL: batch left flight before confirming" >&2; exit 1; }
 
 stage "mine one L1 block, then settle"
 # Unlike Thunder, Bitcoin needs no nudging to include a transaction -- the
@@ -219,42 +278,49 @@ for attempt in 1 2 3 4 5; do
         '{"blocks": 1, "address": "'"$JUNK_ADDR"'"}' > /dev/null
     RESULT="$(run_tick)" || { echo "FAIL: payout tick reported failures: $RESULT" >&2; exit 1; }
     echo "  attempt $attempt: $RESULT"
-    [ "$(jq -r .settled <<< "$RESULT")" = "1" ] && break
+    [ "$(jq -r .settled <<< "$RESULT")" = "3" ] && break
     sleep 1
 done
-[ "$(jq -r .settled <<< "$RESULT")" = "1" ] || {
-    echo "FAIL: payout never settled after 5 L1 blocks" >&2; exit 1; }
+[ "$(jq -r .settled <<< "$RESULT")" = "3" ] || {
+    echo "FAIL: expected 3 settled workers, got $(jq -r .settled <<< "$RESULT")" >&2; exit 1; }
 
-stage "assert the ledger settled"
-LEDGER_TXID="$(sqlite3 "$PAYOUT_DB" "SELECT txid FROM payouts WHERE worker_id = 1")"
-echo "  txid=$LEDGER_TXID paid_sats=$(paid_sats) in_flight=$(inflight_n)"
-[ "$LEDGER_TXID" = "$TXID" ]      || { echo "FAIL: ledger txid '$LEDGER_TXID' != '$TXID'" >&2; exit 1; }
-[ "$(paid_sats)" = "$OWED_SATS" ] || { echo "FAIL: paid_sats=$(paid_sats) != $OWED_SATS" >&2; exit 1; }
-[ "$(inflight_n)" = "0" ]         || { echo "FAIL: $(inflight_n) in-flight rows left" >&2; exit 1; }
+stage "assert the ledger settled, per worker"
+echo "  paid: w1=$(paid_of 1) w2=$(paid_of 2) w3=$(paid_of 3) ledger_rows=$(ledger_n) in_flight=$(inflight_n)"
+[ "$(paid_of 1)" = "$OWED_A" ]  || { echo "FAIL: worker 1 paid_sats=$(paid_of 1) != $OWED_A" >&2; exit 1; }
+# Each of the two rigs is credited its OWN debt, even though one transaction
+# output covered both. Crediting the merged amount to either one would leave
+# the other owed forever.
+[ "$(paid_of 2)" = "$OWED_B1" ] || { echo "FAIL: worker 2 paid_sats=$(paid_of 2) != $OWED_B1" >&2; exit 1; }
+[ "$(paid_of 3)" = "$OWED_B2" ] || { echo "FAIL: worker 3 paid_sats=$(paid_of 3) != $OWED_B2" >&2; exit 1; }
+[ "$(ledger_n)" = "3" ]         || { echo "FAIL: expected 3 ledger rows, got $(ledger_n)" >&2; exit 1; }
+[ "$(inflight_n)" = "0" ]       || { echo "FAIL: $(inflight_n) in-flight rows left" >&2; exit 1; }
+LEDGER_TXIDS="$(sqlite3 "$PAYOUT_DB" "SELECT DISTINCT txid FROM payouts")"
+[ "$LEDGER_TXIDS" = "$TXID" ] || {
+    echo "FAIL: ledger txids '$LEDGER_TXIDS' != the one broadcast '$TXID'" >&2; exit 1; }
 
-stage "assert the sats are really at the worker's address"
+stage "assert the sats are really at the miners' addresses"
 # The one check that reads neither the payout worker's database nor the
-# wallet that sent the money: an unspent output of exactly OWED_SATS at the
-# miner's own address, straight out of the chain's UTXO set. Every other
-# assertion above would still pass if the ledger were being written without
-# a payment behind it.
-SCAN="$(cli scantxoutset start '["addr('"$WORKER_ADDR"')"]')"
-FOUND_SATS="$(jq -r '[.unspents[].amount] | add // 0 | . * 100000000 | round' <<< "$SCAN")"
-echo "  utxo set holds $FOUND_SATS sats at $WORKER_ADDR"
-[ "$FOUND_SATS" = "$OWED_SATS" ] || {
-    echo "FAIL: expected $OWED_SATS sats at $WORKER_ADDR, found $FOUND_SATS" >&2
-    jq . <<< "$SCAN" >&2 || true
-    exit 1; }
+# wallet that sent the money, straight out of the chain's UTXO set. Every
+# other assertion above would still pass if the ledger were being written
+# without a payment behind it.
+A_SATS="$(utxo_sats "$ADDR_A")"
+B_SATS="$(utxo_sats "$ADDR_B")"
+echo "  utxo set: $A_SATS at A, $B_SATS at B"
+[ "$A_SATS" = "$OWED_A" ] || {
+    echo "FAIL: expected $OWED_A sats at $ADDR_A, found $A_SATS" >&2; exit 1; }
+[ "$B_SATS" = "$((OWED_B1 + OWED_B2))" ] || {
+    echo "FAIL: expected $((OWED_B1 + OWED_B2)) sats at $ADDR_B, found $B_SATS" >&2; exit 1; }
 
-# A second settled tick must not pay again. paid_sats is the latch, and the
-# failure it guards against leaves no trace in the amounts themselves.
 stage "a further tick pays nothing more"
+# paid_sats is the latch, and the failure it guards against leaves no trace
+# in the amounts themselves.
 RESULT="$(run_tick)" || { echo "FAIL: payout tick reported failures: $RESULT" >&2; exit 1; }
 echo "  tick result: $RESULT"
-[ "$(paid_sats)" = "$OWED_SATS" ] || {
-    echo "FAIL: paid_sats moved to $(paid_sats) on a tick with nothing owed" >&2; exit 1; }
-[ "$(ledger_n)" = "1" ] || {
-    echo "FAIL: $(ledger_n) ledger rows for one payment" >&2; exit 1; }
+[ "$(paid_total)" = "$((OWED_A + OWED_B1 + OWED_B2))" ] || {
+    echo "FAIL: paid total moved to $(paid_total) on a tick with nothing owed" >&2; exit 1; }
+[ "$(ledger_n)" = "3" ] || {
+    echo "FAIL: $(ledger_n) ledger rows for three payments" >&2; exit 1; }
 
 echo
-echo "btcpay-e2e: PASS (pplns-btc paid a miner on L1 through the enforcer wallet)"
+echo "btcpay-e2e: PASS (pplns-btc paid three miners on L1 in one transaction,"
+echo "                  with the shared address summed)"
