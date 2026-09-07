@@ -54,6 +54,10 @@ esac
 THUNDER_VERSION=0.17.0
 BITCOIN_PATCHED_VERSION=v30.2
 ENFORCER_VALIDATED_VERSION=v0.3.4
+# Bumped with the version, and separately from it: upstream rebuilds `latest`
+# under an unchanged version string, so the commit is the only thing that
+# actually moves. See the drift check below.
+ENFORCER_VALIDATED_COMMIT=9cb14bc
 
 # ---- helpers ----
 fetch_zip() {
@@ -138,14 +142,31 @@ if [[ "$SKIP_THUNDER" != 1 ]]; then
     fetch_bin "$THUNDER_BASE_URL/thunder-cli-${THUNDER_VERSION}-${ARCH}" thunder-cli
 fi
 
-# The enforcer can't be URL-pinned; surface drift loudly so a red CI run
-# is attributable. Version line looks like: "bip300301_enforcer_lib v0.3.4".
-ENFORCER_ACTUAL="$("$BIN/bip300301_enforcer" --version 2>/dev/null \
+# The enforcer can't be URL-pinned; surface drift loudly so a red CI run is
+# attributable.
+#
+# ⚠️ The COMMIT is checked, not just the version, because the version is not
+# enough and we found that out the hard way. Upstream rebuilt `latest` from
+# c188a38 to 9cb14bc while leaving the version string at v0.3.4, and in that
+# rebuild SetAckAllProposals changed from a boolean to a policy enum. Both e2e
+# suites went red on main, and this warning -- the one thing whose entire job
+# is making that attributable -- stayed silent, because v0.3.4 still equalled
+# v0.3.4.
+#
+# Version line looks like:
+#     bip300301_enforcer_lib v0.3.4
+#      commit: 9cb14bc
+ENFORCER_VER_OUT="$("$BIN/bip300301_enforcer" --version 2>/dev/null || true)"
+ENFORCER_ACTUAL="$(printf '%s' "$ENFORCER_VER_OUT" \
     | grep -m1 -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo unknown)"
-if [[ "$ENFORCER_ACTUAL" != "$ENFORCER_VALIDATED_VERSION" ]]; then
-    echo "  WARNING: enforcer is $ENFORCER_ACTUAL, last validated" \
-         "$ENFORCER_VALIDATED_VERSION — unpinnable upstream (latest-only" \
-         "artifacts); revalidate and bump ENFORCER_VALIDATED_VERSION"
+ENFORCER_ACTUAL_COMMIT="$(printf '%s' "$ENFORCER_VER_OUT" \
+    | grep -m1 -oE 'commit: *[0-9a-f]+' | grep -oE '[0-9a-f]+$' || echo unknown)"
+if [[ "$ENFORCER_ACTUAL" != "$ENFORCER_VALIDATED_VERSION" \
+   || "$ENFORCER_ACTUAL_COMMIT" != "$ENFORCER_VALIDATED_COMMIT" ]]; then
+    echo "  WARNING: enforcer is $ENFORCER_ACTUAL ($ENFORCER_ACTUAL_COMMIT)," \
+         "last validated $ENFORCER_VALIDATED_VERSION" \
+         "($ENFORCER_VALIDATED_COMMIT) — unpinnable upstream (latest-only" \
+         "artifacts); revalidate and bump ENFORCER_VALIDATED_{VERSION,COMMIT}"
 fi
 
 echo "==> binaries ready in $BIN"
