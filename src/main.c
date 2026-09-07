@@ -823,8 +823,22 @@ static void *tip_watcher(void *arg) {
 
         /* A new tip is exactly when a candidate's fate can have changed:
          * either it is the one that extended the chain, or something else
-         * was. */
-        if (t->height - 1 != s->last_height) reconcile_blocks(s, t->height - 1);
+         * was.
+         *
+         * new_tip, not a comparison of our own against last_height.
+         * last_height holds the TEMPLATE height, which is the tip plus one,
+         * so `t->height - 1 != s->last_height` asks whether the new tip
+         * differs from the previous tip PLUS ONE. On an ordinary one-block
+         * advance that is false -- the single most common event on any
+         * chain, and the one case this has to catch. It fired only when the
+         * tip jumped two or more blocks between polls, which is why blocks
+         * sat at 'pending' on a quiet chain and PPLNS, whose distribution
+         * hangs off this pass, credited nobody at all.
+         *
+         * new_tip is computed above from both the height and the previous
+         * hash, so it also catches a reorg that replaces the tip at the same
+         * height -- which a height comparison of any kind cannot see. */
+        if (new_tip) reconcile_blocks(s, t->height - 1);
 
         if (need_rebuild) {
             char berr[256] = {0};
