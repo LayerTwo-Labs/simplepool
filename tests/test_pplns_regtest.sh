@@ -167,19 +167,44 @@ stage "activate sidechain #9 via enforcer-template mining"
 # ---------------------------------------------------------------------------
 # One rail.
 # ---------------------------------------------------------------------------
+# run_rail <mode> <username> [backend]
+#
+# backend selects which node serves getblocktemplate, and it is not a detail:
+# it decides which of the two confirmation mechanisms the proxy uses.
+#
+#   enforcer  (default)  serves no getblockhash, so blocks are confirmed from
+#                        the observed chain of template tips
+#   bitcoind             serves getblockhash, which the proxy prefers, and
+#                        which latches on for the life of the process
+#
+# Both must end up distributing. The getblockhash path is the one that used to
+# return before ever reaching the distributor, so a pool on an ordinary
+# bitcoind confirmed its blocks, counted them past maturity, and credited
+# nobody -- with nothing in the rows to show for it. The enforcer serves no
+# getblockhash, so no amount of testing against it can see that.
 run_rail() {
-    local mode="$1" user="$2"
-    POOL_CONF="/tmp/simplepool-pplns-$mode.conf"
-    POOL_LOG="/tmp/simplepool-pplns-$mode.log"
-    POOL_DB="/tmp/simplepool-pplns-$mode.db"
+    local mode="$1" user="$2" backend="${3:-enforcer}"
+    local tag="$mode-$backend"
+    POOL_CONF="/tmp/simplepool-pplns-$tag.conf"
+    POOL_LOG="/tmp/simplepool-pplns-$tag.log"
+    POOL_DB="/tmp/simplepool-pplns-$tag.db"
 
-    stage "[$mode] start simplepool against enforcer GBT"
+    local rpc_lines
+    if [ "$backend" = "bitcoind" ]; then
+        rpc_lines="bitcoind_url = http://127.0.0.1:${REGTEST_BITCOIND_RPC_PORT}
+bitcoind_user = user
+bitcoind_pass = password"
+    else
+        rpc_lines="bitcoind_url = http://127.0.0.1:${REGTEST_ENFORCER_RPC_PORT}"
+    fi
+
+    stage "[$tag] start simplepool against $backend GBT"
     rm -f "$POOL_DB" "$POOL_DB-wal" "$POOL_DB-shm"
     cat > "$POOL_CONF" <<EOF
 listen_addr = 127.0.0.1
 listen_port = ${POOL_PORT}
 
-bitcoind_url = http://127.0.0.1:${REGTEST_ENFORCER_RPC_PORT}
+${rpc_lines}
 bitcoind_poll_interval_ms = 500
 
 operator_address = ${OPERATOR_ADDR}
@@ -208,34 +233,34 @@ EOF
     for _ in $(seq 1 20); do nc -z 127.0.0.1 "$POOL_PORT" 2>/dev/null && break; sleep 1; done
     kill -0 "$POOL_PID" 2>/dev/null || { echo "simplepool died on startup" >&2; exit 1; }
 
-    stage "[$mode] mine one block through stratum as $user"
+    stage "[$tag] mine one block through stratum as $user"
     local before after
     before=$(cli getblockcount)
     node "$ROOT/scripts/regtest/cpuminer.js" --port "$POOL_PORT" --user "$user" --timeout 180
     after=$(cli getblockcount)
     echo "  height: $before -> $after"
     [ "$after" -gt "$before" ] || {
-        echo "FAIL: [$mode] block submitted but the chain did not advance" >&2; exit 1; }
+        echo "FAIL: [$tag] block submitted but the chain did not advance" >&2; exit 1; }
 
     # The username rule is half of what pool_mode decides, so prove the pool
     # actually took this rail's shape rather than accepting anything.
     local nworkers
     nworkers=$(q "SELECT COUNT(*) FROM workers WHERE name = '$user'")
     [ "$nworkers" = "1" ] || {
-        echo "FAIL: [$mode] '$user' was not authorized as a worker" >&2; exit 1; }
+        echo "FAIL: [$tag] '$user' was not authorized as a worker" >&2; exit 1; }
 
-    stage "[$mode] the block carries a snapshotted window"
+    stage "[$tag] the block carries a snapshotted window"
     local hash window
     hash=$(q "SELECT hash FROM blocks_found ORDER BY id DESC LIMIT 1")
-    [ -n "$hash" ] || { echo "FAIL: [$mode] no block row was written" >&2; exit 1; }
+    [ -n "$hash" ] || { echo "FAIL: [$tag] no block row was written" >&2; exit 1; }
     window=$(q "SELECT pplns_window_diff FROM blocks_found WHERE hash='$hash'")
     echo "  block $hash window=$window"
     # Snapshotted at find time; a zero window is skipped by the distributor,
     # so this is the difference between paying out and silently never paying.
     awk -v w="$window" 'BEGIN { exit !(w > 0) }' || {
-        echo "FAIL: [$mode] block was recorded with no PPLNS window" >&2; exit 1; }
+        echo "FAIL: [$tag] block was recorded with no PPLNS window" >&2; exit 1; }
 
-    stage "[$mode] a confirmed but immature block credits nobody"
+    stage "[$tag] a confirmed but immature block credits nobody"
     mine "$SHALLOW"
     # The proxy reconciles only when the tip HEIGHT changes, and it reaches
     # the next tip through a long poll that can sit for 30s. So drive it:
@@ -252,23 +277,23 @@ EOF
     done
     echo "  confirmations=$confs (maturity is $MATURITY)"
     [ "${confs:-0}" -ge 1 ] || {
-        echo "FAIL: [$mode] block never reached even one confirmation" >&2; exit 1; }
+        echo "FAIL: [$tag] block never reached even one confirmation" >&2; exit 1; }
     # The whole point of this stage: it must still be short of maturity, or
     # it proves nothing about the gate.
     [ "${confs:-0}" -lt "$MATURITY" ] || {
-        echo "FAIL: [$mode] block reached $confs confirmations before the" >&2
+        echo "FAIL: [$tag] block reached $confs confirmations before the" >&2
         echo "      immaturity check could run — the nudge budget above is" >&2
         echo "      too large relative to maturity ($MATURITY)" >&2
         exit 1; }
     credited=$(q "SELECT COALESCE(SUM(accrued_sats),0) FROM pps_credits")
     [ "$credited" = "0" ] || {
-        echo "FAIL: [$mode] $credited sats credited from a block only $confs deep —" >&2
+        echo "FAIL: [$tag] $credited sats credited from a block only $confs deep —" >&2
         echo "      a coinbase is unspendable until $MATURITY, so this is a balance" >&2
         echo "      the pool cannot fund" >&2
         exit 1; }
     echo "  credited nothing, as required"
 
-    stage "[$mode] mature the block and distribute"
+    stage "[$tag] mature the block and distribute"
     mine "$MATURITY"
     local dist
     for _ in $(seq 1 40); do
@@ -280,12 +305,12 @@ EOF
     confs=$(q "SELECT COALESCE(confirmations,0) FROM blocks_found WHERE hash='$hash'")
     echo "  confirmations=$confs distributed=$dist"
     [ "${dist:-0}" = "1" ] || {
-        echo "FAIL: [$mode] block is $confs deep and still undistributed" >&2
+        echo "FAIL: [$tag] block is $confs deep and still undistributed" >&2
         echo "      (maturity $MATURITY) — the distributor never ran or never" >&2
         echo "      considered it eligible" >&2
         exit 1; }
 
-    stage "[$mode] the credited ledger matches the block, net of the fee"
+    stage "[$tag] the credited ledger matches the block, net of the fee"
     local reward fee gross payable total
     reward=$(q "SELECT COALESCE(reward_sats,0) FROM blocks_found WHERE hash='$hash'")
     fee=$(q "SELECT COALESCE(fee_sats,0)    FROM blocks_found WHERE hash='$hash'")
@@ -297,16 +322,16 @@ EOF
     # Fees are included deliberately: PPLNS shares what the block actually
     # earned, not a subsidy-only estimate.
     [ "$total" = "$payable" ] || {
-        echo "FAIL: [$mode] credited $total sats, expected $payable" >&2; exit 1; }
+        echo "FAIL: [$tag] credited $total sats, expected $payable" >&2; exit 1; }
     # One miner, so the whole payable amount is its own -- and it must be
     # THIS rail's username that holds it.
     local mine_sats
     mine_sats=$(q "SELECT COALESCE(SUM(c.accrued_sats),0) FROM pps_credits c
                      JOIN workers w ON w.id = c.worker_id WHERE w.name = '$user'")
     [ "$mine_sats" = "$payable" ] || {
-        echo "FAIL: [$mode] '$user' holds $mine_sats of $payable" >&2; exit 1; }
+        echo "FAIL: [$tag] '$user' holds $mine_sats of $payable" >&2; exit 1; }
 
-    stage "[$mode] distribution is exactly once"
+    stage "[$tag] distribution is exactly once"
     # Crediting is additive and there is no negative share, so a second pass
     # over the same block doubles every balance and leaves no trace in the
     # amounts themselves. Give the confirmation pass several more tips to
@@ -316,7 +341,7 @@ EOF
     local again
     again=$(q "SELECT COALESCE(SUM(accrued_sats),0) FROM pps_credits")
     [ "$again" = "$payable" ] || {
-        echo "FAIL: [$mode] balance moved from $payable to $again after further" >&2
+        echo "FAIL: [$tag] balance moved from $payable to $again after further" >&2
         echo "      passes — the block was distributed more than once" >&2
         exit 1; }
     echo "  balance still $again after 5 more tips"
@@ -328,6 +353,10 @@ EOF
 
 run_rail pplns-thunder "$THUNDER_USER"
 run_rail pplns-btc     "$BTC_USER"
+# The same distribution, reached down the other confirmation path. See the
+# comment on run_rail: this is the combination that silently paid nobody.
+run_rail pplns-thunder "$THUNDER_USER" bitcoind
 
 echo
-echo "pplns e2e: PASS (both rails distributed a matured block, exactly once)"
+echo "pplns e2e: PASS (both rails, and both confirmation paths, distributed a"
+echo "                 matured block exactly once)"

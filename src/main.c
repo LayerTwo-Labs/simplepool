@@ -669,6 +669,11 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
 static void reconcile_blocks(server_ctx_t *s, int tip_height) {
     if (!s || !s->store || tip_height <= 0) return;
 
+    /* Whether this pass has already settled candidate statuses, so the
+     * templates fallback below must not run and overwrite them. NOT a reason
+     * to skip the distribution at the end -- see there. */
+    int settled = 0;
+
     if (atomic_load(&s->gbh_state) >= 0) {
         store_block_candidate_t cands[RECONCILE_MAX_PER_TICK];
         int n = store_list_unresolved_blocks(s->store, tip_height,
@@ -688,9 +693,15 @@ static void reconcile_blocks(server_ctx_t *s, int tip_height) {
             }
             if (rc != 0) {
                 /* Transient. Leave the rows alone and retry on the next tip
-                 * rather than recording a verdict we did not get. */
+                 * rather than recording a verdict we did not get. Statuses
+                 * are untouched, so the templates pass must not run either --
+                 * but this is not a reason to stop paying: distribution reads
+                 * only rows settled by an earlier pass, and a backend that
+                 * kept failing this one call would otherwise silently stop
+                 * crediting anyone. */
                 LOG_WARN("getblockhash(%d) failed: %s", cands[i].height, gerr);
-                return;
+                settled = 1;
+                break;
             }
             atomic_store(&s->gbh_state, 1);
             int match = strcasecmp(have, cands[i].hash) == 0;
@@ -704,14 +715,21 @@ static void reconcile_blocks(server_ctx_t *s, int tip_height) {
                          "marked orphaned", cands[i].hash, cands[i].height);
             }
         }
-        if (atomic_load(&s->gbh_state) > 0) return;
+        /* getblockhash is the node's own answer, so where the backend has
+         * one it wins outright and the templates fallback below is skipped
+         * -- running both would have the weaker check overwrite the stronger
+         * one's verdict and its checked_via. */
+        if (atomic_load(&s->gbh_state) > 0) settled = 1;
     }
 
-    int confirmed = 0, orphaned = 0, pending = 0;
-    if (store_reconcile_blocks_from_templates(s->store, tip_height, &confirmed,
-                                              &orphaned, &pending) == 0) {
-        LOG_DEBUG("block reconcile: confirmed=%d orphaned=%d pending=%d",
-                  confirmed, orphaned, pending);
+    if (!settled) {
+        int confirmed = 0, orphaned = 0, pending = 0;
+        if (store_reconcile_blocks_from_templates(s->store, tip_height,
+                                                  &confirmed, &orphaned,
+                                                  &pending) == 0) {
+            LOG_DEBUG("block reconcile: confirmed=%d orphaned=%d pending=%d",
+                      confirmed, orphaned, pending);
+        }
     }
 
     /* PPLNS pays out here rather than at block-find time, because this is the
@@ -721,7 +739,16 @@ static void reconcile_blocks(server_ctx_t *s, int tip_height) {
      * block that later turns out not to be ours cannot be taken back. Running
      * it off the confirmation pass, gated on maturity, means it only ever sees
      * blocks that are 100 deep — by which point "still in the chain" has
-     * stopped being a question. */
+     * stopped being a question.
+     *
+     * ⚠️ This must stay on the function's single exit path, reached however
+     * the statuses above were settled. It used to sit behind an early return
+     * taken whenever the backend served getblockhash — and since that state
+     * latches on for the life of the process, a pool on a getblockhash-capable
+     * node confirmed its blocks, counted them past 100 deep, and then never
+     * distributed one. Nothing looked wrong: the rows carry a window, a
+     * status and the depth, and only pps_credits stays empty. Do not add a
+     * `return` above this without moving it. */
     if (s->cfg && (strcmp(s->cfg->pool_mode, "pplns-thunder") == 0 ||
                    strcmp(s->cfg->pool_mode, "pplns-btc") == 0)) {
         int blocks = 0, workers = 0;
