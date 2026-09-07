@@ -70,7 +70,7 @@ VERSION_H  := $(BUILD_DIR)/version_gen.h
 SRCS := src/main.c src/log.c src/config.c src/coinbase.c \
         src/share.c src/sha256.c src/stratum.c src/store.c \
         src/bitcoind.c src/broadcast.c src/thunder.c src/version.c \
-        src/cjson/cJSON.c
+        src/reconcile.c src/cjson/cJSON.c
 OBJS := $(SRCS:%.c=$(BUILD_DIR)/%.o)
 DEPS := $(OBJS:.o=.d)
 
@@ -123,8 +123,9 @@ include tests/test_coinbase.mk
 include tests/test_broadcast.mk
 include tests/test_thunder.mk
 include tests/test_config.mk
+include tests/test_reconcile.mk
 
-test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_config
+test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_config build/test_reconcile
 	./build/test_share
 	./build/test_bitcoind
 	./build/test_stratum
@@ -133,6 +134,7 @@ test: build/test_share build/test_bitcoind build/test_stratum build/test_store b
 	./build/test_broadcast
 	./build/test_thunder
 	./build/test_config
+	./build/test_reconcile
 
 # Run the suites under AddressSanitizer + UndefinedBehaviorSanitizer.
 #
@@ -203,7 +205,9 @@ coverage:
 	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_thunder tests/test_thunder.c src/thunder.c
 	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_config tests/test_config.c \
 		src/config.c src/log.c src/coinbase.c src/sha256.c
-	@set -e; for t in stratum store coinbase share bitcoind broadcast thunder config; do \
+	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_reconcile tests/test_reconcile.c \
+		src/reconcile.c src/store.c src/log.c $(PLATFORM_LDFLAGS) -lsqlite3 -lpthread
+	@set -e; for t in stratum store coinbase share bitcoind broadcast thunder config reconcile; do \
 		LLVM_PROFILE_FILE=$(COV_DIR)/$$t.profraw ./$(COV_DIR)/test_$$t >/dev/null 2>&1 \
 			|| { echo "coverage: test_$$t FAILED"; exit 1; }; \
 	done
@@ -212,7 +216,7 @@ coverage:
 	@xcrun llvm-cov report $(COV_DIR)/test_stratum \
 		$(addprefix -object ,$(COV_DIR)/test_store $(COV_DIR)/test_coinbase \
 		$(COV_DIR)/test_share $(COV_DIR)/test_bitcoind $(COV_DIR)/test_broadcast \
-		$(COV_DIR)/test_thunder $(COV_DIR)/test_config) \
+		$(COV_DIR)/test_thunder $(COV_DIR)/test_config $(COV_DIR)/test_reconcile) \
 		-instr-profile=$(COV_DIR)/all.profdata $(COV_IGNORE)
 
 format:
