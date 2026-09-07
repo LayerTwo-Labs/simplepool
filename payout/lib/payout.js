@@ -320,7 +320,14 @@ export async function runOnce(ctx, log) {
      * question is itself a transfer. One address goes out first; the answer
      * arrives with it. */
     const groups = groupByAddress(allDue);
-    const canBatchAcrossAddresses = ctx._nodeBroadcastsOnCreate === false;
+    /* A client that KNOWS it can batch says so and is believed; only a node
+     * whose behaviour has to be discovered is made to prove it. The enforcer
+     * wallet is the former -- SendTransaction takes a destinations map, so
+     * there is nothing to find out and nothing a probe could add. Making it
+     * learn instead meant every first tick paid one address and deferred the
+     * rest, and run-once.mjs is a fresh process per tick. */
+    const canBatchAcrossAddresses =
+        thunder.batchesAcrossAddresses === true || ctx._nodeBroadcastsOnCreate === false;
     const due    = canBatchAcrossAddresses ? allDue : groups[0].rows;
     const queued = canBatchAcrossAddresses ? 0 : groups.length - 1;
 

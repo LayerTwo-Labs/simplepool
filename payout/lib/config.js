@@ -55,6 +55,25 @@
  *   THUNDER_FROM_ADDRESS   pool reserve address to send from (must match
  *                          the dashboard's POOL_THUNDER_RESERVE_ADDRESS —
  *                          the wallet the operator deposits mined BTC into)
+ *
+ * L1 rail (pool_mode = pplns-btc). Selected by PAYOUT_RAIL; the Thunder
+ * variables above are then unused, and these are required instead:
+ *   PAYOUT_RAIL            'thunder' (default) or 'btc'. Must match the
+ *                          proxy's pool_mode: pplns-btc pays on L1, every
+ *                          other mode pays over Thunder. A pool runs one or
+ *                          the other — the rail decides what a stratum
+ *                          username even is.
+ *   ENFORCER_RPC_ADDR      bip300301_enforcer ConnectRPC address, e.g.
+ *                          127.0.0.1:50051. It must be running with
+ *                          --enable-wallet: the pool holds no keys and
+ *                          builds no transactions, it asks the enforcer's
+ *                          WalletService to send.
+ *   PAYOUT_FEE_RATE_SAT_VB fee rate handed to the enforcer, which computes
+ *                          the fee from the transaction it actually builds
+ *                          (default 5). There is no local estimator to drift.
+ *   ENFORCER_WALLET_PASSPHRASE
+ *                          optional; needed only for an encrypted wallet.
+ *                          Without it every spend fails at the wallet.
  */
 
 function require_env(name) {
@@ -67,12 +86,26 @@ function require_env(name) {
 }
 
 export function loadConfig() {
+    /* Which rail this worker drives. Read first: it decides which of the two
+     * disjoint sets of variables is required, and demanding Thunder's while
+     * running on L1 would refuse to start a correctly configured pool. */
+    const rail = (process.env.PAYOUT_RAIL || 'thunder').toLowerCase();
+    if (rail !== 'thunder' && rail !== 'btc') {
+        console.error(`fatal: PAYOUT_RAIL must be 'thunder' or 'btc', got '${rail}'`);
+        process.exit(2);
+    }
+    const l1 = rail === 'btc';
+
     return {
+        rail,
         dbPath:        require_env('PAYOUT_DB_PATH'),
-        rpcUrl:        require_env('THUNDER_RPC_URL'),
+        rpcUrl:        l1 ? null : require_env('THUNDER_RPC_URL'),
         rpcUser:       process.env.THUNDER_RPC_USER || null,
         rpcPass:       process.env.THUNDER_RPC_PASS || null,
-        fromAddress:   require_env('THUNDER_FROM_ADDRESS'),
+        fromAddress:   l1 ? null : require_env('THUNDER_FROM_ADDRESS'),
+        enforcerAddr:  l1 ? require_env('ENFORCER_RPC_ADDR') : null,
+        feeRateSatPerVb: parseInt(process.env.PAYOUT_FEE_RATE_SAT_VB || '5', 10),
+        walletPassphrase: process.env.ENFORCER_WALLET_PASSPHRASE || null,
         /* Daily batch cadence. Settlement and retry run on their own,
          * much shorter clocks — see nextDelayMs() in payout.js. */
         intervalMs:       parseInt(process.env.PAYOUT_INTERVAL_MS        || '86400000', 10),

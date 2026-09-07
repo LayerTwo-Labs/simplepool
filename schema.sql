@@ -77,11 +77,25 @@ CREATE TABLE IF NOT EXISTS blocks_found (
   fee_sats        INTEGER,
   status          TEXT NOT NULL DEFAULT 'pending',
   confirmations   INTEGER NOT NULL DEFAULT 0,
+  /* PPLNS distribution. Zero in every other mode.
+   *
+   * pplns_window_diff is the window size in difficulty units, snapshotted
+   * when the block was found rather than recomputed when it is paid out.
+   * Those moments are ~100 blocks apart and the chain can retarget between
+   * them, so recomputing would pay a block across a window its own miners
+   * never worked under. Stored, the split is reproducible from the row.
+   *
+   * pplns_distributed is the exactly-once latch. Crediting is additive, so a
+   * second pass over the same block doubles every balance and leaves no
+   * trace in the amounts themselves. */
+  pplns_window_diff REAL    NOT NULL DEFAULT 0,
+  pplns_distributed INTEGER NOT NULL DEFAULT 0,
   submit_error    TEXT,
   checked_via     TEXT
 );
 CREATE INDEX IF NOT EXISTS blocks_found_ts_idx ON blocks_found(ts);
 CREATE INDEX IF NOT EXISTS blocks_found_status_idx ON blocks_found(status);
+CREATE INDEX IF NOT EXISTS blocks_found_pplns_idx ON blocks_found(pplns_distributed, status);
 
 /* Single-row mirror of the upstream bitcoind tip the proxy is currently
  * mining on. Written by the proxy's tip watcher on every successful

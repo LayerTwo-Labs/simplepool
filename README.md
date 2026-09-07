@@ -6,10 +6,14 @@ connections on TCP `:3334`, builds block templates via `bitcoind`'s
 accepted share into a local SQLite database. A separate Node.js dashboard
 reads that file for stats.
 
-It runs in two modes: **solo**, where the miner who finds a block is paid in
-that block's own coinbase, and **pps-classic**, where every accepted share
-earns a derivable amount paid out over Thunder. Both ship in this repo — see
-[The two modes](#the-two-modes) below.
+It runs in four modes, which differ in who carries the variance: **solo**,
+where the miner who finds a block is paid in that block's own coinbase;
+**pps-classic**, where every accepted share earns a derivable amount and the
+operator absorbs the variance out of a reserve; and **pplns-thunder** /
+**pplns-btc**, where a matured block is split across the shares that produced
+it, so the miners carry the variance and the pool never owes more than it has
+just been paid. All four ship in this repo — see [The four
+modes](#the-four-modes) below.
 
 Created by **Roberto Santacroce**.
 Canonical repository: <https://github.com/LayerTwo-Labs/simplepool>.
@@ -37,15 +41,23 @@ curl -fsSL https://raw.githubusercontent.com/LayerTwo-Labs/simplepool/main/scrip
 > verify what they're owed. simplepool aims to address this transparency
 > gap. (Hopefully!)
 
-> A single-file, no-JavaScript explainer covering both modes end to end —
+> A single-file, no-JavaScript explainer covering every mode end to end —
 > shares, difficulty, the coinbase, PPS credit, Thunder payouts and how to
 > audit every number — lives at [`docs/simplepool.html`](docs/simplepool.html).
 > Open it from disk or serve it next to the dashboard.
 
-### The two modes
+### The four modes
 
-This repository ships **both modes**, selected by `pool_mode` in
-`proxy.conf`:
+This repository ships **all four**, selected by `pool_mode` in
+`proxy.conf`. They differ in two independent things — whether the coinbase
+pays the miner or the pool, and what a stratum username is:
+
+| `pool_mode` | coinbase pays | username | who carries the variance |
+| --- | --- | --- | --- |
+| `solo` | the miner who found it | Bitcoin address | nobody: you are paid what you find |
+| `pps-classic` | the pool | Thunder address | the operator, out of a reserve |
+| `pplns-thunder` | the pool | Thunder address | the miners |
+| `pplns-btc` | the pool | Bitcoin address | the miners |
 
 - **`pool_mode = solo`** (default) — every share lands in the local
   SQLite store, every accepted block is paid directly in its own
@@ -81,9 +93,65 @@ This repository ships **both modes**, selected by `pool_mode` in
   > see [`CLASSIC_PAYOUTS.md`](CLASSIC_PAYOUTS.md) for the evidence and
   > the design that replaced it.
 
-In both modes the operator fee stays in BTC, paid to `operator_address`
-out of the same coinbase. See [`proxy.conf.example`](proxy.conf.example)
-for the full set of PPS / Thunder keys.
+- **`pool_mode = pplns-thunder`** and **`pool_mode = pplns-btc`** — the
+  coinbase pays the pool, exactly as in `pps-classic`, but **nothing is
+  credited when a share arrives**. Instead, once a block has matured **100
+  confirmations** it is split across the shares that produced it — walking
+  back from the block's own share until their difficulty fills a window —
+  and each miner is credited its proportion of `(reward + fees)`, net of
+  `fee_bps`.
+
+  That is the whole difference, and it is a difference about risk. PPS
+  prices a share the moment it arrives, whether or not it ever becomes a
+  block, so the operator needs a reserve measured in block rewards to
+  absorb the gap. Under PPLNS the pool never owes more than it has just
+  been paid: there is no reserve to size and operator ruin is not a failure
+  mode. The miners carry the variance instead, which is what makes it the
+  mode a small pool can actually run.
+
+  Two consequences worth stating, because each has a plausible-looking
+  wrong answer:
+
+  - **Maturity, not confirmation.** A coinbase output is unspendable until
+    it is 100 deep, so crediting at confirmation would create a balance the
+    pool genuinely cannot fund — the reserve requirement PPLNS exists to
+    remove, reintroduced by accident. Waiting also disposes of the orphan
+    question rather than answering it: crediting is additive and there is
+    no negative share, so a credit from a block that turns out not to be
+    ours could not be taken back. At 100 deep that stops being a risk.
+  - **Transaction fees are included**, unlike pure PPS: PPLNS shares what
+    the block actually earned.
+
+  The window is `pplns_window_diff_multiple` × the network difficulty
+  (default 2.0, "the last two blocks' worth of expected work"), a multiple
+  rather than an absolute share count so it self-scales across retargets.
+  It is snapshotted onto the block row when the block is found, not
+  recomputed when it is paid: those moments are ~100 blocks apart and the
+  chain can retarget in between.
+
+  The two differ only in the rail the balance is finally paid over, and
+  that choice is what a stratum username has to be:
+
+  - **`pplns-thunder`** pays over Thunder, like `pps-classic`, and reuses
+    the same payout worker draining the same `pps_credits` table. Username
+    is a bare base58 Thunder address.
+  - **`pplns-btc`** pays on Bitcoin L1, by asking the enforcer's own wallet
+    to send. Username is a Bitcoin address. This requires
+    `bip300301_enforcer` running with `--enable-wallet`, with
+    `pool_btc_address` an address from that wallet, and the payout worker
+    started with `PAYOUT_RAIL=btc` — the proxy says so at startup, because
+    otherwise the first sign of a misconfiguration is a payout failing 100
+    blocks after the block was found.
+
+  One rail per pool, encoded in `pool_mode` rather than a mode plus a
+  separate rail knob, so the inconsistent configuration is unrepresentable
+  rather than merely rejected.
+
+In every mode the operator fee stays in BTC, paid to `operator_address`
+out of the same coinbase. On PPLNS it is normally set lower than on PPS:
+there is no variance being absorbed, so there is no risk premium to charge
+for. See [`proxy.conf.example`](proxy.conf.example) for the full set of
+PPS / PPLNS / Thunder keys.
 
 Optional: set `redis_url` to mirror accepted shares, rejects, blocks,
 tip changes and PPS credits to Redis pub/sub channels (`pool:shares`,
@@ -108,6 +176,11 @@ and historical "blocks found by the pool" view.
 **In `pps-classic` mode** that inverts: the coinbase pays the pool, every
 accepted share credits a balance at a rate derived from the live block
 template, and the pool — not the miner — carries the variance.
+
+**In the `pplns-*` modes** the coinbase also pays the pool, but no balance
+moves until a block matures; it is then divided among the shares that
+produced it. Nobody is paid for work that did not become a block, which is
+precisely why the pool needs no reserve.
 
 ### A note on terminology: "share" vs "work"
 
@@ -550,7 +623,7 @@ src/
   store.{c,h}        # SQLite writer with batching
   bitcoind.{c,h}     # libcurl-based JSON-RPC client
   broadcast.{c,h}    # optional Redis pub/sub mirror of pool events
-  thunder.{c,h}      # Thunder base58 address decoder (pps-classic)
+  thunder.{c,h}      # Thunder base58 address decoder (pps-classic, pplns-thunder)
   version.{c,h}      # build provenance compiled into the binary
   cjson/             # vendored cJSON (MIT) — see src/cjson/README.md
 tests/               # unit tests + integration shell scripts
@@ -561,8 +634,9 @@ scripts/
   release.sh         # build a release tarball (CI runs this exact script)
   deploy-to-server.sh, sync-from-server.sh, record-build.sh, ...
 dashboard/           # Node/Express read-only stats UI
-payout/              # Thunder payout worker (pps-classic)
-docs/simplepool.html # single-file explainer: both modes, end to end
+payout/              # payout worker: Thunder rail (pps-classic, pplns-thunder)
+                     #   and L1 rail via the enforcer wallet (pplns-btc)
+docs/simplepool.html # single-file explainer: every mode, end to end
 ```
 
 ## Roadmap
@@ -576,14 +650,16 @@ Shipped since this list was first written:
 - **Redis broadcast.** Accepted shares, rejects, blocks, tip changes and PPS
   credits are mirrored onto Redis pub/sub when `redis_url` is set. SQLite
   remains the source of truth; the publish is fire-and-forget.
-- **PPS billing as a separate, non-blocking service.** `pool_mode =
-  pps-classic` accrues credits in the proxy; the separate
-  [`payout/`](payout/) worker settles them over **Thunder** on its own
-  process and its own schedule. A payout outage cannot stop the proxy
-  accepting work.
-- **Miner registration turned out to be unnecessary.** PPS miners are
-  identified by the Thunder address in the stratum username, exactly as solo
-  miners are identified by their BTC address. There is nothing to register.
+- **Billing as a separate, non-blocking service.** Both the PPS and the
+  PPLNS modes accrue credits in the proxy, into the same `pps_credits`
+  table; the separate [`payout/`](payout/) worker settles them on its own
+  process and its own schedule — over **Thunder** for `pps-classic` and
+  `pplns-thunder`, and on **L1** through the enforcer's wallet for
+  `pplns-btc`. A payout outage cannot stop the proxy accepting work.
+- **Miner registration turned out to be unnecessary.** Miners are identified
+  by the address in the stratum username — Thunder or Bitcoin depending on
+  the mode's rail — exactly as solo miners are identified by their BTC
+  address. There is nothing to register.
 
 Still open:
 

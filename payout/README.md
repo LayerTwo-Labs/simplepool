@@ -10,6 +10,47 @@ only writer of `accrued_sats`; this worker is the only writer of
 `paid_sats`. SQLite WAL + a 5-second busy timeout keep them out of each
 other's way.
 
+## Two rails
+
+The worker drains `pps_credits` and pays whoever is owed. **Which chain it
+pays on** is `PAYOUT_RAIL`, and it must match the proxy's `pool_mode` — a pool
+runs one or the other, never both, because the rail decides what a stratum
+username even is.
+
+| `pool_mode` | `PAYOUT_RAIL` | username | pays via |
+| --- | --- | --- | --- |
+| `pps-classic`, `pplns-thunder` | `thunder` (default) | Thunder address | Thunder `create_transfer` |
+| `pplns-btc` | `btc` | Bitcoin address | enforcer `WalletService/SendTransaction` |
+
+Everything that makes a payout safe is written once and shared: the
+write-ahead `payouts_in_flight` row, one transaction per batch, and crediting
+`paid_sats` only on confirmation. The two clients present the same interface,
+so the loop never branches on which one it is driving.
+
+### The L1 rail
+
+The pool holds no keys and builds no transactions. The
+`bip300301_enforcer` runs with `--enable-wallet`, the coinbase pays an address
+from that wallet, and paying miners is one RPC — `SendTransaction` takes a
+destinations map and a fee rate and does the input selection, signing and
+broadcasting itself.
+
+```sh
+PAYOUT_RAIL=btc
+ENFORCER_RPC_ADDR=127.0.0.1:50051      # enforcer, with --enable-wallet
+PAYOUT_FEE_RATE_SAT_VB=5               # a rate, not an absolute fee
+ENFORCER_WALLET_PASSPHRASE=...         # only for an encrypted wallet
+```
+
+The fee is a **rate**, not an amount, because the enforcer selects the inputs
+and is therefore the only party that knows the size of the transaction the fee
+applies to. There is no local estimator to drift out of date.
+
+Two miners can authorize with the same payout address from different rigs.
+`destinations` is keyed by address, so the client sums them before sending —
+an unmerged list would let one entry overwrite the other, paying that miner
+once for two debts while the ledger marked both settled.
+
 ## Run
 
 ```

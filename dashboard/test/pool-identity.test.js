@@ -164,3 +164,41 @@ test('malformed listener JSON does not take the strip down', async () => {
      * ports must still say where the money goes. */
     assert.ok(html.includes(OPERATOR));
 });
+
+/* PPLNS is neither of the two modes the strip used to know about, and calling
+ * it either one misstates where a miner's money is.
+ *
+ * The fallback branch was solo's: "Each block's coinbase pays the miner who
+ * found it, directly. No share credit accrues between blocks." Both halves are
+ * false under PPLNS -- the coinbase pays the pool wallet, and a matured block
+ * is split across the shares that produced it into the same pps_credits table
+ * PPS uses. A miner reading that would conclude the pool owed them nothing. */
+test('a pplns pool is not described as solo', async () => {
+    for (const mode of ['pplns-thunder', 'pplns-btc']) {
+        const html = await strip(makeDb({ pool_mode: mode }));
+        assert.match(html, new RegExp(mode), `${mode} must be named`);
+        assert.doesNotMatch(html, /No share credit accrues between blocks/,
+            `${mode} must not carry solo's description`);
+        assert.doesNotMatch(html, /credited at a fixed rate per unit of difficulty/,
+            `${mode} must not carry the PPS description either`);
+        assert.match(html, /split across the shares that produced it/,
+            `${mode} must say how a block is actually divided`);
+    }
+});
+
+/* The rail is the one thing the two pplns modes do not share, and it decides
+ * what a stratum username is -- so it is the fact a miner most needs. */
+test('the strip names the rail a pplns balance is paid over', async () => {
+    assert.match(await strip(makeDb({ pool_mode: 'pplns-btc' })),     /Bitcoin L1/);
+    assert.match(await strip(makeDb({ pool_mode: 'pplns-thunder' })), /Thunder/);
+});
+
+/* accrues means "a balance builds up between payouts", which is true of PPS
+ * and both pplns modes and false only of solo. Reporting it false for pplns
+ * would describe a pool that owes its miners nothing. */
+test('accrues is true for every mode that credits pps_credits', () => {
+    assert.equal(poolMeta(makeDb({ pool_mode: 'pps-classic'   })).accrues, true);
+    assert.equal(poolMeta(makeDb({ pool_mode: 'pplns-thunder' })).accrues, true);
+    assert.equal(poolMeta(makeDb({ pool_mode: 'pplns-btc'     })).accrues, true);
+    assert.equal(poolMeta(makeDb({ pool_mode: 'solo'          })).accrues, false);
+});

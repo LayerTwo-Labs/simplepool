@@ -54,6 +54,87 @@ if (n > 1) {
 
         <section class="card">
             <h2>Audit — why is this number what it is?</h2>
+            <% if (typeof pplns_audit !== 'undefined' && pplns_audit) { %>
+            <%# PPLNS: nothing is credited when a share arrives, so the
+                per-share re-derivation below is structurally empty and used to
+                report the pool as off by the miner's entire balance. This is
+                the derivation that actually produced the number. %>
+            <p class="muted small" style="margin-top:0">
+                Nothing is credited when a share arrives. Each block the pool
+                finds is held until it has matured <strong>100
+                confirmations</strong> — a coinbase cannot be spent before then
+                — and is then divided among the shares that produced it: the
+                pool walks back from the block's own share until their
+                difficulty fills the window, and each miner takes its
+                proportion of the reward <em>plus the fees</em>, net of the
+                operator fee. Every number below is recomputed here from the
+                raw <code>shares</code> and <code>blocks_found</code> rows, not
+                read back from whatever the payout path recorded.
+            </p>
+            <% if (pplns_audit.block_count === 0) { %>
+                <p class="muted">No matured block has been distributed yet.
+                Under PPLNS a balance only appears once the pool has found a
+                block and it has aged 100 deep.</p>
+            <% } else { %>
+            <div class="tablewrap">
+            <table>
+                <thead><tr>
+                    <th>Block</th><th>Reward + fees</th><th>After operator fee</th>
+                    <th>Your difficulty</th><th>Window</th><th>Your share</th><th>Credited</th>
+                </tr></thead>
+                <tbody>
+                <% for (const b of pplns_audit.blocks) { %>
+                    <tr>
+                        <td><%= fmtN(b.height) %></td>
+                        <td><%= fmtSats(b.gross) %></td>
+                        <td><%= fmtSats(b.payable) %></td>
+                        <td><%= b.my_diff.toFixed(6) %></td>
+                        <td><%= b.win_diff.toFixed(6) %></td>
+                        <td><%= b.share_pct.toFixed(4) %>%</td>
+                        <td><%= fmtSats(b.credited) %></td>
+                    </tr>
+                <% } %>
+                </tbody>
+            </table>
+            </div>
+            <div class="grid">
+                <div><label>Blocks you were paid from</label><strong><%= fmtN(pplns_audit.block_count) %></strong></div>
+                <div><label>Σ recomputed<br><span class="muted small">from shares + blocks_found</span></label><strong><%= fmtSats(pplns_audit.credited_total) %></strong></div>
+                <div><label>Stored accrued<br><span class="muted small">from pps_credits</span></label><strong><%= fmtSats(pps_audit.accrued) %></strong></div>
+                <div><label>Match?</label>
+                    <% if (pplns_audit.credited_total === pps_audit.accrued) { %>
+                        <strong style="color:#5b8">✓ Yes — the split reproduces your balance</strong>
+                    <% } else { %>
+                        <strong style="color:#c66">⚠ Off by <%= fmtSats(Math.abs(pps_audit.accrued - pplns_audit.credited_total)) %></strong>
+                    <% } %>
+                </div>
+            </div>
+            <% if (pplns_audit.credited_total !== pps_audit.accrued) { %>
+                <p class="muted small" style="color:#c66;margin-top:0.75em">
+                    The most likely cause is not a discrepancy in the ledger.
+                    This recomputation uses the pool's <strong>current</strong>
+                    operator fee (<%= (pplns_audit.fee_bps / 100).toFixed(2) %>%),
+                    because nothing records what it was per block — so if the
+                    operator has ever changed it, blocks distributed under the
+                    old fee will not reproduce.
+                    <% if (pplns_audit.truncated) { %>
+                        Only the most recent <%= fmtN(pplns_audit.block_count) %>
+                        blocks are shown, so older credits are also missing from
+                        the sum.
+                    <% } %>
+                    Your stored balance is authoritative for payouts either way.
+                </p>
+            <% } %>
+            <% } %>
+            <p class="muted small" style="margin-top:0.75em">
+                There is no "rate" here, and that is the point: PPLNS never
+                promises a price for a share in advance, so the pool can never
+                owe more than a block it has actually been paid for. Work that
+                did not end up in the window of a block is not paid — which is
+                the trade that removes the operator's reserve, and with it the
+                risk of the pool failing owing you money.
+            </p>
+            <% } else { %>
             <p class="muted small" style="margin-top:0">
                 Every accepted share credits your worker
                 <code>FLOOR(share_difficulty × <%= fmtN(pps_audit.rate) %>)</code>
@@ -120,6 +201,7 @@ if (n > 1) {
                         operator — it should never happen.
                     <% } %>
                 </p>
+            <% } %>
             <% } %>
             <p class="muted small" style="margin-top:0.75em">
                 For an even deeper trail (per-share running total, daily

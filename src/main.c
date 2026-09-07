@@ -6,6 +6,7 @@
 #include "log.h"
 #include "share.h"
 #include "store.h"
+#include "reconcile.h"
 #include "stratum.h"
 #include "version.h"
 
@@ -135,6 +136,12 @@ typedef struct {
      * lock per share would not be. Zero means "no accrual" (solo, or a
      * template we could not derive a rate from). */
     _Atomic double  pps_rate;
+    /* Network difficulty from the most recent template. PPLNS reads it when a
+     * block is found, to snapshot the window that block will later be
+     * distributed across — by the time it matures the chain may have
+     * retargeted, and recomputing then would pay it out across a window its
+     * own miners never worked under. */
+    _Atomic double  net_difficulty;
 
     /* Observed share-difficulty throughput, in difficulty units per second,
      * and the window it is accumulated over. This is the pool's own hashrate
@@ -161,12 +168,6 @@ typedef struct {
  * Long enough to be stable, short enough that a pool starting up is measured
  * within a minute. */
 #define HASHRATE_WINDOW_MS 60000
-
-/* A block this deep stops being re-checked. */
-#define BLOCK_FINAL_DEPTH      100
-/* Per tip change. Bounds how long reconciliation can hold the shared client's
- * connection lock, which submitblock also needs. */
-#define RECONCILE_MAX_PER_TICK  16
 
 /* The rate this proxy will credit at: the operator's override verbatim if
  * set, otherwise fair value derived from the template. See the
@@ -326,6 +327,10 @@ static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
         nbits_to_target(t->bits, target_be);
     }
     double net_diff = target_to_diff(target_be);
+    if (net_diff > 0.0 && isfinite(net_diff)) {
+        atomic_store_explicit(&s->net_difficulty, net_diff,
+                              memory_order_relaxed);
+    }
     int64_t value   = t->coinbase_value_sats;
 
     int overridden  = s->cfg->pps_sats_per_diff > 0.0;
@@ -592,10 +597,23 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
      * Nothing here may write 'confirmed'. */
     int status = accepted ? STORE_BLOCK_PENDING : STORE_BLOCK_REJECTED;
     if (s && s->store) {
+        /* Snapshot the PPLNS window for this block. Zero in every other mode,
+         * and zero here too if no template has been priced yet — a block with
+         * no window is skipped by the distributor rather than distributed
+         * across a window of nothing. */
+        double window_diff = 0.0;
+        if (s->cfg && s->cfg->pplns_window_diff_multiple > 0.0 &&
+            (strcmp(s->cfg->pool_mode, "pplns-thunder") == 0 ||
+             strcmp(s->cfg->pool_mode, "pplns-btc") == 0)) {
+            double nd = atomic_load_explicit(&s->net_difficulty,
+                                             memory_order_relaxed);
+            if (nd > 0.0) window_diff = nd * s->cfg->pplns_window_diff_multiple;
+        }
         store_record_block(s->store, ts_ms, (int)height, block_hash,
                            worker_name, finder_address,
                            reward_sats, fee_sats, status,
-                           accepted ? NULL : submit_error);
+                           accepted ? NULL : submit_error,
+                           window_diff);
     }
     /* pool:blocks carries solved blocks. A candidate the node refused is not
      * one, so it does not go out on that channel — the DB row is where a
@@ -633,53 +651,30 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
  * pool_meta.network_source distinguishes an authoritative answer from an
  * inferred one. Nothing here invents a verdict: a candidate that neither path
  * can speak to stays pending, and pending counts as nothing. */
+/* Adapter: the pass needs one thing from the network, and this is it.
+ * Everything else it touches is the store, which a test can hand it directly.
+ * See reconcile.h. */
+static int reconcile_get_block_hash(void *ctx, int height, char *out,
+                                    size_t out_len, char *err, size_t err_len)
+{
+    return bitcoind_get_block_hash((bitcoind_client_t *)ctx, height,
+                                   out, out_len, err, err_len);
+}
+
 static void reconcile_blocks(server_ctx_t *s, int tip_height) {
-    if (!s || !s->store || tip_height <= 0) return;
-
-    if (atomic_load(&s->gbh_state) >= 0) {
-        store_block_candidate_t cands[RECONCILE_MAX_PER_TICK];
-        int n = store_list_unresolved_blocks(s->store, tip_height,
-                                             BLOCK_FINAL_DEPTH, cands,
-                                             RECONCILE_MAX_PER_TICK);
-        for (int i = 0; i < n; ++i) {
-            char have[80] = {0};
-            char gerr[256] = {0};
-            int rc = bitcoind_get_block_hash(s->btc, cands[i].height, have,
-                                             sizeof have, gerr, sizeof gerr);
-            if (rc == BITCOIND_ERR_UNSUPPORTED) {
-                atomic_store(&s->gbh_state, -1);
-                LOG_INFO("backend does not serve getblockhash — confirming "
-                         "blocks from the observed chain of template tips "
-                         "instead");
-                break;
-            }
-            if (rc != 0) {
-                /* Transient. Leave the rows alone and retry on the next tip
-                 * rather than recording a verdict we did not get. */
-                LOG_WARN("getblockhash(%d) failed: %s", cands[i].height, gerr);
-                return;
-            }
-            atomic_store(&s->gbh_state, 1);
-            int match = strcasecmp(have, cands[i].hash) == 0;
-            store_set_block_status(s->store, cands[i].hash,
-                                   match ? STORE_BLOCK_CONFIRMED
-                                         : STORE_BLOCK_ORPHANED,
-                                   match ? tip_height - cands[i].height + 1 : 0,
-                                   "node");
-            if (!match) {
-                LOG_WARN("block %s at height %d is no longer in the chain — "
-                         "marked orphaned", cands[i].hash, cands[i].height);
-            }
-        }
-        if (atomic_load(&s->gbh_state) > 0) return;
-    }
-
-    int confirmed = 0, orphaned = 0, pending = 0;
-    if (store_reconcile_blocks_from_templates(s->store, tip_height, &confirmed,
-                                              &orphaned, &pending) == 0) {
-        LOG_DEBUG("block reconcile: confirmed=%d orphaned=%d pending=%d",
-                  confirmed, orphaned, pending);
-    }
+    if (!s) return;
+    const int pplns = s->cfg &&
+        (strcmp(s->cfg->pool_mode, "pplns-thunder") == 0 ||
+         strcmp(s->cfg->pool_mode, "pplns-btc") == 0);
+    reconcile_cfg_t cfg = {
+        .store              = s->store,
+        .get_block_hash     = reconcile_get_block_hash,
+        .get_block_hash_ctx = s->btc,
+        .gbh_state          = &s->gbh_state,
+        .pplns              = pplns,
+        .fee_bps            = s->cfg ? s->cfg->fee_bps : 0,
+    };
+    reconcile_blocks_pass(&cfg, tip_height, NULL);
 }
 
 /* ---------- tip watcher ---------- */
@@ -765,8 +760,22 @@ static void *tip_watcher(void *arg) {
 
         /* A new tip is exactly when a candidate's fate can have changed:
          * either it is the one that extended the chain, or something else
-         * was. */
-        if (t->height - 1 != s->last_height) reconcile_blocks(s, t->height - 1);
+         * was.
+         *
+         * new_tip, not a comparison of our own against last_height.
+         * last_height holds the TEMPLATE height, which is the tip plus one,
+         * so `t->height - 1 != s->last_height` asks whether the new tip
+         * differs from the previous tip PLUS ONE. On an ordinary one-block
+         * advance that is false -- the single most common event on any
+         * chain, and the one case this has to catch. It fired only when the
+         * tip jumped two or more blocks between polls, which is why blocks
+         * sat at 'pending' on a quiet chain and PPLNS, whose distribution
+         * hangs off this pass, credited nobody at all.
+         *
+         * new_tip is computed above from both the height and the previous
+         * hash, so it also catches a reorg that replaces the tip at the same
+         * height -- which a height comparison of any kind cannot see. */
+        if (new_tip) reconcile_blocks(s, t->height - 1);
 
         if (need_rebuild) {
             char berr[256] = {0};
@@ -1150,13 +1159,22 @@ int main(int argc, char **argv) {
         stcfg.listeners[i] = cfg.listeners[i];
     }
 
-    /* PPS. pool_mode=pps-classic takes Thunder-address usernames, pays every
-     * coinbase into the pool's BTC wallet, and accrues per-share credits. */
-    stcfg.pps_enabled = (strcmp(cfg.pool_mode, "pps-classic") == 0);
+    /* Which of the two things pool_mode decides applies here. See
+     * stratum.h — pplns-btc is the mode that makes them independent: it
+     * pools the reward (coinbase pays the pool) but pays out on L1 (the
+     * username is a Bitcoin address). */
+    int mode_pps_classic   = strcmp(cfg.pool_mode, "pps-classic")   == 0;
+    int mode_pplns_thunder = strcmp(cfg.pool_mode, "pplns-thunder") == 0;
+    int mode_pplns_btc     = strcmp(cfg.pool_mode, "pplns-btc")     == 0;
+    int mode_pplns         = mode_pplns_thunder || mode_pplns_btc;
+
+    stcfg.pps_accrues         = mode_pps_classic;
+    stcfg.coinbase_pays_pool  = mode_pps_classic || mode_pplns;
+    stcfg.username_is_thunder = mode_pps_classic || mode_pplns_thunder;
     snprintf(stcfg.pool_btc_address, sizeof stcfg.pool_btc_address, "%s",
              cfg.pool_btc_address);
 
-    if (stcfg.pps_enabled) {
+    if (stcfg.coinbase_pays_pool) {
         /* Fail fast on a misconfigured pool_btc_address so we don't drop
          * every rendered job at runtime. */
         uint8_t spk[64];
@@ -1246,6 +1264,19 @@ int main(int argc, char **argv) {
         }
     }
     bitcoind_template_free(tmpl);
+
+    /* The one thing pplns-btc needs that no other mode does, said at
+     * startup rather than discovered when the first payout fails 100 blocks
+     * later. The proxy cannot check it: the wallet belongs to the enforcer
+     * and the payout worker is a separate process. */
+    if (strcmp(cfg.pool_mode, "pplns-btc") == 0) {
+        LOG_INFO("pplns-btc: miners are paid on L1. This requires "
+                 "bip300301_enforcer running with --enable-wallet, "
+                 "pool_btc_address (%s) being an address from that wallet, "
+                 "and the payout worker started with PAYOUT_RAIL=btc. The "
+                 "pool holds no keys — the enforcer signs and broadcasts.",
+                 cfg.pool_btc_address);
+    }
 
     LOG_INFO("stratum listening on %s:%d (difficulty from %g)",
              cfg.listen_addr, cfg.listen_port, cfg.initial_diff);

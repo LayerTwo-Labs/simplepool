@@ -21,7 +21,7 @@ on:
 jobs:
   integration-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     # Match check_build.yaml: CI runs only in the LayerTwo-Labs org repo.
     if: github.repository_owner == 'LayerTwo-Labs'
     steps:
@@ -48,6 +48,14 @@ jobs:
       - name: Run end-to-end regtest test
         run: bash tests/test_e2e_regtest.sh
 
+      # PPLNS distribution, both rails. Separate from the pps-classic e2e
+      # above because it is testing a different thing: not the coinbase shape
+      # but what happens 100 blocks later, when a matured block is split
+      # across the window that produced it. It mines its own chain to
+      # maturity, so it is slower and worth failing independently.
+      - name: Run PPLNS end-to-end regtest test
+        run: bash tests/test_pplns_regtest.sh
+
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -55,9 +63,12 @@ jobs:
           name: e2e-logs-${{ github.run_id }}
           path: |
             .regtest-e2e/logs/
+            .regtest-pplns/logs/
             /tmp/simplepool-e2e.log
             /tmp/simplepool-e2e.conf
             /tmp/simplepool-int.log
+            /tmp/simplepool-pplns-*.log
+            /tmp/simplepool-pplns-*.conf
           retention-days: 14
           if-no-files-found: ignore
 
@@ -121,11 +132,20 @@ jobs:
       - name: Run payout regtest test
         run: bash tests/test_payout_regtest.sh
 
+      # The other rail. pplns-btc pays on L1 through the enforcer's own
+      # wallet and never touches a sidechain, so it shares none of the
+      # Thunder path above beyond the ledger bookkeeping -- and until this
+      # existed it had no coverage outside unit tests against a stub.
+      - name: Run pplns-btc L1 payout regtest test
+        run: bash tests/test_pplns_btc_payout_regtest.sh
+
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: payout-logs-${{ github.run_id }}
-          path: .regtest-payout/logs/
+          path: |
+            .regtest-payout/logs/
+            .regtest-btcpay/logs/
           retention-days: 14
           if-no-files-found: ignore

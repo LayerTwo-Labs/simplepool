@@ -19,7 +19,14 @@ ifeq ($(UNAME_S),Darwin)
             BREW_PREFIX := /usr/local
         endif
     endif
-    PLATFORM_CFLAGS  := -I$(BREW_PREFIX)/include \
+    # _POSIX_C_SOURCE (below) is what makes clock_gettime and friends visible
+    # on glibc, but on Darwin the same macro works in reverse: asking for a
+    # strict POSIX namespace *hides* everything BSD, and INADDR_LOOPBACK and
+    # MSG_DONTWAIT are BSD, not POSIX. Without this the test suites do not
+    # compile on macOS at all. _DARWIN_C_SOURCE puts them back; it is a no-op
+    # anywhere else because this block is Darwin-only.
+    PLATFORM_CFLAGS  := -D_DARWIN_C_SOURCE \
+                        -I$(BREW_PREFIX)/include \
                         -I$(BREW_PREFIX)/opt/sqlite/include \
                         -I$(BREW_PREFIX)/opt/curl/include \
                         -I$(BREW_PREFIX)/opt/hiredis/include
@@ -63,11 +70,11 @@ VERSION_H  := $(BUILD_DIR)/version_gen.h
 SRCS := src/main.c src/log.c src/config.c src/coinbase.c \
         src/share.c src/sha256.c src/stratum.c src/store.c \
         src/bitcoind.c src/broadcast.c src/thunder.c src/version.c \
-        src/cjson/cJSON.c
+        src/reconcile.c src/cjson/cJSON.c
 OBJS := $(SRCS:%.c=$(BUILD_DIR)/%.o)
 DEPS := $(OBJS:.o=.d)
 
-.PHONY: all clean test asan format install help FORCE
+.PHONY: all clean test asan coverage format install help FORCE
 
 all: $(BIN)
 
@@ -116,8 +123,9 @@ include tests/test_coinbase.mk
 include tests/test_broadcast.mk
 include tests/test_thunder.mk
 include tests/test_config.mk
+include tests/test_reconcile.mk
 
-test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_config
+test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_config build/test_reconcile
 	./build/test_share
 	./build/test_bitcoind
 	./build/test_stratum
@@ -126,6 +134,7 @@ test: build/test_share build/test_bitcoind build/test_stratum build/test_store b
 	./build/test_broadcast
 	./build/test_thunder
 	./build/test_config
+	./build/test_reconcile
 
 # Run the suites under AddressSanitizer + UndefinedBehaviorSanitizer.
 #
@@ -157,6 +166,59 @@ asan:
 	./$(ASAN_DIR)/test_coinbase
 	./$(ASAN_DIR)/test_share
 
+# Line and function coverage of the C suites, via LLVM source-based coverage.
+#
+# What it measures is the UNIT suites only. The three regtest e2e scripts drive
+# the real binary and cover a great deal that never shows up here -- the tip
+# watcher, the reconcile pass, the distributor, every RPC path -- so a low
+# number for a file like main.c means "not covered by `make test`", not
+# "untested". Reading it the other way round is how a coverage number starts
+# doing harm.
+#
+# Vendored cJSON is excluded: it is upstream code, and including it would move
+# the headline number without saying anything about this project's tests.
+COV_DIR    := build/cov
+COV_CFLAGS := -std=c11 -g -O0 -fprofile-instr-generate -fcoverage-mapping \
+              -D_POSIX_C_SOURCE=200809L -Iinclude -Isrc -Isrc/cjson $(PLATFORM_CFLAGS)
+# Vendored cJSON, the test files themselves, and every system / Homebrew header
+# the suites pull in. Without the last of these the totals are dominated by
+# hiredis and curl inlines this project never calls.
+COV_IGNORE := --ignore-filename-regex='(tests/|src/cjson/|^/usr/|/opt/|/Applications/|/Library/)'
+
+coverage:
+	@command -v xcrun >/dev/null 2>&1 || { echo "coverage needs llvm-profdata/llvm-cov"; exit 1; }
+	@mkdir -p $(COV_DIR)
+	@rm -f $(COV_DIR)/*.profraw $(COV_DIR)/*.profdata
+	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_stratum tests/test_stratum.c \
+		src/stratum.c src/coinbase.c src/share.c src/sha256.c src/thunder.c \
+		src/log.c src/cjson/cJSON.c -lpthread
+	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_store tests/test_store.c \
+		src/store.c src/log.c $(PLATFORM_LDFLAGS) -lsqlite3 -lpthread
+	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_coinbase tests/test_coinbase.c \
+		src/coinbase.c src/sha256.c
+	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_share tests/test_share.c \
+		src/share.c src/sha256.c
+	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_bitcoind tests/test_bitcoind.c \
+		src/bitcoind.c src/log.c src/cjson/cJSON.c $(PLATFORM_LDFLAGS) -lcurl -lpthread
+	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_broadcast tests/test_broadcast.c \
+		src/broadcast.c src/log.c $(PLATFORM_LDFLAGS) -lhiredis -lpthread
+	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_thunder tests/test_thunder.c src/thunder.c
+	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_config tests/test_config.c \
+		src/config.c src/log.c src/coinbase.c src/sha256.c
+	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_reconcile tests/test_reconcile.c \
+		src/reconcile.c src/store.c src/log.c $(PLATFORM_LDFLAGS) -lsqlite3 -lpthread
+	@set -e; for t in stratum store coinbase share bitcoind broadcast thunder config reconcile; do \
+		LLVM_PROFILE_FILE=$(COV_DIR)/$$t.profraw ./$(COV_DIR)/test_$$t >/dev/null 2>&1 \
+			|| { echo "coverage: test_$$t FAILED"; exit 1; }; \
+	done
+	@xcrun llvm-profdata merge -sparse $(COV_DIR)/*.profraw -o $(COV_DIR)/all.profdata
+	@echo
+	@xcrun llvm-cov report $(COV_DIR)/test_stratum \
+		$(addprefix -object ,$(COV_DIR)/test_store $(COV_DIR)/test_coinbase \
+		$(COV_DIR)/test_share $(COV_DIR)/test_bitcoind $(COV_DIR)/test_broadcast \
+		$(COV_DIR)/test_thunder $(COV_DIR)/test_config $(COV_DIR)/test_reconcile) \
+		-instr-profile=$(COV_DIR)/all.profdata $(COV_IGNORE)
+
 format:
 	@if command -v clang-format >/dev/null 2>&1; then \
 		find src include tests -type f \( -name '*.c' -o -name '*.h' \) \
@@ -172,5 +234,5 @@ install: $(BIN)
 	install -m 0755 $(BIN) $(DESTDIR)$(BINDIR)/simplepool
 
 help:
-	@echo "Targets: all clean test format install"
+	@echo "Targets: all clean test asan coverage format install"
 	@echo "  PREFIX=$(PREFIX)  CC=$(CC)  UNAME_S=$(UNAME_S)"

@@ -33,6 +33,7 @@
 #include <math.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -68,6 +69,11 @@
  * work arrives a little late -- a proxy, rented hashrate, anything with a hop
  * in front of it -- is fine there and rejected here. */
 #define RECENT_JOBS    16
+/* How long a listener thread waits in poll() before re-testing the stop flag.
+ * This is shutdown latency, not connection latency -- a waiting connection
+ * wakes poll() immediately. Small enough that stopping the pool feels instant,
+ * large enough that an idle listener is not spinning. */
+#define LISTEN_POLL_MS 200
 /* ⚠️ The sweep is LAZY: retire_job() is its only caller and runs only when a
  * new job is pushed, so the real grace is this value PLUS the time to the next
  * job, and is unbounded if job production stalls. */
@@ -567,7 +573,10 @@ static int buf_append_json_line(char **buf, size_t *len, cJSON *obj) {
 /* Is PPS accrual currently suspended? While it is, work handed to this pool
  * earns nothing, so the pool says so rather than banking it silently. */
 static int pps_gated(const stratum_server_t *s) {
-    return s->cfg.pps_enabled && s->cfg.pps_refuse_shares_below_min &&
+    /* Keyed on pps_accrues, not on the gate pointer: main.c installs that
+     * pointer for every mode, so testing it would suspend solo and PPLNS —
+     * modes that never accrued anything to suspend. */
+    return s->cfg.pps_accrues && s->cfg.pps_refuse_shares_below_min &&
            s->cfg.pps_gate &&
            atomic_load_explicit(s->cfg.pps_gate, memory_order_relaxed) != 0;
 }
@@ -703,7 +712,7 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
     coinbase_parts_t parts = {0};
     char err[256] = {0};
     int rc;
-    if (s->cfg.pps_enabled) {
+    if (s->cfg.coinbase_pays_pool) {
         /* PPS-classic: every miner's coinbase is identical, paying the
          * pool's BTC wallet for the net-of-fee reward and the operator
          * address for the fee. The operator later moves accumulated BTC
@@ -1471,7 +1480,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     c->payout_address[addr_len] = '\0';
 
     char    derr[128] = {0};
-    if (s->cfg.pps_enabled) {
+    if (s->cfg.username_is_thunder) {
         /* Thunder address: 20-byte hash160 in plain base58. The
          * 's<n>_<base58>_<hex6>' deposit-format wrapper is rejected (see
          * thunder.c). We don't need the decoded bytes here — the coinbase
@@ -2448,6 +2457,22 @@ static void *listener_thread(void *arg) {
     struct stratum_listener_slot *ls = arg;
     stratum_server_t *s = ls->srv;
     while (!atomic_load(&s->stop)) {
+        /* Wait for a connection with a bounded timeout rather than blocking in
+         * accept() indefinitely, so the loop re-tests s->stop on its own.
+         *
+         * The teardown in stratum_server_stop calls shutdown() on the listening
+         * fd to break this thread out. That works on Linux, where shutdown() of
+         * a listening socket wakes a blocked accept(); on macOS and the BSDs it
+         * returns ENOTCONN and the accept() stays blocked forever, so the
+         * pthread_join that follows never returns and the process hangs at
+         * exit. Polling makes the wakeup a property of this loop instead of a
+         * property of the platform's shutdown() semantics. The shutdown() is
+         * still worth doing — where it works it wakes us immediately, and this
+         * timeout only bounds the worst case. */
+        struct pollfd pfd = { .fd = ls->fd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, LISTEN_POLL_MS);
+        if (pr <= 0) continue;   /* timeout, or EINTR: re-test stop and retry */
+
         /* sockaddr_storage, not sockaddr_in: on an IPv6 or dual-stack listener
          * accept() writes a sockaddr_in6, which does not fit an IPv4 struct.
          * Passing the smaller one would have the kernel truncate the address

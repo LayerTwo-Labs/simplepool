@@ -320,8 +320,17 @@ export function worker(handle, name, windowSec = 86400) {
         SELECT accrued_sats, paid_sats, last_updated
           FROM pps_credits WHERE worker_id = ?
     `).get(w.id);
+    let pplnsAudit = null;
     if (credit) {
         const meta = poolMeta(d);
+        /* PPLNS prices a share in hindsight, out of a block actually found, so
+         * the per-share re-derivation below is structurally empty for it --
+         * every share carries credited_sats = 0. Give it the audit that
+         * matches how it was actually paid instead of one that reports the
+         * pool as owing nothing. */
+        const isPplns = meta && (meta.pool_mode === 'pplns-thunder' ||
+                                 meta.pool_mode === 'pplns-btc');
+        if (isPplns) pplnsAudit = pplnsAuditFor(d, w.id);
         const totals = d.prepare(`
             SELECT COUNT(*)                            AS share_count,
                    COALESCE(SUM(difficulty), 0)        AS sum_difficulty,
@@ -342,7 +351,14 @@ export function worker(handle, name, windowSec = 86400) {
             share_count:      Number(totals.share_count),
             sum_difficulty:   Number(totals.sum_difficulty),
             accrued_computed: Number(totals.accrued_computed),
-            matches:          Number(totals.accrued_computed) === accrued,
+            /* On PPLNS the per-share sum is meaningless rather than wrong, so
+             * it must not be presented as a mismatch: it said the pool was off
+             * by the miner's entire balance and told them to challenge the
+             * operator. pplns_audit carries the comparison that does hold. */
+            matches: pplnsAudit
+                ? pplnsAudit.credited_total === accrued
+                : Number(totals.accrued_computed) === accrued,
+            mode: meta ? meta.pool_mode : null,
         };
     }
 
@@ -392,6 +408,7 @@ export function worker(handle, name, windowSec = 86400) {
         buckets,
         window_sec: windowSec,
         pps_audit: ppsAudit,
+        pplns_audit: pplnsAudit,
         payouts,
         blocks: workerBlocks,
     };
@@ -500,11 +517,106 @@ export function poolMeta(handle) {
             /* An override whose implied fee has drifted from fee_bps is the
              * failure this table exists to expose. */
             fee_drift_bps: Number(r.effective_fee_bps || 0) - Number(r.fee_bps || 0),
-            accrues: (r.pool_mode || 'solo') === 'pps-classic',
+            /* Does a balance build up in pps_credits between payouts?
+             *
+             * True of PPS and of both PPLNS modes -- they share the table and
+             * the payout worker that drains it. Only solo accrues nothing,
+             * because its coinbase pays the finder directly.
+             *
+             * It is deliberately not "is there a rate": PPS prices a share the
+             * moment it arrives, PPLNS values it in hindsight out of a block
+             * actually found, and only the former leaves rate_used on the row.
+             * rate_source and rate_sats_per_diff above are the PPS-only facts;
+             * this one is about whether the pool owes anyone anything. */
+            accrues: ['pps-classic', 'pplns-thunder', 'pplns-btc']
+                        .includes(r.pool_mode || 'solo'),
         };
     } catch {
         return null;   /* pre-pool_meta DB */
     }
+}
+
+/* The PPLNS answer to "why is this number what it is?".
+ *
+ * PPS credits a share when it arrives, so its audit re-derives from
+ * shares.credited_sats. PPLNS credits nothing on arrival -- every share has
+ * credited_sats = 0 and rate_used = 0 -- so that re-derivation returns zero
+ * against a real balance and the page reported the pool as off by the
+ * miner's whole balance, telling them to go and challenge the operator. On
+ * the one page whose entire purpose is being checkable.
+ *
+ * The honest re-derivation is the one the distributor actually performed:
+ * for each block that has matured and been distributed, walk back from that
+ * block's own share until the window fills, and take this worker's share of
+ * the difficulty in it. Reproduced here from the raw shares and blocks_found
+ * rows, with no reference to anything the payout path wrote, so a miner can
+ * check the pool's arithmetic rather than take delivery of it.
+ *
+ * The window SQL mirrors store_pplns_distribute() exactly, including the
+ * comparison against the running total EXCLUDING the current row, which is
+ * what includes the share that crosses the boundary whole rather than
+ * splitting it.
+ *
+ * ⚠ ONE ASSUMPTION, and it is stated in the UI rather than hidden: fee_bps is
+ * read from pool_meta as it stands NOW. The distributor used whatever it was
+ * when the block matured, and nothing records the value per block. An
+ * operator who has changed the fee will see older blocks fail to reproduce.
+ * That is a real limit of the stored data, not a discrepancy in the ledger,
+ * and saying so beats either hiding it or crying wolf. */
+export function pplnsAuditFor(d, workerId, limit = 50) {
+    const meta = d.prepare('SELECT fee_bps FROM pool_meta WHERE id = 1').get();
+    const feeBps = Number(meta?.fee_bps || 0);
+
+    const blocks = d.prepare(`
+        SELECT id, height, hash, ts,
+               COALESCE(reward_sats, 0) + COALESCE(fee_sats, 0) AS gross,
+               pplns_window_diff AS window_diff
+          FROM blocks_found
+         WHERE pplns_distributed = 1 AND pplns_window_diff > 0
+         ORDER BY height DESC
+         LIMIT ?
+    `).all(limit);
+
+    /* One block's window, split between this worker and everyone else. */
+    const split = d.prepare(`
+        WITH anchored AS (
+          SELECT id, worker_id, difficulty,
+                 SUM(difficulty) OVER (ORDER BY id DESC ROWS UNBOUNDED PRECEDING) AS running
+            FROM shares
+           WHERE id <= (SELECT MAX(id) FROM shares WHERE block_hash = ?)
+        )
+        SELECT COALESCE(SUM(CASE WHEN worker_id = ? THEN difficulty END), 0) AS mine,
+               COALESCE(SUM(difficulty), 0)                                  AS total
+          FROM anchored
+         WHERE running - difficulty < ?
+    `);
+
+    const rows = [];
+    let credited_total = 0;
+    for (const b of blocks) {
+        const gross = Number(b.gross);
+        /* Same truncating integer arithmetic as the distributor. */
+        const payable = feeBps > 0 && feeBps <= 10000
+            ? gross - Math.floor((gross * feeBps) / 10000)
+            : gross;
+        const { mine, total } = split.get(b.hash, workerId, b.window_diff);
+        const my_diff = Number(mine), win_diff = Number(total);
+        /* Truncating, exactly as the C does: the sum of everyone's credits can
+         * fall a few sats short of payable, never over it. */
+        const credited = (win_diff > 0 && my_diff > 0)
+            ? Math.trunc(payable * (my_diff / win_diff))
+            : 0;
+        credited_total += credited;
+        rows.push({
+            height: Number(b.height), hash: b.hash, ts: Number(b.ts),
+            gross, payable, window_diff: Number(b.window_diff),
+            my_diff, win_diff,
+            share_pct: win_diff > 0 ? (my_diff / win_diff) * 100 : 0,
+            credited,
+        });
+    }
+    return { fee_bps: feeBps, blocks: rows, credited_total,
+             block_count: rows.length, truncated: blocks.length === limit };
 }
 
 /* Independently re-derive the PPS ledger instead of reporting it.
