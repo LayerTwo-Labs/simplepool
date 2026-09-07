@@ -4,7 +4,11 @@
 #include "bitcoind.h"
 #include "log.h"
 
+/* strcasecmp lives in <strings.h> on glibc and in <string.h> on macOS, so the
+ * macOS build compiles happily without the first and Linux does not. Include
+ * both rather than the one this machine happens to need. */
 #include <string.h>
+#include <strings.h>
 
 void reconcile_blocks_pass(const reconcile_cfg_t *cfg, int tip_height,
                            reconcile_result_t *out)
