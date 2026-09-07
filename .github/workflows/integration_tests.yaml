@@ -132,11 +132,20 @@ jobs:
       - name: Run payout regtest test
         run: bash tests/test_payout_regtest.sh
 
+      # The other rail. pplns-btc pays on L1 through the enforcer's own
+      # wallet and never touches a sidechain, so it shares none of the
+      # Thunder path above beyond the ledger bookkeeping -- and until this
+      # existed it had no coverage outside unit tests against a stub.
+      - name: Run pplns-btc L1 payout regtest test
+        run: bash tests/test_pplns_btc_payout_regtest.sh
+
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: payout-logs-${{ github.run_id }}
-          path: .regtest-payout/logs/
+          path: |
+            .regtest-payout/logs/
+            .regtest-btcpay/logs/
           retention-days: 14
           if-no-files-found: ignore

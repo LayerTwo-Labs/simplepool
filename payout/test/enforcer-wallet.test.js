@@ -103,7 +103,30 @@ test('balance counts confirmed sats only', async () => {
      * else is how a pool promises what it cannot send. */
     const c = new EnforcerWalletClient({ addr: 'x' });
     stub(c, { GetBalance: { confirmedSats: 500000, pendingSats: 999999999 } });
-    assert.equal(await c.balance(), 500000n);
+    assert.equal((await c.balance()).available_sats, 500000n);
+});
+
+test('balance returns the shape payout.js actually reads', async () => {
+    /* payout.js does `BigInt(bal.available_sats ?? bal.total_sats ?? 0)` --
+     * ThunderClient's shape, and the reason the payout loop can drive either
+     * rail without branching. This client used to return a bare BigInt, on
+     * which both fields are undefined, so the reserve gate read every wallet
+     * as empty and refused to pay: "reserve short — available=0". Asserting
+     * the returned value equals a BigInt passes just fine against that, which
+     * is how it survived. Assert the way the caller reads it instead. */
+    const c = new EnforcerWalletClient({ addr: 'x' });
+    stub(c, { GetBalance: { confirmedSats: '25000000000' } });
+    const bal = await c.balance();
+    assert.equal(BigInt(bal.available_sats ?? bal.total_sats ?? 0), 25000000000n);
+});
+
+test('a balance past 2^53 survives as an exact integer', async () => {
+    /* The enforcer sends confirmedSats as a decimal string. Routing it
+     * through Number() rounds above 2^53 -- about 90,000 BTC, which a pool
+     * wallet can hold -- and the rounding is silently in either direction. */
+    const c = new EnforcerWalletClient({ addr: 'x' });
+    stub(c, { GetBalance: { confirmedSats: '9007199254740993' } });   /* 2^53 + 1 */
+    assert.equal((await c.balance()).available_sats, 9007199254740993n);
 });
 
 test('an unreachable node is unknown, never confirmed and never evicted', async () => {
@@ -136,4 +159,68 @@ test('L1 needs no mining nudge, but answers the call payout.js makes', async () 
     const c = new EnforcerWalletClient({ addr: 'x' });
     assert.equal((await c.mine()).ok, true);
     assert.deepEqual(await c.mempool(), { ok: true, txids: [] });
+});
+
+/* Settlement, as the enforcer actually reports it.
+ *
+ * These three pin the shape that made the L1 rail credit a miner the moment
+ * it broadcast. paid means MINED, not sent: crediting on broadcast marks the
+ * debt settled while the transaction can still be dropped, and there is no
+ * negative credit to undo it with. */
+
+test('a mined transaction is confirmed, from confirmationInfo', async () => {
+    /* The enforcer reports confirmation as a confirmationInfo submessage, not
+     * as a `confirmations` count. Reading the count meant this returned
+     * confirmed:false for every transaction ever mined. */
+    const c = new EnforcerWalletClient({ addr: 'x' });
+    stub(c, { ListTransactions: { transactions: [
+        { txid: { hex: 'aa' },
+          confirmationInfo: { height: 812, blockHash: { hex: 'bb' } } },
+    ] } });
+    assert.deepEqual(await c.getTransaction('aa'),
+                     { confirmed: true, known: true, error: null });
+});
+
+test('a mempool transaction is known but not confirmed', async () => {
+    /* Known-and-unconfirmed is what payout.js turns into "pending", which
+     * blocks the next tick instead of re-broadcasting into a double spend. */
+    const c = new EnforcerWalletClient({ addr: 'x' });
+    stub(c, { ListTransactions: { transactions: [{ txid: { hex: 'aa' } }] } });
+    assert.deepEqual(await c.getTransaction('aa'),
+                     { confirmed: false, known: true, error: null });
+});
+
+test('confirmationInfo with only a timestamp is NOT confirmation', async () => {
+    /* The shape a real enforcer returns for a transaction still in the
+     * mempool:
+     *
+     *   "confirmationInfo": { "timestamp": "..." }            unmined
+     *   "confirmationInfo": { "height": 812, "blockHash": ... }  mined
+     *
+     * The timestamp is when the wallet saw it, not when it was mined. Keying
+     * on the presence of confirmationInfo therefore reported every broadcast
+     * as confirmed, and paid_sats moved while the transaction could still be
+     * dropped. Key on height/blockHash. */
+    const c = new EnforcerWalletClient({ addr: 'x' });
+    stub(c, { ListTransactions: { transactions: [
+        { txid: { hex: 'aa' }, confirmationInfo: { timestamp: '2026-09-07T10:02:33Z' } },
+    ] } });
+    assert.deepEqual(await c.getTransaction('aa'),
+                     { confirmed: false, known: true, error: null });
+});
+
+test('an unconfirmed change output is not evidence of settlement', async () => {
+    /* payout.js cross-checks settlement against wallet outputs, and the
+     * enforcer applies a transaction to its wallet as soon as it broadcasts
+     * it -- so the change output of an unmined payout shows up here at once.
+     * Counting it settled the batch on broadcast. Only confirmed outputs may
+     * stand as proof; unconfirmedLastSeen is present exactly while unmined. */
+    const c = new EnforcerWalletClient({ addr: 'x' });
+    stub(c, { ListUnspentOutputs: { outputs: [
+        { txid: { hex: 'unmined' }, vout: 1, unconfirmedLastSeen: '2026-09-07T10:01:02Z' },
+        { txid: { hex: 'mined'   }, vout: 0 },
+    ] } });
+    const w = await c.walletUtxos();
+    assert.equal(w.ok, true);
+    assert.deepEqual(w.utxos.map(u => u.txid), ['mined']);
 });

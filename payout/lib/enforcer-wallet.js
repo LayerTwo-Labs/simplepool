@@ -63,7 +63,20 @@ export class EnforcerWalletClient {
     async balance() {
         const j = await this._call('GetBalance', {});
         const sats = j.confirmedSats ?? j.confirmed_sats ?? j.confirmed ?? 0;
-        return BigInt(Math.floor(Number(sats)));
+        /* The enforcer sends this as a decimal STRING, so parse it as one
+         * rather than through Number(), which silently loses precision past
+         * 2^53 -- reachable by a pool wallet holding more than ~90,000 BTC. */
+        const confirmed = typeof sats === 'string' && /^[0-9]+$/.test(sats)
+            ? BigInt(sats)
+            : BigInt(Math.floor(Number(sats) || 0));
+        /* The shape payout.js reads, which is ThunderClient's: it does
+         * `BigInt(bal.available_sats ?? bal.total_sats ?? 0)`. Returning the
+         * bare BigInt instead left both fields undefined, so every tick saw a
+         * balance of zero and refused to pay with "reserve short" -- on a
+         * wallet with any amount of money in it. Mirroring the interface is
+         * the whole reason the payout loop can drive either rail, and this
+         * was the one place it did not. */
+        return { available_sats: confirmed, total_sats: confirmed };
     }
 
     /* One transaction for the whole batch. Name and shape match
@@ -126,8 +139,27 @@ export class EnforcerWalletClient {
         const rows = j.transactions || j.txs || [];
         const hit = rows.find(t => (t.txid?.hex ?? t.txid) === txid);
         if (!hit) return { confirmed: false, known: false, error: null };
-        const confs = Number(hit.confirmations ?? hit.confirmationHeight ?? 0);
-        return { confirmed: confs > 0, known: true, error: null };
+        /* The enforcer reports confirmation as a confirmationInfo submessage
+         * ({height, blockHash, timestamp}) that is simply absent while the
+         * transaction is in the mempool -- not as a `confirmations` count.
+         * Reading the count meant this never returned confirmed:true for any
+         * transaction, ever, which handed every settlement decision to the
+         * wallet-output cross-check in payout.js. The scalar spellings are
+         * kept as a fallback in case the RPC grows one. */
+        const info   = hit.confirmationInfo ?? hit.confirmation_info ?? null;
+        /* NOT the presence of confirmationInfo: the enforcer emits it for a
+         * mempool transaction too, carrying only a timestamp -- "when we saw
+         * it", not "when it was mined". A mined one additionally carries
+         * height and blockHash. Treating presence as confirmation credited
+         * every payout the moment it was broadcast. */
+        const height   = Number(info?.height ?? info?.block_height ?? 0);
+        const hasBlock = (info?.blockHash?.hex ?? info?.block_hash?.hex) != null;
+        const legacy   = Number(hit.confirmations ?? hit.confirmationHeight ?? 0);
+        return {
+            confirmed: height > 0 || hasBlock || legacy > 0,
+            known: true,
+            error: null,
+        };
     }
 
     /* payout.js cross-checks settlement against wallet outputs, because a
@@ -137,7 +169,25 @@ export class EnforcerWalletClient {
         try {
             const j = await this._call('ListUnspentOutputs', {});
             const rows = j.outputs || j.utxos || [];
-            return { ok: true, utxos: rows.map(u => ({ txid: u.txid?.hex ?? u.txid })) };
+            /* CONFIRMED outputs only. payout.js treats a wallet output from
+             * the batch's txid as proof the batch settled, and the enforcer
+             * applies a transaction to its wallet the moment it broadcasts --
+             * so the change output of a still-unmined payout appears here
+             * immediately. Counting it credited paid_sats and wrote the
+             * ledger row while the transaction was in the mempool, which is
+             * the exact thing "paid means mined, not sent" forbids: if that
+             * transaction is dropped, the debt is marked settled and the
+             * miner is never paid.
+             *
+             * unconfirmedLastSeen is present only while unmined. Anything
+             * carrying it is excluded. */
+            const unconfirmed = (u) =>
+                (u.unconfirmedLastSeen ?? u.unconfirmed_last_seen) != null;
+            return {
+                ok: true,
+                utxos: rows.filter(u => !unconfirmed(u))
+                           .map(u => ({ txid: u.txid?.hex ?? u.txid })),
+            };
         } catch (e) {
             return { ok: false, utxos: [], error: e.message };
         }
