@@ -56,6 +56,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->vardiff_target_spm = 12.0;   /* ~1 share every 5s per connection */
     cfg->vardiff_min        = 1.0;
     cfg->vardiff_max        = 1e12;
+    cfg->max_suggested_diff = 5e7;
     cfg->vardiff_window_sec = 30;
     cfg->idle_timeout_sec   = 600;    /* 10 min silent recv → reap */
     cfg->idle_timeout_authorized_sec = 7200;  /* 2 h once a miner is working */
@@ -79,6 +80,27 @@ static char *strtrim(char *s) {
     char *e = s + strlen(s) - 1;
     while (e > s && isspace((unsigned char)*e)) { *e = '\0'; e--; }
     return s;
+}
+
+/* Truncate the line at a comment introducer.
+ *
+ * `#` only starts a comment at the start of the line or after whitespace, and
+ * never inside double quotes. The old rule was "the first # anywhere", applied
+ * before the key/value split and before unquote() — so a password of p#ssw0rd
+ * silently became p, quoting did not help, and the pool then failed RPC auth
+ * with nothing in the log to say why. coinbase_tag and the address fields had
+ * the same exposure. Inline comments (` # like this`) still work, which is
+ * what proxy.conf.example documents. */
+static void strip_comment(char *line) {
+    int in_quotes = 0;
+    for (char *p = line; *p; ++p) {
+        if (*p == '"') { in_quotes = !in_quotes; continue; }
+        if (*p == '#' && !in_quotes &&
+            (p == line || p[-1] == ' ' || p[-1] == '\t')) {
+            *p = '\0';
+            return;
+        }
+    }
 }
 
 static void unquote(char *s) {
@@ -188,9 +210,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
     int lineno = 0;
     while (fgets(line, sizeof line, f)) {
         lineno++;
-        /* Strip comment. */
-        char *hash = strchr(line, '#');
-        if (hash) *hash = '\0';
+        strip_comment(line);
 
         char *trimmed = strtrim(line);
         if (*trimmed == '\0') continue;
@@ -248,6 +268,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "vardiff_target_spm")        == 0) cfg->vardiff_target_spm = atof(v);
         else if (strcmp(k, "vardiff_min")               == 0) cfg->vardiff_min = atof(v);
         else if (strcmp(k, "vardiff_max")               == 0) cfg->vardiff_max = atof(v);
+        else if (strcmp(k, "max_suggested_diff")     == 0) cfg->max_suggested_diff = atof(v);
         else if (strcmp(k, "vardiff_window_sec")        == 0) cfg->vardiff_window_sec = atoi(v);
         else if (strcmp(k, "idle_timeout_sec")          == 0) cfg->idle_timeout_sec = atoi(v);
         else if (strcmp(k, "idle_timeout_authorized_sec") == 0) cfg->idle_timeout_authorized_sec = atoi(v);

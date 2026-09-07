@@ -7,6 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -38,22 +43,33 @@ typedef struct {
     char  last_submit_error[128];
 } obs_t;
 
+/* The callbacks run on whichever thread handled the share, and
+ * test_job_rotation_races_submits drives several at once. Guarding the
+ * observer keeps a sanitizer reporting races in the code under test rather
+ * than in the harness watching it. Single-threaded tests pay one uncontended
+ * lock per callback. */
+static pthread_mutex_t obs_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static void on_share(void *ctx, const char *w, const char *addr,
                      uint64_t ts, double d,
                      int is_block, const char *blk) {
     (void)ts; (void)blk; (void)addr;
     obs_t *o = ctx;
+    pthread_mutex_lock(&obs_mu);
     o->shares++;
     o->sum_share_diff += d;
     o->last_is_block = is_block;
     if (is_block) o->blocks++;
     snprintf(o->last_worker, sizeof(o->last_worker), "%s", w ? w : "");
+    pthread_mutex_unlock(&obs_mu);
 }
 static void on_reject(void *ctx, const char *w, uint64_t ts, const char *r) {
     (void)ts; (void)w;
     obs_t *o = ctx;
+    pthread_mutex_lock(&obs_mu);
     o->rejects++;
     snprintf(o->last_reason, sizeof(o->last_reason), "%s", r ? r : "");
+    pthread_mutex_unlock(&obs_mu);
 }
 static int on_block(void *ctx, const char *hex, char *errbuf, size_t errlen) {
     (void)hex;
@@ -342,6 +358,235 @@ static void test_submit_rejects_wrong_extranonce2_size(void) {
 
     stratum_conn_free_for_test(c);
     stratum_server_free(s);
+}
+
+/* Accepting a connection whose peer has already gone away.
+ *
+ * listener_thread hands the new connection to a thread and then does a little
+ * bookkeeping on it. That thread owns the connection and frees it when the
+ * connection ends — so if the peer is already gone, it can finish before the
+ * bookkeeping runs, and the bookkeeping then lands on freed memory. One of the
+ * two touches is a write, which corrupts the allocator's own structures rather
+ * than merely reading rubbish, so the damage usually surfaces later and
+ * somewhere unrelated.
+ *
+ * Connecting and closing immediately, many times over, is the shape that hits
+ * it. Under -fsanitize=address this is reported at the touch; without a
+ * sanitizer it must simply not crash. */
+#define CHURN_ROUNDS 300
+
+static void test_accept_churn_peer_gone(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = NULL;
+    int port = 0;
+
+    /* Any free high port. Bind failure is an environment problem, not a test
+     * failure, so try a few and skip if the sandbox forbids listening. */
+    for (int p = 39331; p < 39341 && !s; ++p) {
+        stratum_cfg_t cfg = { .bind_port = p, .max_conns = CHURN_ROUNDS + 16,
+                               .initial_diff = 1.0,
+                               .ctx = &obs, .on_share = on_share,
+                               .on_reject = on_reject, .on_block = on_block };
+        snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+        if (stratum_server_start(&cfg, &s) == 0 && s) { port = p; break; }
+        s = NULL;
+    }
+    if (!s) {
+        fprintf(stderr, "SKIP accept-churn: could not bind a local port\n");
+        return;
+    }
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    int connected = 0;
+    for (int i = 0; i < CHURN_ROUNDS; ++i) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) continue;
+        if (connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0) {
+            connected++;
+            /* Abort rather than close politely: RST tears the connection down
+             * at once, so the server's thread reaches its teardown as early as
+             * possible — which is the whole point. */
+            struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+            setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+        }
+        close(fd);
+    }
+
+    /* Precondition: connections actually had to be established, or the accept
+     * path this test exists to exercise was never entered. */
+    CHECK(connected > 0);
+
+    /* Let the accept and teardown threads finish while the server is still up,
+     * so anything they corrupt is attributed here rather than at exit. */
+    sleep_ms(300);
+    stratum_server_free(s);
+}
+
+/* Job rotation against concurrent submits.
+ *
+ * The job-swap thread walks every connection on each set_job and re-renders
+ * that connection's coinbase; the connection's own thread renders and reads
+ * the same buffers on submit. Nothing in the suite exercised those two
+ * against each other, so the resulting use-after-free on cb1/cb2 was
+ * invisible to it.
+ *
+ * Under -fsanitize=address (make asan) or ThreadSanitizer this reproduces the
+ * defect on the unfixed code. Without a sanitizer it still drives the paths
+ * and must not crash. */
+#define RACE_CONNS   4
+#define RACE_SUBMITS 400
+#define RACE_JOBS    300
+
+typedef struct {
+    stratum_server_t *s;
+    stratum_conn_t   *c;
+    int               id;
+} race_arg_t;
+
+static atomic_int race_stop;
+/* Index of the job most recently installed by race_job_thread. Submitting
+ * against anything else is answered by find_job() with "stale or unknown
+ * job", which returns long before the coinbase is rendered — so a submitter
+ * picking job ids on its own never reaches the code this test exists to
+ * race. */
+static atomic_int race_cur_job;
+
+static void *race_submit_thread(void *arg) {
+    race_arg_t *a = (race_arg_t *)arg;
+    char msg[256];
+    for (int i = 0; i < RACE_SUBMITS && !atomic_load(&race_stop); ++i) {
+        char *out = NULL; size_t olen = 0;
+        /* Track the live job, and every fourth submit aim one behind it, so
+         * both the current_job fast path and the recent-ring path of
+         * find_job() are exercised against a concurrent retire. */
+        int cur = atomic_load(&race_cur_job);
+        int target = (i % 4 == 0 && cur > 0) ? cur - 1 : cur;
+        /* extranonce2 must be exactly the width advertised at subscribe
+         * (8 bytes); any other width is refused before the coinbase is
+         * built, which would put this test back to proving nothing. */
+        snprintf(msg, sizeof msg,
+                 "{\"id\":9,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J%d\",\"%08x%08x\",\"60000000\",\"%08x\"]}",
+                 target, (unsigned)a->id, (unsigned)i, (unsigned)i);
+        stratum_handle_message(a->s, a->c, msg, &out, &olen);
+        free(out);
+    }
+    return NULL;
+}
+
+/* Drain the miner side of each socketpair. With no reader the kernel buffer
+ * fills and the broadcast's write blocks — which is the head-of-line stall
+ * SO_SNDTIMEO now bounds. Here we want the race, not the stall, so these act
+ * like miners that read. */
+static void *race_drain_thread(void *arg) {
+    int fd = *(int *)arg;
+    char sink[4096];
+    while (!atomic_load(&race_stop)) {
+        ssize_t n = recv(fd, sink, sizeof sink, MSG_DONTWAIT);
+        if (n > 0) continue;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 200000L };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+static void *race_job_thread(void *arg) {
+    stratum_server_t *s = (stratum_server_t *)arg;
+    uint8_t net[32];
+    memset(net, 0xff, sizeof net);
+    for (int i = 0; i < RACE_JOBS && !atomic_load(&race_stop); ++i) {
+        char jid[16];
+        snprintf(jid, sizeof jid, "J%d", i);
+        stratum_job_t *j = make_test_job(jid, net);
+        if (!j) break;
+        stratum_server_set_job(s, j, 1);
+        atomic_store(&race_cur_job, i);
+    }
+    return NULL;
+}
+
+static void test_job_rotation_races_submits(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = RACE_CONNS,
+                           .initial_diff = 1.0,
+                           .vardiff_enabled = 1, .vardiff_window_sec = 1,
+                           .vardiff_target_spm = 60, .vardiff_min = 0.001,
+                           .vardiff_max = 1e6,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    atomic_store(&race_stop, 0);
+    atomic_store(&race_cur_job, 0);
+
+    uint8_t net[32];
+    memset(net, 0xff, sizeof net);
+    stratum_server_set_job(s, make_test_job("J0", net), 1);
+
+    /* Each connection needs a real fd and a place in the broadcast list, or
+     * set_job skips it and the race under test never happens. socketpair
+     * gives a writable fd with a peer we control. */
+    stratum_conn_t *conns[RACE_CONNS];
+    int             fds[RACE_CONNS][2];
+    race_arg_t      args[RACE_CONNS];
+    pthread_t       subs[RACE_CONNS], jobthr;
+
+    for (int i = 0; i < RACE_CONNS; ++i) {
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds[i]) == 0);
+        conns[i] = stratum_conn_new_for_test(s);
+        char *out = NULL; size_t olen = 0;
+        stratum_handle_message(s, conns[i],
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+            &out, &olen); free(out); out = NULL; olen = 0;
+        stratum_handle_message(s, conns[i],
+            "{\"id\":2,\"method\":\"mining.authorize\","
+             "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+            &out, &olen); free(out);
+        /* Precondition: an unauthorized or unsubscribed conn is skipped by
+         * the broadcast loop, and this test would prove nothing. */
+        CHECK(stratum_conn_authorized_for_test(conns[i]) == 1);
+        CHECK(stratum_conn_subscribed_for_test(conns[i]) == 1);
+        stratum_conn_register_for_test(s, conns[i], fds[i][0]);
+        args[i].s = s; args[i].c = conns[i]; args[i].id = i;
+    }
+
+    pthread_t drains[RACE_CONNS];
+    int       peer[RACE_CONNS];
+    for (int i = 0; i < RACE_CONNS; ++i) {
+        peer[i] = fds[i][1];
+        pthread_create(&drains[i], NULL, race_drain_thread, &peer[i]);
+    }
+
+    pthread_create(&jobthr, NULL, race_job_thread, s);
+    for (int i = 0; i < RACE_CONNS; ++i)
+        pthread_create(&subs[i], NULL, race_submit_thread, &args[i]);
+
+    for (int i = 0; i < RACE_CONNS; ++i) pthread_join(subs[i], NULL);
+    atomic_store(&race_stop, 1);
+    pthread_join(jobthr, NULL);
+    for (int i = 0; i < RACE_CONNS; ++i) pthread_join(drains[i], NULL);
+
+    /* Precondition, and the load-bearing assertion of this test: shares must
+     * actually have been CREDITED. Every earlier draft of this test passed
+     * while proving nothing — first because the submitters aimed at job ids
+     * find_job() answered with "stale or unknown job", then because their
+     * extranonce2 was the wrong width. Both are refused long before the
+     * coinbase is rendered, so the render/free path being raced here was
+     * never reached. A submit that is merely *rejected* is not evidence. */
+    CHECK(obs.shares > 0);
+
+    for (int i = 0; i < RACE_CONNS; ++i) {
+        close(fds[i][0]);
+        close(fds[i][1]);
+    }
+    stratum_server_free(s);
+    for (int i = 0; i < RACE_CONNS; ++i) stratum_conn_free_for_test(conns[i]);
 }
 
 /* Invalid Bitcoin address as the username must be rejected outright. */
@@ -659,6 +904,13 @@ static void test_vardiff_still_lowers_for_a_matched_miner(void) {
     }
     CHECK(mined == 1);
     if (!mined) { stratum_conn_free_for_test(c); stratum_server_free(s); return; }
+
+    /* The window was armed at authorize, and the mining above ran inside it —
+     * 163 ms on a quiet machine, over 8 s under a sanitizer. Crossing the
+     * 1 s boundary here spends a retarget this test never asked for, and
+     * everything below then measures the wrong window. Re-arm so the test
+     * turns on behaviour rather than on how fast the box mines. */
+    stratum_conn_rearm_vardiff_for_test(c);
 
     char *out = NULL; size_t olen = 0;
     for (int i = 0; i < N - 1; ++i) {
@@ -1464,7 +1716,13 @@ static void test_job_survives_retirement_while_held(void) {
 
     /* Meanwhile the tip watcher churns through enough templates to push HELD
      * out of the retention ring entirely and free it. */
-    for (int i = 0; i < 24; ++i) {
+    /* ⚠️ Must exceed RECENT_JOBS, which lives in stratum.c and is not visible
+     * here -- so this count cannot be derived and has to be kept ahead of it by
+     * hand. It was 24 against a ring of 8; the ring is now 16. If it ever drops
+     * below the ring size, HELD stays findable, `gone == NULL` fails, and had
+     * the assertion been written the other way the test would have passed while
+     * exercising nothing. */
+    for (int i = 0; i < 64; ++i) {
         char jid[16];
         snprintf(jid, sizeof jid, "J%d", i);
         stratum_server_set_job(s, make_test_job(jid, net), 1);
@@ -2180,12 +2438,292 @@ static void test_pplns_is_never_gated(void) {
     }
 }
 
+/* A failed bind must not close the process's standard input.
+ *
+ * The listener slots live in a calloc'd stratum_server, so every slot's fd
+ * starts at 0 -- a perfectly valid descriptor number, and on a normal process
+ * it is stdin. The bind_failed teardown walks i < listener_count and closes
+ * every slot whose fd is >= 0, but listener_count is set BEFORE the bind loop
+ * runs. So when a bind fails partway, every slot the loop never reached is
+ * still holding fd 0, and the teardown shuts down and closes descriptor 0.
+ *
+ * Three listeners are the minimum that shows it: slot 0 binds, slot 1 fails,
+ * and slot 2 -- untouched, fd still 0 -- is what gets closed.
+ *
+ * The symptom in production is not a crash. It is a pool that failed to start
+ * for an understandable reason (a port already in use) and, on the way out,
+ * quietly closed stdin for whatever runs next in the same process image. */
+static void test_failed_bind_does_not_close_stdin(void) {
+    /* Occupy a port so a listener bound to it is guaranteed to fail. */
+    int squatter = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(squatter >= 0);
+    if (squatter < 0) return;
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;                       /* let the kernel choose */
+    if (bind(squatter, (struct sockaddr *)&a, sizeof a) < 0 ||
+        listen(squatter, 1) < 0) {
+        close(squatter);
+        CHECK(0 && "could not set up an occupied port");
+        return;
+    }
+    socklen_t alen = sizeof a;
+    CHECK(getsockname(squatter, (struct sockaddr *)&a, &alen) == 0);
+    int taken = ntohs(a.sin_port);
+
+    /* stdin must be open going in, or the test proves nothing. */
+    CHECK(fcntl(0, F_GETFD) != -1);
+
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 4, .initial_diff = 1.0 };
+    snprintf(cfg.bind_addr, sizeof cfg.bind_addr, "127.0.0.1");
+    cfg.listeners[0].port = taken;        /* fails: already in use */
+    cfg.listeners[1].port = taken + 1;    /* never reached; fd still 0 */
+    cfg.listener_count = 2;
+
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) < 0);   /* the start must fail */
+    CHECK(s == NULL);
+
+    /* The point of the test: the failure must not have taken stdin with it. */
+    CHECK(fcntl(0, F_GETFD) != -1);
+
+    close(squatter);
+    if (g_fail == 0) printf("ok: a failed bind leaves stdin alone\n");
+}
+
+
+/* ---- dual-stack listener ------------------------------------------------ */
+
+/* Connect to a started server over a chosen family and return the fd, or -1.
+ * Real sockets on purpose: what is under test is which families bind() and
+ * accept() actually serve, and stratum_conn_new_for_test never goes through
+ * accept() at all. */
+static int dial(int family, int port) {
+    int fd = socket(family, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_storage ss;
+    socklen_t len;
+    memset(&ss, 0, sizeof ss);
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *a = (struct sockaddr_in6 *)(void *)&ss;
+        a->sin6_family = AF_INET6;
+        a->sin6_port = htons((uint16_t)port);
+        a->sin6_addr = in6addr_loopback;
+        len = sizeof(*a);
+    } else {
+        struct sockaddr_in *a = (struct sockaddr_in *)(void *)&ss;
+        a->sin_family = AF_INET;
+        a->sin_port = htons((uint16_t)port);
+        a->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        len = sizeof(*a);
+    }
+    if (connect(fd, (struct sockaddr *)&ss, len) < 0) { close(fd); return -1; }
+    return fd;
+}
+
+/* Walks a small port range rather than insisting on one number. A fixed port
+ * makes this kind of test flaky: a back-to-back run can find the previous
+ * process's socket still lingering, and the bind then fails for a reason that
+ * has nothing to do with the code under test. Writes the port actually bound
+ * back through *port. */
+static stratum_server_t *start_on(const char *addr, int *port) {
+    for (int p = *port; p < *port + 20; p++) {
+        stratum_cfg_t cfg = { .bind_port = p, .max_conns = 8,
+                              .initial_diff = 1.0, .vardiff_enabled = 0 };
+        snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "%s", addr);
+        stratum_server_t *s = NULL;
+        if (stratum_server_start(&cfg, &s) != 0) continue;
+        uint8_t net[32]; memset(net, 0xff, sizeof net);
+        stratum_server_set_job(s, make_test_job("J1", net), 1);
+        *port = p;
+        return s;
+    }
+    return NULL;
+}
+
+/* The point of the change: with listen_addr = "::" an IPv6 client connects. */
+static void test_dual_stack_accepts_ipv6(void) {
+    int port = 39334;
+    stratum_server_t *s = start_on("::", &port);
+    if (!s) { printf("ok: dual-stack v6 skipped (no IPv6 on this host)\n"); return; }
+    int fd = dial(AF_INET6, port);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        sleep_ms(150);
+        close(fd);
+        sleep_ms(150);
+    }
+    stratum_server_free(s);
+    printf("ok: a dual-stack listener accepts an IPv6 client\n");
+}
+
+/* ...and IPv4 clients must keep working on the same socket, or turning this on
+ * would silently strand every existing miner. */
+static void test_dual_stack_still_accepts_ipv4(void) {
+    int port = 39364;
+    stratum_server_t *s = start_on("::", &port);
+    if (!s) { printf("ok: dual-stack v4 skipped (no IPv6 on this host)\n"); return; }
+    int fd = dial(AF_INET, port);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        sleep_ms(150);
+        close(fd);
+        sleep_ms(150);
+    }
+    stratum_server_free(s);
+    printf("ok: a dual-stack listener still accepts an IPv4 client\n");
+}
+
+/* 🔴 The gate, and the reason the other two mean anything. The default must not
+ * have changed: on "0.0.0.0" an IPv6 client is still refused. Without this an
+ * accepted-everywhere result would be equally consistent with the config gate
+ * having been ignored and every deployment silently becoming dual-stack. */
+static void test_ipv4_default_still_refuses_ipv6(void) {
+    int port = 39394;
+    stratum_server_t *s = start_on("0.0.0.0", &port);
+    CHECK(s != NULL);
+    if (!s) return;
+    int fd = dial(AF_INET6, port);
+    CHECK(fd < 0);
+    if (fd >= 0) close(fd);
+    stratum_server_free(s);
+    printf("ok: the IPv4 default still refuses an IPv6 client\n");
+}
+
+
+/* ---- miner-requested difficulty ---------------------------------------- */
+
+static stratum_server_t *dr_server(obs_t *obs, double max_suggested) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                          .initial_diff = 1000.0,
+                          .vardiff_enabled = 1,
+                          .vardiff_target_spm = 12,
+                          .vardiff_min = 1.0,
+                          .vardiff_max = 1e12,
+                          .vardiff_window_sec = 30,
+                          .max_suggested_diff = max_suggested,
+                          .ctx = obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    if (stratum_server_start(&cfg, &s) != 0) return NULL;
+    uint8_t net[32] = {0}; net[7] = 0xff; net[8] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    return s;
+}
+
+/* Authorize with `pw` and return the difficulty the server announced. */
+static double dr_authorize(stratum_server_t *s, stratum_conn_t *c, const char *pw) {
+    char *out = NULL; size_t olen = 0; char msg[256];
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out = NULL; olen = 0;
+    snprintf(msg, sizeof msg,
+             "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" TEST_ADDR "\",\"%s\"]}", pw);
+    stratum_handle_message(s, c, msg, &out, &olen);
+    double d = stratum_conn_difficulty_for_test(c);
+    free(out);
+    return d;
+}
+
+/* The point of the feature: a request RAISES the connection. */
+static void test_password_diff_raises(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = dr_server(&obs, 1e9);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(dr_authorize(s, c, "x,d=50000") == 50000.0);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: d= in the password raises the connection's difficulty\n");
+}
+
+/* ⛔ A FLOOR, NOT A PIN. Asking for LESS than the pool assigned must not lower
+ * it — that is the denial-of-service the floor semantics exist to prevent, and
+ * it is the assertion most likely to be broken by a well-meaning change. */
+static void test_password_diff_never_lowers(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = dr_server(&obs, 1e9);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(dr_authorize(s, c, "d=1") == 1000.0);   /* initial_diff, not 1 */
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: a request below the assigned difficulty does not lower it\n");
+}
+
+static void test_request_is_capped(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = dr_server(&obs, 20000.0);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(dr_authorize(s, c, "d=999999999") == 20000.0);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: a request above max_suggested_diff is capped\n");
+}
+
+/* 🔴 <= 0 DISABLES, it does not uncap. The negative control for the two tests
+ * above: without it, "capped at 20000" and "feature switched off" would be
+ * indistinguishable from a single passing assertion. */
+static void test_zero_cap_disables_requests(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = dr_server(&obs, 0.0);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(dr_authorize(s, c, "d=50000") == 1000.0);   /* untouched */
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: max_suggested_diff <= 0 disables requests rather than uncapping\n");
+}
+
+/* `id=7` is not a difficulty request. Token-boundary matching, not substring. */
+static void test_password_diff_token_boundary(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = dr_server(&obs, 1e9);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *a = stratum_conn_new_for_test(s);
+    stratum_conn_t *b = stratum_conn_new_for_test(s);
+    CHECK(dr_authorize(s, a, "id=7") == 1000.0);
+    CHECK(dr_authorize(s, b, "x;d=7000") == 7000.0);
+    stratum_conn_free_for_test(a); stratum_conn_free_for_test(b);
+    stratum_server_free(s);
+    printf("ok: d= is matched at a token boundary, so id=7 is not a request\n");
+}
+
+/* mining.suggest_difficulty is the formal channel and must reach the same
+ * place, including when it arrives BEFORE authorize. */
+static void test_suggest_difficulty_before_authorize(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = dr_server(&obs, 1e9);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.suggest_difficulty\",\"params\":[25000]}",
+        &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.authorize\",\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen);
+    CHECK(stratum_conn_difficulty_for_test(c) == 25000.0);
+    free(out);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: suggest_difficulty before authorize survives to the first job\n");
+}
+
 int main(void) {
+    test_password_diff_raises();
+    test_password_diff_never_lowers();
+    test_request_is_capped();
+    test_zero_cap_disables_requests();
+    test_password_diff_token_boundary();
+    test_suggest_difficulty_before_authorize();
+    test_failed_bind_does_not_close_stdin();
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
     test_submit_unknown_job();
     test_submit_share_and_dedupe();
     test_submit_rejects_wrong_extranonce2_size();
+    test_accept_churn_peer_gone();
+    test_job_rotation_races_submits();
     test_authorize_rejects_non_address();
     test_authorize_address_with_label();
     test_block_wins_over_low_difficulty();
@@ -2223,6 +2761,9 @@ int main(void) {
     test_a_jsonrpc_response_does_not_close_the_connection();
     test_persistent_garbage_still_closes_the_connection();
     test_authorized_miner_gets_the_long_idle_budget();
+    test_dual_stack_accepts_ipv6();
+    test_dual_stack_still_accepts_ipv4();
+    test_ipv4_default_still_refuses_ipv6();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
