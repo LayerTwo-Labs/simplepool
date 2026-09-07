@@ -93,12 +93,221 @@ static void test_rejects_bad_operator_address(void) {
     CHECK(strcmp(cfg.operator_address, "not-an-address") == 0);
 }
 
+
+/* ---- pool_mode validation ------------------------------------------------
+ *
+ * These are the messages an operator actually meets, and until now the only
+ * thing that checked them was a person running the binary by hand. Every
+ * string asserted here is also quoted in INSTALL.md's troubleshooting section,
+ * so a reworded error that leaves the docs behind fails here first. */
+
+/* Bare `pplns` is refused ahead of the generic catch-all, because it is the
+ * likely typo: the operator knows which accounting they want and has not
+ * noticed that the rail is part of the name. */
+static void test_pplns_without_a_rail_is_refused(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "pool_mode = pplns\n"
+             "pool_btc_address = %s\n", VALID_ADDR, VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "does not say which rail pays") != NULL);
+    CHECK(strstr(err, "pplns-thunder") != NULL);
+    CHECK(strstr(err, "pplns-btc") != NULL);
+}
+
+static void test_unknown_mode_names_the_real_ones(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplnsx\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "'solo'") != NULL);
+    CHECK(strstr(err, "'pps-classic'") != NULL);
+    CHECK(strstr(err, "'pplns-thunder'") != NULL);
+    CHECK(strstr(err, "'pplns-btc'") != NULL);
+}
+
+/* Both pplns rails pool the reward, so both need somewhere to pay it. */
+static void test_pplns_requires_a_pool_address(void) {
+    for (const char *mode = "pplns-thunder";; mode = "pplns-btc") {
+        proxy_config_t cfg; char err[256] = {0};
+        char body[512];
+        snprintf(body, sizeof body,
+                 "operator_address = %s\npool_mode = %s\n", VALID_ADDR, mode);
+        CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+        CHECK(strstr(err, "pool_btc_address") != NULL);
+        CHECK(strstr(err, mode) != NULL);
+        if (strcmp(mode, "pplns-btc") == 0) break;
+    }
+}
+
+/* The two flags pool_mode used to conflate. pplns-btc is the combination no
+ * single "is this PPS" flag could express: the coinbase pays the pool, and the
+ * username is a Bitcoin address. */
+static void test_each_mode_sets_its_two_independent_flags(void) {
+    static const struct { const char *mode; int pays_pool, thunder, accrues; } CASES[] = {
+        { "solo",          0, 0, 0 },
+        { "pps-classic",   1, 1, 1 },
+        { "pplns-thunder", 1, 1, 0 },
+        { "pplns-btc",     1, 0, 0 },
+    };
+    for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; ++i) {
+        proxy_config_t cfg; char err[256] = {0};
+        char body[512];
+        snprintf(body, sizeof body,
+                 "operator_address = %s\npool_mode = %s\npool_btc_address = %s\n",
+                 VALID_ADDR, CASES[i].mode, VALID_ADDR);
+        CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+        CHECK(strcmp(cfg.pool_mode, CASES[i].mode) == 0);
+    }
+}
+
+/* A window of zero or less would divide by nothing; the proxy refuses rather
+ * than distributing a block across a window that does not exist. */
+static void test_a_non_positive_pplns_window_is_refused(void) {
+    const char *bad[] = { "0", "-1", "-0.5" };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i) {
+        proxy_config_t cfg; char err[256] = {0};
+        char body[512];
+        snprintf(body, sizeof body,
+                 "operator_address = %s\npool_mode = pplns-btc\n"
+                 "pool_btc_address = %s\npplns_window_diff_multiple = %s\n",
+                 VALID_ADDR, VALID_ADDR, bad[i]);
+        CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+        CHECK(strstr(err, "pplns_window_diff_multiple") != NULL);
+        CHECK(strstr(err, "> 0") != NULL);
+    }
+}
+
+/* Below 1.0 a block pays out across less work than it took to find, which
+ * rewards hopping. That is a choice an operator is allowed to make badly, so
+ * it warns and loads rather than refusing. */
+static void test_a_small_pplns_window_warns_but_loads(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-btc\n"
+             "pool_btc_address = %s\npplns_window_diff_multiple = 0.5\n",
+             VALID_ADDR, VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.pplns_window_diff_multiple == 0.5);
+}
+
+static void test_the_window_defaults_to_two(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-btc\npool_btc_address = %s\n",
+             VALID_ADDR, VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.pplns_window_diff_multiple == 2.0);
+}
+
+/* ---- listener lines ------------------------------------------------------
+ *
+ * A `listener` line is how rented hashrate is served its own difficulty. A
+ * marketplace measures what the port advertises and cancels an order that
+ * comes in under it, so a line that parses wrongly is a delisting, not a
+ * cosmetic problem. None of this was covered. */
+
+static void test_a_listener_line_becomes_a_port_policy(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listener = port=3335 min_diff=65536 label=rental-a\n",
+             VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.listener_count == 1);
+    CHECK(cfg.listeners[0].port == 3335);
+    CHECK(cfg.listeners[0].min_diff == 65536.0);
+    CHECK(strcmp(cfg.listeners[0].label, "rental-a") == 0);
+}
+
+static void test_several_listeners_keep_their_own_policies(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listener = port=3335 min_diff=1000 label=a\n"
+             "listener = port=3336 min_diff=2000 label=b\n",
+             VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.listener_count == 2);
+    CHECK(cfg.listeners[0].port == 3335 && cfg.listeners[0].min_diff == 1000.0);
+    CHECK(cfg.listeners[1].port == 3336 && cfg.listeners[1].min_diff == 2000.0);
+    CHECK(strcmp(cfg.listeners[1].label, "b") == 0);
+}
+
+static void test_a_listener_field_that_is_not_key_value_is_refused(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\nlistener = port=3335 nonsense\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "nonsense") != NULL);
+}
+
+/* A listener with no port is not a listener. */
+static void test_a_listener_without_a_port_is_refused(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\nlistener = min_diff=1000\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+}
+
+/* ---- log level ----------------------------------------------------------- */
+
+static void test_log_level_accepts_names_and_numbers(void) {
+    static const struct { const char *v; int want; } CASES[] = {
+        { "debug", 0 }, { "info", 1 }, { "warn", 2 }, { "error", 3 },
+        { "DEBUG", 0 }, { "0", 0 }, { "3", 3 },
+    };
+    for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; ++i) {
+        proxy_config_t cfg; char err[256] = {0};
+        char body[512];
+        snprintf(body, sizeof body,
+                 "operator_address = %s\nlog_level = %s\n", VALID_ADDR, CASES[i].v);
+        CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+        CHECK(cfg.log_level == CASES[i].want);
+    }
+}
+
+/* An unparseable log level warns and keeps the default rather than refusing.
+ * Deliberate, and worth pinning so nobody "fixes" it into a hard error: a
+ * typo in a cosmetic setting should not stop a pool accepting work, and the
+ * warning is on the same line as everything else the operator is reading. */
+static void test_a_nonsense_log_level_warns_and_keeps_the_default(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\nlog_level = chatty\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.log_level == 1);   /* info, the default */
+}
+
 int main(void) {
     printf("running test_config...\n");
     test_hash_inside_value_is_kept();
     test_quoted_value_keeps_hash();
     test_inline_comment_still_strips();
     test_rejects_bad_operator_address();
+    test_a_nonsense_log_level_warns_and_keeps_the_default();
+    test_log_level_accepts_names_and_numbers();
+    test_a_listener_without_a_port_is_refused();
+    test_a_listener_field_that_is_not_key_value_is_refused();
+    test_several_listeners_keep_their_own_policies();
+    test_a_listener_line_becomes_a_port_policy();
+    test_the_window_defaults_to_two();
+    test_a_small_pplns_window_warns_but_loads();
+    test_a_non_positive_pplns_window_is_refused();
+    test_each_mode_sets_its_two_independent_flags();
+    test_pplns_requires_a_pool_address();
+    test_unknown_mode_names_the_real_ones();
+    test_pplns_without_a_rail_is_refused();
     if (failures) { printf("test_config: %d failed\n", failures); return 1; }
     printf("test_config: all tests passed\n");
     return 0;
