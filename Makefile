@@ -19,7 +19,14 @@ ifeq ($(UNAME_S),Darwin)
             BREW_PREFIX := /usr/local
         endif
     endif
-    PLATFORM_CFLAGS  := -I$(BREW_PREFIX)/include \
+    # _POSIX_C_SOURCE (below) is what makes clock_gettime and friends visible
+    # on glibc, but on Darwin the same macro works in reverse: asking for a
+    # strict POSIX namespace *hides* everything BSD, and INADDR_LOOPBACK and
+    # MSG_DONTWAIT are BSD, not POSIX. Without this the test suites do not
+    # compile on macOS at all. _DARWIN_C_SOURCE puts them back; it is a no-op
+    # anywhere else because this block is Darwin-only.
+    PLATFORM_CFLAGS  := -D_DARWIN_C_SOURCE \
+                        -I$(BREW_PREFIX)/include \
                         -I$(BREW_PREFIX)/opt/sqlite/include \
                         -I$(BREW_PREFIX)/opt/curl/include \
                         -I$(BREW_PREFIX)/opt/hiredis/include
