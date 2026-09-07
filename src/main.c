@@ -1130,6 +1130,7 @@ int main(int argc, char **argv) {
     snprintf(stcfg.bind_addr, sizeof stcfg.bind_addr, "%s", cfg.listen_addr);
     stcfg.bind_port    = cfg.listen_port;
     stcfg.max_conns    = cfg.max_conns;
+    stcfg.max_suggested_diff = cfg.max_suggested_diff;
     stcfg.initial_diff = cfg.initial_diff;
     snprintf(stcfg.operator_address, sizeof stcfg.operator_address, "%s",
              cfg.operator_address);

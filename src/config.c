@@ -56,6 +56,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->vardiff_target_spm = 12.0;   /* ~1 share every 5s per connection */
     cfg->vardiff_min        = 1.0;
     cfg->vardiff_max        = 1e12;
+    cfg->max_suggested_diff = 5e7;
     cfg->vardiff_window_sec = 30;
     cfg->idle_timeout_sec   = 600;    /* 10 min silent recv → reap */
     cfg->idle_timeout_authorized_sec = 7200;  /* 2 h once a miner is working */
@@ -266,6 +267,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "vardiff_target_spm")        == 0) cfg->vardiff_target_spm = atof(v);
         else if (strcmp(k, "vardiff_min")               == 0) cfg->vardiff_min = atof(v);
         else if (strcmp(k, "vardiff_max")               == 0) cfg->vardiff_max = atof(v);
+        else if (strcmp(k, "max_suggested_diff")     == 0) cfg->max_suggested_diff = atof(v);
         else if (strcmp(k, "vardiff_window_sec")        == 0) cfg->vardiff_window_sec = atoi(v);
         else if (strcmp(k, "idle_timeout_sec")          == 0) cfg->idle_timeout_sec = atoi(v);
         else if (strcmp(k, "idle_timeout_authorized_sec") == 0) cfg->idle_timeout_authorized_sec = atoi(v);

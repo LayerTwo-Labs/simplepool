@@ -138,6 +138,9 @@ typedef struct {
     char   bind_addr[64];
     int    bind_port;
     int    max_conns;            /* default 500 */
+
+    /* Ceiling on a miner-requested difficulty; <= 0 disables requests. */
+    double max_suggested_diff;
     double initial_diff;         /* default 1.0 */
 
     /* Extra listeners beyond bind_port, each with its own difficulty policy.

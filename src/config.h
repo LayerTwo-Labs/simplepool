@@ -33,6 +33,21 @@ typedef struct {
     double vardiff_target_spm;    /* default 12 shares/min (one every 5s) */
     double vardiff_min;           /* default 1.0 */
     double vardiff_max;           /* default 1e12; clamped by network diff */
+
+    /* Ceiling on a miner-requested difficulty (stratum password `d=<n>` or
+     * mining.suggest_difficulty). Default 50000000.
+     *
+     * ⚠️ Size this against idle_timeout_authorized_sec, not against taste. A
+     * request is a FLOOR on the connection's difficulty, so it directly
+     * lengthens that connection's expected share interval — and the reaper
+     * measures inbound silence. At 50M a 25 TH/s connection expects a share
+     * roughly every 8600s, which is past the 7200s default: it would be reaped
+     * while mining perfectly well. Raise one or lower the other.
+     *
+     * <= 0 DISABLES requests rather than uncapping them. That is deliberate:
+     * "no ceiling" is not a sane reading of a limit set to zero, and an
+     * operator who wants the feature off needs a way to say so. */
+    double max_suggested_diff;    /* default 5e7; <= 0 disables requests */
     int    vardiff_window_sec;    /* retarget interval, default 30 */
 
     /* Idle-connection reaper. A connection that hasn't sent any bytes in
