@@ -158,6 +158,46 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
                            int *out_blocks, int *out_workers,
                            char *errbuf, size_t errlen);
 
+/* ---- the PPLNS window, as it stands NOW --------------------------------
+ *
+ * store_pplns_distribute() reads the window of a block that has already
+ * matured, anchored on that block's own share. This reads the window a block
+ * found RIGHT NOW would pay, anchored on the newest share there is — which is
+ * what a coinbase-direct pool needs when it builds a template, ~100 blocks
+ * before the other one would run.
+ *
+ * Only workers with a payout address are returned, and the total is summed
+ * over exactly those. A worker with no address cannot be given a coinbase
+ * output, and leaving it in the denominator would shrink everyone else's
+ * share to fund an output that is never created — value quietly destroyed
+ * rather than merely unpaid. */
+typedef struct {
+    int64_t worker_id;
+    char    payout_address[128];
+    double  difficulty;          /* this worker's difficulty inside the window */
+} store_window_entry_t;
+
+/* Fill `out` with the window's payable workers, largest first, and set
+ * *out_total_diff to the difficulty summed across the ones returned.
+ *
+ * `window_diff` is the window size in difficulty units, the same quantity
+ * blocks_found.pplns_window_diff stores. The boundary rule matches the
+ * distributor exactly: the share that crosses it is counted whole, because
+ * the window chooses which work is paid rather than claiming that precisely N
+ * difficulty was performed.
+ *
+ * *out_truncated is set when more payable workers were in the window than
+ * `cap` could hold. The tail is then absent from both the entries and the
+ * total, so their claim is redistributed rather than carried — the caller
+ * must decide whether that is acceptable rather than discovering it in the
+ * amounts.
+ *
+ * Returns the number written, or negative on error. */
+int store_pplns_window(store_t *s, double window_diff,
+                       store_window_entry_t *out, size_t cap,
+                       size_t *out_n, double *out_total_diff,
+                       int *out_truncated, char *errbuf, size_t errlen);
+
 /* Record an accepted share with the miner's payout_address so the worker
  * row can be tagged. payout_address may be NULL (legacy/tests). The
  * share_hash semantics match store_record_share() above.

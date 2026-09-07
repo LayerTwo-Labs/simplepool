@@ -1299,6 +1299,156 @@ static void test_pplns_distributes_two_blocks_in_one_pass(void) {
     printf("  ok test_pplns_distributes_two_blocks_in_one_pass\n");
 }
 
+/* ---- the window as it stands now ---------------------------------------
+ *
+ * store_pplns_distribute() reads the window of a block that already matured.
+ * A coinbase-direct pool needs the window a block found RIGHT NOW would pay,
+ * ~100 blocks before the other one runs. Same walk, different anchor.
+ *
+ * The property that matters is that the two agree. If the template promises a
+ * split the distributor would not have produced, the pool pays out something
+ * other than what it advertised. */
+static void test_the_window_now_matches_the_distributor(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Old work, well outside a 100-difficulty window. */
+    for (int i = 0; i < 40; ++i) {
+        assert(store_record_share_addr(s, "carol", "addr_c",
+                                       1000ULL + (uint64_t)i, 25.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    /* The window: alice and bob, 50 difficulty each. */
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "alice", "addr_a",
+                                       2000ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+        assert(store_record_share_addr(s, "bob", "addr_b",
+                                       2100ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_flush(s) == 0);
+
+    store_window_entry_t win[8];
+    size_t n = 0; double total = 0.0; int truncated = 1;
+    char err[256] = {0};
+    int rc = store_pplns_window(s, 100.0, win, 8, &n, &total, &truncated,
+                                err, sizeof err);
+    assert(rc == 2);
+    assert(n == 2);
+    assert(truncated == 0);
+    /* Ordered largest first; equal here, so the tie breaks by worker id and
+     * alice (inserted first) leads. */
+    assert(win[0].difficulty > 49.9 && win[0].difficulty < 50.1);
+    assert(win[1].difficulty > 49.9 && win[1].difficulty < 50.1);
+    assert(total > 99.9 && total < 100.1);
+    /* carol did 1000 difficulty and is outside the window: absent entirely,
+     * and absent from the denominator, so she does not dilute anyone. */
+    for (size_t i = 0; i < n; ++i)
+        assert(strcmp(win[i].payout_address, "addr_c") != 0);
+
+    store_close(s);
+    printf("  ok test_the_window_now_matches_the_distributor\n");
+}
+
+/* A worker with no payout address cannot be given a coinbase output. Leaving
+ * it in the denominator would shrink everyone else's share to fund an output
+ * that is never created -- value destroyed rather than merely unpaid. */
+static void test_a_worker_with_no_address_is_left_out_of_the_split(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "alice", "addr_a",
+                                       2000ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+        /* No payout address at all -- the legacy/solo share path. */
+        assert(store_record_share(s, "nobody", 2100ULL + (uint64_t)i, 5.0,
+                                  0, NULL) == 0);
+    }
+    assert(store_flush(s) == 0);
+
+    store_window_entry_t win[8];
+    size_t n = 0; double total = 0.0; int truncated = 0;
+    char err[256] = {0};
+    assert(store_pplns_window(s, 100.0, win, 8, &n, &total, &truncated,
+                              err, sizeof err) == 1);
+    assert(n == 1);
+    assert(strcmp(win[0].payout_address, "addr_a") == 0);
+    /* 50, not 100: the unpayable worker is out of the denominator too, so
+     * alice's proportion is of what can actually be paid. */
+    assert(total > 49.9 && total < 50.1);
+    store_close(s);
+    printf("  ok test_a_worker_with_no_address_is_left_out_of_the_split\n");
+}
+
+/* Truncation redistributes rather than carries, so it must be reported: the
+ * caller has to decide, not discover it in the amounts. */
+static void test_a_window_wider_than_the_cap_says_so(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    for (int w = 0; w < 6; ++w) {
+        char name[32], addr[32];
+        snprintf(name, sizeof name, "w%d", w);
+        snprintf(addr, sizeof addr, "addr_%d", w);
+        assert(store_record_share_addr(s, name, addr, 3000ULL + (uint64_t)w,
+                                       10.0, 0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_flush(s) == 0);
+
+    store_window_entry_t win[3];
+    size_t n = 0; double total = 0.0; int truncated = 0;
+    char err[256] = {0};
+    assert(store_pplns_window(s, 1000.0, win, 3, &n, &total, &truncated,
+                              err, sizeof err) == 3);
+    assert(n == 3);
+    assert(truncated == 1);
+    store_close(s);
+    printf("  ok test_a_window_wider_than_the_cap_says_so\n");
+}
+
+/* A pool that has just started has no shares. Nobody to pay is not an error
+ * here -- it is the caller's cue not to build a coinbase-direct template. */
+static void test_an_empty_window_returns_nothing_not_an_error(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    store_window_entry_t win[4];
+    size_t n = 1; double total = 1.0; int truncated = 1;
+    char err[256] = {0};
+    assert(store_pplns_window(s, 100.0, win, 4, &n, &total, &truncated,
+                              err, sizeof err) == 0);
+    assert(n == 0);
+    assert(total == 0.0);
+    assert(truncated == 0);
+    /* A non-positive window is a config bug, not an empty pool. */
+    assert(store_pplns_window(s, 0.0, win, 4, &n, &total, &truncated,
+                              err, sizeof err) < 0);
+    store_close(s);
+    printf("  ok test_an_empty_window_returns_nothing_not_an_error\n");
+}
+
 /* The operator fee comes off the top, exactly as in solo and PPS. */
 static void test_pplns_takes_the_operator_fee(void) {
     const char *path = fresh_db_path();
@@ -1353,6 +1503,10 @@ int main(void) {
     test_pplns_distributes_the_window();
     test_pplns_takes_the_operator_fee();
     test_pplns_distributes_two_blocks_in_one_pass();
+    test_an_empty_window_returns_nothing_not_an_error();
+    test_a_window_wider_than_the_cap_says_so();
+    test_a_worker_with_no_address_is_left_out_of_the_split();
+    test_the_window_now_matches_the_distributor();
     test_schema_sql_matches_store_schema();
     cleanup_dbs();
     printf("all tests passed\n");

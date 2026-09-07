@@ -1427,6 +1427,77 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
     return rc_out < 0 ? rc_out : blocks;
 }
 
+/* ---- the PPLNS window, as it stands now --------------------------------- */
+
+int store_pplns_window(store_t *s, double window_diff,
+                       store_window_entry_t *out, size_t cap,
+                       size_t *out_n, double *out_total_diff,
+                       int *out_truncated, char *errbuf, size_t errlen)
+{
+    if (out_n)         *out_n = 0;
+    if (out_total_diff) *out_total_diff = 0.0;
+    if (out_truncated) *out_truncated = 0;
+    if (!s || !s->db || !out || cap == 0) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "bad arg");
+        return -1;
+    }
+    if (!(window_diff > 0.0)) {
+        if (errbuf && errlen)
+            snprintf(errbuf, errlen, "window_diff must be > 0");
+        return -1;
+    }
+
+    /* The same walk store_pplns_distribute() does, with two differences: it
+     * is anchored on the newest share rather than a particular block's, and
+     * it joins workers so the caller gets an address to pay.
+     *
+     * `running - difficulty < ?` compares against the total EXCLUDING the
+     * current row, which is what includes the share crossing the boundary
+     * whole instead of splitting it. Same rule, same reason, as the
+     * distributor -- if these two ever disagree, a block pays out differently
+     * from what the template promised. */
+    static const char *Q =
+        "WITH anchored AS ("
+        "  SELECT worker_id, difficulty, "
+        "         SUM(difficulty) OVER (ORDER BY id DESC ROWS UNBOUNDED PRECEDING) AS running "
+        "    FROM shares "
+        ") "
+        "SELECT w.id, COALESCE(w.payout_address,''), SUM(a.difficulty) AS wd "
+        "  FROM anchored a "
+        "  JOIN workers w ON w.id = a.worker_id "
+        " WHERE a.running - a.difficulty < ? "
+        "   AND w.payout_address IS NOT NULL AND w.payout_address <> '' "
+        " GROUP BY w.id "
+        " HAVING wd > 0 "
+        " ORDER BY wd DESC, w.id ASC";
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    sqlite3_bind_double(st, 1, window_diff);
+
+    size_t n = 0;
+    double total = 0.0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (n >= cap) { if (out_truncated) *out_truncated = 1; break; }
+        out[n].worker_id = sqlite3_column_int64(st, 0);
+        const unsigned char *addr = sqlite3_column_text(st, 1);
+        snprintf(out[n].payout_address, sizeof out[n].payout_address, "%s",
+                 addr ? (const char *)addr : "");
+        out[n].difficulty = sqlite3_column_double(st, 2);
+        total += out[n].difficulty;
+        n++;
+    }
+    sqlite3_finalize(st);
+
+    if (out_n)          *out_n = n;
+    if (out_total_diff) *out_total_diff = total;
+    return (int)n;
+}
+
 int store_record_credit(store_t *s, const char *worker_name,
                         const char *payout_address,
                         uint64_t ts_ms, int64_t delta_sats)
