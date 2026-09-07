@@ -66,9 +66,58 @@ export class EnforcerWalletClient {
      * unlocked, so do it once up front rather than discovering it mid-batch.
      * Unlocking is idempotent and cheap; a wallet with no passphrase
      * configured is assumed unencrypted and left alone. */
+    /* ⚠️ UNVERIFIED AGAINST A REAL ENFORCER, and not for want of trying.
+     *
+     * Every other RPC this client makes is now exercised against a live node
+     * by tests/test_pplns_btc_payout_regtest.sh. This one cannot be, because
+     * a regtest enforcer cannot be made to hold an ENCRYPTED wallet:
+     *
+     *   --wallet-auto-create      creates an unencrypted wallet, and then
+     *                             CreateWallet refuses ("a wallet seed
+     *                             already exists")
+     *   wallet on, not created    the enforcer will not start: --enable-mempool
+     *                             is mandatory and its sync task refuses an
+     *                             uninitialized wallet
+     *   --walletless              WalletService/CreateWallet is not served at
+     *                             all (unimplemented)
+     *
+     * So the locked path has no coverage. What IS established: the method
+     * exists and is served at this path, and the enforcer carries
+     * AlreadyUnlocked / InvalidPassword / WalletNotUnlocked error variants.
+     * What is NOT: that `password` is the right field name. An unencrypted
+     * wallet answers "already unlocked" BEFORE reading the body, so a probe
+     * with a deliberately bogus field name gets the same reply as this one --
+     * which means no regtest call can tell a correct request from a wrong one.
+     *
+     * The field name matches CreateWallet's, which does take `password`, so
+     * it is likely right. "Likely" is the honest word. The first operator to
+     * run an encrypted wallet is the test, and if this is wrong they will see
+     * payouts fail at the unlock rather than silently mispay -- which is the
+     * safe direction, but say so rather than let it look covered. */
     async ensureUnlocked() {
         if (this._unlocked || !this.passphrase) return;
-        await this._call('UnlockWallet', { password: this.passphrase });
+        try {
+            await this._call('UnlockWallet', { password: this.passphrase });
+        } catch (e) {
+            /* A wallet that is not encrypted is already unlocked, and says so
+             * with already_exists / "enforcer wallet already unlocked". That
+             * is not a failure -- the wallet can sign, which is all this call
+             * is for -- but it was thrown straight out of
+             * transferBatchDetailed, so every tick failed and nobody was paid.
+             *
+             * Not an exotic misconfiguration: --wallet-auto-create makes an
+             * UNENCRYPTED wallet, and that is how the install guide and the
+             * regtest scripts create one. An operator who sets
+             * ENFORCER_WALLET_PASSPHRASE defensively, or who set it for a
+             * wallet that was later decrypted, lands here.
+             *
+             * A wrong passphrase still throws: that one really does leave the
+             * wallet unable to sign, and silence there would turn a typo into
+             * payouts that stop with no reason given. */
+            const alreadyUnlocked =
+                e.code === 'already_exists' || /already unlocked/i.test(e.message || '');
+            if (!alreadyUnlocked) throw e;
+        }
         this._unlocked = true;
     }
 

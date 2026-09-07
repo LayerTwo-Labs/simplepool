@@ -253,3 +253,35 @@ test('one SendTransaction carries every address in the batch', async () => {
     assert.deepEqual(sends[0].body.destinations, { addr_a: 250000, addr_b: 300000 });
     assert.equal(res.txid, 'deadbeef');
 });
+
+/* Unlocking, and the one shape of it that a regtest enforcer can reach.
+ *
+ * The locked path itself is NOT covered here or anywhere: see the note on
+ * ensureUnlocked. These pin the reachable half. */
+
+test('an unencrypted wallet reports "already unlocked", and that is not a failure', async () => {
+    /* --wallet-auto-create makes an UNENCRYPTED wallet -- the install guide's
+     * way and the regtest scripts' way -- and such a wallet answers
+     * UnlockWallet with HTTP 409 already_exists. That was thrown straight out
+     * of transferBatchDetailed, so an operator who set
+     * ENFORCER_WALLET_PASSPHRASE against it had every payout tick fail. The
+     * wallet can sign, which is the only thing the call is for. */
+    const c = new EnforcerWalletClient({ addr: 'x', passphrase: 'hunter2' });
+    const err = new Error('enforcer .../UnlockWallet: already_exists: enforcer wallet already unlocked');
+    err.code = 'already_exists';
+    stub(c, { UnlockWallet: err, SendTransaction: { txid: { hex: 'aa' } } });
+    const res = await c.transferBatchDetailed([{ address: 'a', sats: 1n }]);
+    assert.equal(res.txid, 'aa', 'the payout still goes out');
+});
+
+test('a wrong passphrase still fails loudly', async () => {
+    /* The opposite case, and it must stay noisy: a wallet that cannot be
+     * unlocked cannot sign, and swallowing that turns a typo into payouts
+     * that stop with no reason given. */
+    const c = new EnforcerWalletClient({ addr: 'x', passphrase: 'wrong' });
+    const err = new Error('enforcer .../UnlockWallet: invalid_argument: invalid password');
+    err.code = 'invalid_argument';
+    stub(c, { UnlockWallet: err, SendTransaction: { txid: { hex: 'aa' } } });
+    await assert.rejects(() => c.transferBatchDetailed([{ address: 'a', sats: 1n }]),
+                         /invalid password/);
+});

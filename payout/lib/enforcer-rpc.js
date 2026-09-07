@@ -22,7 +22,14 @@ export async function enforcerRpc(enforcerAddr, rpcPath, body, timeoutMs = 30_00
         }
         if (!r.ok) {
             const code = j.code || `http ${r.status}`;
-            throw new Error(`enforcer ${rpcPath}: ${code}${j.message ? `: ${j.message}` : ''}`);
+            const err = new Error(
+                `enforcer ${rpcPath}: ${code}${j.message ? `: ${j.message}` : ''}`);
+            /* Keep the machine-readable parts on the error. Callers that need
+             * to tell one failure from another should not have to match on
+             * prose that upstream is free to reword. */
+            err.code = j.code ?? null;
+            err.status = r.status;
+            throw err;
         }
         return j;
     } finally {
