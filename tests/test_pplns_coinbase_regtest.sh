@@ -30,19 +30,24 @@
 #      forfeited to the operator and never settled, which is a trap unless
 #      the operator can see it — so the disclosure lines are asserted here
 #      exactly like the money is.
+#   6. a MIXED window really does forfeit, on chain. Claims of 100 : 10 : 1,
+#      a floor between the last two: the first two are paid in the coinbase,
+#      the third gets no output, and its satoshis turn up on the operator's.
 #
-# NOT covered here, deliberately: a forfeit with something actually in it.
-# That needs a window holding claims of very different sizes, and this harness
-# drives cpuminers against one address. Squeezing the byte budget instead does
-# not produce it either: with a single payee, either it fits or the builder
-# refuses, no coinbase is rendered and no block is found.
+# That last stage is the one this file could not do for a long time, and the
+# reason is worth writing down. Share difficulty is clamped to network
+# difficulty on regtest, so a 2.0x window holds about two shares -- every
+# other stage here reports "window of 1 miner(s)". A mixed window needs a much
+# wider multiple AND a share history, so it seeds the shares table directly
+# with the pool STOPPED. That is replaying the pool's own record of accepted
+# work, not stubbing the thing under test: the window query, the split, the
+# builder, the block and the outputs read back off the chain are all real.
 #
-# An earlier version of this file had a stage that squeezed the budget and
-# printed how much had carried. It printed 0 every time and passed regardless,
-# which is worse than no stage at all. The forfeit arithmetic is covered in
-# tests/test_coinbase.c instead, where the amounts can be stated exactly and
-# are mutation-verified. What is missing is an end-to-end run with a
-# mixed-size window, and it is missing on purpose rather than by oversight.
+# An earlier version of this file had a stage that squeezed the byte budget
+# and printed how much had carried. It printed 0 every time and passed
+# regardless, which is worse than no stage at all. This one asserts the
+# amounts: 1 share in 111 of the payable reward, forfeited, and the operator
+# holding strictly more than its fee.
 #
 # Env:
 #   REGTEST_DIR      data dir, WIPED each run (default: <repo>/.regtest-cbwin)
@@ -370,6 +375,175 @@ stage "assert the block was recorded, and needs no distribution"
 BLK_ROWS="$(sqlite3 "$POOL_DB" "SELECT COUNT(*) FROM blocks_found")"
 echo "  blocks_found rows=$BLK_ROWS"
 [ "$BLK_ROWS" -ge 1 ] || { echo "FAIL: the block was not recorded" >&2; exit 1; }
+
+stage "a MIXED window: some claims paid, the smallest forfeited on chain"
+# The one path everything above leaves untouched: a window holding claims of
+# very different sizes, where the floor pays some and forfeits the rest, and
+# the forfeit is visible in the block.
+#
+# It cannot be mined for. Share difficulty is clamped to network difficulty on
+# regtest, so a 2.0x window holds about two shares -- which is why every stage
+# above reports "window of 1 miner(s)". Two levers fix that: a much wider
+# window multiple, and a share history seeded before the pool starts.
+#
+# Seeded, not faked. The shares table is the pool's own record of accepted
+# work, and writing it while the pool is STOPPED is replaying history, not
+# stubbing the thing under test. Everything downstream is real: the window
+# query, the split, the coinbase builder, the block, and the outputs read back
+# off the chain.
+kill "$POOL_PID" 2>/dev/null || true
+wait "$POOL_PID" 2>/dev/null || true
+POOL_PID=""
+
+# Three miners at 100 : 10 : 1, on a fresh ledger so the counts are exactly
+# what this stage put there.
+MIX_DB="/tmp/simplepool-cbmix.db"
+MIX_LOG="/tmp/simplepool-cbmix.log"
+MIX_CONF="/tmp/simplepool-cbmix.conf"
+rm -f "$MIX_DB" "$MIX_DB-wal" "$MIX_DB-shm"
+sqlite3 "$MIX_DB" < "$ROOT/schema.sql" > /dev/null
+
+BIG="bcrt1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3lgth6c"    # 100 shares
+MID="bcrt1qyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zs4w3j0"    # 10
+SMALL="bcrt1qxvenxvenxvenxvenxvenxvenxvenxvenztev8a"  # 1  -> under the floor
+
+# Each seeded share carries the network difficulty a real one would, so a
+# window multiple of N covers N shares.
+NETDIFF="$(sqlite3 "$POOL_DB" "SELECT network_difficulty FROM pool_meta WHERE id=1")"
+[ -n "$NETDIFF" ] || { echo "FAIL: no network difficulty to size the window" >&2; exit 1; }
+echo "  seeding 111 shares at difficulty $NETDIFF (100 : 10 : 1)"
+{
+  echo "BEGIN;"
+  echo "INSERT INTO workers (id,name,payout_address,first_seen,last_seen) VALUES"
+  echo "  (1,'$BIG','$BIG',1,1),(2,'$MID','$MID',1,1),(3,'$SMALL','$SMALL',1,1);"
+  for i in $(seq 1 100); do echo "INSERT INTO shares (worker_id,ts,difficulty) VALUES (1,1,$NETDIFF);"; done
+  for i in $(seq 1 10);  do echo "INSERT INTO shares (worker_id,ts,difficulty) VALUES (2,1,$NETDIFF);"; done
+  echo "INSERT INTO shares (worker_id,ts,difficulty) VALUES (3,1,$NETDIFF);"
+  echo "COMMIT;"
+} | sqlite3 "$MIX_DB"
+
+# The floor sits between the 1-share claim and the 10-share one. Of a
+# 4,950,000,000-sat payable amount: 100/111 = ~4.46e9, 10/111 = ~4.46e8,
+# 1/111 = ~4.46e7. A floor of 100,000,000 forfeits exactly the last.
+MIX_FLOOR=100000000
+sed -e "s|^db_path = .*|db_path = ${MIX_DB}|" \
+    -e "s|^pplns_window_diff_multiple = .*|pplns_window_diff_multiple = 200.0|" \
+    -e "s|^pplns_payout_floor_sats = .*|pplns_payout_floor_sats = ${MIX_FLOOR}|" \
+    "$POOL_CONF" > "$MIX_CONF"
+grep -q "^pplns_payout_floor_sats" "$MIX_CONF" || \
+    echo "pplns_payout_floor_sats = ${MIX_FLOOR}" >> "$MIX_CONF"
+grep -q "^pplns_window_diff_multiple = 200.0" "$MIX_CONF" || {
+    echo "FAIL: could not widen the window in the generated config" >&2; exit 1; }
+
+"$POOL_BIN" "$MIX_CONF" > "$MIX_LOG" 2>&1 &
+POOL_PID=$!
+for _ in $(seq 1 20); do nc -z 127.0.0.1 "$POOL_PORT" 2>/dev/null && break; sleep 1; done
+kill -0 "$POOL_PID" 2>/dev/null || {
+    echo "FAIL: simplepool died on the mixed-window config" >&2
+    tail -20 "$MIX_LOG" >&2; exit 1; }
+
+# The pool must SAY the small miner is about to earn nothing, before a block
+# makes it true. That warning is the operator's only chance to act.
+#
+# Up to 60s, because the FIRST job of a process carries no window -- network
+# difficulty is unread until a template arrives -- and the tip watcher only
+# rebuilds on a new tip or its 30-second refresh. A 20-second wait looked like
+# "the pool never warned" when it simply had not built a second job yet.
+for _ in $(seq 1 60); do
+    grep -q "below the ${MIX_FLOOR}-sat payout floor" "$MIX_LOG" && break
+    sleep 1
+done
+grep -q "below the ${MIX_FLOOR}-sat payout floor" "$MIX_LOG" || {
+    echo "FAIL: the pool never warned that a miner falls below the floor" >&2
+    grep -i "floor" "$MIX_LOG" | tail -5 >&2; exit 1; }
+echo "  warned: $(grep -o '[0-9]* of [0-9]* miner(s) in the window are below' "$MIX_LOG" | tail -1)"
+
+MIX_BEFORE=$(cli getblockcount)
+node "$ROOT/scripts/regtest/cpuminer.js" --port "$POOL_PORT" --user "$MINER_ADDR" --timeout 180
+MIX_AFTER=$(cli getblockcount)
+[ "$MIX_AFTER" -gt "$MIX_BEFORE" ] || {
+    echo "FAIL: no block was mined on the mixed window" >&2; exit 1; }
+
+stage "assert the forfeit happened, in the block itself"
+MIX_TIP="$(cli getbestblockhash)"
+MIX_CB="$(cli getblock "$MIX_TIP" 2 | jq -c '.tx[0]')"
+CB_JSON="$MIX_CB" BIG="$BIG" MID="$MID" SMALL="$SMALL" \
+OPERATOR_ADDR="$OPERATOR_ADDR" MIX_FLOOR="$MIX_FLOOR" python3 - <<'PY'
+import json, os, sys
+
+cb    = json.loads(os.environ['CB_JSON'])
+big   = os.environ['BIG']
+mid   = os.environ['MID']
+small = os.environ['SMALL']
+op    = os.environ['OPERATOR_ADDR']
+floor = int(os.environ['MIX_FLOOR'])
+
+paid = {}
+for o in cb['vout']:
+    spk = o['scriptPubKey']
+    if spk.get('type') == 'nulldata':
+        continue
+    paid[spk['address']] = paid.get(spk['address'], 0) + round(o['value'] * 1e8)
+
+for a, v in sorted(paid.items(), key=lambda kv: -kv[1]):
+    who = {big: 'BIG (100 shares)', mid: 'MID (10)', small: 'SMALL (1)',
+           op: 'operator'}.get(a, 'UNKNOWN')
+    print(f"    {v:>14} sats -> {a}  ({who})")
+
+# The two claims above the floor are paid, in the block.
+for name, addr in (('BIG', big), ('MID', mid)):
+    if addr not in paid:
+        print(f"FAIL: {name} clears the floor but has no coinbase output",
+              file=sys.stderr)
+        sys.exit(1)
+
+# The one below it is NOT -- this is the whole point of the stage.
+if small in paid:
+    print(f"FAIL: SMALL is worth less than the {floor}-sat floor but was paid "
+          f"{paid[small]} anyway", file=sys.stderr)
+    sys.exit(1)
+
+# And its money went to the operator, not nowhere. The operator must hold
+# strictly more than the 1% fee, and the block must still be spent whole:
+# a forfeit that vanished would show up as a coinbase paying out less than
+# it may, which is value destroyed rather than merely redirected.
+total = sum(paid.values())
+if total != 5000000000:
+    print(f"FAIL: the coinbase pays {total}, not the whole 50 BTC block",
+          file=sys.stderr)
+    sys.exit(1)
+fee_only = 50000000
+op_sats = paid.get(op, 0)
+if op_sats <= fee_only:
+    print(f"FAIL: operator holds {op_sats}, no more than the {fee_only}-sat "
+          f"fee — the forfeited claim went nowhere", file=sys.stderr)
+    sys.exit(1)
+forfeited = op_sats - fee_only
+print(f"  forfeited to the operator: {forfeited} sats "
+      f"(on top of the {fee_only}-sat fee)")
+# Roughly 1/111 of the payable amount. Bounded rather than exact because the
+# block finder's own share may or may not have entered the window before the
+# job was built; either way the SMALL claim is the one that lost.
+if not (40000000 <= forfeited <= 50000000):
+    print(f"FAIL: forfeited {forfeited} sats, expected ~44.6M "
+          f"(1 share in 111 of the payable amount)", file=sys.stderr)
+    sys.exit(1)
+PY
+
+# And the pool reported it, with the numbers, so an operator answering "why
+# was I not paid?" has something to answer from.
+grep -q "were forfeited to the operator" "$MIX_LOG" || {
+    echo "FAIL: the block paid a forfeit but the pool never reported one" >&2
+    grep -i "pplns-coinbase: block" "$MIX_LOG" | tail -3 >&2; exit 1; }
+echo "  reported: $(grep -o '[0-9]* claim(s) worth [0-9]* sats were forfeited' "$MIX_LOG" | tail -1)"
+
+# Still no ledger. A forfeit is income, not a debt -- if this mode ever grew a
+# carry it would show up here first.
+MIX_ROWS="$(sqlite3 "$MIX_DB" "SELECT COUNT(*) FROM pps_credits")"
+[ "$MIX_ROWS" = "0" ] || {
+    echo "FAIL: a forfeit created $MIX_ROWS ledger row(s); it must create none" >&2
+    exit 1; }
+echo "  pps_credits rows=0 — forfeited, not carried"
 
 echo
 echo "cbwin-e2e: PASS (the window was paid from the block's own coinbase,"

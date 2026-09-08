@@ -656,7 +656,7 @@ mode, each mining a real chain:
 | `tests/test_e2e_regtest.sh` | `pps-classic`: the coinbase pays the pool, and shares accrue at the derived rate |
 | `tests/test_pplns_regtest.sh` | both pooled PPLNS rails distribute a matured block exactly once |
 | `tests/test_pplns_btc_payout_regtest.sh` | `pplns-btc` pays miners on L1 through the enforcer wallet |
-| `tests/test_pplns_coinbase_regtest.sh` | `pplns-coinbase`: the block's coinbase pays the window, the pool holds nothing, and the payout floor is disclosed |
+| `tests/test_pplns_coinbase_regtest.sh` | `pplns-coinbase`: the block's coinbase pays the window, the pool holds nothing, the payout floor is disclosed, and a mixed 100 : 10 : 1 window really does forfeit the smallest claim to the operator on chain |
 | `tests/test_payout_regtest.sh` | the Thunder payout rail settles and confirms |
 
 All of them run in CI. For the verification checklist behind each mode, see
