@@ -204,7 +204,7 @@ typedef struct {
      * The window itself rides on the job (stratum_job_set_window), because it
      * is a snapshot taken when the template was built. */
     int     coinbase_pays_window;
-    size_t  max_payout_outputs;   /* 0 = COINBASE_MAX_PAYOUT_OUTPUTS */
+    size_t  max_coinbase_bytes;   /* 0 = COINBASE_DEFAULT_MAX_BYTES */
 
     /* Does this mode price a share when it arrives? Only pps-classic does.
      * It is what the accrual gate suspends, so the gate must key on this and

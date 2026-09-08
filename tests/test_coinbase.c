@@ -916,7 +916,14 @@ static void test_the_cap_falls_on_the_smallest_claims(void) {
      * carry needs somewhere to ride even when there is no fee. */
     int rc = coinbase_build_window(800000, value, payees, 3,
                                    WOP, 0, NULL, NULL, 4, 8,
-                                   2, &parts, &res, err, sizeof err);
+                                   /* Byte budget admitting exactly two of the
+                                    * three payouts: the envelope, scriptSig
+                                    * and reserved operator output come to
+                                    * 112 bytes, and each P2WPKH payout costs
+                                    * 31, so 174 fits two and 205 would fit
+                                    * three. */
+                                   180,
+                                   &parts, &res, err, sizeof err);
     assert(rc == 0);
     assert(res.paid_count == 2);
     assert(res.dropped_capped == 1);
@@ -1127,8 +1134,102 @@ static void test_both_window_builders_split_identically(void) {
     printf("ok: both window builders split a window identically\n");
 }
 
+/* The budget is BYTES, and the commitments are part of what spends them.
+ *
+ * This is the correction that production evidence forced. The first version
+ * capped payouts at a count, which cannot express the thing that actually
+ * binds: a coinbase-direct pool reports the same 16 payouts costing 817 bytes
+ * against four drivechain OP_RETURNs and 769 against three
+ * (LayerTwo-Labs/simplepool#61). The commitments are not payouts and a count
+ * cap cannot see them; a byte budget spends them first and pays whoever is
+ * left over.
+ *
+ * Asserted as a relationship rather than against somebody else's absolute
+ * numbers: the same window, the same budget, a template carrying more
+ * commitment bytes -> strictly fewer miners paid. */
+static void test_commitments_eat_the_payout_budget(void) {
+    char err[256] = {0};
+    coinbase_parts_t parts;
+    coinbase_window_result_t res;
+
+    coinbase_parts_t probe; int64_t reward = 0, unused = 0;
+    assert(coinbase_build_from_template(ENF_COINBASE_HEX, ENF_ADDR, NULL, 0,
+                                        NULL, 4, 4, &probe, NULL, &reward,
+                                        &unused, err, sizeof err) == 0);
+    coinbase_parts_free(&probe);
+
+    /* Eight equal claims, all comfortably above dust. */
+    enum { N = 8 };
+    coinbase_payee_t payees[N];
+    int64_t each = reward / N;
+    for (int i = 0; i < N; ++i) {
+        payees[i].address = (i % 2) ? WA : WB;
+        payees[i].sats = each;
+    }
+    payees[0].sats += reward - each * N;    /* exact */
+
+    /* Generous enough to admit several of the eight, tight enough that the
+     * commitments make a visible difference. Measured: at this budget the
+     * enforcer template admits 5 and a bare coinbase admits 6. */
+    const size_t BUDGET = 300;
+    assert(coinbase_build_window_from_template(ENF_COINBASE_HEX, payees, N,
+                                               WOP, 0, NULL, 4, 4, BUDGET,
+                                               &parts, NULL, &res,
+                                               err, sizeof err) == 0);
+    size_t paid_with_template = res.paid_count;
+    assert(paid_with_template > 0 && paid_with_template < N);
+    /* Nothing is lost: whatever did not fit is carried, not dropped. */
+    assert(res.dropped_capped == N - paid_with_template);
+    assert(res.paid_sats + res.carry_sats + res.fee_sats == reward);
+    coinbase_parts_free(&parts);
+
+    /* The same window and the same budget, built from scratch — no template,
+     * so no commitment OP_RETURNs spending the budget. More miners fit. */
+    assert(coinbase_build_window(800000, reward, payees, N, WOP, 0, NULL,
+                                 NULL, 4, 4, BUDGET, &parts, &res,
+                                 err, sizeof err) == 0);
+    assert(res.paid_count > paid_with_template);
+    coinbase_parts_free(&parts);
+    printf("ok: commitments spend the byte budget, so fewer miners fit (%zu vs %zu)\n",
+           paid_with_template, res.paid_count);
+}
+
+/* Whatever the budget says, the coinbase must actually come in under it —
+ * the number is only worth having if it is true of the bytes on the wire. */
+static void test_the_built_coinbase_respects_its_budget(void) {
+    char err[256] = {0};
+    coinbase_parts_t parts;
+    coinbase_window_result_t res;
+
+    enum { N = 12 };
+    coinbase_payee_t payees[N];
+    int64_t total = 5000000000LL;
+    int64_t each = total / N;
+    for (int i = 0; i < N; ++i) {
+        payees[i].address = (i % 2) ? WA : WB;
+        payees[i].sats = each;
+    }
+    payees[0].sats += total - each * N;
+
+    for (size_t budget = 200; budget <= 600; budget += 100) {
+        assert(coinbase_build_window(800000, total, payees, N, WOP, 0, NULL,
+                                     "/sp/", 4, 8, budget, &parts, &res,
+                                     err, sizeof err) == 0);
+        /* cb1 + extranonce + cb2 is the whole serialized coinbase. */
+        size_t built = parts.cb1_len + 12 + parts.cb2_len;
+        if (built > budget) {
+            fprintf(stderr, "FAIL: budget %zu produced %zu bytes\n", budget, built);
+            assert(0);
+        }
+        coinbase_parts_free(&parts);
+    }
+    printf("ok: a built coinbase never exceeds its byte budget\n");
+}
+
 int main(void) {
     test_p2pkh_address();
+    test_the_built_coinbase_respects_its_budget();
+    test_commitments_eat_the_payout_budget();
     test_both_window_builders_split_identically();
     test_window_from_template_preserves_commitments();
     test_window_pays_each_miner_its_own_output();

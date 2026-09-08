@@ -117,6 +117,16 @@ typedef struct {
      * 4x that turns the window into something four times longer or shorter
      * than the operator chose, without anything in the config changing. */
     double pplns_window_diff_multiple;        /* default 2.0 */
+    /* pplns-coinbase: the whole serialized coinbase's byte budget, which is
+     * what actually limits how many miners a block can pay.
+     *
+     * Not a consensus limit. A rented-hashrate marketplace verifies the
+     * coinbase and refuses a job whose coinbase it considers oversized, and
+     * the number that matters therefore belongs to whichever marketplace an
+     * operator sells to. A coinbase-direct pool in production reports whole
+     * coinbases of 721-817 bytes paying up to 16 miners; the default leaves
+     * headroom on that. 0 = COINBASE_DEFAULT_MAX_BYTES. */
+    int coinbase_max_bytes;                  /* default 1000 */
 
     /* pooled modes: coinbase pays this BTC address (P2WPKH/P2PKH/P2SH) for
      * the net-of-fee reward. Required when pool_mode = pps-classic;

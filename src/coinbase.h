@@ -73,18 +73,36 @@ typedef struct {
     size_t  paid_count;        /* payees given an output */
     int64_t paid_sats;         /* summed across those outputs */
     size_t  dropped_dust;      /* payees below COINBASE_DUST_SATS */
-    size_t  dropped_capped;    /* payees past max_payout_outputs */
+    size_t  dropped_capped;    /* payees the byte budget had no room for */
     int64_t carry_sats;        /* owed to the dropped, paid to the operator */
     int64_t fee_sats;          /* the operator's actual fee, excluding carry */
 } coinbase_window_result_t;
 
-/* A practical ceiling on payout outputs, not a consensus one.
+/* The binding limit on payouts is BYTES, not a count.
  *
- * Consensus bounds the coinbase by block weight; at ~31 bytes per P2WPKH
- * output even a thousand payees is a low single-digit percentage of the
- * budget. The real constraint is that some rented-hashrate marketplaces
- * verify a coinbase and reject one they consider oversized, and a delisting
- * costs more than paying a few small miners a block later. */
+ * The first version of this capped the number of outputs at 200, which was
+ * wrong in a way only production evidence showed. A rented-hashrate
+ * marketplace verifies the coinbase and refuses a job whose coinbase it
+ * considers oversized, and it measures bytes. At ~31 bytes per P2WPKH output,
+ * 200 payouts is over 6000 bytes of outputs alone — roughly eight times what
+ * a real coinbase-direct pool is observed to get away with.
+ *
+ * Reported from a coinbase-direct PPLNS pool running on the ECX alpha network
+ * since 2026-08-19 (LayerTwo-Labs/simplepool#61): up to 16 miners paid per
+ * block, whole coinbases measuring 721–817 bytes. Crucially, the binding term
+ * there is not the payouts — it is the drivechain OP_RETURNs sharing the same
+ * transaction. The same 16 payouts cost 817 bytes against four of them and
+ * 769 against three. A count cap cannot express that; a byte budget can,
+ * because the commitments are simply part of what has already been spent.
+ *
+ * 1000 covers the observed working range with headroom. Configurable via
+ * coinbase_max_bytes, because the number that matters belongs to whichever
+ * marketplace an operator is selling to, not to us. */
+#define COINBASE_DEFAULT_MAX_BYTES 1000
+
+/* Array bound only. The byte budget is what actually decides how many miners
+ * are paid; this exists so the builders can use fixed-size storage, and is set
+ * far above anything the budget will admit. */
 #define COINBASE_MAX_PAYOUT_OUTPUTS 200
 
 /* Build cb1/cb2 paying the PPLNS window DIRECTLY, one output per miner.
@@ -98,9 +116,12 @@ typedef struct {
  * fee_bps split every other builder applies. A caller whose arithmetic does
  * not add up is refused rather than silently underpaying the block.
  *
- * Payees are paid largest first, so the cap and the dust limit fall on the
- * smallest claims — the ones for whom waiting a block costs least, and whose
- * carried balance is smallest.
+ * Payees are paid largest first, so the byte budget and the dust limit fall
+ * on the smallest claims — the ones for whom waiting a block costs least, and
+ * whose carried balance is smallest.
+ *
+ * `max_coinbase_bytes` is the whole serialized coinbase, commitments and all,
+ * not just the payouts. 0 means COINBASE_DEFAULT_MAX_BYTES.
  *
  * Returns 0 ok, negative on error (errbuf populated). `res` may be NULL. */
 int coinbase_build_window(uint32_t height, int64_t value_sats,
@@ -109,7 +130,7 @@ int coinbase_build_window(uint32_t height, int64_t value_sats,
                           const char *witness_commitment_hex,
                           const char *coinbase_tag,
                           size_t extranonce1_size, size_t extranonce2_size,
-                          size_t max_payout_outputs,
+                          size_t max_coinbase_bytes,
                           coinbase_parts_t *out,
                           coinbase_window_result_t *res,
                           char *errbuf, size_t errlen);
@@ -179,7 +200,7 @@ int coinbase_build_window_from_template(const char *coinbase_tx_hex,
                                         const char *coinbase_tag,
                                         size_t extranonce1_size,
                                         size_t extranonce2_size,
-                                        size_t max_payout_outputs,
+                                        size_t max_coinbase_bytes,
                                         coinbase_parts_t *out,
                                         int *out_has_witness,
                                         coinbase_window_result_t *res,

@@ -211,6 +211,27 @@ pool_mode = solo
 # proxy warns if you set it there.
 # pplns_window_diff_multiple = 2.0
 
+# pplns-coinbase — the byte budget for the WHOLE serialized coinbase, which is
+# what actually limits how many miners one block can pay.
+#
+# Not a consensus limit. Consensus bounds the coinbase by block weight and
+# would allow far more; the real constraint is that rented-hashrate
+# marketplaces verify the coinbase and refuse a job whose coinbase they
+# consider oversized, and a delisting costs more than paying a few small
+# miners a block later.
+#
+# Counted in bytes rather than in outputs because outputs are not the only
+# thing spending them. On a drivechain pool the binding term is the BIP300/301
+# commitment OP_RETURNs the enforcer's template already carries: a
+# coinbase-direct pool in production reports the same 16 payouts costing 817
+# bytes against four of them and 769 against three. A cap counted in outputs
+# cannot see that; this can, because the commitments are simply part of what
+# has already been spent.
+#
+# Whatever does not fit is not lost — it carries, and the smallest claims are
+# the ones that wait.
+# coinbase_max_bytes = 1000
+
 # pps-classic — OPTIONAL rate override, sats credited per unit of share
 # difficulty. Leave it commented out and the proxy derives the rate from each
 # block template as (coinbasevalue / network_difficulty) * (1 - fee_bps/1e4).

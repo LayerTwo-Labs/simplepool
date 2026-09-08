@@ -1295,6 +1295,7 @@ int main(int argc, char **argv) {
     stcfg.coinbase_pays_pool   = mode_pps_classic ||
                                  mode_pplns_thunder || mode_pplns_btc;
     stcfg.coinbase_pays_window = mode_pplns_cb;
+    stcfg.max_coinbase_bytes   = (size_t)cfg.coinbase_max_bytes;
     stcfg.username_is_thunder = mode_pps_classic || mode_pplns_thunder;
     snprintf(stcfg.pool_btc_address, sizeof stcfg.pool_btc_address, "%s",
              cfg.pool_btc_address);

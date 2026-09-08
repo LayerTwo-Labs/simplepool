@@ -67,6 +67,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
 
     snprintf(cfg->pool_mode, sizeof cfg->pool_mode, "%s", "solo");
     cfg->pplns_window_diff_multiple = 2.0;
+    cfg->coinbase_max_bytes = 1000;
     cfg->pool_btc_address[0] = '\0';
     cfg->pps_sats_per_diff = 0.0;
     cfg->pps_min_network_difficulty = 0.0;
@@ -282,6 +283,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "pool_mode")                 == 0) copy_str(cfg->pool_mode, sizeof cfg->pool_mode, v);
         else if (strcmp(k, "pool_btc_address")          == 0) copy_str(cfg->pool_btc_address, sizeof cfg->pool_btc_address, v);
         else if (strcmp(k, "pplns_window_diff_multiple") == 0) cfg->pplns_window_diff_multiple = atof(v);
+        else if (strcmp(k, "coinbase_max_bytes")         == 0) cfg->coinbase_max_bytes = atoi(v);
         else if (strcmp(k, "pps_sats_per_diff")         == 0) cfg->pps_sats_per_diff = atof(v);
         else if (strcmp(k, "pps_min_network_difficulty") == 0) cfg->pps_min_network_difficulty = atof(v);
         else if (strcmp(k, "block_interval_sec")        == 0) cfg->block_interval_sec = atoi(v);
@@ -374,6 +376,20 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                     "config: 'pool_btc_address' is required when pool_mode=%s",
                     cfg->pool_mode);
             return -9;
+        }
+    }
+    if (mode_cb_window) {
+        /* The coinbase must have room for the transaction, the commitments
+         * and at least one payout. Below that no block can pay anyone, which
+         * is a pool that cannot run rather than one that runs badly. */
+        if (cfg->coinbase_max_bytes < 200) {
+            set_err(errbuf, errlen,
+                    "config: 'coinbase_max_bytes' = %d is too small to hold a "
+                    "coinbase and a single payout; 1000 is the default and a "
+                    "production coinbase-direct pool reports 721-817 bytes "
+                    "paying up to 16 miners",
+                    cfg->coinbase_max_bytes);
+            return -14;
         }
     }
     if (mode_pplns) {

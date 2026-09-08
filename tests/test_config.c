@@ -244,6 +244,33 @@ static void test_pplns_coinbase_validates_the_window(void) {
     CHECK(strstr(err, "pplns_window_diff_multiple") != NULL);
 }
 
+/* The byte budget is what limits how many miners a block can pay, so a value
+ * too small to hold even one payout is a pool that cannot run at all. */
+static void test_a_tiny_coinbase_budget_is_refused(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "coinbase_max_bytes = 150\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "coinbase_max_bytes") != NULL);
+}
+
+static void test_the_coinbase_budget_defaults_and_parses(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.coinbase_max_bytes == 1000);
+
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "coinbase_max_bytes = 820\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.coinbase_max_bytes == 820);
+}
+
 /* ---- listener lines ------------------------------------------------------
  *
  * A `listener` line is how rented hashrate is served its own difficulty. A
@@ -334,6 +361,8 @@ int main(void) {
     test_quoted_value_keeps_hash();
     test_inline_comment_still_strips();
     test_rejects_bad_operator_address();
+    test_the_coinbase_budget_defaults_and_parses();
+    test_a_tiny_coinbase_budget_is_refused();
     test_pplns_coinbase_validates_the_window();
     test_pplns_coinbase_refuses_a_pool_wallet();
     test_pplns_coinbase_is_accepted_without_a_pool_wallet();

@@ -777,14 +777,14 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                     job->coinbasetxn_hex, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps,
                     s->cfg.coinbase_tag, job->en1_size, job->en2_size,
-                    s->cfg.max_payout_outputs, &parts, NULL, NULL,
+                    s->cfg.max_coinbase_bytes, &parts, NULL, NULL,
                     err, sizeof err);
         } else {
             rc = coinbase_build_window(
                     job->height, job->value_sats, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps, job->wc_hex,
                     s->cfg.coinbase_tag, job->en1_size, job->en2_size,
-                    s->cfg.max_payout_outputs, &parts, NULL, err, sizeof err);
+                    s->cfg.max_coinbase_bytes, &parts, NULL, err, sizeof err);
         }
     } else if (s->cfg.coinbase_pays_pool) {
         /* PPS-classic: every miner's coinbase is identical, paying the

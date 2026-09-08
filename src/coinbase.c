@@ -739,9 +739,16 @@ typedef struct {
  * and the reward is only known once the template has been parsed -- so the
  * caller cannot compute it up front, and the parser should not have to know
  * whether it is paying one miner or a whole window. */
-typedef int (*cb_repl_fn)(void *ctx, int64_t reward_sats,
+typedef int (*cb_repl_fn)(void *ctx, int64_t reward_sats, size_t fixed_bytes,
                           cb_repl_out_t *out, size_t cap, size_t *out_n,
                           char *errbuf, size_t errlen);
+
+/* Serialized size of one output: value + the scriptPubKey's length prefix +
+ * the script itself. */
+static size_t out_ser_size(size_t spk_len) {
+    size_t vi = spk_len < 253 ? 1 : (spk_len <= 0xffff ? 3 : 5);
+    return 8 + vi + spk_len;
+}
 
 /* Payees plus the operator. */
 #define CB_MAX_REPL_OUTS (COINBASE_MAX_PAYOUT_OUTPUTS + 1)
@@ -758,7 +765,7 @@ typedef int (*cb_repl_fn)(void *ctx, int64_t reward_sats,
 static int resolve_window_outputs(int64_t value_sats,
                                   const coinbase_payee_t *payees, size_t n_payees,
                                   const char *operator_address, int fee_bps,
-                                  size_t max_payout_outputs,
+                                  size_t max_coinbase_bytes, size_t fixed_bytes,
                                   cb_repl_out_t *out, size_t cap, size_t *out_n,
                                   coinbase_window_result_t *res,
                                   char *errbuf, size_t errlen) {
@@ -774,8 +781,13 @@ static int resolve_window_outputs(int64_t value_sats,
         set_err(errbuf, errlen, "value_sats must be positive");
         return -1;
     }
-    if (max_payout_outputs == 0) max_payout_outputs = COINBASE_MAX_PAYOUT_OUTPUTS;
-    if (max_payout_outputs > cap - 1) max_payout_outputs = cap - 1;
+    if (max_coinbase_bytes == 0) max_coinbase_bytes = COINBASE_DEFAULT_MAX_BYTES;
+    /* What is left for payouts once everything that is not a payout has been
+     * paid for: the transaction envelope, the scriptSig, the operator output
+     * and — the term that actually binds on a drivechain pool — the
+     * commitment OP_RETURNs the template already carries. */
+    size_t payout_budget = max_coinbase_bytes > fixed_bytes
+                         ? max_coinbase_bytes - fixed_bytes : 0;
 
     int64_t fee_sats = 0;
     cb_repl_out_t op;
@@ -821,20 +833,32 @@ static int resolve_window_outputs(int64_t value_sats,
     qsort(rank, n_payees, sizeof *rank, payee_rank_cmp);
 
     size_t  n = 0;
+    size_t  payout_bytes = 0;
     int64_t carry = 0;
     for (size_t k = 0; k < n_payees; ++k) {
         const coinbase_payee_t *pe = &payees[rank[k].idx];
         if (pe->sats < COINBASE_DUST_SATS) {
             r.dropped_dust++; carry += pe->sats; continue;
         }
-        if (n >= max_payout_outputs) {
+        if (n + 1 >= cap) {          /* storage, not policy */
             r.dropped_capped++; carry += pe->sats; continue;
         }
+        /* Resolve first: an output's cost depends on its address type, and a
+         * P2TR payout is 43 bytes against a P2WPKH one's 31. Budgeting at a
+         * fixed per-output figure would let more through than actually fit. */
         if (coinbase_address_to_script(pe->address, out[n].spk,
                                        sizeof out[n].spk, &out[n].spk_len,
                                        errbuf, errlen) < 0) {
             free(rank); return -1;
         }
+        size_t cost = out_ser_size(out[n].spk_len);
+        if (payout_bytes + cost > payout_budget) {
+            /* No room. Keep going rather than breaking: a later payee may be
+             * a cheaper address type and still fit, and dropping it would
+             * carry money that could have been paid. */
+            r.dropped_capped++; carry += pe->sats; continue;
+        }
+        payout_bytes += cost;
         out[n].sats = pe->sats;
         r.paid_sats += pe->sats;
         n++; r.paid_count++;
@@ -843,7 +867,10 @@ static int resolve_window_outputs(int64_t value_sats,
 
     if (r.paid_count == 0) {
         set_err(errbuf, errlen,
-                "no payee in the window clears the %d-sat dust limit",
+                "no payee fits: %zu-byte coinbase budget leaves %zu bytes for "
+                "payouts after %zu bytes of transaction and commitments, and "
+                "nothing clears the %d-sat dust limit",
+                max_coinbase_bytes, payout_budget, fixed_bytes,
                 COINBASE_DUST_SATS);
         return -1;
     }
@@ -881,7 +908,7 @@ int coinbase_build_window(uint32_t height, int64_t value_sats,
                           const char *witness_commitment_hex,
                           const char *coinbase_tag,
                           size_t extranonce1_size, size_t extranonce2_size,
-                          size_t max_payout_outputs,
+                          size_t max_coinbase_bytes,
                           coinbase_parts_t *out,
                           coinbase_window_result_t *res,
                           char *errbuf, size_t errlen) {
@@ -890,12 +917,33 @@ int coinbase_build_window(uint32_t height, int64_t value_sats,
     out->cb1 = NULL; out->cb1_len = 0;
     out->cb2 = NULL; out->cb2_len = 0;
 
+    /* Everything the coinbase costs before a single miner is paid. The byte
+     * budget is the whole transaction, so the payouts get what is left. */
+    size_t wc_probe_len = 0;
+    if (witness_commitment_hex && *witness_commitment_hex)
+        wc_probe_len = strlen(witness_commitment_hex) / 2;
+    size_t tag_len_probe = 0;
+    if (coinbase_tag && *coinbase_tag) {
+        size_t t = strlen(coinbase_tag);
+        tag_len_probe = (t > 75 ? 75 : t) + 1;
+    }
+    uint8_t hp_probe[8];
+    size_t ss_probe = bip34_height_push(height, hp_probe) + tag_len_probe
+                    + extranonce1_size + extranonce2_size;
+    size_t fixed = 4 + 1 + 36 + (ss_probe < 253 ? 1 : 3) + ss_probe
+                 + 4 + 3 /* output-count varint, conservatively */ + 4;
+    if (wc_probe_len) fixed += out_ser_size(wc_probe_len);
+    /* Reserve the operator output whether or not it turns out to be needed:
+     * carry lands on it, and carry is exactly what happens when the budget
+     * bites. Conservative by ~31 bytes in the rare case it is absent. */
+    if (operator_address && operator_address[0]) fixed += out_ser_size(34);
+
     /* Same resolver the template builder uses: the split is one rule, in one
      * place, whatever kind of coinbase it ends up in. */
     cb_repl_out_t repl[CB_MAX_REPL_OUTS];
     size_t n_repl = 0;
     if (resolve_window_outputs(value_sats, payees, n_payees, operator_address,
-                               fee_bps, max_payout_outputs, repl,
+                               fee_bps, max_coinbase_bytes, fixed, repl,
                                CB_MAX_REPL_OUTS, &n_repl, res,
                                errbuf, errlen) < 0) {
         return -1;
@@ -1096,10 +1144,29 @@ static int build_from_template_impl(const char *coinbase_tx_hex,
     }
     int64_t reward = (int64_t)outs[reward_idx].value;
 
+    /* What this coinbase costs before any miner is paid, so the resolver can
+     * spend what is left. On a drivechain pool the dominant term here is the
+     * commitment OP_RETURNs the enforcer put in the template: they are why
+     * the same 16 payouts can fit under one budget and not another, and why
+     * a cap counted in outputs cannot express the limit at all. */
+    size_t tag_probe = 0;
+    if (coinbase_tag && *coinbase_tag) {
+        size_t t = strlen(coinbase_tag);
+        tag_probe = (t > 75 ? 75 : t) + 1;
+    }
+    size_t ss_probe = (size_t)ss_len + tag_probe
+                    + extranonce1_size + extranonce2_size;
+    size_t fixed_bytes = 4 + 1 + 36 + (ss_probe < 253 ? 1 : 3) + ss_probe
+                       + 4 + 3 /* output-count varint, conservatively */ + 4;
+    for (uint64_t i = 0; i < vout; i++) {
+        if ((int64_t)i == reward_idx) continue;
+        fixed_bytes += out_ser_size(outs[i].spk_len);
+    }
+
     /* Hand the reward to the caller's resolver: one miner and a fee, or a
      * whole PPLNS window. Either way it comes back as concrete outputs, and
      * this function does not care which it was. */
-    if (repl_fn(repl_ctx, reward, repl, CB_MAX_REPL_OUTS, &n_repl,
+    if (repl_fn(repl_ctx, reward, fixed_bytes, repl, CB_MAX_REPL_OUTS, &n_repl,
                 errbuf, errlen) < 0) goto done;
     if (n_repl == 0) {
         set_err(errbuf, errlen, "resolver produced no outputs");
@@ -1194,9 +1261,11 @@ typedef struct {
     int64_t    *out_fee_sats;
 } repl_single_ctx_t;
 
-static int repl_single(void *vctx, int64_t reward, cb_repl_out_t *out,
-                       size_t cap, size_t *out_n, char *errbuf, size_t errlen) {
+static int repl_single(void *vctx, int64_t reward, size_t fixed_bytes,
+                       cb_repl_out_t *out, size_t cap, size_t *out_n,
+                       char *errbuf, size_t errlen) {
     repl_single_ctx_t *c = vctx;
+    (void)fixed_bytes;   /* one miner and a fee always fit */
     if (cap < 2) { set_err(errbuf, errlen, "internal: repl cap"); return -1; }
     size_t n = 0;
     int64_t fee_sats = 0, miner_sats = reward;
@@ -1233,17 +1302,18 @@ typedef struct {
     size_t                    n_payees;
     const char               *operator_address;
     int                       fee_bps;
-    size_t                    max_payout_outputs;
+    size_t                    max_coinbase_bytes;
     coinbase_window_result_t *res;
 } repl_window_ctx_t;
 
-static int repl_window(void *vctx, int64_t reward, cb_repl_out_t *out,
-                       size_t cap, size_t *out_n, char *errbuf, size_t errlen) {
+static int repl_window(void *vctx, int64_t reward, size_t fixed_bytes,
+                       cb_repl_out_t *out, size_t cap, size_t *out_n,
+                       char *errbuf, size_t errlen) {
     repl_window_ctx_t *c = vctx;
     return resolve_window_outputs(reward, c->payees, c->n_payees,
                                   c->operator_address, c->fee_bps,
-                                  c->max_payout_outputs, out, cap, out_n,
-                                  c->res, errbuf, errlen);
+                                  c->max_coinbase_bytes, fixed_bytes,
+                                  out, cap, out_n, c->res, errbuf, errlen);
 }
 
 /* ---- public template builders ------------------------------------------- */
@@ -1284,7 +1354,7 @@ int coinbase_build_window_from_template(const char *coinbase_tx_hex,
                                         const char *coinbase_tag,
                                         size_t extranonce1_size,
                                         size_t extranonce2_size,
-                                        size_t max_payout_outputs,
+                                        size_t max_coinbase_bytes,
                                         coinbase_parts_t *out,
                                         int *out_has_witness,
                                         coinbase_window_result_t *res,
@@ -1300,7 +1370,7 @@ int coinbase_build_window_from_template(const char *coinbase_tx_hex,
     ctx.n_payees = n_payees;
     ctx.operator_address = operator_address;
     ctx.fee_bps = fee_bps;
-    ctx.max_payout_outputs = max_payout_outputs;
+    ctx.max_coinbase_bytes = max_coinbase_bytes;
     ctx.res = res;
     return build_from_template_impl(coinbase_tx_hex, repl_window, &ctx,
                                     coinbase_tag, extranonce1_size,
