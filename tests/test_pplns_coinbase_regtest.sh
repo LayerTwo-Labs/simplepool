@@ -243,6 +243,24 @@ stage "mine a SECOND block, now that a window exists"
 # The first block proved bootstrap. This one proves the mode: shares exist
 # now, so the job carries a real window and the coinbase is built from it
 # rather than from the connection.
+#
+# Wait for the pool to publish a job at the NEW height first. Without this the
+# second miner connects while the pool is still serving the height-N job — the
+# tip watcher polls every 500ms — mines a SIBLING of the block just found, and
+# submitblock answers "inconclusive" because it neither extends nor replaces
+# the tip. The chain then reads N -> N and the stage fails for a reason that
+# has nothing to do with the mode. CI caught exactly that; locally the timing
+# happened to hide it.
+NEXT_HEIGHT=$((TIP_AFTER + 1))
+for _ in $(seq 1 40); do
+    grep -q "new job: height=${NEXT_HEIGHT} " "$POOL_LOG" && break
+    sleep 1
+done
+grep -q "new job: height=${NEXT_HEIGHT} " "$POOL_LOG" || {
+    echo "FAIL: the pool never published a job at height ${NEXT_HEIGHT}" >&2
+    exit 1; }
+echo "  pool is serving height ${NEXT_HEIGHT}"
+
 TIP_BEFORE2=$(cli getblockcount)
 node "$ROOT/scripts/regtest/cpuminer.js" --port "$POOL_PORT" --user "$MINER_ADDR" --timeout 180
 TIP_AFTER2=$(cli getblockcount)
