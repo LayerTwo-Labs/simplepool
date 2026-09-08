@@ -1154,6 +1154,8 @@ int main(int argc, char **argv) {
     stcfg.idle_timeout_sec   = cfg.idle_timeout_sec;
     stcfg.idle_timeout_authorized_sec = cfg.idle_timeout_authorized_sec;
     stcfg.max_submits_per_sec = cfg.max_submits_per_sec;
+    stcfg.auth_max_failures     = cfg.auth_max_failures;
+    stcfg.auth_fail_lockout_sec = cfg.auth_fail_lockout_sec;
     stcfg.listener_count     = cfg.listener_count;
     for (int i = 0; i < cfg.listener_count; ++i) {
         stcfg.listeners[i] = cfg.listeners[i];
