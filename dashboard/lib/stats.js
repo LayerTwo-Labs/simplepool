@@ -438,11 +438,13 @@ function poolIdentity(d) {
     const blank = {
         network: null, network_source: null, coinbase_tag: null,
         operator_address: null, pool_btc_address: null, listeners: null,
+        pplns_payout_floor_sats: null,
     };
     try {
         const r = d.prepare(`
             SELECT network, network_source, coinbase_tag,
-                   operator_address, pool_btc_address, listeners
+                   operator_address, pool_btc_address, listeners,
+                   pplns_payout_floor_sats
               FROM pool_meta WHERE id = 1
         `).get();
         if (!r) return blank;
@@ -456,6 +458,15 @@ function poolIdentity(d) {
             operator_address: or_(r.operator_address),
             pool_btc_address: or_(r.pool_btc_address),
             listeners:        parseListeners(r.listeners),
+            /* NULL means "this mode has no payout floor", which is every mode
+             * but pplns-coinbase. Kept distinct from 0, which is a real floor
+             * meaning "pay anything the dust limit allows" -- so `?? null`
+             * rather than `|| null`, or a zero floor would read as no floor
+             * and the page would stop disclosing a policy that still applies. */
+            pplns_payout_floor_sats:
+                r.pplns_payout_floor_sats === undefined ||
+                r.pplns_payout_floor_sats === null
+                    ? null : Number(r.pplns_payout_floor_sats),
         };
     } catch {
         return blank;   /* DB predating the identity columns */
@@ -519,9 +530,10 @@ export function poolMeta(handle) {
             fee_drift_bps: Number(r.effective_fee_bps || 0) - Number(r.fee_bps || 0),
             /* Does a balance build up in pps_credits between payouts?
              *
-             * True of PPS and of both PPLNS modes -- they share the table and
-             * the payout worker that drains it. Only solo accrues nothing,
-             * because its coinbase pays the finder directly.
+             * True of PPS and of the two CUSTODIAL PPLNS rails -- they share
+             * the table and the payout worker that drains it. Solo and
+             * pplns-coinbase accrue nothing, because in both the coinbase
+             * itself is the payment and there is no balance to hold.
              *
              * It is deliberately not "is there a rate": PPS prices a share the
              * moment it arrives, PPLNS values it in hindsight out of a block

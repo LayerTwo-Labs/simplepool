@@ -1,12 +1,16 @@
 <%# What the figures on the overview mean, and how to point a rig at this pool.
 
     Branches on pool_mode because almost nothing here is shared between the
-    two modes: solo pays the finder in the coinbase and accrues nothing,
+    modes: solo pays the finder in the coinbase and accrues nothing,
     pps-classic credits every share and settles through a pool wallet and a
-    BIP300 deposit. The card used to state the pps-classic story
-    unconditionally, which on a solo pool told miners to authorize with a
-    Thunder address — the one thing that cannot work there (stratum.c
-    rejects it with "invalid payout address in stratum username").
+    BIP300 deposit, the two custodial pplns rails credit on maturity, and
+    pplns-coinbase pays the whole window in the block itself. The card used to
+    state the pps-classic story unconditionally, which on a solo pool told
+    miners to authorize with a Thunder address — the one thing that cannot
+    work there (stratum.c rejects it with "invalid payout address in stratum
+    username"). Later it covered only those two, so all three pplns modes fell
+    through to "this pool has not published its mode yet" while the header
+    strip above it named the mode correctly.
 
     Every figure comes from res.locals.pool, i.e. from pool_meta, i.e. from
     the running proxy. Nothing here is a literal, because the previous
@@ -25,6 +29,11 @@ const _sid  = (typeof sidechainId !== 'undefined' && sidechainId != null)
 const _feePct = _p && _p.fee_bps ? (_p.fee_bps / 100).toFixed(2) + '%' : null;
 const _sats = n => Number(n).toLocaleString('en-US',
                      { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+/* Satoshis are integers. _sats above renders 2 decimals, which is right for
+ * the BTC-denominated figures it was written for and wrong for a sat count:
+ * the payout floor read "546.00 sats". */
+const _satsInt = n => Number(n).toLocaleString('en-US',
+                        { maximumFractionDigits: 0 });
 
 /* Address examples for the network this pool is actually on — a miner told
  * to use "bc1q…" on a signet pool has been misled just as surely as one told
@@ -165,18 +174,140 @@ password:  (ignored — any value)</pre>
         paying the same address as separate rows on the per-worker page.
     </p>
 
+<% } else if (_mode === 'pplns-thunder' || _mode === 'pplns-btc') { %>
+    <p class="muted small">
+        This pool runs in <strong><%= _mode %></strong> mode. A block is
+        divided among the shares that produced it — the last
+        <strong>N</strong> shares before it was found — so a share is worth a
+        claim on blocks this pool actually finds, not a fixed price paid on
+        arrival. Nothing is promised in advance, which is why there is no
+        operator reserve here and why the fee is usually lower than PPS.
+    </p>
+    <p class="muted small">
+        Your balance moves when a block <strong>matures</strong>, 100
+        confirmations after it was found (roughly 16 hours). Until then the
+        block is still reversible and nothing is credited. After that your
+        balance is settled
+        <% if (_mode === 'pplns-btc') { %>
+            on <strong>Bitcoin L1</strong>, in a batched transaction.
+        <% } else { %>
+            over <strong>Thunder</strong>, sidechain
+            <strong>#<%= _sid %></strong>, by the payout worker.
+        <% } %>
+        <% if (_feePct) { %>The operator fee of
+        <strong><%= _feePct %></strong> comes off the block before it is
+        divided.<% } %>
+    </p>
+
+    <h3 class="about-h3">Connect a miner</h3>
+    <pre class="about-pre"><%= _url %>
+<% if (_mode === 'pplns-btc') { %>username:  &lt;your-bitcoin-address&gt;[.&lt;rig_label&gt;]<% } else { %>username:  &lt;your-thunder-address&gt;[.&lt;rig_label&gt;]<% } %>
+password:  (ignored — any value)</pre>
+    <p class="muted small about-note">
+        <% if (_mode === 'pplns-btc') { %>
+            The username must be a Bitcoin address this pool can pay:
+            <% if (_ex) { %><strong>P2WPKH</strong> (<code><%= _ex.w %></code>),
+            <strong>P2PKH</strong> (<code><%= _ex.l %></code>) or
+            <strong>P2SH</strong> (<code><%= _ex.s %></code>) on
+            <%= _net %><% } else { %><strong>P2WPKH</strong>,
+            <strong>P2PKH</strong> or <strong>P2SH</strong><% } %>. A
+            <strong>Thunder</strong> address is rejected at authorize — that
+            is the other rail.
+        <% } else { %>
+            The username must be a bare base58 <strong>Thunder</strong>
+            address. A Bitcoin address is rejected at authorize — that is the
+            other rail. Both fail with <em>"invalid payout address in stratum
+            username"</em>.
+        <% } %>
+    </p>
+
+<% } else if (_mode === 'pplns-coinbase') { %>
+    <p class="muted small">
+        This pool runs in <strong>pplns-coinbase</strong> mode. A block is
+        divided among the shares that produced it, exactly as the other PPLNS
+        rails do — but it is paid <strong>in that block's own coinbase</strong>,
+        one output per miner. The pool never receives the reward, holds no
+        wallet and keeps no balance for you. There is nothing to withdraw and
+        nothing to wait for: if you are in the window when a block is found,
+        you are paid in it.
+    </p>
+    <p class="muted small">
+        A block that is later reorged out simply never paid — there is no
+        credit to reverse.<% if (_feePct) { %> The operator fee of
+        <strong><%= _feePct %></strong> comes off the block before it is
+        divided<% if (_p && _p.operator_address) { %>, and goes to
+        <code class="poolid-addr"><%= _p.operator_address %></code><% } %>.<% } %>
+        Coinbase outputs mature after <strong>100 confirmations</strong>
+        (roughly 16 hours), so a block appears here well before it is
+        spendable.
+    </p>
+
+    <%# The disclosure this mode exists to make. A claim below the floor is
+        forfeited to the operator and never settled, so a miner too small to
+        clear it will mine here, submit valid shares, and earn nothing
+        indefinitely. That is defensible as a stated rule and indefensible as
+        a discovery, and the operator's log is the one place the miner it
+        costs cannot see. Only rendered when the proxy actually published a
+        floor -- an older proxy stores NULL, and inventing 546 there would be
+        stating someone else's policy for them. %>
+    <% if (_p && _p.pplns_payout_floor_sats != null) { %>
+    <p class="muted small" style="border-left:3px solid #b5651d;padding-left:0.75em">
+        <strong>There is a minimum, and it is not held over.</strong>
+        If your share of a block comes to less than
+        <strong><%= _satsInt(_p.pplns_payout_floor_sats) %> sats</strong>, you
+        get no output in that coinbase and the amount goes to the operator.
+        It is <strong>not</strong> carried forward and <strong>not</strong>
+        paid later. A coinbase is a fixed budget of bytes and an output too
+        small to be worth its own space cannot be written, so this pool
+        forfeits it rather than keep a balance it would have to custody.
+    </p>
+    <p class="muted small">
+        In practice that is a floor on how small a miner this pool is worth
+        using. Below it you would mine here and earn nothing, however long you
+        stayed — worse than mining solo, where you at least hold a lottery
+        ticket on a whole block. Work out your expected share of a block
+        before pointing a rig here, and ask the operator if you are near the
+        line.
+    </p>
+    <% } %>
+
+    <h3 class="about-h3">Connect a miner</h3>
+    <pre class="about-pre"><%= _url %>
+username:  &lt;your-bitcoin-address&gt;[.&lt;rig_label&gt;]
+password:  (ignored — any value)</pre>
+    <p class="muted small about-note">
+        The username must be a Bitcoin address this pool can build a coinbase
+        output for:
+        <% if (_ex) { %>
+            <strong>P2WPKH</strong> (<code><%= _ex.w %></code>),
+            <strong>P2PKH</strong> (<code><%= _ex.l %></code>) or
+            <strong>P2SH</strong> (<code><%= _ex.s %></code>) on
+            <%= _net %>
+        <% } else { %>
+            <strong>P2WPKH</strong>, <strong>P2PKH</strong> or
+            <strong>P2SH</strong>
+        <% } %>. A <strong>Thunder</strong> address is rejected at authorize —
+        that is a different mode.
+    </p>
+
 <% } else { %>
     <%# Same rule as the identity strip: an unknown mode gets prose that is
         true either way, never a guess. The two modes differ on what a share
         is worth and on what the username must be, so guessing wrong here
         costs a miner real time. %>
     <p class="muted small">
-        This pool has not published its mode yet, and the two differ in ways
-        that change how you connect: <strong>solo</strong> pays the finder
-        directly in the coinbase and takes a Bitcoin address as the stratum
-        username, while <strong>pps-classic</strong> credits every accepted
-        share and takes a Thunder address. Restart the proxy to publish which
-        one this is, or ask the operator before pointing a rig at it.
+        This pool has not published its mode yet. It is one of
+        <strong>solo</strong>, <strong>pps-classic</strong>,
+        <strong>pplns-thunder</strong>, <strong>pplns-btc</strong> or
+        <strong>pplns-coinbase</strong>, and they differ in ways that change
+        how you connect and what you are owed: some pay the finder or the
+        whole window directly in the coinbase and take a
+        <strong>Bitcoin</strong> address as the stratum username, while
+        others credit a balance settled later and take a
+        <strong>Thunder</strong> address. One of them,
+        <strong>pplns-coinbase</strong>, does not pay claims below a minimum
+        at all. Restart the proxy to publish which one this is, and ask the
+        operator before pointing a rig at it.
     </p>
     <h3 class="about-h3">Connect a miner</h3>
     <pre class="about-pre"><%= _url %>

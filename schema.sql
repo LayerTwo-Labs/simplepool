@@ -138,6 +138,15 @@ CREATE TABLE IF NOT EXISTS pool_meta (
   operator_address    TEXT,     /* fee_bps recipient */
   pool_btc_address    TEXT,     /* pps-classic only; NULL in solo */
   pool_mode           TEXT,
+  /* pplns-coinbase only; NULL in every other mode. The least a claim must be
+   * worth to get a coinbase output at all -- below it a miner is not paid and
+   * the amount goes to the operator, permanently.
+   *
+   * Published here because the miner it costs reads the dashboard, not the
+   * operator's log. A forfeit policy nobody can see from outside is not a
+   * policy, it is a surprise, and the whole case for having one is that it is
+   * stated up front. */
+  pplns_payout_floor_sats INTEGER,
   fee_bps             INTEGER,
   rate_source         TEXT,     /* 'derived' | 'override' */
   rate_sats_per_diff  REAL,     /* effective, net of fee; 0 in solo */

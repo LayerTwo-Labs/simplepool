@@ -502,10 +502,13 @@ footer .wrap > p { max-width: 46rem; }
       least hold a lottery ticket.
     </p>
     <p>
-      Because that is a trap unless it is visible, the proxy states the floor
-      at startup, reports how many miners in the current window fall below it,
-      and says per block how many claims were forfeited and for how much.
-      <strong>If you run this mode, publish the floor on your pool page.</strong>
+      Because that is a trap unless it is visible, the floor is disclosed four
+      ways: stated at startup, reported per template as the count of miners
+      about to be excluded, reported per block as the claims actually
+      forfeited — and published to <code>pool_meta</code>, so the
+      <strong>dashboard states it to miners before they connect</strong>.
+      That last one is the one that matters: the operator's log is the one
+      place the miner it costs cannot look.
     </p>
   </div>
 

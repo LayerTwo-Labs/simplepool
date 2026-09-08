@@ -46,7 +46,8 @@
             <div><label>Transactions</label><strong><%= fmtN(cur.tx_count) %></strong></div>
             <div><label>nBits</label><strong class="mono"><%= cur.bits %></strong></div>
             <div><label>PPS rate</label><strong><%= cur.rate_sats_per_diff > 0
-                    ? fmtF(cur.rate_sats_per_diff, 4) + ' sats/diff' : 'n/a (solo)' %></strong></div>
+                    ? fmtF(cur.rate_sats_per_diff, 4) + ' sats/diff'
+                    : 'n/a (only pps-classic prices a share on arrival)' %></strong></div>
             <div><label>Received</label><strong title="<%= fmtTs(cur.ts) %>"><%= ago(cur.ts) %></strong></div>
             <div><label>Last polled</label><strong title="<%= fmtTs(cur.last_seen) %>"><%= ago(cur.last_seen) %>
                 <span class="muted small">(<%= fmtN(cur.polls) %> poll<%= cur.polls === 1 ? '' : 's' %>)</span></strong></div>

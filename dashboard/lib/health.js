@@ -130,6 +130,17 @@ export function health(handle) {
      * its first confirmed block, so the margin is legitimately negative until
      * one lands. That is the honest number, not a fault in the check. */
     checks.push(guard('margin', 'Pool solvency', () => {
+        /* Not a question that exists in pplns-coinbase. There the coinbase
+         * pays the miners directly, so blocks_found.reward_sats is what the
+         * block paid THEM -- the pool never received it and owes nobody.
+         * Summing it as pool revenue reported a healthy 50 BTC of solvency
+         * for a pool holding precisely nothing, which is a green light
+         * asserting custody that does not exist. */
+        const mode = one(d, 'SELECT pool_mode FROM pool_meta WHERE id = 1')?.pool_mode;
+        if (mode === 'pplns-coinbase') {
+            return { ok: true, value: null,
+                     detail: 'pplns-coinbase — the pool never holds the reward' };
+        }
         const r = one(d, `
             SELECT (SELECT COALESCE(SUM(reward_sats),0) + COALESCE(SUM(fee_sats),0)
                       FROM blocks_found WHERE status = 'confirmed')
@@ -161,7 +172,14 @@ export function health(handle) {
     checks.push(guard('pps_difficulty', 'Difficulty supports PPS', () => {
         const meta = one(d, 'SELECT pool_mode, network_difficulty FROM pool_meta WHERE id = 1');
         if (!meta || meta.pool_mode !== 'pps-classic') {
-            return { ok: true, value: null, detail: 'solo — no accrual' };
+            /* Name the mode we are actually in. This used to say "solo — no
+             * accrual" for every non-pps-classic mode, so a pplns pool of any
+             * kind was told it was solo by the same page whose header said
+             * otherwise. The check skipping is right -- only pps-classic
+             * prices a share on arrival -- but the reason has to be true. */
+            const m = meta?.pool_mode || 'unknown';
+            return { ok: true, value: null,
+                     detail: `${m} — shares are not priced on arrival` };
         }
         const r = one(d, `
             SELECT COALESCE(SUM(difficulty),0) AS sd,

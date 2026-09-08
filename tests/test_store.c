@@ -580,7 +580,8 @@ static void test_pool_identity(void) {
     assert(store_record_pool_identity(s, "signet", "node", "/simplepool/",
                                       "tb1qoperator", "tb1qpoolwallet",
                                       "[{\"port\":3334,\"label\":\"\","
-                                      "\"min_diff\":1,\"initial_diff\":1}]") == 0);
+                                      "\"min_diff\":1,\"initial_diff\":1}]",
+                                      -1) == 0);
     assert(store_record_pool_meta(s, "pps-classic", 100, "derived",
                                   2783.22, 2811.33, 100.4,
                                   111157.455, 312500000, 1700000000ULL) == 0);
@@ -611,7 +612,7 @@ static void test_pool_identity(void) {
      * stalled template path would keep looking alive. */
     int64_t seen = scalar_i64(db, "SELECT updated_at FROM pool_meta");
     assert(store_record_pool_identity(s, "regtest", "inferred", "/other/",
-                                      "bcrt1qop", NULL, NULL) == 0);
+                                      "bcrt1qop", NULL, NULL, -1) == 0);
     assert(scalar_i64(db, "SELECT updated_at FROM pool_meta") == seen);
 
     /* Solo mode: NULL, not "". */
@@ -1449,6 +1450,50 @@ static void test_an_empty_window_returns_nothing_not_an_error(void) {
     printf("  ok test_an_empty_window_returns_nothing_not_an_error\n");
 }
 
+/* The payout floor has to reach the DASHBOARD, not just the operator's log.
+ *
+ * pplns-coinbase forfeits a claim below the floor to the operator and never
+ * settles it, and the entire case for that policy is that it is disclosed up
+ * front. The miner it costs reads the dashboard; the operator's terminal is
+ * the one place they cannot see. So the floor being in pool_meta is part of
+ * the policy, not a nicety.
+ *
+ * NULL in every other mode, distinctly from 0: "this pool has no floor" and
+ * "this pool's floor is zero sats" are different claims, and only the first
+ * is true of solo, pps-classic and the two custodial pplns rails. */
+static void test_the_payout_floor_is_published_for_the_dashboard(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    assert(store_record_pool_identity(s, "regtest", "node", "/sp/",
+                                      "bcrt1qop", NULL, NULL, 25000) == 0);
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT pplns_payout_floor_sats FROM pool_meta") == 25000);
+
+    /* A mode with no floor stores NULL, not 0. */
+    assert(store_record_pool_identity(s, "regtest", "node", "/sp/",
+                                      "bcrt1qop", NULL, NULL, -1) == 0);
+    assert(scalar_i64(db, "SELECT pplns_payout_floor_sats IS NULL "
+                          "FROM pool_meta") == 1);
+
+    /* Zero is a real floor and must survive as 0, not collapse to NULL --
+     * it means "pay anything the dust limit allows", which is a different
+     * promise from "there is no floor here". */
+    assert(store_record_pool_identity(s, "regtest", "node", "/sp/",
+                                      "bcrt1qop", NULL, NULL, 0) == 0);
+    assert(scalar_i64(db, "SELECT pplns_payout_floor_sats IS NULL "
+                          "FROM pool_meta") == 0);
+    assert(scalar_i64(db, "SELECT pplns_payout_floor_sats FROM pool_meta") == 0);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_the_payout_floor_is_published_for_the_dashboard\n");
+}
+
 /* The operator fee comes off the top, exactly as in solo and PPS. */
 static void test_pplns_takes_the_operator_fee(void) {
     const char *path = fresh_db_path();
@@ -1502,6 +1547,7 @@ int main(void) {
     test_open_upgrades_a_pre_status_database();
     test_pplns_distributes_the_window();
     test_pplns_takes_the_operator_fee();
+    test_the_payout_floor_is_published_for_the_dashboard();
     test_pplns_distributes_two_blocks_in_one_pass();
     test_an_empty_window_returns_nothing_not_an_error();
     test_a_window_wider_than_the_cap_says_so();

@@ -1222,9 +1222,14 @@ int main(int argc, char **argv) {
             LOG_WARN("pool identity: %d listener(s) did not fit the published "
                      "port list — the dashboard will not show them", dropped);
         }
+        /* -1 means "this mode has no payout floor", which is every mode but
+         * pplns-coinbase. Only there can a miner mine and be paid nothing,
+         * and only there does the dashboard have something to disclose. */
         store_record_pool_identity(store, network, network_src,
                                    cfg.coinbase_tag, cfg.operator_address,
-                                   pps ? cfg.pool_btc_address : NULL, lj);
+                                   pps ? cfg.pool_btc_address : NULL, lj,
+                                   strcmp(cfg.pool_mode, "pplns-coinbase") == 0
+                                       ? cfg.pplns_payout_floor_sats : -1);
     }
 
     /* Broadcast (optional). */

@@ -184,10 +184,13 @@ and what a stratum username is:
   and earn nothing indefinitely, which is strictly worse for them than solo
   mining, where they at least hold a lottery ticket.
 
-  Because that is a trap unless it is visible, the proxy states the floor at
-  startup, logs how many miners in the current window fall below it, and
-  reports per block how many claims were forfeited and for how much. **If
-  you run this mode, publish the floor on your pool page.**
+  Because that is a trap unless it is visible, the floor is disclosed in four
+  places: the proxy states it at startup, logs how many miners in the current
+  window fall below it, and reports per block how many claims were forfeited
+  and for how much — and it publishes the number to `pool_meta`, so the
+  **dashboard states it to miners before they connect**. That last one is the
+  one that matters: the operator's log is the one place the miner it costs
+  cannot look.
 
 In every mode the operator fee stays in BTC, paid to `operator_address`
 out of the same coinbase. On PPLNS it is normally set lower than on PPS:

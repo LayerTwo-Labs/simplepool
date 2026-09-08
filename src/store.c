@@ -151,6 +151,7 @@ static const char *SCHEMA_SQL_PARTS[] = {
     "  operator_address    TEXT,"    /* fee_bps recipient */
     "  pool_btc_address    TEXT,"    /* pps-classic only; NULL in solo */
     "  pool_mode           TEXT,"
+    "  pplns_payout_floor_sats INTEGER,"
     "  fee_bps             INTEGER,"
     "  rate_source         TEXT,"
     "  rate_sats_per_diff  REAL,"     /* effective, net of fee */
@@ -335,6 +336,7 @@ static const char *MIGRATIONS_SQL[] = {
      * until the proxy restarts, which the dashboard renders as "not
      * published yet" rather than claiming the pool has one port. */
     "ALTER TABLE pool_meta    ADD COLUMN listeners        TEXT",
+    "ALTER TABLE pool_meta    ADD COLUMN pplns_payout_floor_sats INTEGER",
     /* Block accounting. Every pre-existing row becomes 'pending' — which
      * counts as nothing — rather than being assumed good: the rows were
      * written unconditionally, including for candidates submitblock had
@@ -1569,7 +1571,8 @@ int store_record_pool_identity(store_t *s, const char *network,
                                const char *coinbase_tag,
                                const char *operator_address,
                                const char *pool_btc_address,
-                               const char *listeners_json)
+                               const char *listeners_json,
+                               int64_t pplns_payout_floor_sats)
 {
     if (!s) return -1;
     /* Upserts the same id=1 row as store_record_pool_meta(), but only the
@@ -1584,15 +1587,17 @@ int store_record_pool_identity(store_t *s, const char *network,
      * blank". */
     static const char *Q =
         "INSERT INTO pool_meta (id, network, network_source, coinbase_tag,"
-        "  operator_address, pool_btc_address, listeners) "
-        "VALUES (1, ?, ?, ?, ?, ?, ?) "
+        "  operator_address, pool_btc_address, listeners,"
+        "  pplns_payout_floor_sats) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(id) DO UPDATE SET "
         "  network = excluded.network,"
         "  network_source = excluded.network_source,"
         "  coinbase_tag = excluded.coinbase_tag,"
         "  operator_address = excluded.operator_address,"
         "  pool_btc_address = excluded.pool_btc_address,"
-        "  listeners = excluded.listeners";
+        "  listeners = excluded.listeners,"
+        "  pplns_payout_floor_sats = excluded.pplns_payout_floor_sats";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
         atomic_fetch_add(&s->pg_errors, 1);
@@ -1615,6 +1620,14 @@ int store_record_pool_identity(store_t *s, const char *network,
         sqlite3_bind_text(st, 6, listeners_json, -1, SQLITE_TRANSIENT);
     } else {
         sqlite3_bind_null(st, 6);
+    }
+    /* NULL in every mode but pplns-coinbase, so a reader can tell "this pool
+     * forfeits nothing because it has no floor" from "this pool's floor is
+     * zero". Only the first is true of the other four modes. */
+    if (pplns_payout_floor_sats >= 0) {
+        sqlite3_bind_int64(st, 7, (sqlite3_int64)pplns_payout_floor_sats);
+    } else {
+        sqlite3_bind_null(st, 7);
     }
     int rc = sqlite3_step(st);
     pthread_mutex_unlock(&s->node_tip_mu);
