@@ -1151,6 +1151,9 @@ int main(int argc, char **argv) {
     stcfg.vardiff_min        = cfg.vardiff_min;
     stcfg.vardiff_max        = cfg.vardiff_max;
     stcfg.vardiff_window_sec = cfg.vardiff_window_sec;
+    stcfg.vardiff_min_samples     = cfg.vardiff_min_samples;
+    stcfg.vardiff_max_window_mult = cfg.vardiff_max_window_mult;
+    stcfg.vardiff_idle_step       = cfg.vardiff_idle_step;
     stcfg.idle_timeout_sec   = cfg.idle_timeout_sec;
     stcfg.idle_timeout_authorized_sec = cfg.idle_timeout_authorized_sec;
     stcfg.max_submits_per_sec = cfg.max_submits_per_sec;

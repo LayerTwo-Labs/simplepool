@@ -50,6 +50,34 @@ typedef struct {
     double max_suggested_diff;    /* default 5e7; <= 0 disables requests */
     int    vardiff_window_sec;    /* retarget interval, default 30 */
 
+    /* Minimum accepted shares a window must hold before its rate is trusted
+     * enough to retarget on. Default 20.
+     *
+     * At the default target_spm = 12 over a 30 s window an ON-TARGET
+     * connection produces SIX shares, and Poisson noise on six samples is
+     * +/-41% (1/sqrt(6)). The ratio therefore lands outside the [0.5, 2.0]
+     * deadband routinely even when the difficulty is already correct, so the
+     * controller oscillates instead of converging. Below this floor the
+     * window is EXTENDED rather than acted on -- up to
+     * vardiff_max_window_mult times the nominal window, after which we act on
+     * what we have so a genuinely over-difficult connection still ratchets
+     * down. 0 restores the previous behaviour exactly. */
+    int    vardiff_min_samples;      /* default 20 */
+
+    /* How far a window may be extended, as a multiple of vardiff_window_sec,
+     * while waiting for vardiff_min_samples. Default 8. */
+    int    vardiff_max_window_mult;  /* default 8 */
+
+    /* Max step for a window that did NOT meet vardiff_min_samples. A window
+     * that met it keeps the historical 4x. Default 2.
+     *
+     * This is what stops a quiet connection being driven to the floor: a
+     * proxied fleet spreads one rig over many connections, each going quiet
+     * between bursts, and at 4x a pair of near-empty windows cuts difficulty
+     * 16x -- which the miner's own firmware then reports back as "difficulty
+     * too low". */
+    double vardiff_idle_step;        /* default 2.0 */
+
     /* Idle-connection reaper. A connection that hasn't sent any bytes in
      * idle_timeout_sec is closed. Guards against half-open TCPs from
      * crashed miners and clients that connect but never authenticate.

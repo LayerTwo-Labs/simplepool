@@ -1115,6 +1115,26 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
     uint64_t window_ms  = (uint64_t)s->cfg.vardiff_window_sec * 1000ULL;
     if (elapsed_ms < window_ms) return;
 
+    /* A window's share RATE only means something if the window holds enough
+     * shares to measure one. At the default target_spm = 12 over a 30 s
+     * window an on-target connection produces six, and Poisson noise on six
+     * samples is +/-41% (1/sqrt(6)) -- so `ratio` leaves the [0.5, 2.0]
+     * deadband on noise alone and the controller oscillates around the right
+     * answer instead of settling on it.
+     *
+     * So: keep accumulating rather than steering on noise. The extension is
+     * bounded, because a connection whose difficulty is genuinely far too
+     * high submits almost nothing and must still be able to ratchet down.
+     *
+     * Leaving the window OPEN -- returning before the reset at the bottom --
+     * is the whole mechanism. */
+    if (s->cfg.vardiff_min_samples > 0 &&
+        c->vd_window_shares < (uint32_t)s->cfg.vardiff_min_samples) {
+        int mult = s->cfg.vardiff_max_window_mult > 0
+                     ? s->cfg.vardiff_max_window_mult : 8;
+        if (elapsed_ms < window_ms * (uint64_t)mult) return;
+    }
+
     /* Observed shares per minute over this window. */
     double observed_spm = ((double)c->vd_window_shares * 60000.0) /
                           (double)elapsed_ms;
@@ -1125,10 +1145,24 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
     double new_diff = old_diff;
     if (ratio > 2.0 || ratio < 0.5) {
         new_diff = old_diff * ratio;
-        /* Cap each adjustment to a 4x step to avoid wild swings on small
-         * windows. */
-        if (new_diff > old_diff * 4.0) new_diff = old_diff * 4.0;
-        if (new_diff < old_diff / 4.0) new_diff = old_diff / 4.0;
+        /* Cap each adjustment. A window that met the sample floor is trusted
+         * with the historical 4x step; one that only ended because it hit the
+         * extension limit is not, and gets the gentler idle step.
+         *
+         * That distinction is what keeps a quiet connection off the floor.
+         * One rig behind a proxy arrives as many connections, each going
+         * quiet between bursts; at 4x a pair of near-empty windows cuts
+         * difficulty 16x and pins the worker to vardiff_min, which is exactly
+         * the state the miner's own firmware reports as "difficulty too
+         * low". */
+        double max_step = 4.0;
+        if (s->cfg.vardiff_min_samples > 0 &&
+            c->vd_window_shares < (uint32_t)s->cfg.vardiff_min_samples) {
+            max_step = s->cfg.vardiff_idle_step > 1.0
+                         ? s->cfg.vardiff_idle_step : 2.0;
+        }
+        if (new_diff > old_diff * max_step) new_diff = old_diff * max_step;
+        if (new_diff < old_diff / max_step) new_diff = old_diff / max_step;
     }
 
     /* Every share this window cleared a difficulty far above the one we

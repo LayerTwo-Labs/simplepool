@@ -41,6 +41,27 @@ vardiff_min        = 1
 vardiff_max        = 1e12
 vardiff_window_sec = 30       # how often to retarget
 
+# How many accepted shares a window must hold before its rate is trusted
+# enough to act on. At the defaults above an ON-TARGET connection produces
+# six shares a window, and Poisson noise on six samples is +/-41%, so the
+# measured rate leaves the retarget deadband on noise alone and the
+# difficulty oscillates around the right answer instead of settling on it.
+#
+# Under the floor the window stays OPEN and keeps accumulating, for up to
+# vardiff_max_window_mult windows -- after which it acts on what it has, so a
+# connection whose difficulty really is far too high still ratchets down.
+#
+# 0 restores the previous behaviour exactly.
+vardiff_min_samples = 20
+vardiff_max_window_mult = 8
+
+# Largest difficulty step a window that never met the sample floor may make.
+# A window that met it keeps the historical 4x. This is what stops a quiet
+# connection being driven to vardiff_min: one rig behind a proxy arrives as
+# many connections, each going quiet between bursts, and at 4x two near-empty
+# windows cut its difficulty 16x.
+vardiff_idle_step = 2
+
 # Extra stratum ports, each with its own difficulty policy. Repeatable —
 # unlike every other key here, a second `listener` line adds a port rather
 # than replacing the first. listen_port above is always served too, on the
