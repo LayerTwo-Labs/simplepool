@@ -45,6 +45,14 @@ jobs:
       - name: Build
         run: make -j"$(nproc)"
 
+      # Solo first, because it is the default mode and the one most operators
+      # actually run -- and until now the only mode with no end-to-end test
+      # anywhere. tests/test_integration.sh looks like one but never mines.
+      # Two miners with two addresses, so "each coinbase pays its own finder"
+      # is a claim a single-miner run could not make.
+      - name: Run solo end-to-end regtest test
+        run: bash tests/test_solo_regtest.sh
+
       - name: Run end-to-end regtest test
         run: bash tests/test_e2e_regtest.sh
 
@@ -69,6 +77,7 @@ jobs:
         with:
           name: e2e-logs-${{ github.run_id }}
           path: |
+            .regtest-solo/logs/
             .regtest-e2e/logs/
             .regtest-pplns/logs/
             .regtest-cbwin/logs/
@@ -78,6 +87,8 @@ jobs:
             /tmp/simplepool-pplns-*.log
             /tmp/simplepool-pplns-*.conf
             /tmp/simplepool-cbwin.log
+            /tmp/simplepool-solo.log
+            /tmp/simplepool-solo.conf
             /tmp/simplepool-cbwin.conf
           retention-days: 14
           if-no-files-found: ignore

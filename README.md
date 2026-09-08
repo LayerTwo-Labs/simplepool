@@ -643,9 +643,21 @@ The script:
 5. Asserts that `workers` has at least one row, `workers.payout_address`
    is populated, and `rejects` has at least one row.
 
-There is also a full end-to-end regtest (`tests/test_e2e_regtest.sh`) and a
-payout regtest (`tests/test_payout_regtest.sh`); both run in CI. For the
-verification checklist behind each mode, see [`VERIFY.md`](VERIFY.md).
+Note what that integration test is not: it never mines, so it cannot see
+whether a coinbase pays the right person. The end-to-end suites do, one per
+mode, each mining a real chain:
+
+| Suite | Proves |
+| --- | --- |
+| `tests/test_solo_regtest.sh` | two miners, two addresses, a block each — every coinbase pays **its own finder**, rendered per connection |
+| `tests/test_e2e_regtest.sh` | `pps-classic`: the coinbase pays the pool, and shares accrue at the derived rate |
+| `tests/test_pplns_regtest.sh` | both pooled PPLNS rails distribute a matured block exactly once |
+| `tests/test_pplns_btc_payout_regtest.sh` | `pplns-btc` pays miners on L1 through the enforcer wallet |
+| `tests/test_pplns_coinbase_regtest.sh` | `pplns-coinbase`: the block's coinbase pays the window, the pool holds nothing, and the payout floor is disclosed |
+| `tests/test_payout_regtest.sh` | the Thunder payout rail settles and confirms |
+
+All of them run in CI. For the verification checklist behind each mode, see
+[`VERIFY.md`](VERIFY.md).
 
 ## Layout
 
