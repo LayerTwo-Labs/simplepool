@@ -344,6 +344,16 @@ int stratum_socket_setup_for_test(int fd, int idle_timeout_sec);
  * for a holder even after the tip watcher has retired and freed it. */
 stratum_job_t *stratum_job_find_for_test(stratum_server_t *s, const char *job_id);
 uint32_t stratum_job_height_for_test(const stratum_job_t *j);
+/* Server-wide share dedupe, on a precomputed key rather than a header hash:
+ * 1 = already recorded, 0 = recorded now. Lets a test drive the index through
+ * eviction with keys it chooses. */
+int    stratum_share_dedupe_key_for_test(stratum_server_t *s, uint64_t key);
+/* Returns the ring's live count; *index_live gets the number of occupied
+ * index slots. The two must be equal -- that equality is the whole invariant
+ * of backward-shift deletion. */
+size_t stratum_share_dedupe_live_for_test(stratum_server_t *s,
+                                          size_t *index_live);
+
 int64_t  stratum_job_value_sats_for_test(const stratum_job_t *j);
 
 /* Process one JSON-RPC line. Appends one or more newline-delimited JSON
