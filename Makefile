@@ -67,7 +67,7 @@ GIT_DIRTY  := $(shell git status --porcelain --untracked-files=no 2>/dev/null | 
 VERSION_H  := $(BUILD_DIR)/version_gen.h
 
 # Sources compiled in this wave. More modules land in later waves.
-SRCS := src/main.c src/log.c src/config.c src/coinbase.c \
+SRCS := src/main.c src/log.c src/config.c src/coinbase.c src/pplns.c \
         src/share.c src/sha256.c src/stratum.c src/store.c \
         src/bitcoind.c src/broadcast.c src/thunder.c src/version.c \
         src/reconcile.c src/cjson/cJSON.c
@@ -124,8 +124,9 @@ include tests/test_broadcast.mk
 include tests/test_thunder.mk
 include tests/test_config.mk
 include tests/test_reconcile.mk
+include tests/test_pplns.mk
 
-test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_config build/test_reconcile
+test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_config build/test_reconcile build/test_pplns
 	./build/test_share
 	./build/test_bitcoind
 	./build/test_stratum
@@ -135,6 +136,7 @@ test: build/test_share build/test_bitcoind build/test_stratum build/test_store b
 	./build/test_thunder
 	./build/test_config
 	./build/test_reconcile
+	./build/test_pplns
 
 # Run the suites under AddressSanitizer + UndefinedBehaviorSanitizer.
 #
@@ -161,10 +163,13 @@ asan:
 		src/coinbase.c src/sha256.c
 	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_share tests/test_share.c \
 		src/share.c src/sha256.c
+	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_pplns tests/test_pplns.c \
+		src/pplns.c src/coinbase.c src/sha256.c
 	./$(ASAN_DIR)/test_stratum
 	./$(ASAN_DIR)/test_store
 	./$(ASAN_DIR)/test_coinbase
 	./$(ASAN_DIR)/test_share
+	./$(ASAN_DIR)/test_pplns
 
 # Line and function coverage of the C suites, via LLVM source-based coverage.
 #
@@ -205,6 +210,8 @@ coverage:
 	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_thunder tests/test_thunder.c src/thunder.c
 	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_config tests/test_config.c \
 		src/config.c src/log.c src/coinbase.c src/sha256.c
+	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_pplns tests/test_pplns.c \
+		src/pplns.c src/coinbase.c src/sha256.c
 	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_reconcile tests/test_reconcile.c \
 		src/reconcile.c src/store.c src/log.c $(PLATFORM_LDFLAGS) -lsqlite3 -lpthread
 	@set -e; for t in stratum store coinbase share bitcoind broadcast thunder config reconcile; do \
@@ -216,7 +223,8 @@ coverage:
 	@xcrun llvm-cov report $(COV_DIR)/test_stratum \
 		$(addprefix -object ,$(COV_DIR)/test_store $(COV_DIR)/test_coinbase \
 		$(COV_DIR)/test_share $(COV_DIR)/test_bitcoind $(COV_DIR)/test_broadcast \
-		$(COV_DIR)/test_thunder $(COV_DIR)/test_config $(COV_DIR)/test_reconcile) \
+		$(COV_DIR)/test_thunder $(COV_DIR)/test_config $(COV_DIR)/test_reconcile \
+		$(COV_DIR)/test_pplns) \
 		-instr-profile=$(COV_DIR)/all.profdata $(COV_IGNORE)
 
 format:

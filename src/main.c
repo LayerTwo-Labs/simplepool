@@ -7,6 +7,7 @@
 #include "share.h"
 #include "store.h"
 #include "reconcile.h"
+#include "pplns.h"
 #include "coinbase.h"
 #include "stratum.h"
 #include "version.h"
@@ -281,31 +282,26 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
         }
         value = from_tx;
     }
-    int64_t fee = 0;
-    if (cfg->operator_address[0] && cfg->fee_bps > 0) {
-        int64_t f = (value * (int64_t)cfg->fee_bps) / 10000;
-        if (f >= COINBASE_DUST_SATS) fee = f;
-    }
-    int64_t payable = value - fee;
-    if (payable <= 0) {
-        LOG_WARN("pplns-coinbase: template pays %lld sats, nothing left after "
-                 "the operator fee", (long long)value);
-        return -1;
+    /* The arithmetic lives in pplns.c so it can be tested against stated
+     * numbers rather than only against a chain -- it decides what people are
+     * paid, and it used to be unreachable from any test. See pplns.h. */
+    pplns_claim_t claims[COINBASE_MAX_PAYOUT_OUTPUTS];
+    for (size_t i = 0; i < n; ++i) {
+        claims[i].payout_address = win[i].payout_address;
+        claims[i].difficulty     = win[i].difficulty;
     }
 
     coinbase_payee_t payees[COINBASE_MAX_PAYOUT_OUTPUTS];
-    int64_t assigned = 0;
-    for (size_t i = 0; i < n; ++i) {
-        payees[i].address = win[i].payout_address;
-        payees[i].sats = (int64_t)((double)payable * (win[i].difficulty / total));
-        assigned += payees[i].sats;
+    pplns_split_t split;
+    char serr[256] = {0};
+    if (pplns_split_window(value, cfg->fee_bps, cfg->operator_address[0] != 0,
+                           claims, n, total, cfg->pplns_payout_floor_sats,
+                           payees, COINBASE_MAX_PAYOUT_OUTPUTS,
+                           &split, serr, sizeof serr) < 0) {
+        LOG_WARN("pplns-coinbase: cannot split this block across the window: "
+                 "%s", serr);
+        return -1;
     }
-    /* Truncating division leaves a few sats over. They cannot be dropped --
-     * the builder requires the split to spend `payable` exactly, and a
-     * coinbase that pays out less forfeits the difference to nobody -- so
-     * they go to the largest claim, which store_pplns_window returns first.
-     * A handful of satoshis, to the miner with the strongest claim on them. */
-    if (assigned < payable) payees[0].sats += payable - assigned;
 
     if (stratum_job_set_window(job, payees, n) < 0) {
         LOG_WARN("pplns-coinbase: could not attach the window to the job");
@@ -325,8 +321,7 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
      * to have, so reporting an unclamped one would understate who loses. */
     int64_t floor_sats = cfg->pplns_payout_floor_sats < COINBASE_DUST_SATS
                        ? COINBASE_DUST_SATS : cfg->pplns_payout_floor_sats;
-    size_t below = 0;
-    for (size_t i = 0; i < n; ++i) if (payees[i].sats < floor_sats) below++;
+    size_t below = split.below_floor;
     static size_t last_below = (size_t)-1;
     if (below != last_below) {
         last_below = below;
@@ -344,7 +339,7 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
     }
 
     LOG_DEBUG("pplns-coinbase: window of %zu miner(s), %.2f difficulty, "
-              "paying %lld sats", n, total, (long long)payable);
+              "paying %lld sats", n, total, (long long)split.payable_sats);
     return 0;
 }
 
