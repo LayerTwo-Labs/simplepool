@@ -763,9 +763,14 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
          * the pooled modes do, because the outputs live in cb2 and only the
          * extranonce differs per connection. */
         if (j_payees_missing(job)) {
-            LOG_WARN("stratum: no PPLNS window on job %s — refusing to render "
-                     "a coinbase that would pay nobody", job->job_id);
-            return -1;
+            /* Bootstrap: no shares have been accepted yet, so there is no
+             * window to pay. Fall through to the solo shape — this
+             * connection's own coinbase, paying this miner. See
+             * attach_pplns_window() in main.c: with no prior work the only
+             * party with a claim on the block is whoever finds it, and
+             * refusing to render here instead would deadlock a new pool
+             * forever (no coinbase, so no shares, so no window). */
+            goto render_solo;
         }
         if (job->coinbasetxn_hex) {
             rc = coinbase_build_window_from_template(
@@ -797,6 +802,25 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
         } else {
             rc = coinbase_build_split(job->height, job->value_sats,
                                       s->cfg.pool_btc_address,
+                                      s->cfg.operator_address, s->cfg.fee_bps,
+                                      job->wc_hex, s->cfg.coinbase_tag,
+                                      job->en1_size, job->en2_size,
+                                      &parts, NULL, NULL, err, sizeof err);
+        }
+    } else if (0) {
+render_solo:
+        /* Reached either by solo mode or by a pplns-coinbase job that has no
+         * window yet. Both pay this one connection's miner. */
+        if (job->coinbasetxn_hex) {
+            rc = coinbase_build_from_template(job->coinbasetxn_hex,
+                                              c->payout_address,
+                                              s->cfg.operator_address, s->cfg.fee_bps,
+                                              s->cfg.coinbase_tag,
+                                              job->en1_size, job->en2_size,
+                                              &parts, NULL, NULL, NULL, err, sizeof err);
+        } else {
+            rc = coinbase_build_split(job->height, job->value_sats,
+                                      c->payout_address,
                                       s->cfg.operator_address, s->cfg.fee_bps,
                                       job->wc_hex, s->cfg.coinbase_tag,
                                       job->en1_size, job->en2_size,

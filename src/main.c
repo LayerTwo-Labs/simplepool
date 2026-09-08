@@ -220,9 +220,23 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
         return -1;
     }
     if (n == 0 || !(total > 0.0)) {
-        LOG_INFO("pplns-coinbase: no shares in the window yet — holding this "
-                 "template back rather than mining a block that pays nobody");
-        return -1;
+        /* Bootstrap. A pool that has never been mined has no shares, so it
+         * has no window, so it cannot build a coinbase — and if that stopped
+         * it publishing a job, no miner could ever submit the share that
+         * would populate the window. A brand-new pool would never start.
+         *
+         * The job goes out with no window attached and the renderer falls
+         * back to paying whoever is connected, per connection, exactly as
+         * solo does. That is not a special case so much as what PPLNS over an
+         * empty window degenerates to: with no prior work, the only party
+         * with a claim on the block is whoever finds it.
+         *
+         * Self-correcting, and only ever true once — the first accepted share
+         * populates the window, and every job after it carries one. */
+        LOG_INFO("pplns-coinbase: no shares yet, so no window; this template "
+                 "pays whoever finds it, as solo would. The first accepted "
+                 "share ends this.");
+        return 0;
     }
     if (truncated) {
         /* store_pplns_window drops the tail from the TOTAL as well, so those
@@ -1331,6 +1345,16 @@ int main(int argc, char **argv) {
      * could be sized. conn_render_coinbase refuses to render from a
      * windowless job rather than paying nobody, and the tip watcher publishes
      * a job with a real window within one poll interval. */
+    if (strcmp(cfg.pool_mode, "pplns-coinbase") == 0) {
+        /* Said out loud because it is otherwise invisible: this job renders a
+         * solo-shaped coinbase, and an operator watching the first block of a
+         * new pool get paid entirely to its finder deserves to know that was
+         * deliberate rather than the window silently failing. */
+        LOG_INFO("pplns-coinbase: the first job of a process carries no "
+                 "window — network difficulty is unread and a fresh pool has "
+                 "no shares — so it pays whoever finds it, as solo would. "
+                 "Every job after the first accepted share carries a window.");
+    }
     stratum_server_set_job(srv, initial_job, 1);
 
     /* A port's promised floor and the chain can disagree, and the floor wins

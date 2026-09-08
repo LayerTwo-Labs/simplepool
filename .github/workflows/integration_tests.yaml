@@ -56,6 +56,13 @@ jobs:
       - name: Run PPLNS end-to-end regtest test
         run: bash tests/test_pplns_regtest.sh
 
+      # The coinbase-direct rail. Distinct from the two above because it has
+      # no ledger step at all -- the payment IS the block -- so what it proves
+      # is on-chain: the coinbase pays the window, and no output pays anything
+      # the pool controls beyond its fee.
+      - name: Run coinbase-direct PPLNS end-to-end regtest test
+        run: bash tests/test_pplns_coinbase_regtest.sh
+
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -64,11 +71,14 @@ jobs:
           path: |
             .regtest-e2e/logs/
             .regtest-pplns/logs/
+            .regtest-cbwin/logs/
             /tmp/simplepool-e2e.log
             /tmp/simplepool-e2e.conf
             /tmp/simplepool-int.log
             /tmp/simplepool-pplns-*.log
             /tmp/simplepool-pplns-*.conf
+            /tmp/simplepool-cbwin.log
+            /tmp/simplepool-cbwin.conf
           retention-days: 14
           if-no-files-found: ignore
 

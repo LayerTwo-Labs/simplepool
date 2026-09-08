@@ -2782,10 +2782,17 @@ static void test_pplns_coinbase_pays_every_miner_in_the_window(void) {
     stratum_server_free(s);
 }
 
-/* A job with no window pays nobody, and a coinbase that pays nobody forfeits
- * the entire block. Rendering nothing and making the miner wait for the next
- * template is the only safe answer. */
-static void test_a_windowless_job_renders_no_coinbase(void) {
+/* Bootstrap. A pool that has never been mined has no shares, so no window —
+ * and refusing to render there would deadlock it forever: no coinbase means
+ * no miner can work, which means no share, which means no window.
+ *
+ * A regtest run found exactly that: "no shares in the window yet — holding
+ * this template back", repeating until the miner timed out. A windowless job
+ * therefore pays whoever is connected, per connection, as solo does. That is
+ * not a special case so much as what PPLNS over an empty window degenerates
+ * to: with no prior work, the only claim on the block belongs to its finder.
+ */
+static void test_a_windowless_job_pays_the_finder(void) {
     obs_t obs = {0};
     stratum_cfg_t cfg;
     stratum_server_t *s = cbwin_server(&cfg, &obs);
@@ -2796,10 +2803,14 @@ static void test_a_windowless_job_renders_no_coinbase(void) {
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     handshake(s, c);
+    /* It renders, rather than refusing... */
     const uint8_t *cb1 = NULL, *cb2 = NULL, *en1 = NULL;
     size_t cb1_len = 0, cb2_len = 0;
     CHECK(stratum_conn_coinbase_for_test(s, c, "JNW", &cb1, &cb1_len,
-                                         &cb2, &cb2_len, &en1) != 0);
+                                         &cb2, &cb2_len, &en1) == 0);
+    /* ...and pays exactly one miner, this connection's own, with no fee
+     * output because fee_bps is 0 here. */
+    CHECK(cbwin_output_count(s, c, "JNW") == 1);
     stratum_conn_free_for_test(c);
     stratum_server_free(s);
 }
@@ -2845,7 +2856,7 @@ int main(void) {
     test_gated_pps_refuses_authorize_and_submits();
     test_gate_can_be_disabled();
     test_solo_is_never_gated();
-    test_a_windowless_job_renders_no_coinbase();
+    test_a_windowless_job_pays_the_finder();
     test_pplns_coinbase_pays_every_miner_in_the_window();
     test_pplns_btc_takes_a_bitcoin_username();
     test_pplns_thunder_takes_a_thunder_username();

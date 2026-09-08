@@ -5,6 +5,7 @@
 /.regtest-payout/
 /.regtest-pplns/
 /.regtest-btcpay/
+/.regtest-cbwin/
 /proxy.conf
 /tests/integration.proxy.conf
 # The installer writes proxy.conf.bak.<timestamp> beside proxy.conf on every
