@@ -42,7 +42,7 @@ static int64_t sum_payees(const coinbase_payee_t *p, size_t n) {
  * satoshi or the builder is right to refuse it. */
 static void test_the_split_always_spends_the_whole_block(void) {
     const pplns_claim_t claims[] = {
-        { A, 700.0 }, { B, 200.0 }, { C, 99.0 }, { D, 1.0 },
+        { A, 700.0, 0, 0.0 }, { B, 200.0, 0, 0.0 }, { C, 99.0, 0, 0.0 }, { D, 1.0, 0, 0.0 },
     };
     coinbase_payee_t out[4];
     pplns_split_t r;
@@ -58,7 +58,7 @@ static void test_the_split_always_spends_the_whole_block(void) {
 
 /* Proportional to difficulty, and in the order the store hands them over. */
 static void test_each_claim_gets_its_difficulty_share(void) {
-    const pplns_claim_t claims[] = { { A, 750.0 }, { B, 250.0 } };
+    const pplns_claim_t claims[] = { { A, 750.0, 0, 0.0 }, { B, 250.0, 0, 0.0 } };
     coinbase_payee_t out[2];
     pplns_split_t r;
     char err[256] = {0};
@@ -79,7 +79,7 @@ static void test_the_rounding_remainder_goes_to_the_largest_claim(void) {
     /* Three equal claims of a reward that does NOT divide by three.
      * 100,000,002 does, which is how the first draft of this test passed
      * while asserting the wrong thing. */
-    const pplns_claim_t claims[] = { { A, 1.0 }, { B, 1.0 }, { C, 1.0 } };
+    const pplns_claim_t claims[] = { { A, 1.0, 0, 0.0 }, { B, 1.0, 0, 0.0 }, { C, 1.0, 0, 0.0 } };
     coinbase_payee_t out[3];
     pplns_split_t r;
     char err[256] = {0};
@@ -103,8 +103,8 @@ static void test_a_mixed_window_predicts_who_the_floor_will_drop(void) {
      * The tail claims are 1 part in 10 million: 312,500,000 * 1e-7 = 31 sats,
      * comfortably under the 546-sat dust floor. */
     const pplns_claim_t claims[] = {
-        { A, 6000000.0 }, { B, 3999997.0 },
-        { C, 2.0 }, { D, 1.0 },
+        { A, 6000000.0, 0, 0.0 }, { B, 3999997.0, 0, 0.0 },
+        { C, 2.0, 0, 0.0 }, { D, 1.0, 0, 0.0 },
     };
     coinbase_payee_t out[4];
     pplns_split_t r;
@@ -134,7 +134,7 @@ static void test_a_mixed_window_predicts_who_the_floor_will_drop(void) {
  * small a miner they will serve, so it has to mean what it says. */
 static void test_raising_the_floor_drops_more_claims(void) {
     const pplns_claim_t claims[] = {
-        { A, 50.0 }, { B, 30.0 }, { C, 15.0 }, { D, 5.0 },
+        { A, 50.0, 0, 0.0 }, { B, 30.0, 0, 0.0 }, { C, 15.0, 0, 0.0 }, { D, 5.0, 0, 0.0 },
     };
     coinbase_payee_t out[4];
     pplns_split_t r;
@@ -161,7 +161,7 @@ static void test_raising_the_floor_drops_more_claims(void) {
  * clamps it. If these two disagreed the pool would warn about one number and
  * pay by another, which is worse than not warning at all. */
 static void test_the_floor_prediction_uses_the_builders_clamp(void) {
-    const pplns_claim_t claims[] = { { A, 999.0 }, { B, 1.0 } };
+    const pplns_claim_t claims[] = { { A, 999.0, 0, 0.0 }, { B, 1.0, 0, 0.0 } };
     coinbase_payee_t out[2];
     pplns_split_t r;
     char err[256] = {0};
@@ -187,14 +187,14 @@ static void test_the_floor_and_dust_boundaries_are_exact(void) {
 
     /* A claim worth EXACTLY the floor clears it. 546 parts in 1,000,000 of
      * 1,000,000 sats is 546 sats on the nose. */
-    const pplns_claim_t at_floor[] = { { A, 999454.0 }, { B, 546.0 } };
+    const pplns_claim_t at_floor[] = { { A, 999454.0, 0, 0.0 }, { B, 546.0, 0, 0.0 } };
     CHECK(pplns_split_window(1000000LL, 0, 0, at_floor, 2, 1000000.0, 546,
                              out, 2, &r, err, sizeof err) == 0);
     CHECK(out[1].sats == 546LL);
     CHECK(r.below_floor == 0);          /* exactly at the floor is PAID */
 
     /* One satoshi under it is not. */
-    const pplns_claim_t under[] = { { A, 999455.0 }, { B, 545.0 } };
+    const pplns_claim_t under[] = { { A, 999455.0, 0, 0.0 }, { B, 545.0, 0, 0.0 } };
     CHECK(pplns_split_window(1000000LL, 0, 0, under, 2, 1000000.0, 546,
                              out, 2, &r, err, sizeof err) == 0);
     CHECK(out[1].sats == 545LL);
@@ -202,7 +202,7 @@ static void test_the_floor_and_dust_boundaries_are_exact(void) {
 
     /* The fee's dust boundary, the same way. 1% of 54,600 is 546 exactly,
      * which is payable; 1% of 54,500 is 545, which is dust and dropped. */
-    const pplns_claim_t one[] = { { A, 1.0 } };
+    const pplns_claim_t one[] = { { A, 1.0, 0, 0.0 } };
     CHECK(pplns_split_window(54600LL, 100, 1, one, 1, 1.0, 546,
                              out, 1, &r, err, sizeof err) == 0);
     CHECK(r.fee_sats == 546LL);
@@ -227,7 +227,7 @@ static void test_the_floor_and_dust_boundaries_are_exact(void) {
  * refuse a split that does not sum to reward-minus-fee, so a disagreement
  * here means no coinbase renders at all. */
 static void test_the_fee_matches_what_the_builder_will_expect(void) {
-    const pplns_claim_t claims[] = { { A, 1.0 } };
+    const pplns_claim_t claims[] = { { A, 1.0, 0, 0.0 } };
     coinbase_payee_t out[1];
     pplns_split_t r;
     char err[256] = {0};
@@ -270,7 +270,7 @@ static void test_the_builder_accepts_what_the_splitter_produces(void) {
     };
     static const int FEES[] = { 0, 1, 100, 250, 1000 };
     const pplns_claim_t claims[] = {
-        { A, 7.0 }, { B, 3.0 }, { C, 1.0 },
+        { A, 7.0, 0, 0.0 }, { B, 3.0, 0, 0.0 }, { C, 1.0, 0, 0.0 },
     };
     for (size_t i = 0; i < sizeof REWARDS / sizeof REWARDS[0]; ++i) {
         for (size_t j = 0; j < sizeof FEES / sizeof FEES[0]; ++j) {
@@ -306,7 +306,7 @@ static void test_the_builder_accepts_what_the_splitter_produces(void) {
  * Refuse rather than hand the builder a split it will reject on every
  * connection. */
 static void test_a_window_total_that_is_too_small_is_refused(void) {
-    const pplns_claim_t claims[] = { { A, 60.0 }, { B, 60.0 } };
+    const pplns_claim_t claims[] = { { A, 60.0, 0, 0.0 }, { B, 60.0, 0, 0.0 } };
     coinbase_payee_t out[2];
     char err[256] = {0};
     CHECK(pplns_split_window(100000000LL, 0, 0, claims, 2, 100.0,
@@ -316,7 +316,7 @@ static void test_a_window_total_that_is_too_small_is_refused(void) {
 }
 
 static void test_the_degenerate_inputs_are_refused(void) {
-    const pplns_claim_t claims[] = { { A, 1.0 } };
+    const pplns_claim_t claims[] = { { A, 1.0, 0, 0.0 } };
     coinbase_payee_t out[2];
     char err[256] = {0};
     CHECK(pplns_split_window(1000, 0, 0, NULL, 1, 1.0, 546, out, 2, NULL, err, sizeof err) < 0);
@@ -326,6 +326,106 @@ static void test_the_degenerate_inputs_are_refused(void) {
     /* More claims than the caller's array holds. */
     CHECK(pplns_split_window(1000, 0, 0, claims, 3, 1.0, 546, out, 2, NULL, err, sizeof err) < 0);
     printf("ok: degenerate inputs are refused, not divided\n");
+}
+
+/* ---- payment order ------------------------------------------------------ */
+
+/* With nobody owed anything, the order is exactly what it was before the
+ * ledger existed: largest claim first, so the floor and the byte budget fall
+ * on the smallest. A pool that has always been able to pay everyone must not
+ * behave differently for having gained a ledger it never uses. */
+static void test_with_nothing_owed_the_order_is_largest_first(void) {
+    pplns_claim_t c[5];
+    double sizes[] = { 10, 50, 30, 5, 20 };
+    for (int i = 0; i < 5; ++i) {
+        c[i].payout_address = A; c[i].worker_id = i + 1;
+        c[i].difficulty = sizes[i]; c[i].owed_fraction = 0.0;
+    }
+    size_t order[5];
+    CHECK(pplns_order_claims(c, 5, 5, order) == 0);
+    CHECK(c[order[0]].difficulty == 50);
+    CHECK(c[order[1]].difficulty == 30);
+    CHECK(c[order[2]].difficulty == 20);
+    CHECK(c[order[3]].difficulty == 10);
+    CHECK(c[order[4]].difficulty == 5);
+    printf("ok: with nothing owed, the order is largest-first\n");
+}
+
+/* THE FAILURE THIS EXISTS FOR.
+ *
+ * Ranking by "claim plus what you are owed" does not move the queue: a large
+ * miner's share of the current window is bigger than the largest debt a small
+ * miner can ever build, so the same addresses take the same slots for ever.
+ * Reserving slots outright is what fixes it, and this asserts that a
+ * long-waiting small miner reaches a slot even when every large miner in the
+ * window outweighs it many times over. */
+static void test_a_long_waiting_small_miner_reaches_a_slot(void) {
+    enum { N = 20, SLOTS = 4 };
+    pplns_claim_t c[N];
+    for (int i = 0; i < N; ++i) {
+        c[i].payout_address = A; c[i].worker_id = i + 1;
+        c[i].difficulty = 1000.0 / (i + 1);      /* i=0 is by far the largest */
+        c[i].owed_fraction = 0.0;
+    }
+    /* The smallest miner in the window, owed a little from being skipped. Its
+     * claim is 1/20th of the largest; no additive ranking would ever promote
+     * it. */
+    c[N - 1].owed_fraction = 0.004;
+
+    size_t order[N];
+    CHECK(pplns_order_claims(c, N, SLOTS, order) == 0);
+    /* One slot of four is reserved, and it goes to the waiting miner. */
+    CHECK(order[0] == N - 1);
+    /* The rest of the slots still go to the largest claims, in order, so the
+     * bulk of the block is not handed to the tail. */
+    CHECK(order[1] == 0);
+    CHECK(order[2] == 1);
+    CHECK(order[3] == 2);
+    printf("ok: a long-waiting small miner reaches a reserved slot\n");
+}
+
+/* Reserved slots are a minority of the coinbase, always. The biggest claims
+ * are also the ones whose omission wastes the most block, so a rotation that
+ * could take every slot would be worse than the problem it solves. */
+static void test_the_reservation_never_takes_every_slot(void) {
+    enum { N = 8 };
+    pplns_claim_t c[N];
+    for (int i = 0; i < N; ++i) {
+        c[i].payout_address = A; c[i].worker_id = i + 1;
+        c[i].difficulty = 100.0 - i;
+        c[i].owed_fraction = 1.0;        /* everyone is owed something */
+    }
+    size_t order[N];
+    for (size_t slots = 1; slots <= N; ++slots) {
+        CHECK(pplns_order_claims(c, N, slots, order) == 0);
+        /* Every claim appears exactly once, whatever the reservation did. */
+        int seen[N] = {0};
+        for (size_t i = 0; i < N; ++i) { CHECK(order[i] < N); seen[order[i]]++; }
+        for (size_t i = 0; i < N; ++i) CHECK(seen[i] == 1);
+        /* And at least one slot is still decided by claim size. */
+        size_t reserved = (slots * PPLNS_RESERVED_SLOT_NUMERATOR)
+                        / PPLNS_RESERVED_SLOT_DENOMINATOR;
+        CHECK(reserved < slots);
+    }
+    printf("ok: the reservation never takes every slot\n");
+}
+
+/* A negative balance means "paid early, out of someone else's skipped share",
+ * so it waits rather than jumping the queue. Only positive balances qualify
+ * for a reserved slot. */
+static void test_being_paid_early_does_not_win_a_reserved_slot(void) {
+    enum { N = 6 };
+    pplns_claim_t c[N];
+    for (int i = 0; i < N; ++i) {
+        c[i].payout_address = A; c[i].worker_id = i + 1;
+        c[i].difficulty = 10.0 * (N - i);
+        c[i].owed_fraction = -0.5;      /* everyone has been paid early */
+    }
+    size_t order[N];
+    CHECK(pplns_order_claims(c, N, 4, order) == 0);
+    /* Nobody is owed, so nothing is reserved and it is pure largest-first. */
+    for (size_t i = 0; i < N; ++i) CHECK(order[i] == i);
+    printf("ok: a negative balance does not win a reserved slot\n");
 }
 
 /* Randomised conservation check.
@@ -347,6 +447,8 @@ static void test_conservation_holds_for_random_windows(void) {
              * proportional split loses satoshis if it is going to. */
             double d = (double)(rand() % 1000000) / (double)(1 + rand() % 1000);
             claims[i].payout_address = A;
+            claims[i].worker_id = (int64_t)i + 1;
+            claims[i].owed_fraction = 0.0;
             claims[i].difficulty = d;
             total += d;
         }
@@ -395,6 +497,10 @@ int main(void) {
     test_the_builder_accepts_what_the_splitter_produces();
     test_a_window_total_that_is_too_small_is_refused();
     test_the_degenerate_inputs_are_refused();
+    test_with_nothing_owed_the_order_is_largest_first();
+    test_a_long_waiting_small_miner_reaches_a_slot();
+    test_the_reservation_never_takes_every_slot();
+    test_being_paid_early_does_not_win_a_reserved_slot();
     test_conservation_holds_for_random_windows();
     if (failures) { printf("test_pplns: %d FAILED\n", failures); return 1; }
     printf("test_pplns: all tests passed\n");

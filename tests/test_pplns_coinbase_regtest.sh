@@ -30,9 +30,12 @@
 #      forfeited to the operator and never settled, which is a trap unless
 #      the operator can see it — so the disclosure lines are asserted here
 #      exactly like the money is.
-#   6. a MIXED window really does forfeit, on chain. Claims of 100 : 10 : 1,
-#      a floor between the last two: the first two are paid in the coinbase,
-#      the third gets no output, and its satoshis turn up on the operator's.
+#   6. a MIXED window really does redistribute, on chain. Claims of
+#      100 : 10 : 1 with a floor between the last two: the first two are paid
+#      in the coinbase, the third gets no output, and its satoshis turn up
+#      spread across the first two -- NOT on the operator's output, which
+#      holds its fee to the satoshi. The block also records whose turn was
+#      skipped, in a queue that sums to zero.
 #
 # That last stage is the one this file could not do for a long time, and the
 # reason is worth writing down. Share difficulty is clamped to network
@@ -503,10 +506,11 @@ if small in paid:
           f"{paid[small]} anyway", file=sys.stderr)
     sys.exit(1)
 
-# And its money went to the operator, not nowhere. The operator must hold
-# strictly more than the 1% fee, and the block must still be spent whole:
-# a forfeit that vanished would show up as a coinbase paying out less than
-# it may, which is value destroyed rather than merely redirected.
+# And its money went to THE OTHER MINERS, not to the operator. This is the
+# assertion that changed in #76: it used to require the operator to hold more
+# than its fee, which is exactly the behaviour that turned out to hand the
+# house a quarter of the block. Now the operator holds its fee to the satoshi
+# and the miners who fit divide everything else.
 total = sum(paid.values())
 if total != 5000000000:
     print(f"FAIL: the coinbase pays {total}, not the whole 50 BTC block",
@@ -514,36 +518,81 @@ if total != 5000000000:
     sys.exit(1)
 fee_only = 50000000
 op_sats = paid.get(op, 0)
-if op_sats <= fee_only:
-    print(f"FAIL: operator holds {op_sats}, no more than the {fee_only}-sat "
-          f"fee — the forfeited claim went nowhere", file=sys.stderr)
+if op_sats != fee_only:
+    print(f"FAIL: operator holds {op_sats}, expected exactly the {fee_only}-sat "
+          f"fee — a dropped claim leaked to the house", file=sys.stderr)
     sys.exit(1)
-forfeited = op_sats - fee_only
-print(f"  forfeited to the operator: {forfeited} sats "
-      f"(on top of the {fee_only}-sat fee)")
-# Roughly 1/111 of the payable amount. Bounded rather than exact because the
-# block finder's own share may or may not have entered the window before the
-# job was built; either way the SMALL claim is the one that lost.
-if not (40000000 <= forfeited <= 50000000):
-    print(f"FAIL: forfeited {forfeited} sats, expected ~44.6M "
+
+# The two who were paid must have received MORE than their own claims: they
+# absorbed the third. Their own shares of the 4,950,000,000 payable amount are
+# 100/111 and 10/111, so anything at or below those means nothing was
+# redistributed and the money was simply destroyed.
+own_big = 4950000000 * 100 // 111
+own_mid = 4950000000 * 10 // 111
+if paid[big] <= own_big or paid[mid] <= own_mid:
+    print(f"FAIL: BIG {paid[big]} (own share {own_big}) and MID {paid[mid]} "
+          f"(own {own_mid}) — the skipped claim was not redistributed",
+          file=sys.stderr)
+    sys.exit(1)
+absorbed = (paid[big] - own_big) + (paid[mid] - own_mid)
+print(f"  redistributed to the miners who fit: {absorbed} sats")
+print(f"    BIG {own_big} -> {paid[big]}")
+print(f"    MID {own_mid} -> {paid[mid]}")
+# Roughly SMALL's 1-in-111 share of the payable amount.
+if not (40000000 <= absorbed <= 50000000):
+    print(f"FAIL: {absorbed} sats redistributed, expected ~44.6M "
           f"(1 share in 111 of the payable amount)", file=sys.stderr)
     sys.exit(1)
 PY
 
 # And the pool reported it, with the numbers, so an operator answering "why
-# was I not paid?" has something to answer from.
-grep -q "were forfeited to the operator" "$MIX_LOG" || {
-    echo "FAIL: the block paid a forfeit but the pool never reported one" >&2
+# was I not paid this block?" has something to answer from.
+grep -q "REDISTRIBUTED across the miners" "$MIX_LOG" || {
+    echo "FAIL: the block redistributed a claim but the pool never reported it" >&2
     grep -i "pplns-coinbase: block" "$MIX_LOG" | tail -3 >&2; exit 1; }
-echo "  reported: $(grep -o '[0-9]* claim(s) worth [0-9]* sats were forfeited' "$MIX_LOG" | tail -1)"
+echo "  reported: $(grep -o '[0-9]* claim(s) worth [0-9]* sats had no room' "$MIX_LOG" | tail -1)"
 
-# Still no ledger. A forfeit is income, not a debt -- if this mode ever grew a
-# carry it would show up here first.
+# Still no BALANCE ledger. The payout queue below is a memory of whose turn it
+# is, not money owed; pps_credits must stay empty regardless.
 MIX_ROWS="$(sqlite3 "$MIX_DB" "SELECT COUNT(*) FROM pps_credits")"
 [ "$MIX_ROWS" = "0" ] || {
-    echo "FAIL: a forfeit created $MIX_ROWS ledger row(s); it must create none" >&2
+    echo "FAIL: a redistribution created $MIX_ROWS credit row(s); it must create none" >&2
     exit 1; }
-echo "  pps_credits rows=0 — forfeited, not carried"
+echo "  pps_credits rows=0 — redistributed, not owed"
+
+stage "assert the payout queue recorded who was skipped, and balances"
+# The block skipped SMALL, so somebody's standing must have moved -- and the
+# whole queue must sum to zero, which is the invariant that makes "nobody is
+# owed money" a checkable claim rather than a promise.
+QROWS="$(sqlite3 "$MIX_DB" "SELECT COUNT(*) FROM pplns_pending_fractions")"
+FROWS="$(sqlite3 "$MIX_DB" "SELECT COUNT(*) FROM pplns_fractions")"
+echo "  staged=$QROWS applied=$FROWS"
+[ "$QROWS" -ge 1 ] || [ "$FROWS" -ge 1 ] || {
+    echo "FAIL: a block skipped a miner but nothing was recorded in the queue" >&2
+    exit 1; }
+
+# Zero-sum, across both the staged rows and any already applied. Rounded to
+# 1e-6 of a block, far below anything that could matter.
+BAL="$(sqlite3 "$MIX_DB" "SELECT CAST(ROUND((
+        COALESCE((SELECT SUM(delta) FROM pplns_pending_fractions),0) +
+        COALESCE((SELECT SUM(owed_fraction) FROM pplns_fractions),0)) * 1000000) AS INT)")"
+[ "$BAL" = "0" ] || {
+    echo "FAIL: the payout queue sums to $BAL (x1e-6), not zero — somebody's" >&2
+    echo "      turn has been invented or destroyed" >&2
+    sqlite3 "$MIX_DB" "SELECT 'pending', worker_id, delta FROM pplns_pending_fractions
+                       UNION ALL SELECT 'applied', worker_id, owed_fraction FROM pplns_fractions" >&2
+    exit 1; }
+echo "  the payout queue sums to zero — nobody is owed money, only a turn"
+
+# And the skipped miner is the one owed, not the ones that were paid.
+SKIPPED_ID="$(sqlite3 "$MIX_DB" "SELECT id FROM workers WHERE payout_address='$SMALL'")"
+OWED="$(sqlite3 "$MIX_DB" "SELECT CAST(ROUND(COALESCE((
+          SELECT SUM(delta) FROM pplns_pending_fractions WHERE worker_id=$SKIPPED_ID),0) * 1000) AS INT)")"
+[ "${OWED:-0}" -gt 0 ] || {
+    echo "FAIL: the skipped miner (worker $SKIPPED_ID) is not owed a turn" >&2
+    sqlite3 "$MIX_DB" "SELECT worker_id, delta FROM pplns_pending_fractions" >&2
+    exit 1; }
+echo "  the skipped miner is owed $OWED/1000 of a block reward, and is next in line"
 
 echo
 echo "cbwin-e2e: PASS (the window was paid from the block's own coinbase,"

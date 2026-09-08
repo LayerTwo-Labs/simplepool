@@ -329,3 +329,50 @@ CREATE TABLE IF NOT EXISTS tx_attempts (
 );
 CREATE INDEX IF NOT EXISTS tx_attempts_ts_idx   ON tx_attempts(ts);
 CREATE INDEX IF NOT EXISTS tx_attempts_kind_idx ON tx_attempts(kind, ts);
+
+-- pplns-coinbase: who has been skipped, and by how much.
+--
+-- A signed fraction of ONE block reward per worker. Positive means the miner
+-- was skipped -- the coinbase had no room for it -- and is first in the queue
+-- for a slot in a future block. Negative means it was paid early, out of
+-- somebody else's skipped share, and waits its turn. The column sums to zero
+-- across the table.
+--
+-- THIS IS NOT A BALANCE AND THE POOL HOLDS NO MONEY AGAINST IT. Nothing is
+-- ever withheld from a coinbase and released later; that would need a block
+-- paying less than the reward followed by one paying more, and the second is
+-- invalid. It is a memory of who was skipped, used only to order the next
+-- block's payouts. If this file were deleted nobody would be owed a payment,
+-- because nobody was ever holding one -- the pool would simply forget whose
+-- turn it was.
+--
+-- Recorded as a fraction rather than in difficulty units on purpose. Shares
+-- stay in the window across several blocks, so rolling unpaid difficulty
+-- forward would count the same work twice; and difficulty is not comparable
+-- over time -- it swings, and it resets at a fork -- so a claim stored in
+-- difficulty units quietly changes meaning at every retarget. A fraction of a
+-- block reward does not.
+CREATE TABLE IF NOT EXISTS pplns_fractions (
+  worker_id     INTEGER PRIMARY KEY REFERENCES workers(id),
+  owed_fraction REAL    NOT NULL DEFAULT 0,
+  updated_at    INTEGER
+);
+
+-- What a block's coinbase did to those fractions, held until the block is
+-- known to have survived.
+--
+-- Written when a block is found, which is a CANDIDATE: submitblock may have
+-- refused it, or the chain may reorg it away, and either way its coinbase
+-- paid nobody. Applying the deltas there would record a rotation that never
+-- happened and quietly move somebody down the queue for a payment they never
+-- received. The confirmation pass applies these when the block is confirmed
+-- and deletes them when it is orphaned -- the same rule, and the same reason,
+-- as PPLNS distribution.
+CREATE TABLE IF NOT EXISTS pplns_pending_fractions (
+  block_hash TEXT    NOT NULL,
+  worker_id  INTEGER NOT NULL,
+  delta      REAL    NOT NULL,
+  PRIMARY KEY (block_hash, worker_id)
+);
+CREATE INDEX IF NOT EXISTS pplns_pending_hash_idx
+  ON pplns_pending_fractions(block_hash);

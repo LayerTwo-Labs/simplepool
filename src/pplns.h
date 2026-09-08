@@ -24,7 +24,50 @@
 typedef struct {
     const char *payout_address;
     double      difficulty;      /* this worker's share of the window */
+    int64_t     worker_id;       /* for the fraction ledger; 0 if unknown */
+    /* What this worker is owed from previous blocks, as a signed fraction of
+     * ONE block reward. Positive: skipped before, and first in the queue for
+     * a slot now. Negative: paid early out of somebody else's skipped share,
+     * so it waits. Zero across a pool that has always been able to pay
+     * everyone. See pplns_order_claims(). */
+    double      owed_fraction;
 } pplns_claim_t;
+
+/* How many of the coinbase's payout slots are held back for whoever has been
+ * waiting longest, rather than given to the largest claims.
+ *
+ * Not a tuning knob so much as the thing that makes the queue move at all. A
+ * large miner's share of the current window is bigger than the largest debt a
+ * small miner can ever accumulate, so ranking by "claim plus what you are
+ * owed" still hands every slot to the same addresses, every block, for ever.
+ * Measured on a production coinbase-direct pool: over 31 blocks, 279 payout
+ * slots reached 34 addresses, 12 of which took 91% of them, while 88
+ * addresses were paid nothing — and 28 of those cleared the payout floor
+ * comfortably, so the floor was not what excluded them
+ * (LayerTwo-Labs/simplepool#76).
+ *
+ * Reserving slots costs no coinbase bytes and changes nobody's total. It
+ * changes how OFTEN people are paid, not how much. */
+#define PPLNS_RESERVED_SLOT_NUMERATOR   1
+#define PPLNS_RESERVED_SLOT_DENOMINATOR 4    /* a quarter of the slots */
+
+/* Order `claims` into the sequence the coinbase should pay them in, writing
+ * the permutation into `order` (indices into `claims`).
+ *
+ * The default is largest claim first, which puts the payout floor and the
+ * byte budget on the smallest claims — the ones for whom missing a block
+ * costs least. Then a fraction of the slots the coinbase is expected to have
+ * room for are handed instead to the workers with the largest positive
+ * `owed_fraction`, longest-waiting first.
+ *
+ * `expected_slots` is how many payouts the caller believes will fit. It only
+ * decides how many slots are reserved; getting it wrong changes the fairness
+ * of the rotation, never the arithmetic — everyone in `order` is still paid
+ * their own claim, and anyone the budget cuts is still redistributed.
+ *
+ * Returns 0, or negative on bad input. */
+int pplns_order_claims(const pplns_claim_t *claims, size_t n_claims,
+                       size_t expected_slots, size_t *order);
 
 typedef struct {
     int64_t fee_sats;            /* the operator's cut, off the top */

@@ -1560,6 +1560,161 @@ static void test_the_window_reads_past_the_first_batch(void) {
     printf("  ok test_the_window_reads_past_the_first_batch\n");
 }
 
+/* ---- the pplns-coinbase payout queue ------------------------------------
+ *
+ * A signed fraction of one block reward per worker: positive means skipped and
+ * owed a slot, negative means paid early out of somebody else's skipped share.
+ * It is a memory of whose turn it is, NOT a balance — the pool holds no money
+ * against it, and deleting the table would cost nobody a payment.
+ *
+ * The invariant that makes that claim checkable is that it sums to zero. These
+ * tests exist for it, and for the orphan case, which is the one that can
+ * silently move a miner down the queue for a payment it never received. */
+static void test_fraction_deltas_must_sum_to_zero(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+
+    /* Balanced: one miner skipped, one paid early by the same amount. */
+    store_fraction_delta_t ok_[] = { {1, 0.25}, {2, -0.25} };
+    assert(store_stage_block_fractions(s, "aa", ok_, 2, err, sizeof err) == 2);
+
+    /* Unbalanced: this would invent a turn out of nothing. */
+    store_fraction_delta_t bad[] = { {1, 0.25}, {2, -0.10} };
+    assert(store_stage_block_fractions(s, "bb", bad, 2, err, sizeof err) < 0);
+    assert(strstr(err, "sum to") != NULL);
+
+    store_close(s);
+    printf("  ok test_fraction_deltas_must_sum_to_zero\n");
+}
+
+/* Staged rows do nothing until the block they came from is CONFIRMED — and
+ * are thrown away if it is orphaned. A block that never stood paid nobody and
+ * rotated nobody. */
+static void test_only_a_confirmed_block_moves_the_queue(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "INSERT INTO workers (id,name,payout_address,first_seen,last_seen)"
+        " VALUES (1,'a','bc1qa',1,1),(2,'b','bc1qb',1,1)",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status)"
+        " VALUES (1,10,'good',100,1,'pending'),(1,11,'bad',100,1,'pending')",
+        NULL, NULL, NULL) == SQLITE_OK);
+
+    store_fraction_delta_t d1[] = { {1, 0.25}, {2, -0.25} };
+    store_fraction_delta_t d2[] = { {1, 0.50}, {2, -0.50} };
+    assert(store_stage_block_fractions(s, "good", d1, 2, err, sizeof err) == 2);
+    assert(store_stage_block_fractions(s, "bad",  d2, 2, err, sizeof err) == 2);
+
+    /* Both blocks are still pending: nothing has moved. */
+    int applied = -1, discarded = -1;
+    assert(store_settle_block_fractions(s, &applied, &discarded, err, sizeof err) == 0);
+    assert(applied == 0 && discarded == 0);
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM pplns_fractions") == 0);
+
+    /* One confirms, one is orphaned. */
+    assert(sqlite3_exec(db, "UPDATE blocks_found SET status='confirmed' WHERE hash='good'",
+                        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(db, "UPDATE blocks_found SET status='orphaned' WHERE hash='bad'",
+                        NULL, NULL, NULL) == SQLITE_OK);
+    assert(store_settle_block_fractions(s, &applied, &discarded, err, sizeof err) == 0);
+    assert(applied == 1);
+    assert(discarded == 1);
+
+    /* Only the confirmed block's rotation took effect... */
+    char buf[64];
+    scalar_text(db, "SELECT CAST(ROUND(owed_fraction*100) AS INT) "
+                    "FROM pplns_fractions WHERE worker_id=1", buf, sizeof buf);
+    assert(strcmp(buf, "25") == 0);       /* 0.25, not 0.75 */
+    /* ...and the ledger still sums to zero. */
+    scalar_text(db, "SELECT CAST(ROUND(SUM(owed_fraction)*1000) AS INT) "
+                    "FROM pplns_fractions", buf, sizeof buf);
+    assert(strcmp(buf, "0") == 0);
+    /* Nothing is left staged, so a second pass is a no-op. */
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM pplns_pending_fractions") == 0);
+    assert(store_settle_block_fractions(s, &applied, &discarded, err, sizeof err) == 0);
+    assert(applied == 0 && discarded == 0);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_only_a_confirmed_block_moves_the_queue\n");
+}
+
+/* Two confirmed blocks that both moved the same worker must move it twice.
+ * Settling them in one statement would fold the rows together and lose one. */
+static void test_two_confirmed_blocks_both_count(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_exec(db, "INSERT INTO workers (id,name,payout_address,first_seen,last_seen)"
+                     " VALUES (1,'a','bc1qa',1,1),(2,'b','bc1qb',1,1)", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status)"
+                     " VALUES (1,10,'h1',100,1,'confirmed'),(1,11,'h2',100,1,'confirmed')",
+                 NULL, NULL, NULL);
+    store_fraction_delta_t d[] = { {1, 0.25}, {2, -0.25} };
+    assert(store_stage_block_fractions(s, "h1", d, 2, err, sizeof err) == 2);
+    assert(store_stage_block_fractions(s, "h2", d, 2, err, sizeof err) == 2);
+
+    int applied = 0, discarded = 0;
+    assert(store_settle_block_fractions(s, &applied, &discarded, err, sizeof err) == 0);
+    assert(applied == 2);
+    char buf[64];
+    scalar_text(db, "SELECT CAST(ROUND(owed_fraction*100) AS INT) "
+                    "FROM pplns_fractions WHERE worker_id=1", buf, sizeof buf);
+    assert(strcmp(buf, "50") == 0);       /* 0.25 twice, not folded to 0.25 */
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_two_confirmed_blocks_both_count\n");
+}
+
+/* The window hands the ledger standing back with each claim, so the ordering
+ * policy can see it. Zero for a worker that has never been skipped. */
+static void test_the_window_reports_each_workers_standing(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_exec(db, "INSERT INTO workers (id,name,payout_address,first_seen,last_seen)"
+                     " VALUES (1,'a','bc1qa',1,1),(2,'b','bc1qb',1,1)", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO shares (worker_id,ts,difficulty) VALUES"
+                     " (1,1,10.0),(2,1,5.0)", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO pplns_fractions (worker_id,owed_fraction,updated_at)"
+                     " VALUES (2,0.4,1)", NULL, NULL, NULL);
+    sqlite3_close(db);
+
+    store_window_entry_t win[4];
+    size_t n = 0; double total = 0; int tr = 0; char err[256];
+    assert(store_pplns_window(s, 100.0, win, 4, &n, &total, &tr, err, sizeof err) == 2);
+    /* Largest claim first, as always. */
+    assert(win[0].worker_id == 1 && win[0].owed_fraction == 0.0);
+    assert(win[1].worker_id == 2);
+    assert(win[1].owed_fraction > 0.39 && win[1].owed_fraction < 0.41);
+    store_close(s);
+    printf("  ok test_the_window_reports_each_workers_standing\n");
+}
+
 /* The operator fee comes off the top, exactly as in solo and PPS. */
 static void test_pplns_takes_the_operator_fee(void) {
     const char *path = fresh_db_path();
@@ -1615,6 +1770,10 @@ int main(void) {
     test_pplns_takes_the_operator_fee();
     test_the_payout_floor_is_published_for_the_dashboard();
     test_the_window_reads_past_the_first_batch();
+    test_fraction_deltas_must_sum_to_zero();
+    test_only_a_confirmed_block_moves_the_queue();
+    test_two_confirmed_blocks_both_count();
+    test_the_window_reports_each_workers_standing();
     test_pplns_distributes_two_blocks_in_one_pass();
     test_an_empty_window_returns_nothing_not_an_error();
     test_a_window_wider_than_the_cap_says_so();

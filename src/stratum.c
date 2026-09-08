@@ -21,6 +21,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "stratum.h"
 #include "coinbase.h"
+#include "store.h"
 #include "share.h"
 #include "log.h"
 #include "thunder.h"
@@ -143,6 +144,10 @@ struct stratum_job {
      * allocations rather than one per miner. */
     coinbase_payee_t *payees;
     char             *payee_addrs;
+    /* Who each payee is, so a found block can name who it skipped. An address
+     * is not enough: two rigs can share one, and the fraction ledger is per
+     * worker. */
+    int64_t          *payee_worker_ids;
     size_t            n_payees;
 
     uint64_t created_ms;    /* for retention ring */
@@ -247,6 +252,7 @@ void stratum_job_free(stratum_job_t *j) {
     }
     free(j->payees);
     free(j->payee_addrs);
+    free(j->payee_worker_ids);
     free(j);
 }
 
@@ -254,25 +260,30 @@ void stratum_job_free(stratum_job_t *j) {
  * of payees and one arena the addresses live in, so a 200-miner window is not
  * 200 strdups that have to be unwound on every job retirement. */
 int stratum_job_set_window(stratum_job_t *j,
-                           const coinbase_payee_t *payees, size_t n_payees) {
+                           const coinbase_payee_t *payees,
+                           const int64_t *worker_ids, size_t n_payees) {
     if (!j) return -1;
     free(j->payees);           j->payees = NULL;
     free(j->payee_addrs);      j->payee_addrs = NULL;
+    free(j->payee_worker_ids); j->payee_worker_ids = NULL;
     j->n_payees = 0;
     if (!payees || n_payees == 0) return 0;
 
     enum { ADDR_STRIDE = 128 };
     coinbase_payee_t *arr = calloc(n_payees, sizeof *arr);
     char *arena = calloc(n_payees, ADDR_STRIDE);
-    if (!arr || !arena) { free(arr); free(arena); return -1; }
+    int64_t *ids = calloc(n_payees, sizeof *ids);
+    if (!arr || !arena || !ids) { free(arr); free(arena); free(ids); return -1; }
     for (size_t i = 0; i < n_payees; ++i) {
         char *dst = arena + i * ADDR_STRIDE;
         snprintf(dst, ADDR_STRIDE, "%s", payees[i].address ? payees[i].address : "");
         arr[i].address = dst;
         arr[i].sats = payees[i].sats;
+        ids[i] = worker_ids ? worker_ids[i] : 0;
     }
     j->payees = arr;
     j->payee_addrs = arena;
+    j->payee_worker_ids = ids;
     j->n_payees = n_payees;
     return 0;
 }
@@ -2176,6 +2187,61 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         }
         if (wrc == 0) {
             coinbase_parts_free(&throwaway);
+            /* Record who this block skipped, and who absorbed their share.
+             *
+             * Expressed as a signed fraction of one block reward: what a
+             * worker was ENTITLED to out of this block, minus what the
+             * coinbase actually paid it. Positive means skipped and owed a
+             * slot; negative means paid early out of somebody else's share.
+             * The set sums to zero by construction, because redistribution
+             * moves value between miners and never in or out.
+             *
+             * Fractions rather than sats or difficulty, because this is
+             * consulted blocks later: shares stay in the window across several
+             * blocks, so rolling unpaid difficulty forward double-counts the
+             * same work, and difficulty is not comparable across a retarget.
+             *
+             * Staged against the block hash, not applied — this block is a
+             * candidate and its coinbase has paid nobody yet. */
+            if (s->cfg.on_window_fractions && job->payee_worker_ids &&
+                res.paid_sats > 0) {
+                struct store_fraction_delta d[COINBASE_MAX_PAYOUT_OUTPUTS];
+                size_t nd = 0;
+                int64_t entitled_total = 0, survivors_own = 0;
+                for (size_t i = 0; i < job->n_payees; ++i) {
+                    entitled_total += job->payees[i].sats;
+                    if (i < res.paid_count) survivors_own += job->payees[i].sats;
+                }
+                if (entitled_total > 0 && survivors_own > 0) {
+                    /* The builder pays in job order, so the first paid_count
+                     * payees are the ones that got an output.
+                     *
+                     * `got` is a survivor's share of what was actually paid
+                     * out, which after redistribution is the WHOLE payable
+                     * amount -- so it is their claim over the survivors' claims,
+                     * not over the window's. Dividing by res.paid_sats instead
+                     * looks equivalent and is not: redistribution sets that to
+                     * the full payable amount, so every delta came out as
+                     * exactly zero and the queue never recorded anybody. */
+                    for (size_t i = 0; i < job->n_payees &&
+                                       nd < COINBASE_MAX_PAYOUT_OUTPUTS; ++i) {
+                        double entitled = (double)job->payees[i].sats /
+                                          (double)entitled_total;
+                        double got = i < res.paid_count
+                                   ? (double)job->payees[i].sats /
+                                     (double)survivors_own
+                                   : 0.0;
+                        double delta = entitled - got;
+                        if (delta > 1e-12 || delta < -1e-12) {
+                            d[nd].worker_id = job->payee_worker_ids[i];
+                            d[nd].delta = delta;
+                            nd++;
+                        }
+                    }
+                }
+                if (nd > 0)
+                    s->cfg.on_window_fractions(s->cfg.ctx, block_hash_hex, d, nd);
+            }
             size_t dropped = res.dropped_below_floor + res.dropped_capped;
             if (dropped > 0) {
                 LOG_INFO("pplns-coinbase: block %s paid %zu miner(s) %lld "

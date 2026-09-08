@@ -175,6 +175,12 @@ typedef struct {
     int64_t worker_id;
     char    payout_address[128];
     double  difficulty;          /* this worker's difficulty inside the window */
+    /* Signed fraction of one block reward this worker is owed from blocks
+     * whose coinbase had no room for it, or has been overpaid from absorbing
+     * somebody else's skipped share. Zero on a pool that has always been able
+     * to pay everyone. See pplns_fractions in schema.sql -- it is a memory of
+     * whose turn it is, not a balance, and the pool holds nothing against it. */
+    double  owed_fraction;
 } store_window_entry_t;
 
 /* Fill `out` with the window's payable workers, largest first, and set
@@ -221,6 +227,42 @@ int store_record_share_addr(store_t *s, const char *worker_name,
 /* PPS credit: add delta_sats to the worker's accrued_sats in pps_credits.
  * Async (writer thread). delta_sats must be > 0. payout_address (the
  * miner's Thunder address) is tagged onto the workers row as usual. */
+/* One worker's change in standing from a block's coinbase. */
+typedef struct store_fraction_delta {
+    int64_t worker_id;
+    double  delta;      /* + skipped and owed; - paid early and owes back */
+} store_fraction_delta_t;
+
+/* Stage what a found block's coinbase did to the fraction ledger.
+ *
+ * Held against `block_hash` rather than applied, because a found block is a
+ * CANDIDATE: submitblock may have refused it and the chain may still reorg it
+ * away, and in either case its coinbase paid nobody. Applying here would
+ * record a rotation that never happened and move a miner down the queue for a
+ * payment it never got.
+ *
+ * The deltas must sum to zero, which the caller computes and this checks: a
+ * ledger that does not is one that has invented or destroyed somebody's turn.
+ *
+ * Returns the number of rows staged, or negative on error. */
+int store_stage_block_fractions(store_t *s, const char *block_hash,
+                                const store_fraction_delta_t *deltas, size_t n,
+                                char *errbuf, size_t errlen);
+
+/* Apply the staged deltas for every block that has since been CONFIRMED, and
+ * discard them for every block that has been ORPHANED.
+ *
+ * Called from the confirmation pass, on the same schedule and for the same
+ * reason as PPLNS distribution: this is the only place that knows whether a
+ * block is still in the chain. Idempotent -- staged rows are deleted as they
+ * are applied, so a second pass over the same block does nothing.
+ *
+ * *out_applied / *out_discarded receive the block counts (either may be NULL).
+ * Returns 0 ok, negative on error. */
+int store_settle_block_fractions(store_t *s, int *out_applied,
+                                 int *out_discarded,
+                                 char *errbuf, size_t errlen);
+
 int store_record_credit(store_t *s, const char *worker_name,
                         const char *payout_address,
                         uint64_t ts_ms, int64_t delta_sats);

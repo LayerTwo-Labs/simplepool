@@ -290,6 +290,9 @@ static const char *SCHEMA_SQL_PARTS[] = {
     ");"
     "CREATE INDEX IF NOT EXISTS payouts_worker_ts_idx ON payouts(worker_id, paid_at);"
     "CREATE INDEX IF NOT EXISTS payouts_paid_at_idx   ON payouts(paid_at);",
+    "CREATE TABLE IF NOT EXISTS pplns_fractions ( worker_id     INTEGER PRIMARY KEY REFERENCES workers(id), owed_fraction REAL    NOT NULL DEFAULT 0, updated_at    INTEGER )",
+    "CREATE TABLE IF NOT EXISTS pplns_pending_fractions ( block_hash TEXT    NOT NULL, worker_id  INTEGER NOT NULL, delta      REAL    NOT NULL, PRIMARY KEY (block_hash, worker_id) )",
+    "CREATE INDEX IF NOT EXISTS pplns_pending_hash_idx ON pplns_pending_fractions(block_hash)",
 };
 
 /* Forward-compat: ALTER existing DBs to add columns that didn't exist in
@@ -1527,9 +1530,11 @@ int store_pplns_window(store_t *s, double window_diff,
     }
 
     static const char *Q =
-        "SELECT w.id, COALESCE(w.payout_address,''), SUM(sh.difficulty) AS wd "
+        "SELECT w.id, COALESCE(w.payout_address,''), SUM(sh.difficulty) AS wd, "
+        "       COALESCE(f.owed_fraction, 0.0) "
         "  FROM shares sh "
         "  JOIN workers w ON w.id = sh.worker_id "
+        "  LEFT JOIN pplns_fractions f ON f.worker_id = w.id "
         " WHERE sh.id >= ? "
         "   AND w.payout_address IS NOT NULL AND w.payout_address <> '' "
         " GROUP BY w.id "
@@ -1553,6 +1558,7 @@ int store_pplns_window(store_t *s, double window_diff,
         snprintf(out[n].payout_address, sizeof out[n].payout_address, "%s",
                  addr ? (const char *)addr : "");
         out[n].difficulty = sqlite3_column_double(st, 2);
+        out[n].owed_fraction = sqlite3_column_double(st, 3);
         total += out[n].difficulty;
         n++;
     }
@@ -1561,6 +1567,158 @@ int store_pplns_window(store_t *s, double window_diff,
     if (out_n)          *out_n = n;
     if (out_total_diff) *out_total_diff = total;
     return (int)n;
+}
+
+int store_stage_block_fractions(store_t *s, const char *block_hash,
+                                const store_fraction_delta_t *deltas, size_t n,
+                                char *errbuf, size_t errlen)
+{
+    if (!s || !s->db || !block_hash || !block_hash[0] || (!deltas && n)) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "bad arg");
+        return -1;
+    }
+    if (n == 0) return 0;
+
+    /* The deltas describe a redistribution, so they must cancel. A set that
+     * does not sum to zero has invented somebody's turn or destroyed it, and
+     * writing it would put the ledger permanently out of balance -- the one
+     * invariant that makes "nobody is owed money" checkable. Floating point
+     * means "zero" is a tolerance, sized well below the smallest rotation
+     * anyone could notice. */
+    double sum = 0.0;
+    for (size_t i = 0; i < n; ++i) sum += deltas[i].delta;
+    if (sum > 1e-9 || sum < -1e-9) {
+        if (errbuf && errlen)
+            snprintf(errbuf, errlen,
+                     "fraction deltas sum to %g, not zero", sum);
+        return -1;
+    }
+
+    static const char *Q =
+        "INSERT INTO pplns_pending_fractions (block_hash, worker_id, delta) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(block_hash, worker_id) DO UPDATE SET delta = excluded.delta";
+
+    if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    int wrote = 0, ok = 1;
+    for (size_t i = 0; i < n; ++i) {
+        if (deltas[i].worker_id <= 0) continue;
+        sqlite3_reset(st);
+        sqlite3_bind_text  (st, 1, block_hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64 (st, 2, (sqlite3_int64)deltas[i].worker_id);
+        sqlite3_bind_double(st, 3, deltas[i].delta);
+        if (sqlite3_step(st) != SQLITE_DONE) { ok = 0; break; }
+        wrote++;
+    }
+    sqlite3_finalize(st);
+    if (!ok) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
+    return wrote;
+}
+
+int store_settle_block_fractions(store_t *s, int *out_applied,
+                                 int *out_discarded,
+                                 char *errbuf, size_t errlen)
+{
+    if (out_applied)   *out_applied = 0;
+    if (out_discarded) *out_discarded = 0;
+    if (!s || !s->db) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "bad arg");
+        return -1;
+    }
+
+    /* One transaction for the whole settlement. A partially applied block
+     * would leave the ledger not summing to zero, and unlike a failed payout
+     * there is no later pass that could notice: the pending rows are gone. */
+    if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        return -1;
+    }
+
+    /* SQLite folds duplicate worker rows within one INSERT..SELECT rather than
+     * applying each, so settle one block at a time: two confirmed blocks that
+     * both moved the same worker must move it twice. */
+    static const char *ONE_HASH =
+        "SELECT DISTINCT p.block_hash, b.status "
+        "  FROM pplns_pending_fractions p "
+        "  JOIN blocks_found b ON b.hash = p.block_hash "
+        " WHERE b.status IN ('confirmed','orphaned') "
+        " LIMIT 64";
+
+    char hashes[64][80];
+    int  is_conf[64];
+    int  nh = 0;
+    sqlite3_stmt *sel = NULL;
+    if (sqlite3_prepare_v2(s->db, ONE_HASH, -1, &sel, NULL) != SQLITE_OK) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        return -2;
+    }
+    while (nh < 64 && sqlite3_step(sel) == SQLITE_ROW) {
+        const unsigned char *h = sqlite3_column_text(sel, 0);
+        const unsigned char *st_ = sqlite3_column_text(sel, 1);
+        if (!h) continue;
+        snprintf(hashes[nh], sizeof hashes[nh], "%s", (const char *)h);
+        is_conf[nh] = st_ && strcmp((const char *)st_, "confirmed") == 0;
+        nh++;
+    }
+    sqlite3_finalize(sel);
+
+    static const char *APPLY_ONE =
+        "INSERT INTO pplns_fractions (worker_id, owed_fraction, updated_at) "
+        "SELECT p.worker_id, p.delta, strftime('%s','now') "
+        "  FROM pplns_pending_fractions p WHERE p.block_hash = ? "
+        "ON CONFLICT(worker_id) DO UPDATE SET "
+        "  owed_fraction = pplns_fractions.owed_fraction + excluded.owed_fraction, "
+        "  updated_at = excluded.updated_at";
+    static const char *DROP_ONE =
+        "DELETE FROM pplns_pending_fractions WHERE block_hash = ?";
+
+    int applied = 0, discarded = 0, ok = 1;
+    for (int i = 0; i < nh && ok; ++i) {
+        if (is_conf[i]) {
+            sqlite3_stmt *a = NULL;
+            if (sqlite3_prepare_v2(s->db, APPLY_ONE, -1, &a, NULL) != SQLITE_OK) { ok = 0; break; }
+            sqlite3_bind_text(a, 1, hashes[i], -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(a) != SQLITE_DONE) ok = 0;
+            sqlite3_finalize(a);
+            if (ok) applied++;
+        } else {
+            discarded++;
+        }
+        if (!ok) break;
+        sqlite3_stmt *d = NULL;
+        if (sqlite3_prepare_v2(s->db, DROP_ONE, -1, &d, NULL) != SQLITE_OK) { ok = 0; break; }
+        sqlite3_bind_text(d, 1, hashes[i], -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(d) != SQLITE_DONE) ok = 0;
+        sqlite3_finalize(d);
+    }
+
+    if (!ok) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
+    if (out_applied)   *out_applied = applied;
+    if (out_discarded) *out_discarded = discarded;
+    return 0;
 }
 
 int store_record_credit(store_t *s, const char *worker_name,

@@ -994,19 +994,20 @@ static void test_the_payout_floor_is_configurable(void) {
     printf("ok: the payout floor is configurable and clamped up to dust\n");
 }
 
-/* The byte budget is about marketplaces rejecting an oversized coinbase, so
- * it has to fall on the smallest claims: paying largest-first means the
- * forfeit lands on whoever has least at stake in it. */
-static void test_the_cap_falls_on_the_smallest_claims(void) {
+/* The byte budget falls on whoever the CALLER put last.
+ *
+ * The builder used to sort largest-first itself, so this was automatic. It no
+ * longer does: the order is policy and belongs to pplns.c, which supplies
+ * largest-first by default. This pins the default arrangement — pass them in
+ * priority order and the smallest claims are the ones that miss out. */
+static void test_the_cap_falls_on_whoever_is_last_in_the_order(void) {
     coinbase_parts_t parts; char err[256];
     coinbase_window_result_t res;
+    /* Priority order, as pplns_order_claims() produces by default. */
     const coinbase_payee_t payees[] = {
-        { WA, 1000000LL }, { WB, 3000000LL }, { WC, 6000000LL },
+        { WC, 6000000LL }, { WB, 3000000LL }, { WA, 1000000LL },
     };
-    /* fee 1% of 10,101,010 ~ 101,010; make the numbers exact instead. */
     int64_t value = 1000000LL + 3000000LL + 6000000LL;   /* fee_bps 0: no fee */
-    /* The operator address is still required: capping produces a forfeit,
-     * and a forfeit needs somewhere to go even when there is no fee. */
     int rc = coinbase_build_window(800000, value, payees, 3,
                                    WOP, 0, NULL, NULL, 4, 8,
                                    /* Byte budget admitting exactly two of the
@@ -1020,12 +1021,42 @@ static void test_the_cap_falls_on_the_smallest_claims(void) {
     assert(rc == 0);
     assert(res.paid_count == 2);
     assert(res.dropped_capped == 1);
-    /* The 1,000,000 claim is the one dropped, and its share goes to the two
-     * that fit — not to the operator. */
+    /* The 1,000,000 claim is last in the order, so it is the one dropped —
+     * and its share goes to the two that fit, not to the operator. */
     assert(res.redistributed_sats == 1000000LL);
     assert(res.paid_sats == 10000000LL);      /* the whole payable amount */
     coinbase_parts_free(&parts);
-    printf("ok: the output cap drops the smallest claims first\n");
+    printf("ok: the byte budget drops whoever is last in the caller's order\n");
+}
+
+/* And the order is genuinely the caller's: put a small claim first and it
+ * keeps its slot while a larger one behind it is cut.
+ *
+ * This is the capability the fraction ledger needs. Without it a large miner's
+ * window share beats any priority a small miner can accumulate, so the same
+ * addresses take the same slots for ever and a queue of skipped miners never
+ * moves — measured on a production pool as 12 addresses taking 91%% of 279
+ * payout slots over 31 blocks (LayerTwo-Labs/simplepool#76). */
+static void test_the_caller_can_promote_a_small_claim(void) {
+    coinbase_parts_t parts; char err[256];
+    coinbase_window_result_t res;
+    /* The 1,000,000 claim promoted to the front; the 3,000,000 one is now
+     * last and should be the one the budget cuts. */
+    const coinbase_payee_t payees[] = {
+        { WA, 1000000LL }, { WC, 6000000LL }, { WB, 3000000LL },
+    };
+    int64_t value = 10000000LL;
+    assert(coinbase_build_window(800000, value, payees, 3, WOP, 0, NULL, NULL,
+                                 4, 8, 180, 0, &parts, &res,
+                                 err, sizeof err) == 0);
+    assert(res.paid_count == 2);
+    assert(res.dropped_capped == 1);
+    assert(res.redistributed_sats == 3000000LL);   /* WB was cut, not WA */
+    assert(res.paid_sats == value);
+    /* And the rounding remainder still lands on the largest claim PAID, which
+     * is no longer the first element. */
+    coinbase_parts_free(&parts);
+    printf("ok: a promoted small claim keeps its slot over a larger one\n");
 }
 
 /* A window that cannot be paid in full no longer needs an operator address at
@@ -1416,7 +1447,8 @@ int main(void) {
     test_a_payee_below_the_floor_is_shared_out_not_given_to_the_operator();
     test_the_operator_cannot_profit_by_shrinking_the_coinbase();
     test_the_payout_floor_is_configurable();
-    test_the_cap_falls_on_the_smallest_claims();
+    test_the_cap_falls_on_whoever_is_last_in_the_order();
+    test_the_caller_can_promote_a_small_claim();
     test_a_dropped_claim_needs_no_operator_address();
     test_no_operator_address_means_no_fee();
     test_a_window_of_only_dust_is_refused();

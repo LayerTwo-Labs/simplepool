@@ -75,6 +75,9 @@ typedef struct {
     int ran_distribution;     /* store_pplns_distribute was called */
     int blocks_distributed;
     int worker_credits;
+    /* pplns-coinbase payout-queue rows settled this pass. */
+    int fractions_applied;
+    int fractions_discarded;
     int distribute_failed;    /* the call returned an error */
 } reconcile_result_t;
 

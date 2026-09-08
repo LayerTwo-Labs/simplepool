@@ -713,18 +713,6 @@ static int rd_u64(const uint8_t *buf, size_t len, size_t *off, uint64_t *val) {
 
 /* ---------- coinbase-direct PPLNS ---------- */
 
-/* Sort helper: largest claim first, ties broken by original position so the
- * output order is deterministic for a given window. A stable, reproducible
- * coinbase matters -- a miner checking the block it was paid from should get
- * the same answer twice. */
-typedef struct { size_t idx; int64_t sats; } payee_rank_t;
-
-static int payee_rank_cmp(const void *a, const void *b) {
-    const payee_rank_t *x = a, *y = b;
-    if (x->sats != y->sats) return x->sats > y->sats ? -1 : 1;
-    return x->idx < y->idx ? -1 : (x->idx > y->idx ? 1 : 0);
-}
-
 /* One concrete output the reward is being replaced with. */
 typedef struct {
     uint8_t spk[64];
@@ -828,19 +816,24 @@ static int resolve_window_outputs(int64_t value_sats,
         return -1;
     }
 
-    payee_rank_t *rank = calloc(n_payees, sizeof *rank);
-    if (!rank) { set_err(errbuf, errlen, "oom"); return -1; }
-    for (size_t i = 0; i < n_payees; ++i) {
-        rank[i].idx = i;
-        rank[i].sats = payees[i].sats;
-    }
-    qsort(rank, n_payees, sizeof *rank, payee_rank_cmp);
-
+    /* Paid in the order the CALLER gave, not in one chosen here.
+     *
+     * This used to sort largest-first internally, so the floor and the byte
+     * budget always fell on the smallest claims. That is the right default and
+     * it is still what pplns.c hands over -- but it can only ever be a
+     * default, because "who gets the slots a coinbase has room for" is policy,
+     * and a policy fixed inside the builder cannot be changed without changing
+     * the builder. Specifically it made the slots unwinnable: a large miner's
+     * share of the window beats any priority a small one can accumulate, so
+     * the same addresses take the same slots every block for ever.
+     *
+     * The caller now owns the order and this pays greedily down it. See
+     * pplns_order_claims(). */
     size_t  n = 0;
     size_t  payout_bytes = 0;
     int64_t dropped = 0;
     for (size_t k = 0; k < n_payees; ++k) {
-        const coinbase_payee_t *pe = &payees[rank[k].idx];
+        const coinbase_payee_t *pe = &payees[k];
         if (pe->sats < payout_floor_sats) {
             r.dropped_below_floor++; dropped += pe->sats; continue;
         }
@@ -853,7 +846,7 @@ static int resolve_window_outputs(int64_t value_sats,
         if (coinbase_address_to_script(pe->address, out[n].spk,
                                        sizeof out[n].spk, &out[n].spk_len,
                                        errbuf, errlen) < 0) {
-            free(rank); return -1;
+            return -1;
         }
         size_t cost = out_ser_size(out[n].spk_len);
         if (payout_bytes + cost > payout_budget) {
@@ -867,7 +860,6 @@ static int resolve_window_outputs(int64_t value_sats,
         r.paid_sats += pe->sats;
         n++; r.paid_count++;
     }
-    free(rank);
 
     if (r.paid_count == 0) {
         set_err(errbuf, errlen,
@@ -915,9 +907,16 @@ static int resolve_window_outputs(int64_t value_sats,
             assigned += out[i].sats;
         }
         /* Truncation again, and the same rule as everywhere else: the
-         * remainder goes to the largest surviving claim, which is out[0]
-         * because payees were resolved largest-first. */
-        if (assigned < payable) out[0].sats += payable - assigned;
+         * remainder goes to the largest surviving claim. Found by scanning
+         * rather than assumed to be out[0] -- that was only true while this
+         * function did its own largest-first sort, and a caller-supplied
+         * order can put anyone first. */
+        if (assigned < payable) {
+            size_t big = 0;
+            for (size_t i = 1; i < n; ++i)
+                if (out[i].sats > out[big].sats) big = i;
+            out[big].sats += payable - assigned;
+        }
         else if (assigned > payable) {
             set_err(errbuf, errlen, "internal: redistribution overshot");
             return -1;
@@ -1455,6 +1454,35 @@ int coinbase_build_window_from_template(const char *coinbase_tx_hex,
 static int cb_reward_probe(void *ctx, int64_t reward_sats, size_t fixed_bytes,
                            cb_repl_out_t *out, size_t cap, size_t *out_n,
                            char *errbuf, size_t errlen);
+
+size_t coinbase_expected_payout_slots(size_t max_coinbase_bytes,
+                                      const char *coinbase_tx_hex)
+{
+    size_t budget = max_coinbase_bytes ? max_coinbase_bytes
+                                       : (size_t)COINBASE_DEFAULT_MAX_BYTES;
+    /* The envelope the builder always pays: version, input, scriptSig with a
+     * generous extranonce and tag, output count, locktime, and a reserved
+     * operator output. Deliberately on the pessimistic side -- reserving one
+     * slot too few costs a rotation, reserving one too many costs a payout. */
+    size_t fixed = 160;
+    if (coinbase_tx_hex) {
+        /* Everything the template already spends: its commitments, and the
+         * output being replaced. Counted from the transaction rather than
+         * guessed, because the same 16 payouts cost 817 bytes against four
+         * drivechain OP_RETURNs and 769 against three. */
+        size_t hexlen = strlen(coinbase_tx_hex);
+        fixed += hexlen / 2;
+        /* The spendable output goes away as the payouts arrive, so do not
+         * charge for it twice. One P2WPKH-shaped output, approximately. */
+        if (fixed > 31) fixed -= 31;
+    }
+    if (budget <= fixed) return 1;
+    /* 31 bytes is a P2WPKH payout, the common case. */
+    size_t slots = (budget - fixed) / 31;
+    if (slots < 1) slots = 1;
+    if (slots > COINBASE_MAX_PAYOUT_OUTPUTS) slots = COINBASE_MAX_PAYOUT_OUTPUTS;
+    return slots;
+}
 
 int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_sats) {
     if (!coinbase_tx_hex || !out_sats) return -1;

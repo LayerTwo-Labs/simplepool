@@ -78,7 +78,8 @@ stratum_job_t *stratum_job_new(
  *
  * Returns 0 on success, negative on allocation failure. */
 int stratum_job_set_window(stratum_job_t *j,
-                           const coinbase_payee_t *payees, size_t n_payees);
+                           const coinbase_payee_t *payees,
+                           const int64_t *worker_ids, size_t n_payees);
 
 void stratum_job_free(stratum_job_t *j);
 
@@ -106,6 +107,15 @@ typedef int (*block_submit_fn)(void *ctx, const char *block_hex,
  * `submit_error` the reason when it was not. A candidate the node refused is
  * still reported here — it is recorded as 'rejected' rather than dropped,
  * because a silent reject is how phantom rewards went unnoticed. */
+/* What a found block's coinbase did to each miner's standing in the queue, as
+ * signed fractions of one block reward that sum to zero. The callback stages
+ * them against the block hash; the confirmation pass decides whether they ever
+ * take effect. pplns-coinbase only. */
+struct store_fraction_delta;
+typedef void (*window_fractions_fn)(void *ctx, const char *block_hash,
+                                    const struct store_fraction_delta *deltas,
+                                    size_t n);
+
 typedef void (*block_found_fn)(void *ctx,
                                const char *worker_name,
                                const char *finder_address,
@@ -205,7 +215,8 @@ typedef struct {
      * is a snapshot taken when the template was built. */
     int     coinbase_pays_window;
     size_t  max_coinbase_bytes;   /* 0 = COINBASE_DEFAULT_MAX_BYTES */
-    int64_t payout_floor_sats;    /* below this a claim is forfeited, not paid */
+    int64_t payout_floor_sats;    /* below this a claim is not paid this block */
+    window_fractions_fn on_window_fractions;  /* pplns-coinbase only */
 
     /* Does this mode price a share when it arrives? Only pps-classic does.
      * It is what the accrual gate suspends, so the gate must key on this and

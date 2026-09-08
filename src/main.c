@@ -181,6 +181,32 @@ static double effective_pps_rate(const proxy_config_t *cfg,
     return pps_rate_from_template(value_sats, net_diff, cfg->fee_bps);
 }
 
+/* Stage what a found block's coinbase did to the payout queue.
+ *
+ * Staged, not applied: this block is a candidate, and a block that never
+ * stands rotated nobody. reconcile_blocks_pass() applies these once the block
+ * is confirmed and discards them if it is orphaned. */
+static void on_window_fractions_cb(void *ctx, const char *block_hash,
+                                   const struct store_fraction_delta *deltas,
+                                   size_t n) {
+    server_ctx_t *s = (server_ctx_t *)ctx;
+    if (!s || !s->store || !deltas || n == 0) return;
+    char ferr[256] = {0};
+    int rc = store_stage_block_fractions(s->store, block_hash, deltas, n,
+                                         ferr, sizeof ferr);
+    if (rc < 0) {
+        /* Not fatal — the block is paid either way, this only decides whose
+         * turn is next. Worth a warning because a queue that stops recording
+         * silently reverts to "largest claim always wins". */
+        LOG_WARN("pplns-coinbase: could not record the payout queue for block "
+                 "%.16s: %s — rotation for this block is lost",
+                 block_hash ? block_hash : "?", ferr);
+        return;
+    }
+    LOG_DEBUG("pplns-coinbase: staged %d payout-queue row(s) for block %.16s",
+              rc, block_hash ? block_hash : "?");
+}
+
 /* Snapshot the PPLNS window onto a freshly built job, for pplns-coinbase.
  *
  * The window is taken from the template that is about to go out, so the
@@ -289,13 +315,34 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
     for (size_t i = 0; i < n; ++i) {
         claims[i].payout_address = win[i].payout_address;
         claims[i].difficulty     = win[i].difficulty;
+        claims[i].worker_id      = win[i].worker_id;
+        claims[i].owed_fraction  = win[i].owed_fraction;
     }
+
+    /* Decide who gets the slots before deciding what they are worth.
+     *
+     * A coinbase has room for a bounded number of payouts, and paying the
+     * largest claims first — which is what the builder used to do on its own —
+     * hands the same addresses the same slots every block, because a large
+     * miner's share of the window beats any priority a small one can
+     * accumulate. A fraction of the slots is therefore reserved for whoever
+     * has waited longest. Costs no bytes, changes nobody's total, changes only
+     * how often people are paid. */
+    size_t expected_slots = coinbase_expected_payout_slots(
+        (size_t)cfg->coinbase_max_bytes, t->coinbasetxn_hex);
+    size_t order[COINBASE_MAX_PAYOUT_OUTPUTS];
+    if (pplns_order_claims(claims, n, expected_slots, order) < 0) {
+        LOG_WARN("pplns-coinbase: could not order the window for payment");
+        return -1;
+    }
+    pplns_claim_t ordered[COINBASE_MAX_PAYOUT_OUTPUTS];
+    for (size_t i = 0; i < n; ++i) ordered[i] = claims[order[i]];
 
     coinbase_payee_t payees[COINBASE_MAX_PAYOUT_OUTPUTS];
     pplns_split_t split;
     char serr[256] = {0};
     if (pplns_split_window(value, cfg->fee_bps, cfg->operator_address[0] != 0,
-                           claims, n, total, cfg->pplns_payout_floor_sats,
+                           ordered, n, total, cfg->pplns_payout_floor_sats,
                            payees, COINBASE_MAX_PAYOUT_OUTPUTS,
                            &split, serr, sizeof serr) < 0) {
         LOG_WARN("pplns-coinbase: cannot split this block across the window: "
@@ -303,7 +350,10 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
         return -1;
     }
 
-    if (stratum_job_set_window(job, payees, n) < 0) {
+    int64_t worker_ids[COINBASE_MAX_PAYOUT_OUTPUTS];
+    for (size_t i = 0; i < n; ++i) worker_ids[i] = ordered[i].worker_id;
+
+    if (stratum_job_set_window(job, payees, worker_ids, n) < 0) {
         LOG_WARN("pplns-coinbase: could not attach the window to the job");
         return -1;
     }
@@ -1370,6 +1420,7 @@ int main(int argc, char **argv) {
     stcfg.coinbase_pays_pool   = mode_pps_classic ||
                                  mode_pplns_thunder || mode_pplns_btc;
     stcfg.coinbase_pays_window = mode_pplns_cb;
+    stcfg.on_window_fractions  = mode_pplns_cb ? on_window_fractions_cb : NULL;
     stcfg.max_coinbase_bytes   = (size_t)cfg.coinbase_max_bytes;
     stcfg.payout_floor_sats    = cfg.pplns_payout_floor_sats;
     stcfg.username_is_thunder = mode_pps_classic || mode_pplns_thunder;

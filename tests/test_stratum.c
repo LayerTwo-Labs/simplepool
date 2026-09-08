@@ -2759,7 +2759,7 @@ static void test_pplns_coinbase_pays_every_miner_in_the_window(void) {
         { TEST_ADDR,  3000000000LL },
         { TEST_ADDR2, 2000000000LL },
     };
-    CHECK(stratum_job_set_window(job, win, 2) == 0);
+    CHECK(stratum_job_set_window(job, win, NULL, 2) == 0);
     stratum_server_set_job(s, job, 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
