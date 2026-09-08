@@ -53,10 +53,19 @@ typedef struct {
  * `claims` must be ordered largest-difficulty-first, as store_pplns_window()
  * returns them, so the remainder lands on the strongest claim.
  *
- * `total_diff` is the window's total, passed in rather than re-summed: the
- * store computes it over rows this array may have been truncated from, and
- * silently re-deriving it here would pay a truncated window as if it were
- * whole.
+ * `total_diff` is the window's total as the store reported it, passed in
+ * rather than re-summed here.
+ *
+ * It covers EXACTLY the claims in `claims`, truncation included: when
+ * store_pplns_window() cannot fit the whole window it drops the tail from the
+ * total as well as from the entries, so the survivors divide the block between
+ * them rather than funding an output that is never created. This comment used
+ * to say the opposite -- that the total still counted truncated rows -- which
+ * store.h and store.c both contradict (LayerTwo-Labs/simplepool#76). Believing
+ * the old version would make a denominator larger than the claims sum, every
+ * payee would be shorted, and the whole shortfall would land on out[0] via the
+ * remainder rule: the largest miner silently absorbing everyone else's. The
+ * `assigned > payable` check below catches the opposite error only.
  *
  * Returns 0 on success, negative on error (errbuf populated). */
 int pplns_split_window(int64_t reward_sats, int fee_bps, int have_operator,
