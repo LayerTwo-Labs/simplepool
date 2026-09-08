@@ -1175,6 +1175,19 @@ int main(int argc, char **argv) {
                  network, network_src, cfg.pool_mode, cfg.fee_bps,
                  cfg.coinbase_tag, cfg.operator_address,
                  pps ? " pool_btc=" : "", pps ? cfg.pool_btc_address : "");
+        /* Say the policy out loud on every start, next to the rest of the
+         * identity rather than down by the stratum config -- this is a
+         * configured fact, not a template one, and printing it here means it
+         * survives a node that is not answering yet. An operator who never
+         * saw it stated cannot disclose it to the miners it costs. */
+        if (strcmp(cfg.pool_mode, "pplns-coinbase") == 0) {
+            LOG_INFO("pplns-coinbase: payout floor %lld sats — a miner whose "
+                     "share of a block is worth less than that is NOT PAID, "
+                     "and the amount goes to the operator. Nothing is carried "
+                     "and nothing settles later. The dashboard states this to "
+                     "miners; publish it on your pool page too.",
+                     (long long)cfg.pplns_payout_floor_sats);
+        }
         /* Publish the ports so the dashboard can tell a miner which one to
          * dial. Labels are constrained to [A-Za-z0-9_-] at config parse time,
          * so this needs no escaping. */
@@ -1362,16 +1375,6 @@ int main(int argc, char **argv) {
     stcfg.coinbase_pays_pool   = mode_pps_classic ||
                                  mode_pplns_thunder || mode_pplns_btc;
     stcfg.coinbase_pays_window = mode_pplns_cb;
-    if (mode_pplns_cb) {
-        /* Say the policy out loud on every start. It is the one place this
-         * pool is harsher than a custodial one, and an operator who never
-         * saw it stated cannot disclose it to the miners it costs. */
-        LOG_INFO("pplns-coinbase: payout floor %lld sats — a miner whose "
-                 "share of a block is worth less than that is NOT PAID, and "
-                 "the amount goes to the operator. Nothing is carried and "
-                 "nothing settles later. Publish this on your pool page.",
-                 (long long)cfg.pplns_payout_floor_sats);
-    }
     stcfg.max_coinbase_bytes   = (size_t)cfg.coinbase_max_bytes;
     stcfg.payout_floor_sats    = cfg.pplns_payout_floor_sats;
     stcfg.username_is_thunder = mode_pps_classic || mode_pplns_thunder;
