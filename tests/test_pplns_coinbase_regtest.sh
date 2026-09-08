@@ -23,23 +23,26 @@
 #      the chain rather than out of anything simplepool wrote.
 #   3. NO output pays an address the pool controls. That is the whole claim of
 #      the mode and it is the one thing a bookkeeping bug cannot fake.
-#   4. only UNPAID claims are owed off-chain. A miner the coinbase paid must
-#      not appear in pps_credits at all: a row there would mean the pool
-#      believes it owes money it already paid on chain.
+#   4. NOTHING is owed off-chain, ever. pps_credits must be empty: this mode
+#      writes no ledger row at all, so a row of any size means some other
+#      rail's code path ran.
+#   5. the policy is stated in the log. A claim below the payout floor is
+#      forfeited to the operator and never settled, which is a trap unless
+#      the operator can see it — so the disclosure lines are asserted here
+#      exactly like the money is.
 #
-# NOT covered here, deliberately: the carry ledger with something actually in
-# it. Carry needs a window where some claims fit the coinbase and others do
-# not, which needs several miners of very different sizes — and this harness
-# drives one cpuminer. Shrinking the byte budget instead does not produce it
-# either: when NOTHING fits, the builder refuses, no coinbase is rendered and
-# no block is found, so there is nothing to record.
+# NOT covered here, deliberately: a forfeit with something actually in it.
+# That needs a window holding claims of very different sizes, and this harness
+# drives cpuminers against one address. Squeezing the byte budget instead does
+# not produce it either: with a single payee, either it fits or the builder
+# refuses, no coinbase is rendered and no block is found.
 #
 # An earlier version of this file had a stage that squeezed the budget and
 # printed how much had carried. It printed 0 every time and passed regardless,
-# which is worse than no stage at all. The carry ledger is covered by
-# tests/test_store.c instead, where the outcome can be stated exactly and is
-# mutation-verified; what is missing is an end-to-end run with a mixed-size
-# window, and it is missing on purpose rather than by oversight.
+# which is worse than no stage at all. The forfeit arithmetic is covered in
+# tests/test_coinbase.c instead, where the amounts can be stated exactly and
+# are mutation-verified. What is missing is an end-to-end run with a
+# mixed-size window, and it is missing on purpose rather than by oversight.
 #
 # Env:
 #   REGTEST_DIR      data dir, WIPED each run (default: <repo>/.regtest-cbwin)
@@ -311,21 +314,56 @@ if unknown:
 print(f"  miner {paid[miner]} sats, operator {paid.get(op, 0)} sats")
 PY
 
-stage "assert only UNPAID claims are owed off-chain"
-# The payment was the block, so a miner the coinbase paid must not appear in
-# pps_credits at all: a row there would mean the pool believes it owes money
-# it has already paid on chain.
+stage "assert NOTHING is owed off-chain"
+# The payment was the block, so there is no ledger at all in this mode: not
+# for the miners the coinbase paid, and not for the ones it could not. A claim
+# below the payout floor is forfeited to the operator outright — it is income,
+# not a debt, and nothing records it.
 #
-# The ledger is not empty by definition, though. A claim below the payout
-# floor, or one the byte budget had no room for, rides on the operator output
-# — the operator is holding it, and owes it. Here the single miner takes the
-# whole block and clears the floor easily, so nothing should carry.
+# So this is unconditional, which is what makes it worth asserting. Any row
+# here means some other rail's crediting path ran against a pplns-coinbase
+# pool, which is the bug that would quietly recreate the custody this mode
+# exists to remove.
 CREDITS="$(sqlite3 "$POOL_DB" "SELECT COALESCE(SUM(accrued_sats),0) FROM pps_credits")"
 ROWS="$(sqlite3 "$POOL_DB" "SELECT COUNT(*) FROM pps_credits")"
 echo "  pps_credits rows=$ROWS accrued=$CREDITS"
 [ "$ROWS" = "0" ] && [ "$CREDITS" = "0" ] || {
-    echo "FAIL: pplns-coinbase recorded $CREDITS sats owed across $ROWS row(s)," >&2
-    echo "      but the coinbase paid this miner in full" >&2
+    echo "FAIL: pplns-coinbase wrote $CREDITS sats across $ROWS ledger row(s)." >&2
+    echo "      This mode has no ledger: the block IS the payment." >&2
+    exit 1; }
+
+stage "assert the payout floor is disclosed, not silent"
+# The floor decides who this pool refuses to pay, and a miner below it earns
+# nothing however long it mines. That is a defensible policy and an
+# indefensible surprise, so the operator has to be told twice: once at
+# startup, and once per block with the actual numbers. If these lines ever
+# regress the policy silently becomes a trap, which is why they are asserted
+# here alongside the money.
+grep -q "payout floor 546 sats" "$POOL_LOG" || {
+    echo "FAIL: the pool never stated its payout floor at startup" >&2
+    grep -i "floor" "$POOL_LOG" | head -5 >&2
+    exit 1; }
+grep -q "NOT PAID" "$POOL_LOG" || {
+    echo "FAIL: the startup line does not say a miner below the floor is unpaid" >&2
+    exit 1; }
+echo "  startup: $(grep -o 'payout floor [0-9]* sats' "$POOL_LOG" | head -1)"
+
+# And per block: this harness has one miner, who takes the whole window, so
+# the expected line is the all-paid one. Asserting the all-paid wording rather
+# than merely "some line was printed" is what keeps this from passing on a
+# build where the reporting broke in the direction of saying nothing.
+grep -q "paid all .* miner(s) in the window" "$POOL_LOG" || {
+    echo "FAIL: no per-block payment line for a block that paid everyone" >&2
+    grep -i "pplns-coinbase: block" "$POOL_LOG" | tail -5 >&2
+    exit 1; }
+echo "  per block: $(grep -o 'paid all [0-9]* miner(s) in the window [0-9]* sats' "$POOL_LOG" | tail -1)"
+
+# The window-level warning is the one an operator can act on BEFORE a block
+# makes it real. With everyone clearing the floor it must say so rather than
+# say nothing — a line that only ever appears on the bad path is a line
+# nobody notices is missing.
+grep -q "every miner in the window clears the 546-sat payout floor" "$POOL_LOG" || {
+    echo "FAIL: the pool never reported the window against its floor" >&2
     exit 1; }
 
 stage "assert the block was recorded, and needs no distribution"

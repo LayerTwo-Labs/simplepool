@@ -198,30 +198,6 @@ int store_pplns_window(store_t *s, double window_diff,
                        size_t *out_n, double *out_total_diff,
                        int *out_truncated, char *errbuf, size_t errlen);
 
-/* Record what a found block's coinbase paid, and what it did not.
- *
- * pplns-coinbase pays miners in the block itself, so most of the ledger the
- * other rails keep is unnecessary — with one exception. A claim too small to
- * put in a coinbase output, or one the byte budget had no room for, is not
- * paid and is not lost: it rides on the operator output, which means the
- * operator is holding it and owes it.
- *
- * That debt is recorded here, in the same pps_credits table the other rails
- * use, so it appears wherever a miner's balance already appears. accrued_sats
- * is incremented by the carried amount and nothing else: a claim the coinbase
- * paid is settled on chain and has no business in a ledger of what is owed.
- *
- * This is the honest form of the cost the mode has to admit to. It is not
- * zero custody; it is custody proportional to dust, recorded per worker
- * rather than implied.
- *
- * Returns the number of workers credited, or negative on error. */
-int store_record_window_carry(store_t *s,
-                              const int64_t *worker_ids,
-                              const int64_t *owed_sats,
-                              const int64_t *paid_sats,
-                              size_t n, char *errbuf, size_t errlen);
-
 /* Record an accepted share with the miner's payout_address so the worker
  * row can be tagged. payout_address may be NULL (legacy/tests). The
  * share_hash semantics match store_record_share() above.

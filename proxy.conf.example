@@ -228,9 +228,30 @@ pool_mode = solo
 # cannot see that; this can, because the commitments are simply part of what
 # has already been spent.
 #
-# Whatever does not fit is not lost — it carries, and the smallest claims are
-# the ones that wait.
+# Whatever does not fit is forfeited to the operator — see
+# pplns_payout_floor_sats below.
 # coinbase_max_bytes = 1000
+
+# pplns-coinbase — the payout floor, in satoshis. A miner whose share of a
+# block comes to less than this is NOT PAID. The money goes to the operator
+# output, there is no ledger entry, and it is not settled later.
+#
+# This is a deliberate policy and it needs stating to your miners, because it
+# is the one place this pool is harsher than a custodial one. A custodial
+# pool can hold a tiny balance until it is worth a transaction. Coinbase-direct
+# has nowhere to hold it: the payment IS the block, so the only alternatives
+# are to pay an output that costs more in bytes than it is worth, or to carry
+# a debt against a block that may never come. We do neither.
+#
+# The practical effect is a hashrate floor. With a 3.125 BTC block and a 2x
+# window, a miner needs roughly a 546/312500000 share of the window — about
+# 0.0002% — to clear the default. Anyone below that will mine here, produce
+# valid shares, and receive nothing, which is worse for them than solo mining
+# where they at least hold a lottery ticket. Say so on your pool page.
+#
+# Raising it makes blocks cheaper in bytes and the floor harsher. Clamped up
+# to 546 (the dust limit) — no smaller output is relayable anyway.
+# pplns_payout_floor_sats = 546
 
 # pps-classic — OPTIONAL rate override, sats credited per unit of share
 # difficulty. Leave it commented out and the proxy derives the rate from each

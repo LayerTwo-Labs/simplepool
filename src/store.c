@@ -1498,67 +1498,6 @@ int store_pplns_window(store_t *s, double window_diff,
     return (int)n;
 }
 
-int store_record_window_carry(store_t *s,
-                              const int64_t *worker_ids,
-                              const int64_t *owed_sats,
-                              const int64_t *paid_sats,
-                              size_t n, char *errbuf, size_t errlen)
-{
-    if (!s || !s->db || !worker_ids || !owed_sats || !paid_sats) {
-        if (errbuf && errlen) snprintf(errbuf, errlen, "bad arg");
-        return -1;
-    }
-    if (n == 0) return 0;
-
-    static const char *Q =
-        "INSERT INTO pps_credits (worker_id, accrued_sats, paid_sats, last_updated) "
-        "VALUES (?, ?, 0, ?) "
-        "ON CONFLICT(worker_id) DO UPDATE SET "
-        "  accrued_sats = pps_credits.accrued_sats + excluded.accrued_sats, "
-        "  last_updated = excluded.last_updated";
-
-    /* One transaction for the whole block: either every carried claim is
-     * recorded or none is. A partial record is the failure that cannot be
-     * repaired by running again, because there is no second chance to see
-     * this coinbase. */
-    if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
-        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
-        return -1;
-    }
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
-        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
-        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
-        atomic_fetch_add(&s->pg_errors, 1);
-        return -2;
-    }
-    int credited = 0, ok = 1;
-    sqlite3_int64 now = (sqlite3_int64)time(NULL);
-    for (size_t i = 0; i < n; ++i) {
-        int64_t carried = owed_sats[i] - paid_sats[i];
-        /* Paid in full on chain: nothing is owed, so nothing is recorded.
-         * Writing a zero row would put every miner in a ledger of debts the
-         * pool does not have. */
-        if (carried <= 0 || worker_ids[i] <= 0) continue;
-        sqlite3_bind_int64(st, 1, worker_ids[i]);
-        sqlite3_bind_int64(st, 2, carried);
-        sqlite3_bind_int64(st, 3, now);
-        if (sqlite3_step(st) != SQLITE_DONE) { ok = 0; }
-        sqlite3_reset(st);
-        if (!ok) break;
-        credited++;
-    }
-    sqlite3_finalize(st);
-    if (!ok) {
-        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
-        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
-        atomic_fetch_add(&s->pg_errors, 1);
-        return -2;
-    }
-    sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
-    return credited;
-}
-
 int store_record_credit(store_t *s, const char *worker_name,
                         const char *payout_address,
                         uint64_t ts_ms, int64_t delta_sats)

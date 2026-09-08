@@ -138,7 +138,6 @@ struct stratum_job {
      * allocations rather than one per miner. */
     coinbase_payee_t *payees;
     char             *payee_addrs;
-    int64_t          *payee_worker_ids;
     size_t            n_payees;
 
     uint64_t created_ms;    /* for retention ring */
@@ -243,7 +242,6 @@ void stratum_job_free(stratum_job_t *j) {
     }
     free(j->payees);
     free(j->payee_addrs);
-    free(j->payee_worker_ids);
     free(j);
 }
 
@@ -251,33 +249,25 @@ void stratum_job_free(stratum_job_t *j) {
  * of payees and one arena the addresses live in, so a 200-miner window is not
  * 200 strdups that have to be unwound on every job retirement. */
 int stratum_job_set_window(stratum_job_t *j,
-                           const coinbase_payee_t *payees,
-                           const int64_t *worker_ids, size_t n_payees) {
+                           const coinbase_payee_t *payees, size_t n_payees) {
     if (!j) return -1;
     free(j->payees);           j->payees = NULL;
     free(j->payee_addrs);      j->payee_addrs = NULL;
-    free(j->payee_worker_ids); j->payee_worker_ids = NULL;
     j->n_payees = 0;
     if (!payees || n_payees == 0) return 0;
 
     enum { ADDR_STRIDE = 128 };
     coinbase_payee_t *arr = calloc(n_payees, sizeof *arr);
     char *arena = calloc(n_payees, ADDR_STRIDE);
-    /* Worker ids ride alongside so a found block can name who carried. An
-     * address is not enough: two rigs can share one, and the ledger is per
-     * worker. */
-    int64_t *ids = calloc(n_payees, sizeof *ids);
-    if (!arr || !arena || !ids) { free(arr); free(arena); free(ids); return -1; }
+    if (!arr || !arena) { free(arr); free(arena); return -1; }
     for (size_t i = 0; i < n_payees; ++i) {
         char *dst = arena + i * ADDR_STRIDE;
         snprintf(dst, ADDR_STRIDE, "%s", payees[i].address ? payees[i].address : "");
         arr[i].address = dst;
         arr[i].sats = payees[i].sats;
-        ids[i] = worker_ids ? worker_ids[i] : 0;
     }
     j->payees = arr;
     j->payee_addrs = arena;
-    j->payee_worker_ids = ids;
     j->n_payees = n_payees;
     return 0;
 }
@@ -787,14 +777,16 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                     job->coinbasetxn_hex, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps,
                     s->cfg.coinbase_tag, job->en1_size, job->en2_size,
-                    s->cfg.max_coinbase_bytes, &parts, NULL, NULL,
+                    s->cfg.max_coinbase_bytes, s->cfg.payout_floor_sats,
+                    &parts, NULL, NULL,
                     err, sizeof err);
         } else {
             rc = coinbase_build_window(
                     job->height, job->value_sats, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps, job->wc_hex,
                     s->cfg.coinbase_tag, job->en1_size, job->en2_size,
-                    s->cfg.max_coinbase_bytes, &parts, NULL, err, sizeof err);
+                    s->cfg.max_coinbase_bytes, s->cfg.payout_floor_sats,
+                    &parts, NULL, err, sizeof err);
         }
     } else if (s->cfg.coinbase_pays_pool) {
         /* PPS-classic: every miner's coinbase is identical, paying the
@@ -2044,15 +2036,20 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         c->vd_window_max_assigned = assigned_diff;
     }
     vardiff_maybe_retarget(s, c, now_ms(), buf, len);
-    /* Who this block's coinbase actually paid. Recomputed rather than
-     * remembered: the split is deterministic from the job and the config, so
-     * running the same builder again reproduces exactly what was rendered,
-     * and a found block is rare enough that the cost does not matter. Doing
-     * it here is the only option — the coinbase is decided when the template
-     * is built, but almost no template becomes a block, so nothing can be
-     * written to a ledger until one does. */
-    if (is_block && block_accepted && s->cfg.on_window_outcome &&
-        s->cfg.coinbase_pays_window && job->payees && job->n_payees > 0) {
+    /* What this block's coinbase actually paid, and what it forfeited.
+     *
+     * Recomputed rather than remembered: the split is deterministic from the
+     * job and the config, so running the same builder again reproduces
+     * exactly what was rendered, and a found block is rare enough that the
+     * cost does not matter.
+     *
+     * This is a log line rather than a ledger row on purpose. Forfeits are
+     * not a debt -- see coinbase_window_result_t -- but they ARE somebody's
+     * lost claim, and the one thing that makes a hard floor a rule instead of
+     * a trap is that it is visible. So every block that forfeits says so, in
+     * sats, at INFO. */
+    if (is_block && block_accepted && s->cfg.coinbase_pays_window &&
+        job->payees && job->n_payees > 0) {
         coinbase_parts_t throwaway;
         coinbase_window_result_t res;
         char werr[256] = {0};
@@ -2062,30 +2059,46 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                     job->coinbasetxn_hex, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps,
                     s->cfg.coinbase_tag, job->en1_size, job->en2_size,
-                    s->cfg.max_coinbase_bytes, &throwaway, NULL, &res,
-                    werr, sizeof werr);
+                    s->cfg.max_coinbase_bytes, s->cfg.payout_floor_sats,
+                    &throwaway, NULL, &res, werr, sizeof werr);
         } else {
             wrc = coinbase_build_window(
                     job->height, job->value_sats, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps, job->wc_hex,
                     s->cfg.coinbase_tag, job->en1_size, job->en2_size,
-                    s->cfg.max_coinbase_bytes, &throwaway, &res,
-                    werr, sizeof werr);
+                    s->cfg.max_coinbase_bytes, s->cfg.payout_floor_sats,
+                    &throwaway, &res, werr, sizeof werr);
         }
         if (wrc == 0) {
             coinbase_parts_free(&throwaway);
-            int64_t owed[COINBASE_MAX_PAYOUT_OUTPUTS];
-            size_t n = job->n_payees > COINBASE_MAX_PAYOUT_OUTPUTS
-                     ? COINBASE_MAX_PAYOUT_OUTPUTS : job->n_payees;
-            for (size_t i = 0; i < n; ++i) owed[i] = job->payees[i].sats;
-            s->cfg.on_window_outcome(s->cfg.ctx, block_hash_hex,
-                                     job->payee_worker_ids, owed,
-                                     res.paid_per_payee, n);
+            size_t dropped = res.dropped_below_floor + res.dropped_capped;
+            if (dropped > 0) {
+                LOG_INFO("pplns-coinbase: block %s paid %zu miner(s) %lld "
+                         "sats directly; %zu claim(s) worth %lld sats were "
+                         "forfeited to the operator (%zu below the %lld-sat "
+                         "payout floor, %zu with no room in a %zu-byte "
+                         "coinbase). Forfeited claims are NOT carried and are "
+                         "not settled later.",
+                         block_hash_hex, res.paid_count,
+                         (long long)res.paid_sats, dropped,
+                         (long long)res.forfeited_sats,
+                         res.dropped_below_floor,
+                         (long long)s->cfg.payout_floor_sats,
+                         res.dropped_capped,
+                         s->cfg.max_coinbase_bytes
+                             ? s->cfg.max_coinbase_bytes
+                             : (size_t)COINBASE_DEFAULT_MAX_BYTES);
+            } else {
+                LOG_INFO("pplns-coinbase: block %s paid all %zu miner(s) in "
+                         "the window %lld sats directly",
+                         block_hash_hex, res.paid_count,
+                         (long long)res.paid_sats);
+            }
         } else {
-            /* The ledger is the only record of who is owed, so failing to
-             * write it is worth saying loudly even though the block stands. */
-            LOG_WARN("stratum: could not determine the window outcome for "
-                     "block %s: %s — carried claims are unrecorded",
+            /* The block stands either way -- it was already accepted -- but
+             * an operator who cannot see what a block paid cannot answer a
+             * miner asking why it was not paid. */
+            LOG_WARN("stratum: could not determine what block %s paid: %s",
                      block_hash_hex, werr);
         }
     }

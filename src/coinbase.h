@@ -78,6 +78,12 @@ typedef struct {
  * marketplace an operator is selling to, not to us. */
 #define COINBASE_DEFAULT_MAX_BYTES 1000
 
+/* Below this an output is not relayable, so it is the floor under every other
+ * floor. In the header rather than coinbase.c because main.c reports the
+ * effective payout floor to the operator and config.c documents it, and three
+ * copies of 546 is three chances to disagree. */
+#define COINBASE_DUST_SATS 546
+
 /* Array bound only. The byte budget is what actually decides how many miners
  * are paid; this exists so the builders can use fixed-size storage, and is set
  * far above anything the budget will admit. */
@@ -85,32 +91,40 @@ typedef struct {
 
 /* What the builder actually managed to pay, and what it could not.
  *
- * `carry_sats` is the honest part. A payee below the dust limit, or past the
- * output cap, cannot be paid in THIS coinbase — but its value cannot simply
- * vanish either: a coinbase that pays out less than it is allowed forfeits
- * the difference to nobody. So the shortfall is added to the operator output
- * and reported here, which means the pool is holding it and owes it.
+ * `forfeited_sats` is the honest part. A payee below the payout floor, or
+ * past the byte budget, cannot be paid in THIS coinbase, and its value cannot
+ * simply vanish either: a coinbase that pays out less than it is allowed
+ * forfeits the difference to nobody. So the shortfall goes to the operator
+ * output — and it stays there.
  *
- * That is the cost the design has to own: coinbase-direct removes custody for
- * everyone the block can pay, and replaces it with a small, bounded,
- * disclosable balance for everyone it cannot. It is not "zero custody"; it is
- * custody proportional to dust, and the number is right here rather than
- * implied. */
+ * That is the cost the design has to own, and it is a cost borne by the
+ * smallest miners rather than by the pool. The alternative was a carried
+ * balance, which is the custodial ledger this mode exists to delete: it
+ * reintroduces a debt, an off-chain record of it, and a settlement that can
+ * fail. Forfeiting instead keeps the property that the block IS the payment,
+ * at the price of a hard floor under who this pool is worth mining at. The
+ * number is right here so it can be disclosed rather than discovered. */
 typedef struct {
     size_t  paid_count;        /* payees given an output */
     int64_t paid_sats;         /* summed across those outputs */
-    size_t  dropped_dust;      /* payees below COINBASE_DUST_SATS */
-    size_t  dropped_capped;    /* payees the byte budget had no room for */
-    int64_t carry_sats;        /* owed to the dropped, paid to the operator */
-    int64_t fee_sats;          /* the operator's actual fee, excluding carry */
-    /* What each payee actually received, indexed as the CALLER passed them —
-     * not in the largest-first order the builder pays in. 0 means the payee
-     * carried: it was below the floor, or the byte budget had no room.
+    size_t  dropped_below_floor; /* payees under payout_floor_sats */
+    size_t  dropped_capped;      /* payees the byte budget had no room for */
+    /* Claims the coinbase could not pay, which go to the operator.
      *
-     * Without this the carry is a single number and nobody knows whose it is.
-     * A pool that cannot say which miner is owed the dust is not running a
-     * ledger, it is just keeping the money. */
-    int64_t paid_per_payee[COINBASE_MAX_PAYOUT_OUTPUTS];
+     * FORFEITED, not owed. This is a deliberate policy choice and not an
+     * accounting convenience: a coinbase-direct pool cannot pay an amount too
+     * small to be an economical output, and carrying it creates exactly the
+     * custodial balance the mode exists to remove. So a claim below the
+     * payout floor is not paid, is not remembered, and is not a debt — it
+     * becomes operator income.
+     *
+     * The consequence is real and has to be disclosed rather than discovered:
+     * a miner whose share never reaches the floor earns nothing, however long
+     * it mines. That is the intended incentive — a miner that small is better
+     * off mining solo — but it is only a rule rather than a trap if the miner
+     * can see it, which is why the floor is logged at startup and per block. */
+    int64_t forfeited_sats;
+    int64_t fee_sats;          /* the operator's fee, excluding forfeits */
 } coinbase_window_result_t;
 
 
@@ -125,9 +139,13 @@ typedef struct {
  * fee_bps split every other builder applies. A caller whose arithmetic does
  * not add up is refused rather than silently underpaying the block.
  *
- * Payees are paid largest first, so the byte budget and the dust limit fall
- * on the smallest claims — the ones for whom waiting a block costs least, and
- * whose carried balance is smallest.
+ * Payees are paid largest first, so the byte budget and the payout floor fall
+ * on the smallest claims. Those are forfeited to the operator, not carried:
+ * see coinbase_window_result_t.
+ *
+ * `payout_floor_sats` is clamped UP to COINBASE_DUST_SATS — below the dust
+ * limit an output is not relayable, so there is no floor lower than that to
+ * have.
  *
  * `max_coinbase_bytes` is the whole serialized coinbase, commitments and all,
  * not just the payouts. 0 means COINBASE_DEFAULT_MAX_BYTES.
@@ -140,6 +158,7 @@ int coinbase_build_window(uint32_t height, int64_t value_sats,
                           const char *coinbase_tag,
                           size_t extranonce1_size, size_t extranonce2_size,
                           size_t max_coinbase_bytes,
+                          int64_t payout_floor_sats,
                           coinbase_parts_t *out,
                           coinbase_window_result_t *res,
                           char *errbuf, size_t errlen);
@@ -186,6 +205,21 @@ void coinbase_parts_free(coinbase_parts_t *p);
  * enforcer (plus the mandatory BIP300/301 commitments), which is what tells an
  * observer whether a sidechain can be merge-mined into these blocks.
  * Returns 0 ok, negative on malformed input. */
+/* The reward a server-provided coinbasetxn actually pays, in sats: the value
+ * of its single spendable output, which is the one the window replaces.
+ *
+ * A caller splitting a window has to divide THIS number, not the template's
+ * `coinbasevalue`. The two normally agree, but nothing makes them: the field
+ * is what the node says the block may pay, and the transaction is what its
+ * coinbase does pay. When they disagree the builders refuse the split -- the
+ * payees no longer sum to the reward -- and since that happens per job, on
+ * every connection, a pool would simply stop publishing work with a warning
+ * per render and no single cause to find.
+ *
+ * Returns 0 ok, negative if the tx is malformed or does not have exactly one
+ * spendable output (in which case there is no single reward to speak of). */
+int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_sats);
+
 /* coinbase_build_window(), but replacing the single spendable output of a
  * server-provided coinbasetxn instead of building one from scratch.
  *
@@ -210,6 +244,7 @@ int coinbase_build_window_from_template(const char *coinbase_tx_hex,
                                         size_t extranonce1_size,
                                         size_t extranonce2_size,
                                         size_t max_coinbase_bytes,
+                                        int64_t payout_floor_sats,
                                         coinbase_parts_t *out,
                                         int *out_has_witness,
                                         coinbase_window_result_t *res,

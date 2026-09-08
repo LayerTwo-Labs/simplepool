@@ -128,6 +128,18 @@ typedef struct {
      * headroom on that. 0 = COINBASE_DEFAULT_MAX_BYTES. */
     int coinbase_max_bytes;                  /* default 1000 */
 
+    /* pplns-coinbase: a claim worth less than this is not paid at all. It is
+     * forfeited to the operator output, and there is no ledger entry and no
+     * later settlement -- see the long note in proxy.conf.example.
+     *
+     * Deliberate policy, not a rounding artefact: coinbase-direct pays out of
+     * the block itself, so every extra output is bytes an operator may not
+     * have. Rather than carry a debt no one can see, the floor is stated up
+     * front and a miner too small to clear it is better off solo mining.
+     * Clamped up to COINBASE_DUST_SATS (546); below that no output is
+     * relayable anyway. */
+    int64_t pplns_payout_floor_sats;         /* default 546 (dust) */
+
     /* pooled modes: coinbase pays this BTC address (P2WPKH/P2PKH/P2SH) for
      * the net-of-fee reward. Required when pool_mode = pps-classic;
      * ignored otherwise. */

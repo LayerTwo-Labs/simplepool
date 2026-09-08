@@ -267,14 +267,17 @@ footer .wrap > p { max-width: 46rem; }
     <p class="lede">
       A single-binary stratum server in pure C11. It hands work to your ASICs,
       checks every submission itself, submits found blocks, and records the whole
-      thing in a SQLite file you are allowed to read. It runs in four modes,
-      which differ in who carries the variance — <strong>solo</strong>, where the
+      thing in a SQLite file you are allowed to read. It runs in five modes,
+      which differ in who carries the variance and who holds the money in
+      between — <strong>solo</strong>, where the
       miner who finds a block is paid in that block's own coinbase;
       <strong>pps-classic</strong>, where every accepted share earns a fixed,
       derivable amount and the operator absorbs the difference out of a reserve;
-      and <strong>pplns-thunder</strong> / <strong>pplns-btc</strong>, where a
+      <strong>pplns-thunder</strong> / <strong>pplns-btc</strong>, where a
       matured block is divided among the shares that produced it, so the pool
-      never owes more than it has just been paid.
+      never owes more than it has just been paid; and
+      <strong>pplns-coinbase</strong>, the same accounting with the custody
+      taken out — the block's own coinbase pays the whole window directly.
     </p>
     <div class="badges">
       <span class="badge">C11 · no runtime dependencies beyond libc, sqlite3, libcurl, hiredis</span>
@@ -292,7 +295,7 @@ footer .wrap > p { max-width: 46rem; }
   <div class="toc-title">Contents</div>
   <ol>
     <li><a href="#what">What it is</a></li>
-    <li><a href="#modes">The four modes</a></li>
+    <li><a href="#modes">The five modes</a></li>
     <li><a href="#stack">The stack</a></li>
     <li><a href="#lifecycle">Life of a share</a></li>
     <li><a href="#nonce">Dividing the search space</a></li>
@@ -369,7 +372,7 @@ footer .wrap > p { max-width: 46rem; }
 
 <!-- ========================================================= 2. the modes == -->
 <section id="modes">
-  <h2>The four modes</h2>
+  <h2>The five modes</h2>
   <p class="section-sub">
     One config key — <code>pool_mode</code> — decides the shape of the coinbase,
     what a stratum username must be, when any off-chain balance moves, and
@@ -449,10 +452,65 @@ footer .wrap > p { max-width: 46rem; }
         <dt>Needs</dt><dd><code>bitcoind</code>, and the enforcer with <code>--enable-wallet</code></dd>
       </dl>
     </div>
+
+    <div class="mode">
+      <h3><code>pool_mode = pplns-coinbase</code></h3>
+      <p>
+        The same accounting again, with the custody taken out. There is no pool
+        wallet, no payout worker, no ledger row and no maturity wait: the
+        block's own coinbase pays the whole window directly, one output per
+        miner, largest claim first. A reorged block simply never paid, so there
+        is nothing to claw back.
+      </p>
+      <p>
+        The window is snapshotted onto the job when the template is built, so
+        the coinbase pays the work that exists <em>now</em>. On a drivechain
+        the coinbase comes from the enforcer and its BIP300/301 commitment
+        <code>OP_RETURN</code>s are preserved byte-for-byte — only the
+        enforcer's own reward output is replaced, by the window.
+      </p>
+      <dl>
+        <dt>Stratum username</dt><dd>your Bitcoin address, <code>bc1q…</code> or base58</dd>
+        <dt>Who gets paid</dt><dd>everyone in the window who clears the payout floor</dd>
+        <dt>When</dt><dd>in the block itself — there is no "when"</dd>
+        <dt>Variance</dt><dd>the miners'</dd>
+        <dt>Shares are</dt><dd>a claim on the next block this pool finds</dd>
+        <dt>Needs</dt><dd><code>bitcoind</code>, or the enforcer for a drivechain</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="warnbox">
+    <span class="label">pplns-coinbase forfeits small claims to the operator</span>
+    <p>
+      A coinbase is a fixed budget of bytes, and every payout spends some of
+      it. Two limits follow, and <strong>both cost miners money rather than the
+      pool</strong>: <code>coinbase_max_bytes</code> (default 1000) budgets the
+      whole serialized coinbase, commitments included, because that is what a
+      rented-hashrate marketplace measures when it refuses a job as oversized;
+      and <code>pplns_payout_floor_sats</code> (default 546, the dust limit) is
+      the least a claim must be worth to get an output at all.
+    </p>
+    <p>
+      A claim that clears neither is <strong>forfeited to the operator — not
+      carried, not recorded, and not settled later</strong>. That is deliberate.
+      There is nowhere to hold it, because the payment <em>is</em> the block,
+      and carrying it would rebuild exactly the custodial ledger this mode
+      exists to delete. The consequence is a hashrate floor: a miner too small
+      to clear it will mine here, submit valid shares, and earn nothing
+      indefinitely — strictly worse for them than solo mining, where they at
+      least hold a lottery ticket.
+    </p>
+    <p>
+      Because that is a trap unless it is visible, the proxy states the floor
+      at startup, reports how many miners in the current window fall below it,
+      and says per block how many claims were forfeited and for how much.
+      <strong>If you run this mode, publish the floor on your pool page.</strong>
+    </p>
   </div>
 
   <div class="note">
-    <span class="label">Why a fourth mode at all</span>
+    <span class="label">Why the PPLNS modes exist at all</span>
     <p>
       PPS prices a share the moment it arrives, whether or not it ever becomes
       a block. Somebody has to fund the gap between what has been promised and
@@ -473,46 +531,57 @@ footer .wrap > p { max-width: 46rem; }
 
   <div class="tablewrap">
     <table>
-      <thead><tr><th>&nbsp;</th><th>solo</th><th>pps-classic</th><th>pplns-thunder</th><th>pplns-btc</th></tr></thead>
+      <thead><tr><th>&nbsp;</th><th>solo</th><th>pps-classic</th><th>pplns-thunder</th><th>pplns-btc</th><th>pplns-coinbase</th></tr></thead>
       <tbody>
         <tr><td>Coinbase outputs</td>
             <td>miner's address + operator fee</td>
             <td><code>pool_btc_address</code> + operator fee</td>
-            <td colspan="2"><code>pool_btc_address</code> + operator fee</td></tr>
+            <td colspan="2"><code>pool_btc_address</code> + operator fee</td>
+            <td>one per miner in the window + operator</td></tr>
         <tr><td>Per-connection coinbase</td>
             <td>yes — each miner's <code>cb1</code>/<code>cb2</code> pay <em>that</em> miner</td>
             <td>no — every miner's coinbase pays the pool</td>
-            <td colspan="2">no — every miner's coinbase pays the pool</td></tr>
+            <td colspan="2">no — every miner's coinbase pays the pool</td>
+            <td>no — every miner's coinbase pays the whole window</td></tr>
         <tr><td>Stratum username</td><td>Bitcoin address</td><td>Thunder address</td>
-            <td>Thunder address</td><td>Bitcoin address</td></tr>
+            <td>Thunder address</td><td>Bitcoin address</td><td>Bitcoin address</td></tr>
         <tr><td>Off-chain accounting</td><td>none</td><td><code>pps_credits</code></td>
-            <td colspan="2"><code>pps_credits</code>, same table</td></tr>
+            <td colspan="2"><code>pps_credits</code>, same table</td>
+            <td>none — the block is the ledger</td></tr>
         <tr><td>When a balance moves</td><td>never — the coinbase is the payment</td>
             <td>as each share arrives</td>
-            <td colspan="2">when a block matures, 100 deep</td></tr>
+            <td colspan="2">when a block matures, 100 deep</td>
+            <td>never — the coinbase is the payment</td></tr>
         <tr><td>Paid for work that found nothing</td><td>no</td><td>yes</td>
-            <td colspan="2">no</td></tr>
+            <td colspan="3">no</td></tr>
         <tr><td>Transaction fees shared</td><td>yes, to the finder</td><td>no — subsidy-derived rate</td>
-            <td colspan="2">yes, to the window</td></tr>
+            <td colspan="3">yes, to the window</td></tr>
         <tr><td>Pool custodies BTC</td><td>never</td><td>yes, between mining and deposit</td>
-            <td>yes, between mining and deposit</td><td>yes, in the enforcer wallet</td></tr>
+            <td>yes, between mining and deposit</td><td>yes, in the enforcer wallet</td>
+            <td>never</td></tr>
         <tr><td>Operator reserve needed</td><td>none</td><td>yes — measured in block rewards</td>
-            <td colspan="2">none</td></tr>
+            <td colspan="3">none</td></tr>
         <tr><td>Payout asset</td><td>BTC, on the mainchain</td><td>BTC on Thunder, a BIP300 sidechain</td>
-            <td>BTC on Thunder</td><td>BTC, on the mainchain</td></tr>
+            <td>BTC on Thunder</td><td>BTC, on the mainchain</td>
+            <td>BTC, on the mainchain</td></tr>
         <tr><td>Payout worker</td><td>not installed</td><td><code>simplepool-payout.service</code></td>
             <td><code>simplepool-payout.service</code></td>
-            <td>same, with <code>PAYOUT_RAIL=btc</code></td></tr>
+            <td>same, with <code>PAYOUT_RAIL=btc</code></td>
+            <td>not installed</td></tr>
+        <tr><td>A claim too small to pay</td><td colspan="2">cannot arise</td>
+            <td colspan="2">accrues until the payout worker can batch it</td>
+            <td><strong>forfeited to the operator</strong>, permanently</td></tr>
         <tr><td>Miner's income</td><td>lumpy and rare, but complete</td><td>smooth and proportional</td>
-            <td colspan="2">proportional, but only when the pool finds a block</td></tr>
+            <td colspan="2">proportional, but only when the pool finds a block</td>
+            <td>the same, above the payout floor — nothing below it</td></tr>
         <tr><td>Who eats bad luck</td><td>the miner</td><td>the pool operator</td>
-            <td colspan="2">the miners, together</td></tr>
+            <td colspan="3">the miners, together</td></tr>
       </tbody>
     </table>
   </div>
 
   <div class="warnbox">
-    <span class="label">A fifth mode existed and was removed</span>
+    <span class="label">A sixth mode existed and was removed</span>
     <p>
       <code>pool_mode = pps</code> put a BIP300 drivechain deposit directly in
       each coinbase, so the pool would never custody BTC at all. It does not
@@ -1843,13 +1912,21 @@ Password  (anything — it is discarded)</code></pre>
       <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
       <tbody>
         <tr><td><code>pool_mode</code></td><td><code>solo</code></td>
-            <td><code>solo</code>, <code>pps-classic</code>, <code>pplns-thunder</code> or <code>pplns-btc</code>.
+            <td><code>solo</code>, <code>pps-classic</code>, <code>pplns-thunder</code>, <code>pplns-btc</code> or <code>pplns-coinbase</code>.
                 Decides the coinbase shape, what a username must be, and when a balance moves.
                 Bare <code>pplns</code> is refused: it does not say which rail pays.</td></tr>
         <tr><td><code>pplns_window_diff_multiple</code></td><td><code>2.0</code></td>
             <td>PPLNS only. Window size as a multiple of the CURRENT network difficulty, so it
                 self-scales across retargets. Must be &gt; 0; below 1.0 a block pays out across
                 less work than it took to find, which rewards pool hopping, and the proxy warns.</td></tr>
+        <tr><td><code>coinbase_max_bytes</code></td><td><code>1000</code></td>
+            <td><code>pplns-coinbase</code> only. Byte budget for the WHOLE serialized coinbase,
+                commitments included — a rented-hashrate marketplace measures bytes, and drivechain
+                <code>OP_RETURN</code>s spend them before any payout does. Minimum 200.</td></tr>
+        <tr><td><code>pplns_payout_floor_sats</code></td><td><code>546</code></td>
+            <td><code>pplns-coinbase</code> only. A claim worth less than this is <strong>not paid,
+                and is forfeited to the operator</strong> — nothing is carried and nothing settles
+                later. Clamped up to 546, the dust limit. Disclose it to your miners.</td></tr>
         <tr><td><code>operator_address</code></td><td>—</td>
             <td><strong>Required.</strong> Receives the <code>fee_bps</code> cut. The proxy refuses to start without it.</td></tr>
         <tr><td><code>fee_bps</code></td><td><code>100</code></td>

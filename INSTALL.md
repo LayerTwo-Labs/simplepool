@@ -28,12 +28,21 @@ possibilities are called out clearly:
 - **`pool_mode = pplns-btc`** — the same accounting, paid on Bitcoin L1
   through the enforcer's own wallet. Usernames are Bitcoin addresses.
   No Thunder node anywhere in the stack.
+- **`pool_mode = pplns-coinbase`** — the same accounting with no custody
+  at all: the block's coinbase pays the whole window directly, one output
+  per miner. No pool wallet, no payout worker, no maturity wait.
+  Usernames are Bitcoin addresses. **A miner whose share of a block is
+  worth less than `pplns_payout_floor_sats` (default 546) is not paid,
+  and the amount goes to the operator — it is not carried and not settled
+  later.** That is deliberate; see the mode's section in
+  [README.md](README.md#the-five-modes) and publish the floor to your
+  miners before you run it.
 
 If you cannot fund a PPS reserve, one of the `pplns-*` modes is the
 pooled mode you can actually run: the pool never owes more than it has
 just been paid.
 
-(A fifth mode, `pool_mode = pps`, put the drivechain deposit directly in
+(A sixth mode, `pool_mode = pps`, put the drivechain deposit directly in
 the coinbase. The enforcer never credited it, so it has been removed —
 `CLASSIC_PAYOUTS.md` has the evidence.)
 

@@ -6,14 +6,16 @@ connections on TCP `:3334`, builds block templates via `bitcoind`'s
 accepted share into a local SQLite database. A separate Node.js dashboard
 reads that file for stats.
 
-It runs in four modes, which differ in who carries the variance: **solo**,
-where the miner who finds a block is paid in that block's own coinbase;
-**pps-classic**, where every accepted share earns a derivable amount and the
-operator absorbs the variance out of a reserve; and **pplns-thunder** /
-**pplns-btc**, where a matured block is split across the shares that produced
-it, so the miners carry the variance and the pool never owes more than it has
-just been paid. All four ship in this repo — see [The four
-modes](#the-four-modes) below.
+It runs in five modes, which differ in who carries the variance and who holds
+the money in between: **solo**, where the miner who finds a block is paid in
+that block's own coinbase; **pps-classic**, where every accepted share earns a
+derivable amount and the operator absorbs the variance out of a reserve;
+**pplns-thunder** / **pplns-btc**, where a matured block is split across the
+shares that produced it, so the miners carry the variance and the pool never
+owes more than it has just been paid; and **pplns-coinbase**, which is that
+same PPLNS accounting with the custody removed — the block's own coinbase pays
+the whole window directly, one output per miner. All five ship in this repo —
+see [The five modes](#the-five-modes) below.
 
 Created by **Roberto Santacroce**.
 Canonical repository: <https://github.com/LayerTwo-Labs/simplepool>.
@@ -46,11 +48,11 @@ curl -fsSL https://raw.githubusercontent.com/LayerTwo-Labs/simplepool/main/scrip
 > audit every number — lives at [`docs/simplepool.html`](docs/simplepool.html).
 > Open it from disk or serve it next to the dashboard.
 
-### The four modes
+### The five modes
 
-This repository ships **all four**, selected by `pool_mode` in
-`proxy.conf`. They differ in two independent things — whether the coinbase
-pays the miner or the pool, and what a stratum username is:
+This repository ships **all five**, selected by `pool_mode` in
+`proxy.conf`. They differ in two independent things — who the coinbase pays,
+and what a stratum username is:
 
 | `pool_mode` | coinbase pays | username | who carries the variance |
 | --- | --- | --- | --- |
@@ -58,6 +60,7 @@ pays the miner or the pool, and what a stratum username is:
 | `pps-classic` | the pool | Thunder address | the operator, out of a reserve |
 | `pplns-thunder` | the pool | Thunder address | the miners |
 | `pplns-btc` | the pool | Bitcoin address | the miners |
+| `pplns-coinbase` | **the whole window, directly** | Bitcoin address | the miners |
 
 - **`pool_mode = solo`** (default) — every share lands in the local
   SQLite store, every accepted block is paid directly in its own
@@ -146,6 +149,45 @@ pays the miner or the pool, and what a stratum username is:
   One rail per pool, encoded in `pool_mode` rather than a mode plus a
   separate rail knob, so the inconsistent configuration is unrepresentable
   rather than merely rejected.
+
+- **`pool_mode = pplns-coinbase`** — the same PPLNS accounting as the two
+  rails above, with the custody taken out. There is no pool wallet, no
+  payout worker, no `pps_credits` row and no maturity wait: the block's own
+  coinbase pays the entire window directly, one output per miner, largest
+  claim first. A reorged block simply never paid, so there is nothing to
+  claw back. Username is a Bitcoin address.
+
+  The window is snapshotted onto the job when the template is built, so the
+  coinbase pays the work that exists *now* rather than work from 100 blocks
+  ago. On a drivechain the coinbase comes from the CUSF enforcer, and its
+  BIP300/301 commitment `OP_RETURN`s are preserved byte-for-byte — only the
+  enforcer's own reward output is replaced, by the window.
+
+  **Two limits, and both cost miners money rather than the pool:**
+
+  - `coinbase_max_bytes` (default 1000) budgets the *whole serialized
+    coinbase*, commitments included, because that is what a rented-hashrate
+    marketplace measures when it decides a job is oversized. A production
+    coinbase-direct pool reports whole coinbases of 721–817 bytes paying up
+    to 16 miners, where the same 16 payouts cost 817 bytes against four
+    drivechain `OP_RETURN`s and 769 against three. A cap counted in outputs
+    cannot see that; a byte budget can.
+  - `pplns_payout_floor_sats` (default 546, the dust limit) is the minimum
+    a claim must be worth to get an output at all.
+
+  **A claim that clears neither is forfeited to the operator. It is not
+  carried, not recorded, and not settled later.** That is a deliberate
+  policy and not a rounding artefact: there is nowhere to hold it, because
+  the payment *is* the block, and carrying it would rebuild exactly the
+  custodial ledger this mode exists to delete. The consequence is a hashrate
+  floor — a miner too small to clear it will mine here, submit valid shares,
+  and earn nothing indefinitely, which is strictly worse for them than solo
+  mining, where they at least hold a lottery ticket.
+
+  Because that is a trap unless it is visible, the proxy states the floor at
+  startup, logs how many miners in the current window fall below it, and
+  reports per block how many claims were forfeited and for how much. **If
+  you run this mode, publish the floor on your pool page.**
 
 In every mode the operator fee stays in BTC, paid to `operator_address`
 out of the same coinbase. On PPLNS it is normally set lower than on PPS:

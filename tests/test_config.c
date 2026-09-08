@@ -271,6 +271,39 @@ static void test_the_coinbase_budget_defaults_and_parses(void) {
     CHECK(cfg.coinbase_max_bytes == 820);
 }
 
+/* The payout floor decides who this pool refuses to serve, so it has to parse
+ * exactly and default to something an operator can defend. It is the harshest
+ * knob in the file: above it a miner is paid out of the block, below it a
+ * miner mines here and earns nothing. */
+static void test_the_payout_floor_defaults_and_parses(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.pplns_payout_floor_sats == 546);   /* the dust limit */
+
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "pplns_payout_floor_sats = 25000\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.pplns_payout_floor_sats == 25000);
+
+    /* Zero is legitimate: it means "pay anything the dust limit allows", and
+     * coinbase.c clamps it up. Only a negative is a typo. */
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "pplns_payout_floor_sats = 0\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.pplns_payout_floor_sats == 0);
+
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "pplns_payout_floor_sats = -1\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "pplns_payout_floor_sats") != NULL);
+}
+
 /* ---- listener lines ------------------------------------------------------
  *
  * A `listener` line is how rented hashrate is served its own difficulty. A
@@ -362,6 +395,7 @@ int main(void) {
     test_inline_comment_still_strips();
     test_rejects_bad_operator_address();
     test_the_coinbase_budget_defaults_and_parses();
+    test_the_payout_floor_defaults_and_parses();
     test_a_tiny_coinbase_budget_is_refused();
     test_pplns_coinbase_validates_the_window();
     test_pplns_coinbase_refuses_a_pool_wallet();

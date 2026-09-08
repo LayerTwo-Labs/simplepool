@@ -180,40 +180,6 @@ static double effective_pps_rate(const proxy_config_t *cfg,
     return pps_rate_from_template(value_sats, net_diff, cfg->fee_bps);
 }
 
-/* Build a job from a freshly fetched template. The coinbase is rendered
- * per-connection inside stratum.c (each miner pays their own address),
- * so we only pass template-level data here. */
-/* What a found block's coinbase actually paid, and what it carried.
- *
- * Only the carried part is recorded. A claim the coinbase paid is settled on
- * chain and has no business in a ledger of what is owed; a claim it could not
- * pay rode on the operator output, which means the operator is holding it. */
-static void on_window_outcome_cb(void *ctx, const char *block_hash,
-                                 const int64_t *worker_ids,
-                                 const int64_t *owed_sats,
-                                 const int64_t *paid_sats, size_t n) {
-    server_ctx_t *s = (server_ctx_t *)ctx;
-    if (!s || !s->store) return;
-    char werr[256] = {0};
-    int rc = store_record_window_carry(s->store, worker_ids, owed_sats,
-                                       paid_sats, n, werr, sizeof werr);
-    if (rc < 0) {
-        LOG_WARN("pplns-coinbase: could not record carried claims for block "
-                 "%.16s: %s — the operator is holding money the ledger does "
-                 "not know about", block_hash ? block_hash : "?", werr);
-        return;
-    }
-    if (rc > 0) {
-        int64_t carried = 0;
-        for (size_t i = 0; i < n; ++i) carried += owed_sats[i] - paid_sats[i];
-        LOG_INFO("pplns-coinbase: block %.16s paid %zu miner(s) directly; "
-                 "%d claim(s) totalling %lld sats were below the floor or out "
-                 "of coinbase room and are carried",
-                 block_hash ? block_hash : "?", n - (size_t)rc, rc,
-                 (long long)carried);
-    }
-}
-
 /* Snapshot the PPLNS window onto a freshly built job, for pplns-coinbase.
  *
  * The window is taken from the template that is about to go out, so the
@@ -283,12 +249,42 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
     /* Split the payable amount by difficulty. The fee comes off the top the
      * same way every other builder does it, so it is computed here too --
      * the payees have to sum to exactly what is left, or the builder refuses
-     * rather than letting the block forfeit the difference. */
+     * rather than letting the block forfeit the difference.
+     *
+     * On a server-provided coinbase the number to divide is what that
+     * transaction's spendable output actually pays, NOT the template's
+     * coinbase_value_sats, which is the SUM of every output. They agree
+     * whenever the commitments carry no value, which is the only shape seen
+     * in practice -- but "agree in practice" is exactly the kind of premise
+     * that fails on somebody else's node, and the failure has no floor: the
+     * payees would no longer sum to the reward, so the builder would refuse
+     * every render, on every connection, and the pool would stop publishing
+     * work with nothing but a repeated warning to explain it.
+     *
+     * Ask the transaction instead, and the premise cannot fail. If it cannot
+     * be asked, refuse THIS template with a reason rather than mining a split
+     * that the builder will reject a thousand times over. */
     int64_t value = t->coinbase_value_sats;
+    if (t->coinbasetxn_hex) {
+        int64_t from_tx = 0;
+        if (coinbase_template_reward(t->coinbasetxn_hex, &from_tx) < 0) {
+            LOG_WARN("pplns-coinbase: the template's coinbase does not have a "
+                     "single spendable output to replace — no window can be "
+                     "paid from it, so this template is skipped");
+            return -1;
+        }
+        if (from_tx != value) {
+            LOG_WARN("pplns-coinbase: template says coinbasevalue=%lld but its "
+                     "coinbase pays %lld — splitting what the transaction "
+                     "actually pays",
+                     (long long)value, (long long)from_tx);
+        }
+        value = from_tx;
+    }
     int64_t fee = 0;
     if (cfg->operator_address[0] && cfg->fee_bps > 0) {
         int64_t f = (value * (int64_t)cfg->fee_bps) / 10000;
-        if (f >= 546) fee = f;      /* COINBASE_DUST_SATS */
+        if (f >= COINBASE_DUST_SATS) fee = f;
     }
     int64_t payable = value - fee;
     if (payable <= 0) {
@@ -298,10 +294,8 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
     }
 
     coinbase_payee_t payees[COINBASE_MAX_PAYOUT_OUTPUTS];
-    int64_t worker_ids[COINBASE_MAX_PAYOUT_OUTPUTS];
     int64_t assigned = 0;
     for (size_t i = 0; i < n; ++i) {
-        worker_ids[i] = win[i].worker_id;
         payees[i].address = win[i].payout_address;
         payees[i].sats = (int64_t)((double)payable * (win[i].difficulty / total));
         assigned += payees[i].sats;
@@ -313,15 +307,50 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
      * A handful of satoshis, to the miner with the strongest claim on them. */
     if (assigned < payable) payees[0].sats += payable - assigned;
 
-    if (stratum_job_set_window(job, payees, worker_ids, n) < 0) {
+    if (stratum_job_set_window(job, payees, n) < 0) {
         LOG_WARN("pplns-coinbase: could not attach the window to the job");
         return -1;
     }
+
+    /* Warn about miners the floor will exclude, BEFORE a block makes it real.
+     *
+     * The per-block line in stratum.c reports what was forfeited after the
+     * fact; this reports who is about to be, which is the only form an
+     * operator can act on -- by telling those miners, or by lowering the
+     * floor. Rate-limited to changes in the count, because it is recomputed
+     * on every template and a steady state is not news -- the static needs no
+     * lock, this runs only on the template-poller thread.
+     *
+     * The clamp mirrors coinbase.c's: below the dust limit there is no floor
+     * to have, so reporting an unclamped one would understate who loses. */
+    int64_t floor_sats = cfg->pplns_payout_floor_sats < COINBASE_DUST_SATS
+                       ? COINBASE_DUST_SATS : cfg->pplns_payout_floor_sats;
+    size_t below = 0;
+    for (size_t i = 0; i < n; ++i) if (payees[i].sats < floor_sats) below++;
+    static size_t last_below = (size_t)-1;
+    if (below != last_below) {
+        last_below = below;
+        if (below > 0) {
+            LOG_INFO("pplns-coinbase: %zu of %zu miner(s) in the window are "
+                     "below the %lld-sat payout floor and will earn NOTHING "
+                     "from the next block — their share is forfeited to the "
+                     "operator, not carried. Tell them, or lower "
+                     "pplns_payout_floor_sats.",
+                     below, n, (long long)floor_sats);
+        } else {
+            LOG_INFO("pplns-coinbase: every miner in the window clears the "
+                     "%lld-sat payout floor", (long long)floor_sats);
+        }
+    }
+
     LOG_DEBUG("pplns-coinbase: window of %zu miner(s), %.2f difficulty, "
               "paying %lld sats", n, total, (long long)payable);
     return 0;
 }
 
+/* Build a job from a freshly fetched template. The coinbase is rendered
+ * per-connection inside stratum.c (each miner pays their own address),
+ * so we only pass template-level data here. */
 static stratum_job_t *build_job_from_template(const proxy_config_t *cfg,
                                               const bitcoind_template_t *t,
                                               char *errbuf, size_t errlen) {
@@ -1328,8 +1357,18 @@ int main(int argc, char **argv) {
     stcfg.coinbase_pays_pool   = mode_pps_classic ||
                                  mode_pplns_thunder || mode_pplns_btc;
     stcfg.coinbase_pays_window = mode_pplns_cb;
-    stcfg.on_window_outcome    = mode_pplns_cb ? on_window_outcome_cb : NULL;
+    if (mode_pplns_cb) {
+        /* Say the policy out loud on every start. It is the one place this
+         * pool is harsher than a custodial one, and an operator who never
+         * saw it stated cannot disclose it to the miners it costs. */
+        LOG_INFO("pplns-coinbase: payout floor %lld sats — a miner whose "
+                 "share of a block is worth less than that is NOT PAID, and "
+                 "the amount goes to the operator. Nothing is carried and "
+                 "nothing settles later. Publish this on your pool page.",
+                 (long long)cfg.pplns_payout_floor_sats);
+    }
     stcfg.max_coinbase_bytes   = (size_t)cfg.coinbase_max_bytes;
+    stcfg.payout_floor_sats    = cfg.pplns_payout_floor_sats;
     stcfg.username_is_thunder = mode_pps_classic || mode_pplns_thunder;
     snprintf(stcfg.pool_btc_address, sizeof stcfg.pool_btc_address, "%s",
              cfg.pool_btc_address);
