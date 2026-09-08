@@ -331,22 +331,41 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
     if (strcmp(cfg->pool_mode, "pplns") == 0) {
         set_err(errbuf, errlen,
                 "config: 'pool_mode = pplns' does not say which rail pays. "
-                "Use 'pplns-thunder' or 'pplns-btc' — an operator runs one or "
-                "the other, and the rail decides what a stratum username is");
+                "Use 'pplns-thunder', 'pplns-btc' or 'pplns-coinbase' — an "
+                "operator runs one, and the rail decides what a stratum "
+                "username is and who ever holds the reward");
         return -5;
     }
+    /* Pays the window straight out of the coinbase of the block that produced
+     * it. Same accounting as the other two, and the pool never receives the
+     * reward at all — so there is no wallet, no payout worker and no maturity
+     * gate, because a reorged block simply never paid. */
+    int mode_cb_window = strcmp(cfg->pool_mode, "pplns-coinbase") == 0;
     int mode_pplns = strcmp(cfg->pool_mode, "pplns-thunder") == 0 ||
-                     strcmp(cfg->pool_mode, "pplns-btc")     == 0;
+                     strcmp(cfg->pool_mode, "pplns-btc")     == 0 ||
+                     mode_cb_window;
     if (strcmp(cfg->pool_mode, "solo")        != 0 &&
         strcmp(cfg->pool_mode, "pps-classic") != 0 &&
         !mode_pplns) {
         set_err(errbuf, errlen,
                 "config: 'pool_mode' must be 'solo', 'pps-classic', "
-                "'pplns-thunder' or 'pplns-btc', got '%s'",
+                "'pplns-thunder', 'pplns-btc' or 'pplns-coinbase', got '%s'",
                 cfg->pool_mode);
         return -5;
     }
-    if (mode_pplns) {
+    if (mode_cb_window && cfg->pool_btc_address[0] != '\0') {
+        /* Not a harmless leftover. The whole claim of this mode is that the
+         * pool never holds the reward, and a configured pool wallet is the
+         * shape of a pool that does — most likely a mode switched in place
+         * without the rest of the config following. Refusing beats running a
+         * custodial-looking pool that quietly is not one. */
+        set_err(errbuf, errlen,
+                "config: 'pool_btc_address' must not be set when "
+                "pool_mode=pplns-coinbase — this mode pays miners directly "
+                "from the coinbase and the pool never receives the reward");
+        return -9;
+    }
+    if (mode_pplns && !mode_cb_window) {
         /* Same custody shape as pps-classic: the coinbase pays the pool, and
          * the payout worker distributes. Without an address every rendered
          * coinbase would fail at runtime instead of here. */
@@ -356,6 +375,8 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                     cfg->pool_mode);
             return -9;
         }
+    }
+    if (mode_pplns) {
         if (!(cfg->pplns_window_diff_multiple > 0.0)) {
             set_err(errbuf, errlen,
                     "config: 'pplns_window_diff_multiple' must be > 0, got %g",

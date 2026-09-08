@@ -7,6 +7,7 @@
 #include "share.h"
 #include "store.h"
 #include "reconcile.h"
+#include "coinbase.h"
 #include "stratum.h"
 #include "version.h"
 
@@ -182,6 +183,98 @@ static double effective_pps_rate(const proxy_config_t *cfg,
 /* Build a job from a freshly fetched template. The coinbase is rendered
  * per-connection inside stratum.c (each miner pays their own address),
  * so we only pass template-level data here. */
+/* Snapshot the PPLNS window onto a freshly built job, for pplns-coinbase.
+ *
+ * The window is taken from the template that is about to go out, so the
+ * coinbase pays the work that exists NOW. That is the whole difference from
+ * the other two rails, which read the window ~100 blocks later out of a block
+ * that already matured. There is nothing to mature here: the payment IS the
+ * block, so a reorged block simply never paid and there is no credit to claw
+ * back.
+ *
+ * Returns 0 when the job may be published. Non-zero means no coinbase can be
+ * rendered from it -- an empty window, or arithmetic that would not add up --
+ * and the caller must not publish it: a coinbase paying nobody forfeits the
+ * whole block.
+ */
+static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
+                               double net_diff, const bitcoind_template_t *t,
+                               stratum_job_t *job) {
+    if (strcmp(cfg->pool_mode, "pplns-coinbase") != 0) return 0;
+    if (!(net_diff > 0.0)) {
+        LOG_WARN("pplns-coinbase: no network difficulty yet — cannot size the "
+                 "window, holding this template back");
+        return -1;
+    }
+    double window = net_diff * cfg->pplns_window_diff_multiple;
+
+    store_window_entry_t win[COINBASE_MAX_PAYOUT_OUTPUTS];
+    size_t n = 0;
+    double total = 0.0;
+    int truncated = 0;
+    char werr[256] = {0};
+    if (store_pplns_window(store, window, win,
+                           sizeof win / sizeof win[0], &n, &total,
+                           &truncated, werr, sizeof werr) < 0) {
+        LOG_WARN("pplns-coinbase: window query failed: %s", werr);
+        return -1;
+    }
+    if (n == 0 || !(total > 0.0)) {
+        LOG_INFO("pplns-coinbase: no shares in the window yet — holding this "
+                 "template back rather than mining a block that pays nobody");
+        return -1;
+    }
+    if (truncated) {
+        /* store_pplns_window drops the tail from the TOTAL as well, so those
+         * miners' claims are redistributed to the ones that fit rather than
+         * carried as a debt. Say so: it is a real, if small, unfairness and
+         * it should not be discovered in the amounts. */
+        LOG_WARN("pplns-coinbase: window holds more than %zu payable miners; "
+                 "the smallest are not in this block's coinbase and their "
+                 "share of it goes to the others",
+                 (size_t)(sizeof win / sizeof win[0]));
+    }
+
+    /* Split the payable amount by difficulty. The fee comes off the top the
+     * same way every other builder does it, so it is computed here too --
+     * the payees have to sum to exactly what is left, or the builder refuses
+     * rather than letting the block forfeit the difference. */
+    int64_t value = t->coinbase_value_sats;
+    int64_t fee = 0;
+    if (cfg->operator_address[0] && cfg->fee_bps > 0) {
+        int64_t f = (value * (int64_t)cfg->fee_bps) / 10000;
+        if (f >= 546) fee = f;      /* COINBASE_DUST_SATS */
+    }
+    int64_t payable = value - fee;
+    if (payable <= 0) {
+        LOG_WARN("pplns-coinbase: template pays %lld sats, nothing left after "
+                 "the operator fee", (long long)value);
+        return -1;
+    }
+
+    coinbase_payee_t payees[COINBASE_MAX_PAYOUT_OUTPUTS];
+    int64_t assigned = 0;
+    for (size_t i = 0; i < n; ++i) {
+        payees[i].address = win[i].payout_address;
+        payees[i].sats = (int64_t)((double)payable * (win[i].difficulty / total));
+        assigned += payees[i].sats;
+    }
+    /* Truncating division leaves a few sats over. They cannot be dropped --
+     * the builder requires the split to spend `payable` exactly, and a
+     * coinbase that pays out less forfeits the difference to nobody -- so
+     * they go to the largest claim, which store_pplns_window returns first.
+     * A handful of satoshis, to the miner with the strongest claim on them. */
+    if (assigned < payable) payees[0].sats += payable - assigned;
+
+    if (stratum_job_set_window(job, payees, n) < 0) {
+        LOG_WARN("pplns-coinbase: could not attach the window to the job");
+        return -1;
+    }
+    LOG_DEBUG("pplns-coinbase: window of %zu miner(s), %.2f difficulty, "
+              "paying %lld sats", n, total, (long long)payable);
+    return 0;
+}
+
 static stratum_job_t *build_job_from_template(const proxy_config_t *cfg,
                                               const bitcoind_template_t *t,
                                               char *errbuf, size_t errlen) {
@@ -785,6 +878,19 @@ static void *tip_watcher(void *arg) {
                 bitcoind_template_free(t);
                 continue;
             }
+            /* pplns-coinbase pays the window out of this block's own
+             * coinbase, so the window has to be on the job before anyone
+             * mines it. A job that cannot carry one is not published: every
+             * coinbase rendered from it would pay nobody, which forfeits the
+             * whole block. */
+            if (attach_pplns_window(s->store, s->cfg,
+                                    atomic_load_explicit(&s->net_difficulty,
+                                                         memory_order_relaxed),
+                                    t, job) != 0) {
+                stratum_job_free(job);
+                bitcoind_template_free(t);
+                continue;
+            }
             stratum_server_set_job(s->srv, job, new_tip);
             /* Difficulty and block value move with the template, so the
              * rate has to move with it too. */
@@ -1166,10 +1272,15 @@ int main(int argc, char **argv) {
     int mode_pps_classic   = strcmp(cfg.pool_mode, "pps-classic")   == 0;
     int mode_pplns_thunder = strcmp(cfg.pool_mode, "pplns-thunder") == 0;
     int mode_pplns_btc     = strcmp(cfg.pool_mode, "pplns-btc")     == 0;
-    int mode_pplns         = mode_pplns_thunder || mode_pplns_btc;
+    /* Same accounting, no custody: the coinbase pays the window directly. */
+    int mode_pplns_cb      = strcmp(cfg.pool_mode, "pplns-coinbase") == 0;
 
     stcfg.pps_accrues         = mode_pps_classic;
-    stcfg.coinbase_pays_pool  = mode_pps_classic || mode_pplns;
+    /* Mutually exclusive by construction: the reward goes to the miners or
+     * to the pool, never both. */
+    stcfg.coinbase_pays_pool   = mode_pps_classic ||
+                                 mode_pplns_thunder || mode_pplns_btc;
+    stcfg.coinbase_pays_window = mode_pplns_cb;
     stcfg.username_is_thunder = mode_pps_classic || mode_pplns_thunder;
     snprintf(stcfg.pool_btc_address, sizeof stcfg.pool_btc_address, "%s",
              cfg.pool_btc_address);
@@ -1212,7 +1323,14 @@ int main(int argc, char **argv) {
     }
     sctx.srv = srv;
     /* First job of the process: nobody is connected yet, so the flag reaches
-     * no one, but a new tip is what it describes. */
+     * no one, but a new tip is what it describes.
+     *
+     * Under pplns-coinbase this one deliberately carries no window. Network
+     * difficulty has not been read yet, and a process that has just started
+     * has no shares to pay anyway — so the window would be empty even if it
+     * could be sized. conn_render_coinbase refuses to render from a
+     * windowless job rather than paying nobody, and the tip watcher publishes
+     * a job with a real window within one poll interval. */
     stratum_server_set_job(srv, initial_job, 1);
 
     /* A port's promised floor and the chain can disagree, and the floor wins

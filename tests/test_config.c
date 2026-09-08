@@ -205,6 +205,45 @@ static void test_the_window_defaults_to_two(void) {
     CHECK(cfg.pplns_window_diff_multiple == 2.0);
 }
 
+/* pplns-coinbase pays the window out of the block's own coinbase, so the pool
+ * never receives the reward. */
+static void test_pplns_coinbase_is_accepted_without_a_pool_wallet(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(strcmp(cfg.pool_mode, "pplns-coinbase") == 0);
+    CHECK(cfg.pplns_window_diff_multiple == 2.0);
+}
+
+/* A configured pool wallet is refused rather than ignored. The whole claim of
+ * this mode is that the pool never holds the reward, and a pool_btc_address is
+ * the shape of a pool that does — most likely a mode switched in place without
+ * the rest of the config following. Running a custodial-looking pool that
+ * quietly is not one is worse than refusing to start. */
+static void test_pplns_coinbase_refuses_a_pool_wallet(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "pool_btc_address = %s\n", VALID_ADDR, VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "must not be set") != NULL);
+    CHECK(strstr(err, "pays miners directly from the coinbase") != NULL);
+}
+
+/* It is a pplns mode, so the window knob applies to it too. */
+static void test_pplns_coinbase_validates_the_window(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "pplns_window_diff_multiple = 0\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "pplns_window_diff_multiple") != NULL);
+}
+
 /* ---- listener lines ------------------------------------------------------
  *
  * A `listener` line is how rented hashrate is served its own difficulty. A
@@ -295,6 +334,9 @@ int main(void) {
     test_quoted_value_keeps_hash();
     test_inline_comment_still_strips();
     test_rejects_bad_operator_address();
+    test_pplns_coinbase_validates_the_window();
+    test_pplns_coinbase_refuses_a_pool_wallet();
+    test_pplns_coinbase_is_accepted_without_a_pool_wallet();
     test_a_nonsense_log_level_warns_and_keeps_the_default();
     test_log_level_accepts_names_and_numbers();
     test_a_listener_without_a_port_is_refused();

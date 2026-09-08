@@ -6,6 +6,8 @@
 #include <stdatomic.h>
 #include <stdint.h>
 
+#include "coinbase.h"   /* coinbase_payee_t */
+
 typedef struct stratum_job stratum_job_t;
 
 /* The extranonce split, advertised on mining.subscribe and baked into every
@@ -63,6 +65,20 @@ stratum_job_t *stratum_job_new(
     uint32_t height,
     const char *const *tx_hex_list, size_t tx_count,
     const char *coinbasetxn_hex, int coinbase_has_witness);
+
+/* Attach the PPLNS window this job's block would pay, for pool_mode =
+ * pplns-coinbase. The job takes its own copy of both the amounts and the
+ * addresses, so the caller's array can be stack-allocated and reused.
+ *
+ * Called once, before the job is published — the window is a SNAPSHOT taken
+ * when the template was built, not a live view. A miner that connects after
+ * the job went out is not in that job's coinbase and is not paid by a block
+ * found against it; it is picked up by the next template. The refresh cadence
+ * is what bounds how stale that snapshot gets.
+ *
+ * Returns 0 on success, negative on allocation failure. */
+int stratum_job_set_window(stratum_job_t *j,
+                           const coinbase_payee_t *payees, size_t n_payees);
 
 void stratum_job_free(stratum_job_t *j);
 
@@ -179,6 +195,16 @@ typedef struct {
      */
     int     coinbase_pays_pool;
     int     username_is_thunder;
+
+    /* pplns-coinbase: the coinbase pays the WINDOW directly, one output per
+     * miner, so the pool never receives the reward at all. Mutually exclusive
+     * with coinbase_pays_pool — the reward goes to the miners or to the pool,
+     * never both — and distinct from solo, which pays only the finder.
+     *
+     * The window itself rides on the job (stratum_job_set_window), because it
+     * is a snapshot taken when the template was built. */
+    int     coinbase_pays_window;
+    size_t  max_payout_outputs;   /* 0 = COINBASE_MAX_PAYOUT_OUTPUTS */
 
     /* Does this mode price a share when it arrives? Only pps-classic does.
      * It is what the accrual gate suspends, so the gate must key on this and

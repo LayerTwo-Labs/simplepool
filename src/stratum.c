@@ -133,6 +133,13 @@ struct stratum_job {
     char   **tx_hex_list;   /* owned */
     size_t   tx_count;
 
+    /* pplns-coinbase: who this job's block pays, snapshotted at build time.
+     * `payees[i].address` points into the arena so the whole window is two
+     * allocations rather than one per miner. */
+    coinbase_payee_t *payees;
+    char             *payee_addrs;
+    size_t            n_payees;
+
     uint64_t created_ms;    /* for retention ring */
 
     /* References held. The server holds one for current_job and one for each
@@ -233,7 +240,36 @@ void stratum_job_free(stratum_job_t *j) {
         for (size_t i = 0; i < j->tx_count; ++i) free(j->tx_hex_list[i]);
         free(j->tx_hex_list);
     }
+    free(j->payees);
+    free(j->payee_addrs);
     free(j);
+}
+
+/* Copy a window onto the job. Two allocations for the whole thing: one array
+ * of payees and one arena the addresses live in, so a 200-miner window is not
+ * 200 strdups that have to be unwound on every job retirement. */
+int stratum_job_set_window(stratum_job_t *j,
+                           const coinbase_payee_t *payees, size_t n_payees) {
+    if (!j) return -1;
+    free(j->payees);      j->payees = NULL;
+    free(j->payee_addrs); j->payee_addrs = NULL;
+    j->n_payees = 0;
+    if (!payees || n_payees == 0) return 0;
+
+    enum { ADDR_STRIDE = 128 };
+    coinbase_payee_t *arr = calloc(n_payees, sizeof *arr);
+    char *arena = calloc(n_payees, ADDR_STRIDE);
+    if (!arr || !arena) { free(arr); free(arena); return -1; }
+    for (size_t i = 0; i < n_payees; ++i) {
+        char *dst = arena + i * ADDR_STRIDE;
+        snprintf(dst, ADDR_STRIDE, "%s", payees[i].address ? payees[i].address : "");
+        arr[i].address = dst;
+        arr[i].sats = payees[i].sats;
+    }
+    j->payees = arr;
+    j->payee_addrs = arena;
+    j->n_payees = n_payees;
+    return 0;
 }
 
 /* ============================================================ server ==== */
@@ -703,6 +739,13 @@ static cJSON *make_notify_params(const stratum_job_t *j,
  *
  * Caller must hold c->cb_lock, and must keep holding it for as long as it
  * reads the cb1/cb2 this leaves behind. */
+/* A pplns-coinbase job with no window pays nobody, and a coinbase that pays
+ * nobody forfeits the whole block. Better to render nothing and let the miner
+ * wait for the next template. */
+static int j_payees_missing(const stratum_job_t *job) {
+    return !job->payees || job->n_payees == 0;
+}
+
 static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                 const stratum_job_t *job) {
     if (!c->authorized || c->payout_address[0] == '\0') return -1;
@@ -712,7 +755,33 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
     coinbase_parts_t parts = {0};
     char err[256] = {0};
     int rc;
-    if (s->cfg.coinbase_pays_pool) {
+    if (s->cfg.coinbase_pays_window) {
+        /* pplns-coinbase: the block pays the window that produced it, one
+         * output per miner, and the pool never receives the reward. The
+         * window was snapshotted onto the job when the template was built —
+         * every connection therefore renders the SAME coinbase, exactly as
+         * the pooled modes do, because the outputs live in cb2 and only the
+         * extranonce differs per connection. */
+        if (j_payees_missing(job)) {
+            LOG_WARN("stratum: no PPLNS window on job %s — refusing to render "
+                     "a coinbase that would pay nobody", job->job_id);
+            return -1;
+        }
+        if (job->coinbasetxn_hex) {
+            rc = coinbase_build_window_from_template(
+                    job->coinbasetxn_hex, job->payees, job->n_payees,
+                    s->cfg.operator_address, s->cfg.fee_bps,
+                    s->cfg.coinbase_tag, job->en1_size, job->en2_size,
+                    s->cfg.max_payout_outputs, &parts, NULL, NULL,
+                    err, sizeof err);
+        } else {
+            rc = coinbase_build_window(
+                    job->height, job->value_sats, job->payees, job->n_payees,
+                    s->cfg.operator_address, s->cfg.fee_bps, job->wc_hex,
+                    s->cfg.coinbase_tag, job->en1_size, job->en2_size,
+                    s->cfg.max_payout_outputs, &parts, NULL, err, sizeof err);
+        }
+    } else if (s->cfg.coinbase_pays_pool) {
         /* PPS-classic: every miner's coinbase is identical, paying the
          * pool's BTC wallet for the net-of-fee reward and the operator
          * address for the fee. The operator later moves accumulated BTC

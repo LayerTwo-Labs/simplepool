@@ -120,6 +120,8 @@ static int count_lines(const char *buf, size_t len) {
 /* Standard regtest P2WPKH used in fixtures so the per-connection coinbase
  * renderer can produce a valid scriptPubKey. */
 #define TEST_ADDR "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+/* A second, distinct regtest address, so a window can have two payees. */
+#define TEST_ADDR2 "bcrt1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3lgth6c"
 
 /* Build a tiny job for tests. The coinbase is rendered per-connection at
  * notify/submit time using the miner's address, so the job only carries
@@ -2709,6 +2711,99 @@ static void test_suggest_difficulty_before_authorize(void) {
     printf("ok: suggest_difficulty before authorize survives to the first job\n");
 }
 
+/* ---------------------------------------------------------------------- */
+/* pplns-coinbase: the block pays the window, and the pool holds nothing      */
+/* ---------------------------------------------------------------------- */
+
+/* The window rides on the JOB, not the connection, because it is a snapshot
+ * taken when the template was built. Every connection therefore renders the
+ * same coinbase -- the outputs live in cb2 and only the extranonce differs --
+ * which is the same shape the pooled modes already have. */
+static stratum_server_t *cbwin_server(stratum_cfg_t *cfg, obs_t *obs) {
+    *cfg = (stratum_cfg_t){ .bind_port = 0, .max_conns = 2, .initial_diff = 1.0,
+                            .coinbase_pays_window = 1,
+                            .username_is_thunder = 0,
+                            .pps_accrues = 0,
+                            .ctx = obs, .on_share = on_share,
+                            .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg->bind_addr, sizeof cfg->bind_addr, "127.0.0.1");
+    snprintf(cfg->operator_address, sizeof cfg->operator_address, "%s", TEST_ADDR);
+    stratum_server_t *s = NULL;
+    stratum_server_start(cfg, &s);
+    return s;
+}
+
+/* Count outputs in the rendered coinbase, reading the transaction rather than
+ * trusting anything the builder reported. */
+static uint64_t cbwin_output_count(stratum_server_t *s, stratum_conn_t *c,
+                                   const char *job_id) {
+    const uint8_t *cb1 = NULL, *cb2 = NULL, *en1 = NULL;
+    size_t cb1_len = 0, cb2_len = 0;
+    if (stratum_conn_coinbase_for_test(s, c, job_id, &cb1, &cb1_len,
+                                       &cb2, &cb2_len, &en1) != 0) return 0;
+    /* cb2 = sequence(4) | varint n_outputs | ... */
+    return cb2_len > 4 ? cb2[4] : 0;   /* every case here is < 253 outputs */
+}
+
+static void test_pplns_coinbase_pays_every_miner_in_the_window(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg;
+    stratum_server_t *s = cbwin_server(&cfg, &obs);
+    CHECK(s != NULL); if (!s) return;
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_job_t *job = make_test_job("JW", net);
+    /* 50 BTC, no fee configured on the job's side: the two payees sum to the
+     * whole value, which is what the builder requires. */
+    const coinbase_payee_t win[] = {
+        { TEST_ADDR,  3000000000LL },
+        { TEST_ADDR2, 2000000000LL },
+    };
+    CHECK(stratum_job_set_window(job, win, 2) == 0);
+    stratum_server_set_job(s, job, 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+    /* Exactly two outputs: one per miner in the window, and nothing else.
+     * fee_bps is 0 here, so there is not even an operator output — which is
+     * the mode stated at its plainest. Every satoshi of the block leaves to
+     * the miners, and no address the pool controls appears at all. */
+    uint64_t n = cbwin_output_count(s, c, "JW");
+    CHECK(n == 2);
+
+    /* And it is the same coinbase for a second connection: the window is a
+     * property of the job, not of who is asking. */
+    stratum_conn_t *c2 = stratum_conn_new_for_test(s);
+    handshake(s, c2);
+    CHECK(cbwin_output_count(s, c2, "JW") == n);
+
+    stratum_conn_free_for_test(c);
+    stratum_conn_free_for_test(c2);
+    stratum_server_free(s);
+}
+
+/* A job with no window pays nobody, and a coinbase that pays nobody forfeits
+ * the entire block. Rendering nothing and making the miner wait for the next
+ * template is the only safe answer. */
+static void test_a_windowless_job_renders_no_coinbase(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg;
+    stratum_server_t *s = cbwin_server(&cfg, &obs);
+    CHECK(s != NULL); if (!s) return;
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("JNW", net), 1);   /* no window */
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+    const uint8_t *cb1 = NULL, *cb2 = NULL, *en1 = NULL;
+    size_t cb1_len = 0, cb2_len = 0;
+    CHECK(stratum_conn_coinbase_for_test(s, c, "JNW", &cb1, &cb1_len,
+                                         &cb2, &cb2_len, &en1) != 0);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 int main(void) {
     test_password_diff_raises();
     test_password_diff_never_lowers();
@@ -2750,6 +2845,8 @@ int main(void) {
     test_gated_pps_refuses_authorize_and_submits();
     test_gate_can_be_disabled();
     test_solo_is_never_gated();
+    test_a_windowless_job_renders_no_coinbase();
+    test_pplns_coinbase_pays_every_miner_in_the_window();
     test_pplns_btc_takes_a_bitcoin_username();
     test_pplns_thunder_takes_a_thunder_username();
     test_pplns_is_never_gated();
