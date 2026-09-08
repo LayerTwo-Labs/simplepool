@@ -6,6 +6,20 @@
 one `.mk` fragment each). No external processes needed. CI runs these
 in `.github/workflows/check_build.yaml`.
 
+Two of them exist because the logic they cover was once unreachable from any
+test, sitting in a `static` function inside `main.c`:
+
+- `test_reconcile.c` — the block-confirmation pass (`src/reconcile.c`).
+- `test_pplns.c` — the window-to-payees split (`src/pplns.c`): the fee, the
+  proportional division, the rounding remainder and the payout-floor
+  prediction. It is also the only place the **mixed-window** cases can be
+  stated exactly, because on regtest the window holds about two shares (share
+  difficulty is clamped to network difficulty), so a chain cannot produce a
+  window of wildly different claim sizes without help.
+
+`make asan` runs a subset under AddressSanitizer + UBSan; `make coverage`
+reports line and function coverage of the unit suites only.
+
 ## Integration tests
 
 Upstream binary versions are pinned in the pinned-versions block of
@@ -50,9 +64,47 @@ the version last validated against.
 
       bash tests/test_payout_regtest.sh
 
-Both one-shot tests allocate their stack ports dynamically per run, so
+- `test_solo_regtest.sh` — `pool_mode=solo`, the default and the mode most
+  operators run. Two miners with two **different** addresses mine a block
+  each, and each block's coinbase must pay its own finder: that is the
+  defining property of solo, and a regression rendering one coinbase for
+  every connection would still pass a single-miner test. Also asserts the
+  enforcer's commitments survived, that nothing was credited off-chain, and
+  that the pool reported `mode=solo` — which pins the default, since the
+  config sets no `pool_mode` at all. Own `.regtest-solo/` dir.
+
+- `test_pplns_regtest.sh` — both custodial PPLNS rails, and both
+  confirmation paths. Mines to maturity and asserts a matured block is
+  distributed across its window exactly once. Own `.regtest-pplns/` dir.
+
+- `test_pplns_btc_payout_regtest.sh` — the L1 payout rail: three miners, one
+  batched transaction through the enforcer's wallet, with a shared address
+  summed. Own `.regtest-btcpay/` dir.
+
+- `test_pplns_coinbase_regtest.sh` — `pool_mode=pplns-coinbase`, which has no
+  ledger step at all: the payment IS the block. Asserts the coinbase pays the
+  window on chain, that no output pays anything the pool controls beyond its
+  fee, that `pps_credits` stays empty, and that the payout floor is disclosed
+  at startup, per template and per block.
+
+  Its last stage is the one worth knowing about. A **mixed** window — claims
+  of 100 : 10 : 1 with the floor between the last two — cannot be mined for
+  on regtest, because a 2.0x window holds about two shares. So that stage
+  widens the window multiple and seeds the shares table directly, with the
+  pool stopped. That is replaying the pool's own record of accepted work, not
+  stubbing what is under test: the window query, the split, the builder, the
+  block and the outputs read back off the chain are all real, and the
+  forfeited amount is asserted against the arithmetic. Own `.regtest-cbwin/`
+  dir.
+
+Every one-shot test allocates its stack ports dynamically per run, so
 they can run concurrently — with each other and with a dev stack from
 `scripts/regtest/start.sh` (which keeps the traditional fixed ports;
 override via the `REGTEST_*_PORT` env vars). CI runs them as separate
 jobs in `.github/workflows/integration_tests.yaml` on every PR and
 push to main.
+
+One caveat about `test_integration.sh`, first in the list above: it looks
+like a solo end-to-end test and is not. It never mines, so it cannot see
+whether a coinbase pays the right person, and it is not in CI. That is what
+`test_solo_regtest.sh` was written for.

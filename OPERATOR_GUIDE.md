@@ -4,6 +4,24 @@ Everything you need to run this pool day-to-day. Assumes the branch
 already deployed (see `CLASSIC_PAYOUTS.md` for background on why the
 design looks like this).
 
+> **This guide is specific to `pool_mode = pps-classic`.** The pool ships five
+> modes and they differ in what a stratum username is, whether a payout worker
+> exists at all, and who holds the money in between — so the operational
+> advice below does not transfer wholesale. See
+> [the five modes](README.md#the-five-modes) for what each one is, and in
+> particular:
+>
+> - `solo` and `pplns-coinbase` have **no payout worker and no pool wallet**;
+>   the coinbase is the payment. Everything here about Thunder deposits, the
+>   reserve, and `simplepool-payout.service` simply does not apply.
+> - `pplns-thunder` and `pplns-btc` reuse this guide's payout worker, but pay
+>   on maturity out of a block actually found rather than a reserve, so there
+>   is no reserve to size or top up.
+> - `pplns-coinbase` additionally has a **payout floor**: a claim worth less
+>   than `pplns_payout_floor_sats` is forfeited to the operator and never
+>   settled. That is a policy you have to publish to your miners, not just a
+>   setting. [`VERIFY.md` section 13](VERIFY.md) is its operational checklist.
+
 ---
 
 ## Quick reference

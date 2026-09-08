@@ -132,8 +132,10 @@ and what a stratum username is:
   recomputed when it is paid: those moments are ~100 blocks apart and the
   chain can retarget in between.
 
-  The two differ only in the rail the balance is finally paid over, and
-  that choice is what a stratum username has to be:
+  These two differ only in the rail the balance is finally paid over, and
+  that choice is what a stratum username has to be. (The third PPLNS mode,
+  `pplns-coinbase` below, has no balance and no rail at all — it pays out of
+  the block itself.)
 
   - **`pplns-thunder`** pays over Thunder, like `pps-classic`, and reuses
     the same payout worker draining the same `pps_credits` table. Username

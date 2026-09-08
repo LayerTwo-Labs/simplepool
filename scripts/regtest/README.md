@@ -4,6 +4,13 @@ Local stack for validating simplepool's coinbase shape against the
 canonical LayerTwo-Labs enforcer, and for reproducing the finding that
 killed the coinbase-as-deposit design (see below).
 
+The diagram shows `pps-classic` because that is what this stack was first
+built for, but every pool mode is now driven against it by its own one-shot
+suite in `tests/` — `solo`, `pps-classic`, both custodial PPLNS rails, and
+`pplns-coinbase`. Each allocates its own ports and wipes its own chain dir,
+so they neither collide with each other nor with a dev stack started here.
+See [`tests/README.md`](../../tests/README.md).
+
 ## Stack
 
 ```
