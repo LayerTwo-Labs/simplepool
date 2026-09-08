@@ -754,7 +754,7 @@ static size_t out_ser_size(size_t spk_len) {
 
 /* Turn a window into concrete outputs: fee off the top, the payout floor and
  * the byte budget applied largest-first, and whatever cannot be paid
- * forfeited onto the operator output.
+ * redistributed across the miners who could be.
  *
  * Shared by the from-scratch and from-template builders precisely so the two
  * cannot drift. A pool mining a drivechain template and one mining plain
@@ -838,14 +838,14 @@ static int resolve_window_outputs(int64_t value_sats,
 
     size_t  n = 0;
     size_t  payout_bytes = 0;
-    int64_t forfeited = 0;
+    int64_t dropped = 0;
     for (size_t k = 0; k < n_payees; ++k) {
         const coinbase_payee_t *pe = &payees[rank[k].idx];
         if (pe->sats < payout_floor_sats) {
-            r.dropped_below_floor++; forfeited += pe->sats; continue;
+            r.dropped_below_floor++; dropped += pe->sats; continue;
         }
         if (n + 1 >= cap) {          /* storage, not policy */
-            r.dropped_capped++; forfeited += pe->sats; continue;
+            r.dropped_capped++; dropped += pe->sats; continue;
         }
         /* Resolve first: an output's cost depends on its address type, and a
          * P2TR payout is 43 bytes against a P2WPKH one's 31. Budgeting at a
@@ -860,7 +860,7 @@ static int resolve_window_outputs(int64_t value_sats,
             /* No room. Keep going rather than breaking: a later payee may be
              * a cheaper address type and still fit, and dropping it would
              * forfeit money that could have been paid. */
-            r.dropped_capped++; forfeited += pe->sats; continue;
+            r.dropped_capped++; dropped += pe->sats; continue;
         }
         payout_bytes += cost;
         out[n].sats = pe->sats;
@@ -879,16 +879,60 @@ static int resolve_window_outputs(int64_t value_sats,
         return -1;
     }
 
-    /* Forfeits ride on the operator output, because value not paid out is
-     * value destroyed — a coinbase paying less than it may does not leave the
-     * remainder anywhere. They are the operator's income, not a debt: see
-     * coinbase_window_result_t. */
-    int64_t operator_out = fee_sats + forfeited;
+    /* Whatever could not be paid is REDISTRIBUTED ACROSS THE MINERS WHO COULD.
+     *
+     * It used to go to the operator, on the reasoning that value not paid out
+     * is value destroyed and the operator output is the only place left. The
+     * first half is true; the second was wrong, and the measurement that
+     * settled it is worth keeping. With 100 miners on a 1/n hashrate spread
+     * and the default 1000-byte budget, 28 are paid, 72 are cut by the byte
+     * cap, NONE by the dust floor -- and the operator received 25% of the
+     * block on a 1% fee. The rule was defended as a dust policy and dust was
+     * never involved.
+     *
+     * Two things made it indefensible rather than merely harsh. A miner's
+     * window share tracks its hashrate, so the same miners fall below the
+     * cut every block: it pays them nothing ever, rather than occasionally.
+     * And it paid the operator MORE the smaller the coinbase, so an operator
+     * maximised revenue by starving its own miners -- 46% of the block at a
+     * 400-byte budget against 2% at 3000.
+     *
+     * Redistributing keeps every property the forfeit had. The block still
+     * pays out to the satoshi, the pool still holds nothing, and no ledger
+     * appears. What changes is only who receives what the coinbase had no
+     * room for: the other miners, not the house.
+     *
+     * (LayerTwo-Labs/simplepool#76, and Wired4ncer, who ran the pool that
+     * showed it.) */
+    if (dropped > 0) {
+        /* Scale the survivors up to spend `payable` exactly. Amounts do not
+         * affect an output's size -- a value is 8 bytes whatever it holds --
+         * so this cannot break the byte budget just measured. */
+        int64_t assigned = 0;
+        for (size_t i = 0; i < n; ++i) {
+            out[i].sats = (int64_t)((double)payable *
+                                    ((double)out[i].sats / (double)r.paid_sats));
+            assigned += out[i].sats;
+        }
+        /* Truncation again, and the same rule as everywhere else: the
+         * remainder goes to the largest surviving claim, which is out[0]
+         * because payees were resolved largest-first. */
+        if (assigned < payable) out[0].sats += payable - assigned;
+        else if (assigned > payable) {
+            set_err(errbuf, errlen, "internal: redistribution overshot");
+            return -1;
+        }
+        r.redistributed_sats = dropped;
+        r.paid_sats = payable;
+    }
+
+    /* The operator now receives its fee and nothing else. */
+    int64_t operator_out = fee_sats;
     if (operator_out > 0 && !has_operator) {
         if (!operator_address || !operator_address[0]) {
             set_err(errbuf, errlen,
-                    "%lld sats could not be paid to the window and there is no "
-                    "operator_address to receive them", (long long)operator_out);
+                    "a %lld-sat operator fee has no operator_address to "
+                    "receive it", (long long)operator_out);
             return -1;
         }
         if (coinbase_address_to_script(operator_address, op.spk, sizeof op.spk,
@@ -902,7 +946,6 @@ static int resolve_window_outputs(int64_t value_sats,
     }
 
     r.fee_sats = fee_sats;
-    r.forfeited_sats = forfeited;
     if (out_n) *out_n = n;
     if (res) *res = r;
     return 0;

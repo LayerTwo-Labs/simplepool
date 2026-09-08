@@ -1494,6 +1494,72 @@ static void test_the_payout_floor_is_published_for_the_dashboard(void) {
     printf("  ok test_the_payout_floor_is_published_for_the_dashboard\n");
 }
 
+/* The window query must read only as far back as the window reaches.
+ *
+ * The version this replaced summed a running total over the WHOLE shares table
+ * and applied the boundary afterwards, so every template build re-read every
+ * share the pool had ever recorded: 250ms per million rows, on the template
+ * thread. A production pool reported a 5.5 GB database, where that is half a
+ * minute per template and the pool simply stops publishing work.
+ *
+ * The replacement walks back in bounded batches, doubling until the batch
+ * covers the window. These tests exist for the doubling, because that is the
+ * part that can silently return a PARTIAL window -- which would not error, it
+ * would just pay the wrong people. */
+static void test_the_window_reads_past_the_first_batch(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* 10,000 shares of difficulty 1 across 4 workers. The first batch is
+     * 4096, so a 6000-wide window MUST make the walk widen; if it did not,
+     * the total would come back as 4096 and nobody would notice but the
+     * miners. */
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+    for (int i = 1; i <= 4; ++i) {
+        char q[256];
+        snprintf(q, sizeof q,
+                 "INSERT INTO workers (id,name,payout_address,first_seen,last_seen)"
+                 " VALUES (%d,'w%d','bc1qw%d',1,1)", i, i, i);
+        assert(sqlite3_exec(db, q, NULL, NULL, NULL) == SQLITE_OK);
+    }
+    for (int i = 0; i < 10000; ++i) {
+        char q[160];
+        snprintf(q, sizeof q,
+                 "INSERT INTO shares (worker_id,ts,difficulty) VALUES (%d,1,1.0)",
+                 (i % 4) + 1);
+        assert(sqlite3_exec(db, q, NULL, NULL, NULL) == SQLITE_OK);
+    }
+    sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+    sqlite3_close(db);
+
+    store_window_entry_t win[16];
+    size_t n = 0; double total = 0; int truncated = 0; char err[256];
+
+    /* Inside the first batch. */
+    assert(store_pplns_window(s, 1000.0, win, 16, &n, &total, &truncated,
+                              err, sizeof err) > 0);
+    assert(total == 1000.0);
+
+    /* Past it — this is the case the doubling exists for. */
+    assert(store_pplns_window(s, 6000.0, win, 16, &n, &total, &truncated,
+                              err, sizeof err) > 0);
+    assert(total == 6000.0);
+
+    /* Wider than the entire history: every share, and no infinite loop
+     * doubling past the end of the table. */
+    assert(store_pplns_window(s, 999999.0, win, 16, &n, &total, &truncated,
+                              err, sizeof err) > 0);
+    assert(total == 10000.0);
+
+    store_close(s);
+    printf("  ok test_the_window_reads_past_the_first_batch\n");
+}
+
 /* The operator fee comes off the top, exactly as in solo and PPS. */
 static void test_pplns_takes_the_operator_fee(void) {
     const char *path = fresh_db_path();
@@ -1548,6 +1614,7 @@ int main(void) {
     test_pplns_distributes_the_window();
     test_pplns_takes_the_operator_fee();
     test_the_payout_floor_is_published_for_the_dashboard();
+    test_the_window_reads_past_the_first_batch();
     test_pplns_distributes_two_blocks_in_one_pass();
     test_an_empty_window_returns_nothing_not_an_error();
     test_a_window_wider_than_the_cap_says_so();

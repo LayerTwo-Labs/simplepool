@@ -91,40 +91,34 @@ typedef struct {
 
 /* What the builder actually managed to pay, and what it could not.
  *
- * `forfeited_sats` is the honest part. A payee below the payout floor, or
- * past the byte budget, cannot be paid in THIS coinbase, and its value cannot
- * simply vanish either: a coinbase that pays out less than it is allowed
- * forfeits the difference to nobody. So the shortfall goes to the operator
- * output — and it stays there.
+ * A coinbase has a fixed budget of bytes, so a window with more miners in it
+ * than the budget admits cannot pay them all in one block. `redistributed_sats`
+ * is what the ones it could not pay were owed.
  *
- * That is the cost the design has to own, and it is a cost borne by the
- * smallest miners rather than by the pool. The alternative was a carried
- * balance, which is the custodial ledger this mode exists to delete: it
- * reintroduces a debt, an off-chain record of it, and a settlement that can
- * fail. Forfeiting instead keeps the property that the block IS the payment,
- * at the price of a hard floor under who this pool is worth mining at. The
- * number is right here so it can be disclosed rather than discovered. */
+ * That value goes TO THE OTHER MINERS, not to the operator. The block still
+ * pays out to the satoshi and the pool still holds nothing; the only question
+ * a byte budget forces is which miners receive what it had no room for, and
+ * the honest answer is the rest of the window rather than the house.
+ *
+ * It used to go to the operator. See the long note at the redistribution in
+ * coinbase.c for the measurement that ended that: the rule was defended as a
+ * dust policy, and dust turned out not to be involved at all. */
 typedef struct {
-    size_t  paid_count;        /* payees given an output */
-    int64_t paid_sats;         /* summed across those outputs */
+    size_t  paid_count;          /* payees given an output */
+    int64_t paid_sats;           /* summed across those outputs */
     size_t  dropped_below_floor; /* payees under payout_floor_sats */
     size_t  dropped_capped;      /* payees the byte budget had no room for */
-    /* Claims the coinbase could not pay, which go to the operator.
+    /* What the dropped payees were owed, now spread across the ones that were
+     * paid. Reported so an operator can see how much of a block is landing on
+     * miners other than the ones who earned it -- a large figure here means
+     * the byte budget is too tight for the size of the pool, and is the number
+     * to raise coinbase_max_bytes against.
      *
-     * FORFEITED, not owed. This is a deliberate policy choice and not an
-     * accounting convenience: a coinbase-direct pool cannot pay an amount too
-     * small to be an economical output, and carrying it creates exactly the
-     * custodial balance the mode exists to remove. So a claim below the
-     * payout floor is not paid, is not remembered, and is not a debt — it
-     * becomes operator income.
-     *
-     * The consequence is real and has to be disclosed rather than discovered:
-     * a miner whose share never reaches the floor earns nothing, however long
-     * it mines. That is the intended incentive — a miner that small is better
-     * off mining solo — but it is only a rule rather than a trap if the miner
-     * can see it, which is why the floor is logged at startup and per block. */
-    int64_t forfeited_sats;
-    int64_t fee_sats;          /* the operator's fee, excluding forfeits */
+     * Nobody is left out of pocket by a single block being unable to pay them,
+     * but nobody is made whole by it either: this is the unfairness the
+     * per-worker fraction ledger exists to even out over time. */
+    int64_t redistributed_sats;
+    int64_t fee_sats;            /* the operator's fee, and nothing else */
 } coinbase_window_result_t;
 
 

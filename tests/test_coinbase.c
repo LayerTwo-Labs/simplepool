@@ -841,7 +841,7 @@ static void test_window_pays_each_miner_its_own_output(void) {
     assert(rc == 0);
     assert(res.paid_count == 3);
     assert(res.fee_sats == 50000000LL);
-    assert(res.forfeited_sats == 0);
+    assert(res.redistributed_sats == 0);
     assert(res.paid_sats == 4950000000LL);
 
     uint64_t n = 0; int64_t sum = 0;
@@ -871,12 +871,17 @@ static void test_a_split_that_does_not_add_up_is_refused(void) {
     printf("ok: a window split that does not sum to the block is refused\n");
 }
 
-/* Below the floor. The value has to go somewhere -- a coinbase paying out
- * less than it may forfeits the difference to nobody -- and the somewhere is
- * the operator output. It is income, not a debt: nothing records it and
- * nothing settles it later. This is the design's harshest edge, so it is
- * pinned rather than left implied. */
-static void test_a_payee_below_the_floor_is_forfeited_to_the_operator(void) {
+/* Below the floor. The value has to go somewhere -- a coinbase paying out less
+ * than it may forfeits the difference to nobody -- and the somewhere is the
+ * OTHER MINERS, not the operator.
+ *
+ * This assertion was the other way round until #76. The rule was defended as a
+ * dust policy; measurement showed the byte cap, not dust, was doing the
+ * excluding, and that the operator was collecting a quarter of the block on a
+ * 1% fee. The test now pins the property that makes the mode defensible: the
+ * operator receives its fee and nothing else, whatever the coinbase could not
+ * fit. */
+static void test_a_payee_below_the_floor_is_shared_out_not_given_to_the_operator(void) {
     coinbase_parts_t parts; char err[256];
     coinbase_window_result_t res;
     /* fee 1% of 100,000,000 = 1,000,000; payable 99,000,000. */
@@ -890,20 +895,64 @@ static void test_a_payee_below_the_floor_is_forfeited_to_the_operator(void) {
     assert(rc == 0);
     assert(res.paid_count == 1);
     assert(res.dropped_below_floor == 1);
-    assert(res.forfeited_sats == 100LL);
-    /* Forfeits are reported apart from the fee. The operator output carries
-     * both, but an operator publishing its take has to be able to say which
-     * part was the advertised fee and which part was somebody's lost claim. */
+    assert(res.redistributed_sats == 100LL);
+    /* The survivor absorbs it: it is paid the whole payable amount. */
+    assert(res.paid_sats == 99000000LL);
+    /* And the operator gets its fee, to the satoshi, and nothing else. */
     assert(res.fee_sats == 1000000LL);
 
     uint64_t n = 0; int64_t sum = 0;
     window_outputs(&parts, 12, &n, &sum);
     assert(n == 2);                          /* one miner + the operator */
     assert(sum == 100000000LL);              /* still the whole block */
-    /* And the operator output is fee + forfeit, not just the fee. */
-    assert(sum - res.paid_sats == res.fee_sats + res.forfeited_sats);
+    assert(sum - res.paid_sats == res.fee_sats);
     coinbase_parts_free(&parts);
-    printf("ok: a payee below the floor is forfeited to the operator\n");
+    printf("ok: a payee below the floor is shared out, not given to the operator\n");
+}
+
+/* The property the old rule broke, stated on its own: an operator cannot
+ * increase its take by tightening the coinbase.
+ *
+ * Under forfeit-to-operator this was the whole problem -- a 400-byte budget
+ * paid the operator 46%% of the block against 2%% at 3000, so starving your own
+ * miners was the revenue-maximising move. Now the fee is the fee at every
+ * budget, and the only thing a tighter coinbase changes is how many miners
+ * share the block. */
+static void test_the_operator_cannot_profit_by_shrinking_the_coinbase(void) {
+    enum { N = 40 };
+    coinbase_payee_t payees[N];
+    int64_t payable = 4950000000LL, tot = 0;
+    double w[N], tw = 0;
+    for (int i = 0; i < N; ++i) { w[i] = 1.0 / (i + 1); tw += w[i]; }
+    for (int i = 0; i < N; ++i) {
+        payees[i].address = (i % 2) ? WA : WB;
+        payees[i].sats = (int64_t)((double)payable * (w[i] / tw));
+        tot += payees[i].sats;
+    }
+    payees[0].sats += payable - tot;
+
+    size_t budgets[] = { 400, 600, 1000, 2000 };
+    size_t seen_paid = 0;
+    for (size_t b = 0; b < sizeof budgets / sizeof budgets[0]; ++b) {
+        coinbase_parts_t parts; char err[256];
+        coinbase_window_result_t res;
+        assert(coinbase_build_window(800000, 5000000000LL, payees, N, WOP, 100,
+                                     NULL, "/sp/", 4, 8, budgets[b], 546,
+                                     &parts, &res, err, sizeof err) == 0);
+        /* The fee never moves, whatever the budget does. */
+        assert(res.fee_sats == 50000000LL);
+        /* The miners always receive the entire rest of the block. */
+        assert(res.paid_sats == payable);
+        uint64_t n = 0; int64_t sum = 0;
+        window_outputs(&parts, 12, &n, &sum);
+        assert(sum == 5000000000LL);
+        /* A bigger budget pays strictly more miners -- that is the only
+         * thing it buys. */
+        assert(res.paid_count >= seen_paid);
+        seen_paid = res.paid_count;
+        coinbase_parts_free(&parts);
+    }
+    printf("ok: the operator's take is its fee at every byte budget\n");
 }
 
 /* The floor is configurable, and raising it forfeits claims that the dust
@@ -920,7 +969,7 @@ static void test_the_payout_floor_is_configurable(void) {
                                  WOP, 0, NULL, NULL, 4, 8,
                                  0, 0, &parts, &res, err, sizeof err) == 0);
     assert(res.paid_count == 2);
-    assert(res.forfeited_sats == 0);
+    assert(res.redistributed_sats == 0);
     coinbase_parts_free(&parts);
 
     /* Floor above the small claim: it is forfeited, not carried. */
@@ -929,7 +978,7 @@ static void test_the_payout_floor_is_configurable(void) {
                                  0, 50000, &parts, &res, err, sizeof err) == 0);
     assert(res.paid_count == 1);
     assert(res.dropped_below_floor == 1);
-    assert(res.forfeited_sats == 10000LL);
+    assert(res.redistributed_sats == 10000LL);
     coinbase_parts_free(&parts);
 
     /* A floor below the dust limit is clamped up to it rather than honoured:
@@ -971,27 +1020,63 @@ static void test_the_cap_falls_on_the_smallest_claims(void) {
     assert(rc == 0);
     assert(res.paid_count == 2);
     assert(res.dropped_capped == 1);
-    /* The 1,000,000 claim is the one that loses out, not the 6,000,000 one. */
-    assert(res.forfeited_sats == 1000000LL);
-    assert(res.paid_sats == 9000000LL);
+    /* The 1,000,000 claim is the one dropped, and its share goes to the two
+     * that fit — not to the operator. */
+    assert(res.redistributed_sats == 1000000LL);
+    assert(res.paid_sats == 10000000LL);      /* the whole payable amount */
     coinbase_parts_free(&parts);
     printf("ok: the output cap drops the smallest claims first\n");
 }
 
-/* With no operator address there is nowhere for a forfeit to go, so a window
- * that cannot be paid in full has to be refused rather than silently burn the
- * difference into the void. */
-static void test_a_forfeit_without_an_operator_address_is_refused(void) {
+/* A window that cannot be paid in full no longer needs an operator address at
+ * all, because nothing lands on the operator any more.
+ *
+ * This test used to assert the opposite -- that such a build is refused,
+ * because the forfeit had nowhere to go. Redistribution removes the whole
+ * problem: the survivors absorb it, and a pool running with no operator
+ * address and no fee can still pay a window bigger than its coinbase. */
+static void test_a_dropped_claim_needs_no_operator_address(void) {
     coinbase_parts_t parts; char err[256];
+    coinbase_window_result_t res;
     const coinbase_payee_t payees[] = {
-        { WA, 999900LL }, { WB, 100LL },
+        { WA, 999900LL }, { WB, 100LL },     /* the second is dust */
     };
     int rc = coinbase_build_window(800000, 1000000LL, payees, 2,
                                    NULL, 0, NULL, NULL, 4, 8,
-                                   0, 0, &parts, NULL, err, sizeof err);
-    assert(rc < 0);
-    assert(strstr(err, "no operator_address to receive") != NULL);
-    printf("ok: a forfeit with nowhere to go is refused, not burnt\n");
+                                   0, 0, &parts, &res, err, sizeof err);
+    assert(rc == 0);
+    assert(res.dropped_below_floor == 1);
+    assert(res.redistributed_sats == 100LL);
+    assert(res.fee_sats == 0);
+    /* One output, holding the entire block. */
+    uint64_t n = 0; int64_t sum = 0;
+    window_outputs(&parts, 12, &n, &sum);
+    assert(n == 1);
+    assert(sum == 1000000LL);
+    assert(res.paid_sats == 1000000LL);
+    coinbase_parts_free(&parts);
+    printf("ok: a dropped claim needs no operator address — it goes to the miners\n");
+}
+
+/* With no operator address there is no fee, whatever fee_bps says — so the
+ * miners take the entire block. Worth pinning because it is now the ONLY
+ * thing operator_address affects in this mode: since dropped claims go to the
+ * other miners rather than the operator, a pool can run without one. */
+static void test_no_operator_address_means_no_fee(void) {
+    coinbase_parts_t parts; char err[256];
+    coinbase_window_result_t res;
+    const coinbase_payee_t payees[] = { { WA, 990000LL }, { WB, 10000LL } };
+    int rc = coinbase_build_window(800000, 1000000LL, payees, 2,
+                                   NULL, 100, NULL, NULL, 4, 8,
+                                   0, 0, &parts, &res, err, sizeof err);
+    assert(rc == 0);
+    assert(res.fee_sats == 0);              /* fee_bps=100 but nowhere to pay */
+    assert(res.paid_sats == 1000000LL);     /* so the miners take all of it */
+    uint64_t n = 0; int64_t sum = 0;
+    window_outputs(&parts, 12, &n, &sum);
+    assert(n == 2 && sum == 1000000LL);
+    coinbase_parts_free(&parts);
+    printf("ok: no operator address means no fee, and the miners take the block\n");
 }
 
 /* If nobody clears the floor, paying the operator the whole block and calling
@@ -1122,7 +1207,7 @@ static void test_window_from_template_preserves_commitments(void) {
     if (rc != 0) fprintf(stderr, "window_from_template err: %s\n", err);
     assert(rc == 0);
     assert(res.paid_count == 2);
-    assert(res.forfeited_sats == 0);
+    assert(res.redistributed_sats == 0);
     assert(res.paid_sats == reward);
 
     /* The enforcer's own outputs must survive: one spendable output was
@@ -1214,10 +1299,10 @@ static void test_both_window_builders_split_identically(void) {
     assert(r1.paid_count   == r2.paid_count);
     assert(r1.paid_sats    == r2.paid_sats);
     assert(r1.fee_sats     == r2.fee_sats);
-    assert(r1.forfeited_sats     == r2.forfeited_sats);
+    assert(r1.redistributed_sats == r2.redistributed_sats);
     assert(r1.dropped_below_floor == r2.dropped_below_floor);
     assert(r1.dropped_below_floor == 1);
-    assert(r1.forfeited_sats     >= 100);
+    assert(r1.redistributed_sats >= 100);
     coinbase_parts_free(&p1);
     coinbase_parts_free(&p2);
     printf("ok: both window builders split a window identically\n");
@@ -1270,7 +1355,10 @@ static void test_commitments_eat_the_payout_budget(void) {
     /* The block is still fully spent: whatever did not fit was forfeited to
      * the operator rather than left unpaid in the coinbase. */
     assert(res.dropped_capped == N - paid_with_template);
-    assert(res.paid_sats + res.forfeited_sats + res.fee_sats == reward);
+    /* Redistribution means the miners get the whole payable amount, so the
+     * block is exactly the miners' share plus the fee. */
+    assert(res.paid_sats + res.fee_sats == reward);
+    assert(res.redistributed_sats > 0);
     coinbase_parts_free(&parts);
 
     /* The same window and the same budget, built from scratch — no template,
@@ -1325,10 +1413,12 @@ int main(void) {
     test_window_from_template_preserves_commitments();
     test_window_pays_each_miner_its_own_output();
     test_a_split_that_does_not_add_up_is_refused();
-    test_a_payee_below_the_floor_is_forfeited_to_the_operator();
+    test_a_payee_below_the_floor_is_shared_out_not_given_to_the_operator();
+    test_the_operator_cannot_profit_by_shrinking_the_coinbase();
     test_the_payout_floor_is_configurable();
     test_the_cap_falls_on_the_smallest_claims();
-    test_a_forfeit_without_an_operator_address_is_refused();
+    test_a_dropped_claim_needs_no_operator_address();
+    test_no_operator_address_means_no_fee();
     test_a_window_of_only_dust_is_refused();
     test_an_empty_window_is_refused();
     test_the_witness_commitment_is_preserved();

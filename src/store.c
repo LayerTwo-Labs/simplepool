@@ -1458,16 +1458,79 @@ int store_pplns_window(store_t *s, double window_diff,
      * whole instead of splitting it. Same rule, same reason, as the
      * distributor -- if these two ever disagree, a block pays out differently
      * from what the template promised. */
+    /* Find where the window starts, reading only as far back as it reaches.
+     *
+     * The obvious query -- a running SUM() OVER the whole shares table, with
+     * the window boundary in the WHERE -- computes the running total FIRST and
+     * filters afterwards, so there is no early exit and no bound: every
+     * template build re-reads every share the pool has ever recorded.
+     * Measured at 250ms per million rows, linear, on the template thread. A
+     * production pool reported a 5.5 GB shares database, which is on the order
+     * of a hundred million rows and half a minute per template -- the pool
+     * would simply stop publishing work (LayerTwo-Labs/simplepool#76).
+     *
+     * So walk backwards in bounded batches instead, doubling until the batch
+     * covers the window, and let the main query use the primary-key index from
+     * the boundary id. A window is a small multiple of one block's expected
+     * work, so the first batch almost always covers it; the loop exists for
+     * the pathological cases (a difficulty crash, a freshly-lowered window)
+     * rather than the normal one.
+     *
+     * The boundary rule is unchanged and must stay unchanged: `running -
+     * difficulty < window` counts the share that CROSSES the boundary whole,
+     * matching store_pplns_distribute() exactly. If these two ever disagree a
+     * block pays out differently from what its template promised. */
+    static const char *QB =
+        "SELECT MIN(id), MAX(running) FROM ("
+        "  SELECT id, difficulty,"
+        "         SUM(difficulty) OVER (ORDER BY id DESC ROWS UNBOUNDED PRECEDING) AS running"
+        "    FROM (SELECT id, difficulty FROM shares ORDER BY id DESC LIMIT ?)"
+        ") WHERE running - difficulty < ?";
+
+    sqlite3_int64 cutoff_id = 0;
+    {
+        sqlite3_stmt *b = NULL;
+        if (sqlite3_prepare_v2(s->db, QB, -1, &b, NULL) != SQLITE_OK) {
+            if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -2;
+        }
+        /* 4096 covers a 2x window at any sane share difficulty; the cap stops
+         * a pool whose entire history is smaller than one window from looping
+         * forever doubling past the end of the table. */
+        sqlite3_int64 batch = 4096;
+        for (;;) {
+            sqlite3_reset(b);
+            sqlite3_bind_int64(b, 1, batch);
+            sqlite3_bind_double(b, 2, window_diff);
+            if (sqlite3_step(b) != SQLITE_ROW) break;
+            if (sqlite3_column_type(b, 0) == SQLITE_NULL) break;   /* no shares */
+            cutoff_id = sqlite3_column_int64(b, 0);
+            double covered = sqlite3_column_double(b, 1);
+            /* Covered means the batch reached past the window. If it did not,
+             * the window extends further back than we read and the answer
+             * would silently be a partial window -- so widen and retry. */
+            if (covered >= window_diff) break;
+            sqlite3_int64 seen = 0;
+            sqlite3_stmt *c = NULL;
+            if (sqlite3_prepare_v2(s->db,
+                    "SELECT COUNT(*) FROM (SELECT 1 FROM shares LIMIT ?)",
+                    -1, &c, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(c, 1, batch);
+                if (sqlite3_step(c) == SQLITE_ROW) seen = sqlite3_column_int64(c, 0);
+                sqlite3_finalize(c);
+            }
+            if (seen < batch) break;      /* read the whole table already */
+            batch *= 4;
+        }
+        sqlite3_finalize(b);
+    }
+
     static const char *Q =
-        "WITH anchored AS ("
-        "  SELECT worker_id, difficulty, "
-        "         SUM(difficulty) OVER (ORDER BY id DESC ROWS UNBOUNDED PRECEDING) AS running "
-        "    FROM shares "
-        ") "
-        "SELECT w.id, COALESCE(w.payout_address,''), SUM(a.difficulty) AS wd "
-        "  FROM anchored a "
-        "  JOIN workers w ON w.id = a.worker_id "
-        " WHERE a.running - a.difficulty < ? "
+        "SELECT w.id, COALESCE(w.payout_address,''), SUM(sh.difficulty) AS wd "
+        "  FROM shares sh "
+        "  JOIN workers w ON w.id = sh.worker_id "
+        " WHERE sh.id >= ? "
         "   AND w.payout_address IS NOT NULL AND w.payout_address <> '' "
         " GROUP BY w.id "
         " HAVING wd > 0 "
@@ -1479,7 +1542,7 @@ int store_pplns_window(store_t *s, double window_diff,
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;
     }
-    sqlite3_bind_double(st, 1, window_diff);
+    sqlite3_bind_int64(st, 1, cutoff_id);
 
     size_t n = 0;
     double total = 0.0;

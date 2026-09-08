@@ -2179,14 +2179,15 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             size_t dropped = res.dropped_below_floor + res.dropped_capped;
             if (dropped > 0) {
                 LOG_INFO("pplns-coinbase: block %s paid %zu miner(s) %lld "
-                         "sats directly; %zu claim(s) worth %lld sats were "
-                         "forfeited to the operator (%zu below the %lld-sat "
-                         "payout floor, %zu with no room in a %zu-byte "
-                         "coinbase). Forfeited claims are NOT carried and are "
-                         "not settled later.",
+                         "sats directly; %zu claim(s) worth %lld sats had no "
+                         "room and were REDISTRIBUTED across the miners who "
+                         "did fit (%zu below the %lld-sat floor, %zu past the "
+                         "%zu-byte coinbase). The operator took its fee and "
+                         "nothing more. A large figure here means the byte "
+                         "budget is too tight for this many miners.",
                          block_hash_hex, res.paid_count,
                          (long long)res.paid_sats, dropped,
-                         (long long)res.forfeited_sats,
+                         (long long)res.redistributed_sats,
                          res.dropped_below_floor,
                          (long long)s->cfg.payout_floor_sats,
                          res.dropped_capped,
