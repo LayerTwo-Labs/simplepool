@@ -183,6 +183,37 @@ static double effective_pps_rate(const proxy_config_t *cfg,
 /* Build a job from a freshly fetched template. The coinbase is rendered
  * per-connection inside stratum.c (each miner pays their own address),
  * so we only pass template-level data here. */
+/* What a found block's coinbase actually paid, and what it carried.
+ *
+ * Only the carried part is recorded. A claim the coinbase paid is settled on
+ * chain and has no business in a ledger of what is owed; a claim it could not
+ * pay rode on the operator output, which means the operator is holding it. */
+static void on_window_outcome_cb(void *ctx, const char *block_hash,
+                                 const int64_t *worker_ids,
+                                 const int64_t *owed_sats,
+                                 const int64_t *paid_sats, size_t n) {
+    server_ctx_t *s = (server_ctx_t *)ctx;
+    if (!s || !s->store) return;
+    char werr[256] = {0};
+    int rc = store_record_window_carry(s->store, worker_ids, owed_sats,
+                                       paid_sats, n, werr, sizeof werr);
+    if (rc < 0) {
+        LOG_WARN("pplns-coinbase: could not record carried claims for block "
+                 "%.16s: %s — the operator is holding money the ledger does "
+                 "not know about", block_hash ? block_hash : "?", werr);
+        return;
+    }
+    if (rc > 0) {
+        int64_t carried = 0;
+        for (size_t i = 0; i < n; ++i) carried += owed_sats[i] - paid_sats[i];
+        LOG_INFO("pplns-coinbase: block %.16s paid %zu miner(s) directly; "
+                 "%d claim(s) totalling %lld sats were below the floor or out "
+                 "of coinbase room and are carried",
+                 block_hash ? block_hash : "?", n - (size_t)rc, rc,
+                 (long long)carried);
+    }
+}
+
 /* Snapshot the PPLNS window onto a freshly built job, for pplns-coinbase.
  *
  * The window is taken from the template that is about to go out, so the
@@ -267,8 +298,10 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
     }
 
     coinbase_payee_t payees[COINBASE_MAX_PAYOUT_OUTPUTS];
+    int64_t worker_ids[COINBASE_MAX_PAYOUT_OUTPUTS];
     int64_t assigned = 0;
     for (size_t i = 0; i < n; ++i) {
+        worker_ids[i] = win[i].worker_id;
         payees[i].address = win[i].payout_address;
         payees[i].sats = (int64_t)((double)payable * (win[i].difficulty / total));
         assigned += payees[i].sats;
@@ -280,7 +313,7 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
      * A handful of satoshis, to the miner with the strongest claim on them. */
     if (assigned < payable) payees[0].sats += payable - assigned;
 
-    if (stratum_job_set_window(job, payees, n) < 0) {
+    if (stratum_job_set_window(job, payees, worker_ids, n) < 0) {
         LOG_WARN("pplns-coinbase: could not attach the window to the job");
         return -1;
     }
@@ -1295,6 +1328,7 @@ int main(int argc, char **argv) {
     stcfg.coinbase_pays_pool   = mode_pps_classic ||
                                  mode_pplns_thunder || mode_pplns_btc;
     stcfg.coinbase_pays_window = mode_pplns_cb;
+    stcfg.on_window_outcome    = mode_pplns_cb ? on_window_outcome_cb : NULL;
     stcfg.max_coinbase_bytes   = (size_t)cfg.coinbase_max_bytes;
     stcfg.username_is_thunder = mode_pps_classic || mode_pplns_thunder;
     snprintf(stcfg.pool_btc_address, sizeof stcfg.pool_btc_address, "%s",

@@ -78,7 +78,8 @@ stratum_job_t *stratum_job_new(
  *
  * Returns 0 on success, negative on allocation failure. */
 int stratum_job_set_window(stratum_job_t *j,
-                           const coinbase_payee_t *payees, size_t n_payees);
+                           const coinbase_payee_t *payees,
+                           const int64_t *worker_ids, size_t n_payees);
 
 void stratum_job_free(stratum_job_t *j);
 
@@ -106,6 +107,23 @@ typedef int (*block_submit_fn)(void *ctx, const char *block_hex,
  * `submit_error` the reason when it was not. A candidate the node refused is
  * still reported here — it is recorded as 'rejected' rather than dropped,
  * because a silent reject is how phantom rewards went unnoticed. */
+/* Who the coinbase of a found block actually paid, and who it did not.
+ *
+ * Called once per found block in pplns-coinbase mode, before on_block_found.
+ * `paid_sats[i]` is what worker_ids[i] received in that coinbase; 0 means the
+ * claim carried, because it was below the floor or the byte budget had no
+ * room. `owed_sats[i]` is what it was entitled to either way.
+ *
+ * This is the only moment the information exists: the coinbase is decided
+ * when the template is built, but almost every template never becomes a
+ * block, so nothing can be written to a ledger until one does. */
+typedef void (*window_outcome_fn)(void *ctx,
+                                  const char *block_hash,
+                                  const int64_t *worker_ids,
+                                  const int64_t *owed_sats,
+                                  const int64_t *paid_sats,
+                                  size_t n);
+
 typedef void (*block_found_fn)(void *ctx,
                                const char *worker_name,
                                const char *finder_address,
@@ -272,6 +290,7 @@ typedef struct {
     reject_observer_fn on_reject;
     block_submit_fn    on_block;
     block_found_fn     on_block_found;
+    window_outcome_fn  on_window_outcome;   /* pplns-coinbase only */
 } stratum_cfg_t;
 
 typedef struct stratum_server stratum_server_t;

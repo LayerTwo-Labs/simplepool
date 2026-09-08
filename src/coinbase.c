@@ -861,6 +861,8 @@ static int resolve_window_outputs(int64_t value_sats,
         payout_bytes += cost;
         out[n].sats = pe->sats;
         r.paid_sats += pe->sats;
+        if (rank[k].idx < COINBASE_MAX_PAYOUT_OUTPUTS)
+            r.paid_per_payee[rank[k].idx] = pe->sats;
         n++; r.paid_count++;
     }
     free(rank);

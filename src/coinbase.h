@@ -56,28 +56,6 @@ typedef struct {
     int64_t     sats;      /* what the window entitles this miner to */
 } coinbase_payee_t;
 
-/* What the builder actually managed to pay, and what it could not.
- *
- * `carry_sats` is the honest part. A payee below the dust limit, or past the
- * output cap, cannot be paid in THIS coinbase — but its value cannot simply
- * vanish either: a coinbase that pays out less than it is allowed forfeits
- * the difference to nobody. So the shortfall is added to the operator output
- * and reported here, which means the pool is holding it and owes it.
- *
- * That is the cost the design has to own: coinbase-direct removes custody for
- * everyone the block can pay, and replaces it with a small, bounded,
- * disclosable balance for everyone it cannot. It is not "zero custody"; it is
- * custody proportional to dust, and the number is right here rather than
- * implied. */
-typedef struct {
-    size_t  paid_count;        /* payees given an output */
-    int64_t paid_sats;         /* summed across those outputs */
-    size_t  dropped_dust;      /* payees below COINBASE_DUST_SATS */
-    size_t  dropped_capped;    /* payees the byte budget had no room for */
-    int64_t carry_sats;        /* owed to the dropped, paid to the operator */
-    int64_t fee_sats;          /* the operator's actual fee, excluding carry */
-} coinbase_window_result_t;
-
 /* The binding limit on payouts is BYTES, not a count.
  *
  * The first version of this capped the number of outputs at 200, which was
@@ -104,6 +82,37 @@ typedef struct {
  * are paid; this exists so the builders can use fixed-size storage, and is set
  * far above anything the budget will admit. */
 #define COINBASE_MAX_PAYOUT_OUTPUTS 200
+
+/* What the builder actually managed to pay, and what it could not.
+ *
+ * `carry_sats` is the honest part. A payee below the dust limit, or past the
+ * output cap, cannot be paid in THIS coinbase — but its value cannot simply
+ * vanish either: a coinbase that pays out less than it is allowed forfeits
+ * the difference to nobody. So the shortfall is added to the operator output
+ * and reported here, which means the pool is holding it and owes it.
+ *
+ * That is the cost the design has to own: coinbase-direct removes custody for
+ * everyone the block can pay, and replaces it with a small, bounded,
+ * disclosable balance for everyone it cannot. It is not "zero custody"; it is
+ * custody proportional to dust, and the number is right here rather than
+ * implied. */
+typedef struct {
+    size_t  paid_count;        /* payees given an output */
+    int64_t paid_sats;         /* summed across those outputs */
+    size_t  dropped_dust;      /* payees below COINBASE_DUST_SATS */
+    size_t  dropped_capped;    /* payees the byte budget had no room for */
+    int64_t carry_sats;        /* owed to the dropped, paid to the operator */
+    int64_t fee_sats;          /* the operator's actual fee, excluding carry */
+    /* What each payee actually received, indexed as the CALLER passed them —
+     * not in the largest-first order the builder pays in. 0 means the payee
+     * carried: it was below the floor, or the byte budget had no room.
+     *
+     * Without this the carry is a single number and nobody knows whose it is.
+     * A pool that cannot say which miner is owed the dust is not running a
+     * ledger, it is just keeping the money. */
+    int64_t paid_per_payee[COINBASE_MAX_PAYOUT_OUTPUTS];
+} coinbase_window_result_t;
+
 
 /* Build cb1/cb2 paying the PPLNS window DIRECTLY, one output per miner.
  *

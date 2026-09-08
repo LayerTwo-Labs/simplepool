@@ -23,9 +23,23 @@
 #      the chain rather than out of anything simplepool wrote.
 #   3. NO output pays an address the pool controls. That is the whole claim of
 #      the mode and it is the one thing a bookkeeping bug cannot fake.
-#   4. pps_credits stays empty. Nothing accrues off-chain because nothing is
-#      owed off-chain — a balance here would mean the pool thinks it owes
-#      money it already paid on-chain.
+#   4. only UNPAID claims are owed off-chain. A miner the coinbase paid must
+#      not appear in pps_credits at all: a row there would mean the pool
+#      believes it owes money it already paid on chain.
+#
+# NOT covered here, deliberately: the carry ledger with something actually in
+# it. Carry needs a window where some claims fit the coinbase and others do
+# not, which needs several miners of very different sizes — and this harness
+# drives one cpuminer. Shrinking the byte budget instead does not produce it
+# either: when NOTHING fits, the builder refuses, no coinbase is rendered and
+# no block is found, so there is nothing to record.
+#
+# An earlier version of this file had a stage that squeezed the budget and
+# printed how much had carried. It printed 0 every time and passed regardless,
+# which is worse than no stage at all. The carry ledger is covered by
+# tests/test_store.c instead, where the outcome can be stated exactly and is
+# mutation-verified; what is missing is an end-to-end run with a mixed-size
+# window, and it is missing on purpose rather than by oversight.
 #
 # Env:
 #   REGTEST_DIR      data dir, WIPED each run (default: <repo>/.regtest-cbwin)
@@ -297,16 +311,21 @@ if unknown:
 print(f"  miner {paid[miner]} sats, operator {paid.get(op, 0)} sats")
 PY
 
-stage "assert nothing accrued off-chain"
-# The payment was the block. A pps_credits row here would mean the pool
-# believes it owes money it has already paid on-chain — the double-payment
-# this mode exists to make impossible.
+stage "assert only UNPAID claims are owed off-chain"
+# The payment was the block, so a miner the coinbase paid must not appear in
+# pps_credits at all: a row there would mean the pool believes it owes money
+# it has already paid on chain.
+#
+# The ledger is not empty by definition, though. A claim below the payout
+# floor, or one the byte budget had no room for, rides on the operator output
+# — the operator is holding it, and owes it. Here the single miner takes the
+# whole block and clears the floor easily, so nothing should carry.
 CREDITS="$(sqlite3 "$POOL_DB" "SELECT COALESCE(SUM(accrued_sats),0) FROM pps_credits")"
 ROWS="$(sqlite3 "$POOL_DB" "SELECT COUNT(*) FROM pps_credits")"
 echo "  pps_credits rows=$ROWS accrued=$CREDITS"
 [ "$ROWS" = "0" ] && [ "$CREDITS" = "0" ] || {
-    echo "FAIL: pplns-coinbase accrued $CREDITS sats off-chain across $ROWS row(s);" >&2
-    echo "      the coinbase already paid the miners" >&2
+    echo "FAIL: pplns-coinbase recorded $CREDITS sats owed across $ROWS row(s)," >&2
+    echo "      but the coinbase paid this miner in full" >&2
     exit 1; }
 
 stage "assert the block was recorded, and needs no distribution"

@@ -58,6 +58,16 @@ static int64_t scalar_i64(sqlite3 *db, const char *sql) {
     return v;
 }
 
+/* Same as scalar_i64 but opens the file itself, for assertions made after
+ * store_close(). */
+static int64_t scalar_path(const char *path, const char *sql) {
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    int64_t v = scalar_i64(db, sql);
+    sqlite3_close(db);
+    return v;
+}
+
 /* Copies into `out` because the sqlite3_stmt is finalized before returning.
  * Writes "" for SQL NULL, and returns whether the column was non-NULL — the
  * identity test needs to tell "stored blank" from "stored nothing". */
@@ -1449,6 +1459,124 @@ static void test_an_empty_window_returns_nothing_not_an_error(void) {
     printf("  ok test_an_empty_window_returns_nothing_not_an_error\n");
 }
 
+/* ---- the coinbase-direct carry ledger ----------------------------------
+ *
+ * pplns-coinbase pays miners in the block itself, so there is almost no
+ * ledger — except for the claims the coinbase could NOT carry: below the
+ * payout floor, or past the byte budget. Those ride on the operator output,
+ * which means the operator holds them and owes them.
+ *
+ * Recording that is what makes "a small custodial balance" an honest
+ * statement rather than a hidden one. */
+static void test_only_unpaid_claims_are_recorded_as_owed(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Three workers exist. */
+    for (int i = 0; i < 3; ++i) {
+        char name[16], addr[16];
+        snprintf(name, sizeof name, "w%d", i + 1);
+        snprintf(addr, sizeof addr, "addr_%d", i + 1);
+        assert(store_record_share_addr(s, name, addr, 1000ULL + (uint64_t)i,
+                                       1.0, 0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_flush(s) == 0);
+
+    /* w1 paid in full, w2 paid nothing, w3 paid nothing. */
+    const int64_t ids[]  = { 1, 2, 3 };
+    const int64_t owed[] = { 500000, 400, 900 };
+    const int64_t paid[] = { 500000,   0,   0 };
+    char err[256] = {0};
+    assert(store_record_window_carry(s, ids, owed, paid, 3, err, sizeof err) == 2);
+    store_close(s);
+
+    /* The miner the coinbase paid is owed nothing and must not appear: a row
+     * of zero would put a settled miner into a ledger of debts. */
+    assert(scalar_path(path, "SELECT COUNT(*) FROM pps_credits") == 2);
+    assert(scalar_path(path, "SELECT COUNT(*) FROM pps_credits WHERE worker_id = 1") == 0);
+    assert(scalar_path(path, "SELECT accrued_sats FROM pps_credits WHERE worker_id = 2") == 400);
+    assert(scalar_path(path, "SELECT accrued_sats FROM pps_credits WHERE worker_id = 3") == 900);
+    printf("  ok test_only_unpaid_claims_are_recorded_as_owed\n");
+}
+
+/* Carry accumulates across blocks. That is the whole point: a miner too small
+ * to pay in one block becomes payable once enough blocks have passed. */
+static void test_carry_accumulates_across_blocks(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    assert(store_record_share_addr(s, "w1", "addr_1", 1000, 1.0,
+                                   0, NULL, 0, 0.0) == 0);
+    assert(store_flush(s) == 0);
+
+    const int64_t ids[]  = { 1 };
+    const int64_t paid[] = { 0 };
+    char err[256] = {0};
+    for (int i = 0; i < 5; ++i) {
+        const int64_t owed[] = { 120 };
+        assert(store_record_window_carry(s, ids, owed, paid, 1,
+                                         err, sizeof err) == 1);
+    }
+    store_close(s);
+    assert(scalar_path(path, "SELECT accrued_sats FROM pps_credits WHERE worker_id = 1") == 600);
+    printf("  ok test_carry_accumulates_across_blocks\n");
+}
+
+/* A partially-paid claim carries only the remainder, not the whole of it.
+ * Recording the full claim would have the pool owing money it already paid. */
+static void test_a_partly_paid_claim_carries_only_the_remainder(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    assert(store_record_share_addr(s, "w1", "addr_1", 1000, 1.0,
+                                   0, NULL, 0, 0.0) == 0);
+    assert(store_flush(s) == 0);
+
+    const int64_t ids[]  = { 1 };
+    const int64_t owed[] = { 1000 };
+    const int64_t paid[] = { 600 };
+    char err[256] = {0};
+    assert(store_record_window_carry(s, ids, owed, paid, 1, err, sizeof err) == 1);
+    store_close(s);
+    assert(scalar_path(path, "SELECT accrued_sats FROM pps_credits WHERE worker_id = 1") == 400);
+    printf("  ok test_a_partly_paid_claim_carries_only_the_remainder\n");
+}
+
+/* Defensive: an unknown worker id, and an empty window, must not write
+ * anything or fail. */
+static void test_the_carry_ledger_ignores_nothing_to_record(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+    const int64_t ids[]  = { 0 };       /* no such worker */
+    const int64_t owed[] = { 900 };
+    const int64_t paid[] = { 0 };
+    assert(store_record_window_carry(s, ids, owed, paid, 1, err, sizeof err) == 0);
+    assert(store_record_window_carry(s, ids, owed, paid, 0, err, sizeof err) == 0);
+    assert(store_record_window_carry(s, NULL, owed, paid, 1, err, sizeof err) < 0);
+    store_close(s);
+    assert(scalar_path(path, "SELECT COUNT(*) FROM pps_credits") == 0);
+    printf("  ok test_the_carry_ledger_ignores_nothing_to_record\n");
+}
+
 /* The operator fee comes off the top, exactly as in solo and PPS. */
 static void test_pplns_takes_the_operator_fee(void) {
     const char *path = fresh_db_path();
@@ -1503,6 +1631,10 @@ int main(void) {
     test_pplns_distributes_the_window();
     test_pplns_takes_the_operator_fee();
     test_pplns_distributes_two_blocks_in_one_pass();
+    test_the_carry_ledger_ignores_nothing_to_record();
+    test_a_partly_paid_claim_carries_only_the_remainder();
+    test_carry_accumulates_across_blocks();
+    test_only_unpaid_claims_are_recorded_as_owed();
     test_an_empty_window_returns_nothing_not_an_error();
     test_a_window_wider_than_the_cap_says_so();
     test_a_worker_with_no_address_is_left_out_of_the_split();
