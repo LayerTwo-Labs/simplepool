@@ -372,6 +372,9 @@ struct stratum_conn {
      * its hashrate is split. */
     double   requested_min_diff;
 
+    /* This connection's coinbase byte ceiling, from its listener; 0 means the
+     * server-wide one. See stratum_listener_t.max_coinbase_bytes. */
+    int    pol_max_coinbase_bytes;
     /* Difficulty policy inherited from the listener this connection was
      * accepted on, resolved once at accept time so nothing downstream has to
      * know which port it came in on. Seeded from the server-wide defaults,
@@ -774,6 +777,20 @@ static int j_payees_missing(const stratum_job_t *job) {
     return !job->payees || job->n_payees == 0;
 }
 
+/* The byte ceiling that applies to THIS connection: its listener's, or the
+ * server-wide one when the listener did not set its own.
+ *
+ * One accessor rather than two lookups, because the coinbase is rendered in
+ * one place and re-derived in another (to work out what a found block paid),
+ * and those two disagreeing would mean the payout queue recorded a rotation
+ * that did not happen. */
+static size_t conn_coinbase_budget(const stratum_server_t *s,
+                                   const stratum_conn_t *c) {
+    if (c && c->pol_max_coinbase_bytes > 0)
+        return (size_t)c->pol_max_coinbase_bytes;
+    return s->cfg.max_coinbase_bytes;
+}
+
 static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                 const stratum_job_t *job) {
     if (!c->authorized || c->payout_address[0] == '\0') return -1;
@@ -805,7 +822,7 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                     job->coinbasetxn_hex, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps,
                     s->cfg.coinbase_tag, job->en1_size, job->en2_size,
-                    s->cfg.max_coinbase_bytes, s->cfg.payout_floor_sats,
+                    conn_coinbase_budget(s, c), s->cfg.payout_floor_sats,
                     &parts, NULL, NULL,
                     err, sizeof err);
         } else {
@@ -813,7 +830,7 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                     job->height, job->value_sats, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps, job->wc_hex,
                     s->cfg.coinbase_tag, job->en1_size, job->en2_size,
-                    s->cfg.max_coinbase_bytes, s->cfg.payout_floor_sats,
+                    conn_coinbase_budget(s, c), s->cfg.payout_floor_sats,
                     &parts, NULL, err, sizeof err);
         }
     } else if (s->cfg.coinbase_pays_pool) {
@@ -2175,14 +2192,14 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                     job->coinbasetxn_hex, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps,
                     s->cfg.coinbase_tag, job->en1_size, job->en2_size,
-                    s->cfg.max_coinbase_bytes, s->cfg.payout_floor_sats,
+                    conn_coinbase_budget(s, c), s->cfg.payout_floor_sats,
                     &throwaway, NULL, &res, werr, sizeof werr);
         } else {
             wrc = coinbase_build_window(
                     job->height, job->value_sats, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps, job->wc_hex,
                     s->cfg.coinbase_tag, job->en1_size, job->en2_size,
-                    s->cfg.max_coinbase_bytes, s->cfg.payout_floor_sats,
+                    conn_coinbase_budget(s, c), s->cfg.payout_floor_sats,
                     &throwaway, &res, werr, sizeof werr);
         }
         if (wrc == 0) {
@@ -2257,8 +2274,8 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                          res.dropped_below_floor,
                          (long long)s->cfg.payout_floor_sats,
                          res.dropped_capped,
-                         s->cfg.max_coinbase_bytes
-                             ? s->cfg.max_coinbase_bytes
+                         conn_coinbase_budget(s, c)
+                             ? conn_coinbase_budget(s, c)
                              : (size_t)COINBASE_DEFAULT_MAX_BYTES);
             } else {
                 LOG_INFO("pplns-coinbase: block %s paid all %zu miner(s) in "
@@ -2437,6 +2454,7 @@ static void conn_apply_listener(stratum_conn_t *c,
     if (pol->vardiff_min  > 0.0) c->pol_vardiff_min  = pol->vardiff_min;
     if (pol->vardiff_max  > 0.0) c->pol_vardiff_max  = pol->vardiff_max;
     c->pol_min_diff = pol->min_diff;   /* 0 unless the port promised one */
+    c->pol_max_coinbase_bytes = pol->max_coinbase_bytes;  /* 0 = server-wide */
     c->pol_port = pol->port;
     snprintf(c->pol_label, sizeof c->pol_label, "%s", pol->label);
     /* Before authorize the connection has no assigned difficulty yet, so
@@ -2448,6 +2466,14 @@ static void conn_apply_listener(stratum_conn_t *c,
 void stratum_conn_apply_listener_for_test(stratum_conn_t *c,
                                           const stratum_listener_t *pol) {
     conn_apply_listener(c, pol);
+}
+
+/* Put a test connection on a listener's policy, the way accept() does for a
+ * real one. Only the coinbase ceiling is exposed: it is the one piece of
+ * listener policy that changes what a block PAYS rather than how hard the
+ * work is, so it is the one a test has to be able to drive. */
+void stratum_conn_set_coinbase_budget_for_test(stratum_conn_t *c, int bytes) {
+    if (c) c->pol_max_coinbase_bytes = bytes;
 }
 
 stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {

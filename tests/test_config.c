@@ -271,6 +271,38 @@ static void test_the_coinbase_budget_defaults_and_parses(void) {
     CHECK(cfg.coinbase_max_bytes == 820);
 }
 
+/* A per-listener coinbase ceiling.
+ *
+ * The ceiling that actually binds is a marketplace rule, enforced by whoever
+ * rents you hashrate, and it applies only to the port they connect to. Since
+ * every byte of ceiling costs a payout, imposing a rental market's limit on
+ * your own miners' port cuts their slots for nothing. */
+static void test_a_listener_can_carry_its_own_coinbase_ceiling(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[640];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "coinbase_max_bytes = 4000\n"
+             "listener = port=3335 label=rental min_diff=1000 initial_diff=1000 max_coinbase_bytes=900\n"
+             "listener = port=3336 label=home\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.coinbase_max_bytes == 4000);
+    CHECK(cfg.listener_count == 2);
+    /* The rented port takes the tight ceiling... */
+    CHECK(cfg.listeners[0].max_coinbase_bytes == 900);
+    /* ...and a port that did not ask for one stays at 0, which means "use the
+     * server-wide setting" rather than "no payouts". */
+    CHECK(cfg.listeners[1].max_coinbase_bytes == 0);
+
+    /* Too small to hold one payout is refused, exactly as the server-wide
+     * setting is — a port that can pay nobody is not a port. */
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "listener = port=3335 max_coinbase_bytes=150\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "max_coinbase_bytes") != NULL);
+}
+
 /* The payout floor decides who this pool refuses to serve, so it has to parse
  * exactly and default to something an operator can defend. It is the harshest
  * knob in the file: above it a miner is paid out of the block, below it a
@@ -396,6 +428,7 @@ int main(void) {
     test_rejects_bad_operator_address();
     test_the_coinbase_budget_defaults_and_parses();
     test_the_payout_floor_defaults_and_parses();
+    test_a_listener_can_carry_its_own_coinbase_ceiling();
     test_a_tiny_coinbase_budget_is_refused();
     test_pplns_coinbase_validates_the_window();
     test_pplns_coinbase_refuses_a_pool_wallet();

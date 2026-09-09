@@ -565,7 +565,10 @@ rather than the pool:
 - `coinbase_max_bytes` budgets the **whole serialized coinbase**, commitments
   included — that is what a rented-hashrate marketplace measures when it
   refuses a job as oversized. On a drivechain the BIP300/301 `OP_RETURN`s
-  spend it before any payout does.
+  spend it before any payout does. Settable per listener
+  (`listener = port=3335 … max_coinbase_bytes=900`), which is usually what you
+  want: the ceiling only applies to the port rented hashrate connects to, and
+  every byte of it costs a payout.
 - `pplns_payout_floor_sats` is the least a claim must be worth to get an
   output at all.
 

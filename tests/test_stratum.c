@@ -2719,6 +2719,22 @@ static void test_suggest_difficulty_before_authorize(void) {
  * taken when the template was built. Every connection therefore renders the
  * same coinbase -- the outputs live in cb2 and only the extranonce differs --
  * which is the same shape the pooled modes already have. */
+static stratum_server_t *cbwin_server_budget(stratum_cfg_t *cfg, obs_t *obs,
+                                            size_t max_coinbase_bytes) {
+    *cfg = (stratum_cfg_t){ .bind_port = 0, .max_conns = 4, .initial_diff = 1.0,
+                            .coinbase_pays_window = 1,
+                            .username_is_thunder = 0,
+                            .pps_accrues = 0,
+                            .max_coinbase_bytes = max_coinbase_bytes,
+                            .ctx = obs, .on_share = on_share,
+                            .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg->bind_addr, sizeof cfg->bind_addr, "127.0.0.1");
+    snprintf(cfg->operator_address, sizeof cfg->operator_address, "%s", TEST_ADDR);
+    stratum_server_t *s = NULL;
+    stratum_server_start(cfg, &s);
+    return s;
+}
+
 static stratum_server_t *cbwin_server(stratum_cfg_t *cfg, obs_t *obs) {
     *cfg = (stratum_cfg_t){ .bind_port = 0, .max_conns = 2, .initial_diff = 1.0,
                             .coinbase_pays_window = 1,
@@ -2780,6 +2796,90 @@ static void test_pplns_coinbase_pays_every_miner_in_the_window(void) {
     stratum_conn_free_for_test(c);
     stratum_conn_free_for_test(c2);
     stratum_server_free(s);
+}
+
+/* Two ports, one job, different numbers of payouts.
+ *
+ * The byte ceiling that actually binds is a marketplace rule: whoever rents
+ * you hashrate verifies the coinbase and refuses a job it considers oversized.
+ * It applies to the port they connect to and nowhere else — and since every
+ * byte of ceiling costs a payout, imposing it on your own miners' port cuts
+ * their slots for nothing. A pool measured 9 miners paid at a 400-byte ceiling
+ * against 93 at 3000 (LayerTwo-Labs/simplepool#76).
+ *
+ * So the ceiling is per-listener, and the same job renders a different number
+ * of outputs depending on which port asked. The window itself is unchanged:
+ * the payees and their order come off the job, and each port simply takes as
+ * many of them as it can fit. */
+static void test_a_listener_ceiling_changes_how_many_the_coinbase_pays(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg;
+    stratum_server_t *s = cbwin_server_budget(&cfg, &obs, 3000);  /* generous */
+    CHECK(s != NULL); if (!s) return;
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_job_t *job = make_test_job("JCAP", net);
+    enum { N = 20 };
+    coinbase_payee_t win[N];
+    int64_t each = 5000000000LL / N, tot = 0;
+    for (int i = 0; i < N; ++i) {
+        win[i].address = (i % 2) ? TEST_ADDR : TEST_ADDR2;
+        win[i].sats = each; tot += each;
+    }
+    win[0].sats += 5000000000LL - tot;
+    CHECK(stratum_job_set_window(job, win, NULL, N) == 0);
+    stratum_server_set_job(s, job, 1);
+
+    /* A miner on the default port gets the server-wide ceiling. */
+    stratum_conn_t *home = stratum_conn_new_for_test(s);
+    handshake(s, home);
+    uint64_t n_home = cbwin_output_count(s, home, "JCAP");
+
+    /* A miner on the rented port gets that port's tighter one, and is served
+     * strictly fewer payouts from the very same job. */
+    stratum_conn_t *rented = stratum_conn_new_for_test(s);
+    stratum_conn_set_coinbase_budget_for_test(rented, 500);
+    handshake(s, rented);
+    uint64_t n_rent = cbwin_output_count(s, rented, "JCAP");
+
+    CHECK(n_home == N);          /* 3000 bytes fits the whole window */
+    CHECK(n_rent > 0);
+    CHECK(n_rent < n_home);      /* and 500 does not */
+
+    /* Both are still valid coinbases paying out the whole block — the tighter
+     * one redistributes across the fewer miners it could fit rather than
+     * dropping the difference. */
+    stratum_conn_free_for_test(home);
+    stratum_conn_free_for_test(rented);
+    stratum_server_free(s);
+    printf("ok: a listener's coinbase ceiling changes how many it pays "
+           "(%llu vs %llu)\n",
+           (unsigned long long)n_home, (unsigned long long)n_rent);
+}
+
+/* A listener that sets no ceiling of its own uses the server-wide one, rather
+ * than reading 0 as "no payouts at all". */
+static void test_a_listener_without_a_ceiling_uses_the_server_wide_one(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg;
+    stratum_server_t *s = cbwin_server_budget(&cfg, &obs, 3000);
+    CHECK(s != NULL); if (!s) return;
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_job_t *job = make_test_job("JDEF", net);
+    const coinbase_payee_t win[] = {
+        { TEST_ADDR, 3000000000LL }, { TEST_ADDR2, 2000000000LL },
+    };
+    CHECK(stratum_job_set_window(job, win, NULL, 2) == 0);
+    stratum_server_set_job(s, job, 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    stratum_conn_set_coinbase_budget_for_test(c, 0);   /* explicitly unset */
+    handshake(s, c);
+    CHECK(cbwin_output_count(s, c, "JDEF") == 2);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: a listener with no ceiling of its own uses the server-wide one\n");
 }
 
 /* Bootstrap. A pool that has never been mined has no shares, so no window —
@@ -2945,6 +3045,8 @@ int main(void) {
     test_gate_can_be_disabled();
     test_solo_is_never_gated();
     test_a_windowless_job_pays_the_finder();
+    test_a_listener_ceiling_changes_how_many_the_coinbase_pays();
+    test_a_listener_without_a_ceiling_uses_the_server_wide_one();
     test_pplns_coinbase_pays_every_miner_in_the_window();
     test_pplns_btc_takes_a_bitcoin_username();
     test_pplns_thunder_takes_a_thunder_username();

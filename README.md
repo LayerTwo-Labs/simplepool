@@ -174,6 +174,13 @@ and what a stratum username is:
     to 16 miners, where the same 16 payouts cost 817 bytes against four
     drivechain `OP_RETURN`s and 769 against three. A cap counted in outputs
     cannot see that; a byte budget can.
+
+    It is settable **per listener**, and usually should be. The ceiling is a
+    marketplace rule enforced on the port the rented hashrate connects to, and
+    every byte of it costs a payout — a 100-miner window pays 9 at 400 bytes
+    and 93 at 3000 — so there is no reason to make your own miners live under a
+    limit their port is never measured against. Set it tight on the rental
+    listener and leave the rest alone.
   - `pplns_payout_floor_sats` (default 546, the dust limit) is the minimum
     a claim must be worth to get an output at all.
 

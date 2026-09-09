@@ -158,11 +158,22 @@ static int parse_listener(const char *v, stratum_listener_t *out,
         else if (strcmp(fk, "min_diff")     == 0) min_diff = atof(fv);
         else if (strcmp(fk, "initial_diff") == 0) initial = atof(fv);
         else if (strcmp(fk, "max_diff")     == 0) out->vardiff_max = atof(fv);
+        else if (strcmp(fk, "max_coinbase_bytes") == 0) out->max_coinbase_bytes = atoi(fv);
         else if (strcmp(fk, "label")        == 0) copy_str(out->label, sizeof out->label, fv);
         else {
             set_err(errbuf, errlen, "unknown listener field '%s'", fk);
             return -1;
         }
+    }
+    /* Same floor as the server-wide setting: below this no coinbase can hold
+     * even one payout, so the port could not pay anybody at all. 0 means "use
+     * the server-wide one" and is always fine. */
+    if (out->max_coinbase_bytes != 0 && out->max_coinbase_bytes < 200) {
+        set_err(errbuf, errlen,
+                "listener max_coinbase_bytes = %d is too small to hold a "
+                "coinbase and a single payout; omit it to use the server-wide "
+                "coinbase_max_bytes", out->max_coinbase_bytes);
+        return -1;
     }
     if (out->port <= 0 || out->port > 65535) {
         set_err(errbuf, errlen, "listener needs a port between 1 and 65535");

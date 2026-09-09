@@ -228,8 +228,19 @@ pool_mode = solo
 # cannot see that; this can, because the commitments are simply part of what
 # has already been spent.
 #
-# Whatever does not fit is forfeited to the operator — see
+# Whatever does not fit is redistributed across the miners it could pay — see
 # pplns_payout_floor_sats below.
+#
+# Settable PER LISTENER, and usually should be. The ceiling that actually binds
+# is a marketplace rule enforced on the port rented hashrate connects to, and
+# every byte of it costs a payout: at 400 bytes a 100-miner window pays 9, at
+# 3000 it pays 93. There is no reason to make your own miners live under a
+# limit their port is not measured against:
+#
+#   coinbase_max_bytes = 3000
+#   listener = port=3335 label=rental min_diff=500000 initial_diff=500000 max_coinbase_bytes=900
+#
+# A listener that sets none uses the server-wide value below.
 # coinbase_max_bytes = 1000
 
 # pplns-coinbase — the payout floor, in satoshis. A miner whose share of a

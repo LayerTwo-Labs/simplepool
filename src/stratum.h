@@ -153,6 +153,17 @@ typedef struct {
      * for one, which is how the default port and every low-difficulty chain
      * keep their existing behaviour. See clamp_assigned_difficulty. */
     double min_diff;
+    /* This port's coinbase byte ceiling, overriding the server-wide
+     * coinbase_max_bytes. 0 means "use the server-wide one".
+     *
+     * Here for the same reason min_diff is: the ceiling that actually binds is
+     * a MARKETPLACE rule, enforced by whoever is renting you hashrate, and it
+     * only applies to the port they connect to. A byte ceiling costs payouts —
+     * every miner it cuts is one the block cannot pay — so applying a
+     * rental market's limit to your own miners' port buys nothing and costs
+     * them their slots (LayerTwo-Labs/simplepool#76). Set it tight on the
+     * rented port and leave it alone everywhere else. */
+    int    max_coinbase_bytes;
     /* Free-form, for logs and for the dashboard to tell miners which port to
      * point which machine at. Empty for the default listener. */
     char   label[32];
@@ -322,6 +333,7 @@ typedef struct stratum_conn stratum_conn_t;
 /* Allocate a connection state attached to a server. Used by tests; the
  * real listener uses an internal allocator. */
 stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s);
+void stratum_conn_set_coinbase_budget_for_test(stratum_conn_t *c, int bytes);
 void            stratum_conn_free_for_test(stratum_conn_t *c);
 
 /* Test accessors — connection internals are otherwise opaque. */

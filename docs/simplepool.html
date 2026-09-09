@@ -2179,7 +2179,10 @@ Password  (anything — it is discarded)</code></pre>
         <tr><td><code>coinbase_max_bytes</code></td><td><code>1000</code></td>
             <td><code>pplns-coinbase</code> only. Byte budget for the WHOLE serialized coinbase,
                 commitments included — a rented-hashrate marketplace measures bytes, and drivechain
-                <code>OP_RETURN</code>s spend them before any payout does. Minimum 200.</td></tr>
+                <code>OP_RETURN</code>s spend them before any payout does. Minimum 200. Settable
+                per listener (<code>max_coinbase_bytes=</code> on a <code>listener</code> line),
+                which is usually right: the ceiling binds only on the port rented hashrate
+                connects to, and every byte of it costs a payout.</td></tr>
         <tr><td><code>pplns_payout_floor_sats</code></td><td><code>546</code></td>
             <td><code>pplns-coinbase</code> only. A claim worth less than this is <strong>not paid,
                 and is forfeited to the operator</strong> — nothing is carried and nothing settles
