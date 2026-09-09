@@ -1433,12 +1433,13 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
     served a job whose coinbase pays that miner. Finding a block and being paid
     are the same event; there is nothing after it.
   </p>
-  <figure>
+  <!-- seq:solo -->
+<figure>
   <div class="svgbox">
     <svg viewBox="0 0 626 434" role="img"
-         aria-labelledby="sq22713t sq22713d" style="max-width: 626px; margin: 0 auto;">
-      <title id="sq22713t">solo mode: the finder is paid in the block it found</title>
-      <desc id="sq22713d">A miner subscribes, simplepool builds a coinbase paying that miner and hands out work. When the miner finds a block the coinbase already pays it, so no ledger and no payout step exist.</desc>
+         aria-labelledby="sq69a9b7t sq69a9b7d" style="max-width: 626px; margin: 0 auto;">
+      <title id="sq69a9b7t">solo mode: the finder is paid in the block it found</title>
+      <desc id="sq69a9b7d">A miner subscribes, simplepool builds a coinbase paying that miner and hands out work. When the miner finds a block the coinbase already pays it, so no ledger and no payout step exist.</desc>
       <style>
         .abx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; }
         .abx.accent { fill: var(--solo-bg); stroke: var(--solo); }
@@ -1465,6 +1466,7 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
     </svg>
   </div>
 </figure>
+<!-- /seq:solo -->
 
   <h3><code>pps-classic</code> — paid on arrival, out of a reserve</h3>
   <p>
@@ -1473,12 +1475,13 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
     earned any, and the gap has to be funded by an operator reserve measured in
     block rewards.
   </p>
-  <figure>
+  <!-- seq:pps -->
+<figure>
   <div class="svgbox">
     <svg viewBox="0 0 784 478" role="img"
-         aria-labelledby="sq4683t sq4683d" style="max-width: 784px; margin: 0 auto;">
-      <title id="sq4683t">pps-classic: every share is priced on arrival, the pool carries the risk</title>
-      <desc id="sq4683d">Each accepted share is credited immediately at a rate derived from the template. The coinbase pays the pool wallet, and a payout worker settles balances over Thunder on a daily batch.</desc>
+         aria-labelledby="sqa8556at sqa8556ad" style="max-width: 784px; margin: 0 auto;">
+      <title id="sqa8556at">pps-classic: every share is priced on arrival, the pool carries the risk</title>
+      <desc id="sqa8556ad">Each accepted share is credited immediately at a rate derived from the template. The coinbase pays the pool wallet, and a payout worker settles balances over Thunder on a daily batch.</desc>
       <style>
         .abx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; }
         .abx.accent { fill: var(--pps-bg); stroke: var(--pps); }
@@ -1505,6 +1508,7 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
     </svg>
   </div>
 </figure>
+<!-- /seq:pps -->
 
   <h3><code>pplns-thunder</code> / <code>pplns-btc</code> — paid when a block matures</h3>
   <p>
@@ -1513,12 +1517,13 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
     there is no reserve to size. The two rails differ only in where the balance
     is finally settled, which is what a stratum username has to be.
   </p>
-  <figure>
+  <!-- seq:pplns_custodial -->
+<figure>
   <div class="svgbox">
     <svg viewBox="0 0 626 518" role="img"
-         aria-labelledby="sq61756t sq61756d" style="max-width: 626px; margin: 0 auto;">
-      <title id="sq61756t">pplns-thunder and pplns-btc: a matured block is split across the work that found it</title>
-      <desc id="sq61756d">Shares are recorded but not priced. When a block reaches 100 confirmations it is divided across the window of shares that produced it, and the payout worker settles the resulting balances over Thunder or on Bitcoin L1.</desc>
+         aria-labelledby="sqc435b4t sqc435b4d" style="max-width: 626px; margin: 0 auto;">
+      <title id="sqc435b4t">pplns-thunder and pplns-btc: a matured block is split across the work that found it</title>
+      <desc id="sqc435b4d">Shares are recorded but not priced. When a block reaches 100 confirmations it is divided across the window of shares that produced it, and the payout worker settles the resulting balances over Thunder or on Bitcoin L1.</desc>
       <style>
         .abx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; }
         .abx.accent { fill: var(--pplns-bg); stroke: var(--pplns); }
@@ -1545,6 +1550,7 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
     </svg>
   </div>
 </figure>
+<!-- /seq:pplns_custodial -->
 
   <h3><code>pplns-coinbase</code> — the same accounting, no custody</h3>
   <p>
@@ -1555,12 +1561,13 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
     operator — and whoever was left out goes first in the queue for the next
     block. See <a href="#modes">the five modes</a> for the policy in full.
   </p>
-  <figure>
+  <!-- seq:cbwin -->
+<figure>
   <div class="svgbox">
     <svg viewBox="0 0 626 490" role="img"
-         aria-labelledby="sq66551t sq66551d" style="max-width: 626px; margin: 0 auto;">
-      <title id="sq66551t">pplns-coinbase: the block pays the whole window, directly</title>
-      <desc id="sq66551d">The window is snapshotted onto the job when the template is built, so the coinbase carries one output per miner it has room for. There is no pool wallet, no ledger and no maturity wait. What one block cannot fit is shared among the miners it could pay, and those left out go first in the queue for the next block.</desc>
+         aria-labelledby="sq5b7c20t sq5b7c20d" style="max-width: 626px; margin: 0 auto;">
+      <title id="sq5b7c20t">pplns-coinbase: the block pays the whole window, directly</title>
+      <desc id="sq5b7c20d">The window is snapshotted onto the job when the template is built, so the coinbase carries one output per miner it has room for. There is no pool wallet, no ledger and no maturity wait. What one block cannot fit is shared among the miners it could pay, and those left out go first in the queue for the next block.</desc>
       <style>
         .abx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; }
         .abx.accent { fill: var(--pplns-bg); stroke: var(--pplns); }
@@ -1587,6 +1594,7 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
     </svg>
   </div>
 </figure>
+<!-- /seq:cbwin -->
 
   <h3>The payout worker, in the three modes that have one</h3>
   <p>
@@ -1596,12 +1604,13 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
     design: the write-ahead row goes in <em>before</em> the money moves, and
     <code>paid_sats</code> is credited only once the transaction confirms.
   </p>
-  <figure>
+  <!-- seq:payout -->
+<figure>
   <div class="svgbox">
     <svg viewBox="0 0 560 494" role="img"
-         aria-labelledby="sq16811t sq16811d" style="max-width: 560px; margin: 0 auto;">
-      <title id="sq16811t">the payout worker: never pay twice, never claim to have paid</title>
-      <desc id="sq16811d">A write-ahead in-flight row is written before the transaction is sent, so a crash mid-payout is recoverable; paid_sats is credited only once the transaction confirms.</desc>
+         aria-labelledby="sq96bd6dt sq96bd6dd" style="max-width: 560px; margin: 0 auto;">
+      <title id="sq96bd6dt">the payout worker: never pay twice, never claim to have paid</title>
+      <desc id="sq96bd6dd">A write-ahead in-flight row is written before the transaction is sent, so a crash mid-payout is recoverable; paid_sats is credited only once the transaction confirms.</desc>
       <style>
         .abx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; }
         .abx.accent { fill: var(--pps-bg); stroke: var(--pps); }
@@ -1628,6 +1637,7 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
     </svg>
   </div>
 </figure>
+<!-- /seq:payout -->
 
   <div class="note">
     <span class="label">Why the order matters more than the rail</span>

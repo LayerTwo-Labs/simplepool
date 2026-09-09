@@ -109,3 +109,25 @@ One caveat about `test_integration.sh`, first in the list above: it looks
 like a solo end-to-end test and is not. It never mines, so it cannot see
 whether a coinbase pays the right person, and it is not in CI. That is what
 `test_solo_regtest.sh` was written for.
+
+## Generated documentation
+
+The sequence diagrams in `docs/simplepool.html` are inline SVG produced by
+`docs/sequence-diagrams.py` — no library, no external requests, colours from
+the page's own CSS variables so they follow the reader's theme. Do not edit
+the SVG by hand: it is ~4 KB per diagram of computed coordinates, and the
+script owns the layout, the note wrapping and the element ids.
+
+    python3 docs/sequence-diagrams.py            # rewrite the diagrams in place
+    python3 docs/sequence-diagrams.py --check    # fail if they are out of date
+
+To change a diagram, edit the `DIAGRAMS` spec at the bottom of that script and
+re-run it. Output is deterministic, so a no-op run leaves the file
+byte-identical — which is what `--check` relies on, and what CI runs in
+`check_build.yaml`.
+
+That guard exists because the diagrams have gone stale once already: the
+`pplns-coinbase` rule that a claim too small to pay is forfeited to the
+operator was reversed, and "FORFEITED to the operator" stayed drawn into the
+picture. A diagram nobody can regenerate is a diagram that quietly stops being
+true.
