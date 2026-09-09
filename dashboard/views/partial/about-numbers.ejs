@@ -242,32 +242,33 @@ password:  (ignored — any value)</pre>
         spendable.
     </p>
 
-    <%# The disclosure this mode exists to make. A claim below the floor is
-        forfeited to the operator and never settled, so a miner too small to
-        clear it will mine here, submit valid shares, and earn nothing
-        indefinitely. That is defensible as a stated rule and indefensible as
-        a discovery, and the operator's log is the one place the miner it
-        costs cannot see. Only rendered when the proxy actually published a
-        floor -- an older proxy stores NULL, and inventing 546 there would be
-        stating someone else's policy for them. %>
+    <%# The disclosure this mode owes its miners. A coinbase has a fixed budget
+        of bytes, so one block cannot pay everyone in a large window -- and
+        what it cannot pay goes to the OTHER MINERS, never to the operator.
+        Small miners are paid less OFTEN here, not less. Only rendered when
+        the proxy actually published a floor: an older proxy stores NULL, and
+        inventing 546 would state someone else's policy for them. %>
     <% if (_p && _p.pplns_payout_floor_sats != null) { %>
     <p class="muted small" style="border-left:3px solid #b5651d;padding-left:0.75em">
-        <strong>There is a minimum, and it is not held over.</strong>
-        If your share of a block comes to less than
-        <strong><%= _satsInt(_p.pplns_payout_floor_sats) %> sats</strong>, you
-        get no output in that coinbase and the amount goes to the operator.
-        It is <strong>not</strong> carried forward and <strong>not</strong>
-        paid later. A coinbase is a fixed budget of bytes and an output too
-        small to be worth its own space cannot be written, so this pool
-        forfeits it rather than keep a balance it would have to custody.
+        <strong>A single block may not pay everyone.</strong> A coinbase has
+        room for only so many outputs, so if your share of a block comes to
+        less than <strong><%= _satsInt(_p.pplns_payout_floor_sats) %> sats</strong>,
+        or there is simply no room left in it, you get no output in
+        <em>that</em> block.
     </p>
     <p class="muted small">
-        In practice that is a floor on how small a miner this pool is worth
-        using. Below it you would mine here and earn nothing, however long you
-        stayed — worse than mining solo, where you at least hold a lottery
-        ticket on a whole block. Work out your expected share of a block
-        before pointing a rig here, and ask the operator if you are near the
-        line.
+        What you were owed does not go to the pool: it is <strong>shared out
+        among the miners that block could pay</strong>, and the operator still
+        takes only its fee. You are then <strong>first in the queue</strong>
+        for the next one — a share of every coinbase's slots is reserved for
+        whoever has waited longest, so being small here means being paid
+        <em>less often</em>, not less.
+    </p>
+    <p class="muted small">
+        Nothing is held on your behalf, and there is no balance to withdraw.
+        That queue records whose turn it is, not money the pool owes you: if it
+        were deleted tomorrow nobody would be short a payment — the pool would
+        simply forget the order.
     </p>
     <% } %>
 

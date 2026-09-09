@@ -482,54 +482,53 @@ footer .wrap > p { max-width: 46rem; }
   </div>
 
   <div class="warnbox">
-    <span class="label">pplns-coinbase forfeits small claims to the operator</span>
+    <span class="label">pplns-coinbase pays what one block cannot fit to the other miners</span>
     <p>
       A coinbase is a fixed budget of bytes, and every payout spends some of
-      it. Two limits follow, and <strong>both cost miners money rather than the
-      pool</strong>: <code>coinbase_max_bytes</code> (default 1000) budgets the
-      whole serialized coinbase, commitments included, because that is what a
-      rented-hashrate marketplace measures when it refuses a job as oversized;
-      and <code>pplns_payout_floor_sats</code> (default 546, the dust limit) is
-      the least a claim must be worth to get an output at all.
+      it. Two limits follow: <code>coinbase_max_bytes</code> (default 1000)
+      budgets the whole serialized coinbase, commitments included, because that
+      is what a rented-hashrate marketplace measures when it refuses a job as
+      oversized — settable per listener, since the ceiling only binds on the
+      port the rented hashrate connects to. And
+      <code>pplns_payout_floor_sats</code> (default 546, the dust limit) is the
+      least a claim must be worth to get an output at all.
     </p>
     <p>
-      A claim that clears neither is <strong>forfeited to the operator — not
-      carried, not recorded, and not settled later</strong>. That is deliberate.
-      There is nowhere to hold it, because the payment <em>is</em> the block,
-      and carrying it would rebuild exactly the custodial ledger this mode
-      exists to delete. The consequence is a hashrate floor: a miner too small
-      to clear it will mine here, submit valid shares, and earn nothing
-      indefinitely — strictly worse for them than solo mining, where they at
-      least hold a lottery ticket.
+      A claim that clears neither is <strong>shared out among the miners that
+      block could pay</strong> — never given to the operator, which still takes
+      only its fee. The block pays out to the satoshi and the pool holds
+      nothing.
     </p>
     <p>
-      Because that is a trap unless it is visible, the floor is disclosed four
-      ways: stated at startup, reported per template as the count of miners
-      about to be excluded, reported per block as the claims actually
-      forfeited — and published to <code>pool_meta</code>, so the
-      <strong>dashboard states it to miners before they connect</strong>.
-      That last one is the one that matters: the operator's log is the one
-      place the miner it costs cannot look.
+      Being small therefore costs you <strong>frequency, not money</strong>. A
+      miner's share of the window tracks its hashrate, so without help the
+      largest claims would take the same slots in every block and the same
+      addresses would never be paid at all. A quarter of each coinbase's slots
+      are reserved for whoever has waited longest, tracked as a signed fraction
+      of one block reward per worker that sums to zero. That is
+      <strong>not a balance</strong>: nothing is withheld from a coinbase and
+      released later, and deleting the table would cost nobody a payment — the
+      pool would just forget whose turn it was.
+    </p>
+    <p>
+      The floor is stated at startup, per template, per block, and on the
+      dashboard before a miner connects, because the operator's log is the one
+      place the miner it affects cannot look.
     </p>
   </div>
 
   <div class="note">
-    <span class="label">Why the PPLNS modes exist at all</span>
+    <span class="label">This was the other way round, and measurement changed it</span>
     <p>
-      PPS prices a share the moment it arrives, whether or not it ever becomes
-      a block. Somebody has to fund the gap between what has been promised and
-      what has been mined, and that somebody is the operator — who therefore
-      needs a reserve measured in block rewards, and who is ruined by a long
-      enough run of bad luck. That is a real barrier: a pool that cannot fund
-      the reserve cannot honestly run PPS.
-    </p>
-    <p>
-      PPLNS removes it by never promising anything in advance. A block is
-      divided among the work that produced it, so <strong>the pool never owes
-      more than it has just been paid</strong>. There is no reserve to size and
-      operator ruin is not a failure mode. The miners carry the variance
-      instead — which is the trade, stated plainly, and the reason the operator
-      fee is normally set lower here: there is no risk premium to charge for.
+      Until <a href="https://github.com/LayerTwo-Labs/simplepool/pull/76">#76</a>
+      a dropped claim rode on the <em>operator's</em> output, defended as a dust
+      policy. With 100 miners on a 1/n hashrate spread and the default budget,
+      28 were paid, <strong>72 were cut by the byte cap and none by the dust
+      floor</strong>, and the operator received <strong>25% of the block on a
+      1% fee</strong>. The take also rose as the coinbase shrank — 46% at 400
+      bytes against 2% at 3000 — so starving your own miners was the
+      revenue-maximising move. Neither the dust framing nor the incentive
+      survived contact with the numbers.
     </p>
   </div>
 
@@ -572,9 +571,9 @@ footer .wrap > p { max-width: 46rem; }
             <td><code>simplepool-payout.service</code></td>
             <td>same, with <code>PAYOUT_RAIL=btc</code></td>
             <td>not installed</td></tr>
-        <tr><td>A claim too small to pay</td><td colspan="2">cannot arise</td>
+        <tr><td>A claim one block cannot pay</td><td colspan="2">cannot arise</td>
             <td colspan="2">accrues until the payout worker can batch it</td>
-            <td><strong>forfeited to the operator</strong>, permanently</td></tr>
+            <td><strong>shared out among the miners that block could pay</strong>; you go first in the queue for the next one</td></tr>
         <tr><td>Miner's income</td><td>lumpy and rare, but complete</td><td>smooth and proportional</td>
             <td colspan="2">proportional, but only when the pool finds a block</td>
             <td>the same, above the payout floor — nothing below it</td></tr>
@@ -1550,17 +1549,18 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
   <h3><code>pplns-coinbase</code> — the same accounting, no custody</h3>
   <p>
     The window is snapshotted onto the job when the template is built, so the
-    coinbase carries one output per miner in it. No pool wallet, no ledger row,
-    no maturity wait — and no way to hold a claim too small to be worth an
-    output, which is why this mode has a payout floor and forfeits what falls
-    below it. See <a href="#modes">the five modes</a> for the policy in full.
+    coinbase carries one output per miner it has room for. No pool wallet, no
+    ledger row, no maturity wait. A coinbase only fits so many payouts, so what
+    one block cannot pay is shared among the miners it could — never the
+    operator — and whoever was left out goes first in the queue for the next
+    block. See <a href="#modes">the five modes</a> for the policy in full.
   </p>
   <figure>
   <div class="svgbox">
-    <svg viewBox="0 0 626 404" role="img"
-         aria-labelledby="sq42076t sq42076d" style="max-width: 626px; margin: 0 auto;">
-      <title id="sq42076t">pplns-coinbase: the block pays the whole window, directly</title>
-      <desc id="sq42076d">The window is snapshotted onto the job when the template is built, so the coinbase carries one output per miner. There is no pool wallet, no ledger and no maturity wait — but a claim below the payout floor is forfeited to the operator.</desc>
+    <svg viewBox="0 0 626 490" role="img"
+         aria-labelledby="sq66551t sq66551d" style="max-width: 626px; margin: 0 auto;">
+      <title id="sq66551t">pplns-coinbase: the block pays the whole window, directly</title>
+      <desc id="sq66551d">The window is snapshotted onto the job when the template is built, so the coinbase carries one output per miner it has room for. There is no pool wallet, no ledger and no maturity wait. What one block cannot fit is shared among the miners it could pay, and those left out go first in the queue for the next block.</desc>
       <style>
         .abx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; }
         .abx.accent { fill: var(--pplns-bg); stroke: var(--pplns); }
@@ -1582,8 +1582,8 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
         </marker>
       </defs>
       <rect class="abx" x="10.0" y="34" width="132" height="46" rx="7"/><text class="at" x="76" y="54" text-anchor="middle">Miner</text><text class="as" x="76" y="70" text-anchor="middle">ASIC</text><rect class="abx accent" x="168.0" y="34" width="132" height="46" rx="7"/><text class="at" x="234" y="54" text-anchor="middle">simplepool</text><text class="as" x="234" y="70" text-anchor="middle">:3334</text><rect class="abx" x="326.0" y="34" width="132" height="46" rx="7"/><text class="at" x="392" y="54" text-anchor="middle">shares.db</text><text class="as" x="392" y="70" text-anchor="middle">SQLite</text><rect class="abx" x="484.0" y="34" width="132" height="46" rx="7"/><text class="at" x="550" y="54" text-anchor="middle">Bitcoin L1</text><text class="as" x="550" y="70" text-anchor="middle">the chain</text>
-      <line class="life" x1="76" y1="80" x2="76" y2="390"/><line class="life" x1="234" y1="80" x2="234" y2="390"/><line class="life" x1="392" y1="80" x2="392" y2="390"/><line class="life" x1="550" y1="80" x2="550" y2="390"/>
-      <line class="ln" x1="238" y1="118" x2="387" y2="118" marker-end="url(#sqar)"/><text class="lbl" x="312" y="112" text-anchor="middle">who is in the window NOW?</text><line class="ln dash" x1="388" y1="152" x2="239" y2="152" marker-end="url(#sqar)"/><text class="lbl" x="314" y="146" text-anchor="middle">claims, largest first</text><path class="ln" d="M238,186 h26 v16 h-26" marker-end="url(#sqar)"/><text class="lbl" x="270" y="190" text-anchor="start">split by difficulty; drop anything under the floor</text><rect class="note warn" x="14" y="210" width="598" height="26" rx="5"/><text class="notet" x="313" y="227" text-anchor="middle">A claim below pplns_payout_floor_sats is FORFEITED to the operator — not carried, not settled later.</text><line class="ln" x1="230" y1="262" x2="81" y2="262" marker-end="url(#sqar)"/><text class="lbl" x="156" y="256" text-anchor="middle">notify — pays the whole window</text><line class="ln" x1="80" y1="296" x2="229" y2="296" marker-end="url(#sqar)"/><text class="lbl" x="154" y="290" text-anchor="middle">submit  (a block)</text><line class="ln" x1="238" y1="330" x2="545" y2="330" marker-end="url(#sqar)"/><text class="lbl" x="392" y="324" text-anchor="middle">submitblock</text><rect class="note win" x="14" y="350" width="598" height="26" rx="5"/><text class="notet" x="313" y="367" text-anchor="middle">Everyone above the floor is paid, in this block. No ledger row is ever written.</text>
+      <line class="life" x1="76" y1="80" x2="76" y2="476"/><line class="life" x1="234" y1="80" x2="234" y2="476"/><line class="life" x1="392" y1="80" x2="392" y2="476"/><line class="life" x1="550" y1="80" x2="550" y2="476"/>
+      <line class="ln" x1="238" y1="118" x2="387" y2="118" marker-end="url(#sqar)"/><text class="lbl" x="312" y="112" text-anchor="middle">who is in the window NOW?</text><line class="ln dash" x1="388" y1="152" x2="239" y2="152" marker-end="url(#sqar)"/><text class="lbl" x="314" y="146" text-anchor="middle">claims + who has waited longest</text><path class="ln" d="M238,186 h26 v16 h-26" marker-end="url(#sqar)"/><text class="lbl" x="270" y="190" text-anchor="start">order: biggest claims, plus reserved slots</text><rect class="note plain" x="14" y="210" width="598" height="40" rx="5"/><text class="notet" x="313" y="227" text-anchor="middle">A coinbase fits only so many outputs. What it cannot pay is shared among the miners it can — never the</text><text class="notet" x="313" y="241" text-anchor="middle">operator, who takes only its fee.</text><line class="ln" x1="230" y1="276" x2="81" y2="276" marker-end="url(#sqar)"/><text class="lbl" x="156" y="270" text-anchor="middle">notify — pays the whole window</text><line class="ln" x1="80" y1="310" x2="229" y2="310" marker-end="url(#sqar)"/><text class="lbl" x="154" y="304" text-anchor="middle">submit  (a block)</text><line class="ln" x1="238" y1="344" x2="545" y2="344" marker-end="url(#sqar)"/><text class="lbl" x="392" y="338" text-anchor="middle">submitblock</text><line class="ln" x1="238" y1="378" x2="387" y2="378" marker-end="url(#sqar)"/><text class="lbl" x="312" y="372" text-anchor="middle">stage who was skipped (sums to zero)</text><rect class="note warn" x="14" y="398" width="598" height="26" rx="5"/><text class="notet" x="313" y="415" text-anchor="middle">Staged, not applied: an orphaned block paid nobody and rotates nobody. The confirmation pass decides.</text><rect class="note win" x="14" y="436" width="598" height="26" rx="5"/><text class="notet" x="313" y="453" text-anchor="middle">Nobody is owed money — only a turn. Skipped miners go first in the next block.</text>
     </svg>
   </div>
 </figure>
@@ -2185,8 +2185,9 @@ Password  (anything — it is discarded)</code></pre>
                 connects to, and every byte of it costs a payout.</td></tr>
         <tr><td><code>pplns_payout_floor_sats</code></td><td><code>546</code></td>
             <td><code>pplns-coinbase</code> only. A claim worth less than this is <strong>not paid,
-                and is forfeited to the operator</strong> — nothing is carried and nothing settles
-                later. Clamped up to 546, the dust limit. Disclose it to your miners.</td></tr>
+                in that block</strong>; what it was owed is shared among the miners the block
+                could pay, and it goes first in the queue for the next one. Clamped up to 546,
+                the dust limit. Disclose it to your miners.</td></tr>
         <tr><td><code>operator_address</code></td><td>—</td>
             <td><strong>Required.</strong> Receives the <code>fee_bps</code> cut. The proxy refuses to start without it.</td></tr>
         <tr><td><code>fee_bps</code></td><td><code>100</code></td>

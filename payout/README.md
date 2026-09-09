@@ -33,8 +33,9 @@ username even is.
 > If you are looking for where a `pplns-coinbase` miner gets paid: in the
 > block, at the moment it is found, one coinbase output per miner. See the
 > mode's section in [../README.md](../README.md#the-five-modes) — including
-> the payout floor, below which a claim is forfeited to the operator rather
-> than accrued here.
+> the payout floor, below which a claim is shared among the miners that block
+> could pay rather than accrued here. Nothing is ever owed, so there is still
+> nothing for this worker to settle.
 
 Everything that makes a payout safe is written once and shared: the
 write-ahead `payouts_in_flight` row, one transaction per batch, and crediting

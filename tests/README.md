@@ -94,8 +94,9 @@ the version last validated against.
   pool stopped. That is replaying the pool's own record of accepted work, not
   stubbing what is under test: the window query, the split, the builder, the
   block and the outputs read back off the chain are all real, and the
-  forfeited amount is asserted against the arithmetic. Own `.regtest-cbwin/`
-  dir.
+  redistributed amount is asserted against the arithmetic — as is the operator
+  holding exactly its fee, and the payout queue summing to zero. Own
+  `.regtest-cbwin/` dir.
 
 Every one-shot test allocates its stack ports dynamically per run, so
 they can run concurrently — with each other and with a dev stack from

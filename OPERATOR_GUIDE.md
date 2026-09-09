@@ -18,8 +18,10 @@ design looks like this).
 >   on maturity out of a block actually found rather than a reserve, so there
 >   is no reserve to size or top up.
 > - `pplns-coinbase` additionally has a **payout floor**: a claim worth less
->   than `pplns_payout_floor_sats` is forfeited to the operator and never
->   settled. That is a policy you have to publish to your miners, not just a
+>   than `pplns_payout_floor_sats` gets no output in that block. What it was
+>   owed is shared among the miners the block could pay — never you — and the
+>   skipped miner goes first in the queue for the next block. You take your fee
+>   and nothing else. That is a policy to publish to your miners, not just a
 >   setting. [`VERIFY.md` section 13](VERIFY.md) is its operational checklist.
 
 ---

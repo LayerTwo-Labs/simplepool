@@ -498,8 +498,9 @@ has to agree with, not just a config to fill in.
 
 ### 13.2 · The floor is disclosed, four ways
 
-This is the whole justification for forfeiting rather than carrying, so check
-it rather than assume it.
+A block cannot pay everyone in a large window, so miners have to know both
+halves: what one block may not pay them, and what happens to it. Check this
+rather than assume it.
 
 - [ ] **Startup**, beside the identity line: *"payout floor N sats — a miner
       whose share of a block is worth less than that is NOT PAID…"*. It prints
@@ -508,10 +509,11 @@ it rather than assume it.
       miner(s) in the window are below the …-sat payout floor and will earn
       NOTHING from the next block"*. Only re-logged when the count changes.
 - [ ] **Per block**: either *"paid all N miner(s)"* or *"N claim(s) worth X
-      sats were forfeited to the operator"*.
+      sats had no room and were REDISTRIBUTED across the miners who did fit"*.
 - [ ] **The dashboard**, before anyone connects. Open `/` and read the
       "About the numbers" card: it must state the floor in sats and say the
-      amount is *not carried forward and not paid later*. If it does not, the
+      amount is *shared out among the miners that block could pay*, and that
+      the miner goes *first in the queue* for the next one. If it does not, the
       proxy is on a build that predates `pool_meta.pplns_payout_floor_sats` —
       the card stays silent rather than inventing a default, so check
       `sqlite3 shares.db "SELECT pplns_payout_floor_sats FROM pool_meta"`.
@@ -528,15 +530,35 @@ homework. `bitcoin-cli getblock <hash> 2 | jq '.tx[0].vout'`:
       There is no pool wallet, so a third address means something is wrong.
 - [ ] The outputs sum to the whole block reward. A coinbase paying out less
       than it may destroys the difference.
-- [ ] The operator output is `fee + forfeits`, so it is **larger than
-      `fee_bps` alone** on any block that forfeited. That is the forfeit
-      arriving, and it is the one number that proves it went somewhere rather
-      than nowhere.
+- [ ] The operator output is **exactly `fee_bps` of the block, and no more**,
+      on every block — including ones that could not pay the whole window.
+      This is the check that matters most: until #76 a dropped claim rode on
+      the operator's output, and on a 100-miner window that came to 25% of the
+      block against a 1% advertised fee.
+- [ ] The miners who *were* paid received **more than their own window
+      share**, and the outputs still sum to the whole block. That is the
+      redistribution arriving — if the total is short, value was destroyed
+      rather than shared.
 - [ ] `sqlite3 shares.db "SELECT COUNT(*) FROM pps_credits"` is **0**. This
-      mode writes no ledger row, ever. Any row means a pooled mode's accrual
+      mode credits no balance, ever. Any row means a pooled mode's accrual
       path ran.
+- [ ] The payout queue balances:
+      `sqlite3 shares.db "SELECT ROUND(COALESCE((SELECT SUM(delta) FROM
+      pplns_pending_fractions),0) + COALESCE((SELECT SUM(owed_fraction) FROM
+      pplns_fractions),0), 9)"` is **0**. It is a record of whose turn it is,
+      not money — a non-zero sum means somebody's turn was invented or
+      destroyed.
+- [ ] After a block is found but before it confirms, its rows are in
+      `pplns_pending_fractions` and **not** in `pplns_fractions`. An orphaned
+      block paid nobody and must rotate nobody; the confirmation pass is what
+      applies them.
 
 ### 13.4 · The byte budget
+
+- [ ] On a rented port, set `max_coinbase_bytes=` on that **listener** rather
+      than server-wide. The ceiling is a marketplace rule that binds only on
+      the port the rented hashrate connects to, and every byte of it costs a
+      payout — a 100-miner window pays 9 at 400 bytes and 93 at 3000.
 
 - [ ] Measure a real coinbase: `bitcoin-cli getblock <hash> 2 |
       jq -r '.tx[0].hex' | wc -c` ÷ 2 = bytes. Compare against

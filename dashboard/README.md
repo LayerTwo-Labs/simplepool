@@ -125,8 +125,9 @@ do the one thing that cannot work.
 
 **`pplns-coinbase` gets one more thing the others do not: the payout floor.**
 That mode does not pay a claim worth less than `pplns_payout_floor_sats` — it
-forfeits it to the operator, permanently, with no ledger entry and no later
-settlement. The card states the number before anyone connects, because the
+shares it out among the miners that block could pay — never the operator, who
+takes only its fee — and puts the skipped miner first in the queue for the next
+block. The card states the number before anyone connects, because the
 operator's log is the one place the miner it costs cannot look. It renders
 only when the proxy published a floor (`pool_meta.pplns_payout_floor_sats`);
 an older proxy stores NULL, and printing a default there would be stating some

@@ -165,7 +165,7 @@ and what a stratum username is:
   BIP300/301 commitment `OP_RETURN`s are preserved byte-for-byte — only the
   enforcer's own reward output is replaced, by the window.
 
-  **Two limits, and both cost miners money rather than the pool:**
+  **Two limits decide how many miners one block can pay:**
 
   - `coinbase_max_bytes` (default 1000) budgets the *whole serialized
     coinbase*, commitments included, because that is what a rented-hashrate
@@ -184,22 +184,44 @@ and what a stratum username is:
   - `pplns_payout_floor_sats` (default 546, the dust limit) is the minimum
     a claim must be worth to get an output at all.
 
-  **A claim that clears neither is forfeited to the operator. It is not
-  carried, not recorded, and not settled later.** That is a deliberate
-  policy and not a rounding artefact: there is nowhere to hold it, because
-  the payment *is* the block, and carrying it would rebuild exactly the
-  custodial ledger this mode exists to delete. The consequence is a hashrate
-  floor — a miner too small to clear it will mine here, submit valid shares,
-  and earn nothing indefinitely, which is strictly worse for them than solo
-  mining, where they at least hold a lottery ticket.
+  **A claim that clears neither is paid to the other miners in the window,
+  not to the operator.** The block still pays out to the satoshi, the pool
+  still holds nothing, and the operator still takes only its fee.
 
-  Because that is a trap unless it is visible, the floor is disclosed in four
-  places: the proxy states it at startup, logs how many miners in the current
-  window fall below it, and reports per block how many claims were forfeited
-  and for how much — and it publishes the number to `pool_meta`, so the
-  **dashboard states it to miners before they connect**. That last one is the
-  one that matters: the operator's log is the one place the miner it costs
-  cannot look.
+  > This was the other way round until [#76][pr76]. A dropped claim used to
+  > ride on the operator's output, defended as a dust policy. Measurement
+  > killed it: with 100 miners on a 1/n hashrate spread and the default
+  > budget, 28 were paid, **72 were cut by the byte cap and none by the dust
+  > floor**, and the operator received **25% of the block on a 1% fee**. The
+  > take also rose as the coinbase shrank — 46% at 400 bytes against 2% at
+  > 3000 — so starving your own miners was the revenue-maximising move.
+  > Credit to [@Wired4ncer][pr76], who runs the pool that showed it.
+
+  **Being small costs you frequency, not money.** A miner's share of the
+  window tracks its hashrate, so without help the largest claims would take
+  the same slots every block and the same addresses would never be paid at
+  all. A quarter of each coinbase's slots are therefore reserved for whoever
+  has waited longest, tracked in `pplns_fractions`: a signed fraction of one
+  block reward per worker, positive if you were skipped and negative if you
+  were paid early out of someone else's skipped share. The column sums to
+  zero.
+
+  That is **not a balance and the pool holds nothing against it**. Nothing is
+  ever withheld from a coinbase and released later — that would need a block
+  paying less than the reward followed by one paying more, and the second is
+  invalid. Delete the table and nobody is owed a payment; the pool just
+  forgets whose turn it was. Rows are staged when a block is found and applied
+  only once it is confirmed, so an orphaned block — which paid nobody —
+  rotates nobody.
+
+  The floor is disclosed in four places: the proxy states it at startup, logs
+  how many miners in the current window fall below it, reports per block what
+  was redistributed and to whom — and publishes the number to `pool_meta`, so
+  the **dashboard states it to miners before they connect**. That last one is
+  the one that matters: the operator's log is the one place the miner it
+  affects cannot look.
+
+[pr76]: https://github.com/LayerTwo-Labs/simplepool/pull/76
 
 In every mode the operator fee stays in BTC, paid to `operator_address`
 out of the same coinbase. On PPLNS it is normally set lower than on PPS:
@@ -665,7 +687,7 @@ mode, each mining a real chain:
 | `tests/test_e2e_regtest.sh` | `pps-classic`: the coinbase pays the pool, and shares accrue at the derived rate |
 | `tests/test_pplns_regtest.sh` | both pooled PPLNS rails distribute a matured block exactly once |
 | `tests/test_pplns_btc_payout_regtest.sh` | `pplns-btc` pays miners on L1 through the enforcer wallet |
-| `tests/test_pplns_coinbase_regtest.sh` | `pplns-coinbase`: the block's coinbase pays the window, the pool holds nothing, the payout floor is disclosed, and a mixed 100 : 10 : 1 window really does forfeit the smallest claim to the operator on chain |
+| `tests/test_pplns_coinbase_regtest.sh` | `pplns-coinbase`: the block's coinbase pays the window, the pool holds nothing, the payout floor is disclosed, and a mixed 100 : 10 : 1 window really does redistribute the smallest claim across the miners that fit — on chain, with the operator holding only its fee and the payout queue summing to zero |
 | `tests/test_payout_regtest.sh` | the Thunder payout rail settles and confirms |
 
 All of them run in CI. For the verification checklist behind each mode, see

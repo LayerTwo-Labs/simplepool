@@ -62,14 +62,30 @@ test('the payout floor is stated to the miner, in sats', async () => {
     assert.doesNotMatch(html, /25,000\.00 sats/);
 });
 
-test('the floor is described as forfeited, never as carried', async () => {
+test('a skipped claim is described as shared out, never as the operator\'s', async () => {
     const html = await about(makeDb());
-    /* The exact claim a miner has to come away with. Softening any of these
-     * into "held" or "later" would describe the design we deliberately did
-     * NOT build, and would be a false promise rather than a vague one. */
-    assert.match(html, /not.{0,30}carried forward/is);
-    assert.match(html, /goes to the operator/i);
-    assert.match(html, /earn nothing/i);
+    /* The exact claim a miner has to come away with, and it is the opposite of
+     * what this test asserted before #76: what a block cannot pay goes to the
+     * OTHER MINERS, and the operator still takes only its fee. */
+    assert.match(html, /shared out\s*among the miners/is);
+    assert.match(html, /takes only its fee/i);
+    /* And that the cost is frequency, not amount — the sentence a small miner
+     * needs in order to decide whether to point a rig here. */
+    assert.match(html, /less often/i);
+    assert.match(html, /first in the queue/i);
+    /* The page must NOT tell miners their share goes to the operator, which
+     * is what it used to say and is now simply false. */
+    assert.doesNotMatch(html, /amount goes to the operator/i);
+    assert.doesNotMatch(html, /forfeit/i);
+});
+
+test('the queue is described as an order, not a balance', async () => {
+    /* The property that makes it defensible: no money is held. A miner who
+     * reads this must not come away believing the pool owes them a payout
+     * they could one day claim. */
+    const html = await about(makeDb());
+    assert.match(html, /no balance to withdraw/i);
+    assert.match(html, /nobody would be short a payment/i);
 });
 
 test('a proxy that never published a floor claims none', async () => {
@@ -79,7 +95,7 @@ test('a proxy that never published a floor claims none', async () => {
     const db = makeDb();
     db.prepare('UPDATE pool_meta SET pplns_payout_floor_sats = NULL').run();
     const html = await about(db);
-    assert.doesNotMatch(html, /There is a minimum/i);
+    assert.doesNotMatch(html, /may not pay everyone/i);
     assert.doesNotMatch(html, /546/);
     /* But the mode itself is still described -- silence about the floor must
      * not become silence about the mode. */
@@ -91,7 +107,7 @@ test('a zero floor is still a floor, and still disclosed', async () => {
      * distinct from NULL. A `|| null` normalisation would collapse the two
      * and silently stop disclosing. */
     const html = await about(makeDb({ floor: 0 }));
-    assert.match(html, /There is a minimum/i);
+    assert.match(html, /may not pay everyone/i);
 });
 
 test('every mode gets its own guidance, and none is called solo', async () => {

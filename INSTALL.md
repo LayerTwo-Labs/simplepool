@@ -572,14 +572,20 @@ rather than the pool:
 - `pplns_payout_floor_sats` is the least a claim must be worth to get an
   output at all.
 
-**A claim that clears neither is forfeited to the operator — not carried, not
-recorded, not settled later.** That is deliberate: there is nowhere to hold it
-because the payment *is* the block. The consequence is a hashrate floor —
-a miner too small to clear it will mine here, submit valid shares and earn
-nothing indefinitely. The proxy states the floor at startup, warns per
-template how many miners fall below it, reports per block what was forfeited,
-and publishes the number so the dashboard states it to miners before they
-connect. **Publish it on your pool page as well.** See
+**A claim that clears neither is paid to the other miners in the window, not
+to the operator.** The block still pays out to the satoshi, the pool still
+holds nothing, and the operator still takes only its fee.
+
+Being small costs your miners **frequency, not money**. A quarter of every
+coinbase's payout slots are reserved for whoever has waited longest, tracked in
+`pplns_fractions` as a signed fraction of one block reward per worker that sums
+to zero. It is not a balance and you hold nothing against it — delete the table
+and nobody is owed a payment, the pool just forgets whose turn it was.
+
+The proxy states the floor at startup, warns per template how many miners fall
+below it, reports per block what was redistributed, and publishes the number so
+the dashboard states it to miners before they connect. **Publish it on your
+pool page as well.** See
 [the five modes](README.md#the-five-modes) and
 [`VERIFY.md` section 13](VERIFY.md).
 
