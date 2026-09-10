@@ -102,6 +102,19 @@ listener = port=3335 label=rental min_diff=500000 initial_diff=500000 max_coinba
   block value above it is what gets divided, among the window, when a block is
   found. The label stops calling itself a PPS rate on a pool that has none,
   and the history table drops the rate column when no row was ever priced.
+- **"The proxy may not be reaching its backend" was reading the wrong clock.**
+  The templates page measured staleness from `ts` — when a template was first
+  seen — which stopped advancing once repeat polls began folding into the row
+  they match. From then on it reported chain speed as a proxy fault: on a
+  chain averaging ~30 minutes a block against a 10-minute target, the 900 s
+  threshold fired on roughly every second block, permanently, while the
+  backend was in fact being polled every 30 seconds. It now measures from
+  `last_seen`, which is the column that tracks backend contact, and the
+  threshold follows the cadence the row was actually polled at — six missed
+  polls, never sooner than two minutes — so a pool with a deliberately slow
+  `bitcoind_poll_interval_ms` is not accused of being unreachable either. How
+  long the chain has stood on one tip is still shown, as the plain fact it is
+  rather than in the error colour.
 - **Pool solvency** counted `blocks_found.reward_sats` as pool revenue in
   `pplns-coinbase`, where that is what the block paid the *miners* — reporting
   a healthy margin for a pool that holds nothing. Now skipped, with the reason.

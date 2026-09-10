@@ -19,7 +19,27 @@
         </section>
     <% } else {
          const cur = templates.current;
-         const age = cur ? Math.max(0, Math.floor(Date.now() / 1000) - cur.ts) : 0;
+         const now = Math.floor(Date.now() / 1000);
+         /* Two clocks, and the backend warning below used to read the wrong
+            one. `ts` is when this template was FIRST seen; since repeat polls
+            started folding into the row they match it stops advancing for as
+            long as the chain sits on one block, so it measures how long the
+            tip has stood, not how long since the proxy heard from its
+            backend. `last_seen` is the one that tracks backend contact.
+            On a DB predating the fold every poll inserted its own row, so
+            stats.templates() coalesces last_seen to ts there and this stays
+            correct on both. */
+         const age     = cur ? Math.max(0, now - cur.ts) : 0;
+         const pollAge = cur ? Math.max(0, now - cur.last_seen) : 0;
+         /* How often this pool actually polls. bitcoind_poll_interval_ms is
+            the proxy's, and the dashboard cannot read it — but the row knows
+            it anyway: `polls` observations spanning `held_sec` is the cadence
+            this template was really polled at. Warn at six missed polls,
+            never sooner than two minutes, so a deliberately slow-polling pool
+            is not accused of being unreachable. A fresh row has nothing to
+            measure and falls back to the floor. */
+         const cadence    = cur && cur.polls > 1 ? cur.held_sec / (cur.polls - 1) : 0;
+         const stallAfter = Math.max(120, Math.ceil(cadence * 6));
          /* Only pps-classic puts a price on a share the moment it arrives, so
             in every other mode this column is 0 by construction. That much was
             right; the wording was not. It used to answer with "only pps-classic
@@ -81,10 +101,17 @@
         </div>
         <p class="muted small" style="margin-top:0.75em">
             Previous block <span class="mono" title="<%= cur.prev_hash %>"><%= cur.prev_hash.slice(0,20) %>…<%= cur.prev_hash.slice(-8) %></span>
-            <% if (age > 900) { %>
-                &nbsp;·&nbsp;<span style="color:#c66">no new template for
-                <%= Math.floor(age / 60) %> min — the proxy may not be reaching
-                its backend</span>
+            <%# How long the chain has stood on this tip. Real information and
+                not a fault — a slow chain is a slow chain — so it is stated
+                plainly rather than in the error colour the backend warning
+                below uses. %>
+            <% if (age >= 60) { %>
+                &nbsp;·&nbsp;mining this tip for <%= Math.floor(age / 60) %> min
+            <% } %>
+            <% if (pollAge > stallAfter) { %>
+                &nbsp;·&nbsp;<span style="color:#c66">no word from the backend
+                for <%= Math.floor(pollAge / 60) %> min — the proxy may not be
+                reaching it</span>
             <% } %>
         </p>
         <% if (pplns) { %>
