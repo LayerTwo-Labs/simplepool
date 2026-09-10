@@ -23,6 +23,7 @@
 
 static int tsw_step(sqlite3_stmt *st);
 static void maybe_delete_oldest(sqlite3_stmt *st);
+static void maybe_insert_behind_the_walk(sqlite3_stmt *st);
 
 /* Redirect every sqlite3_step() inside store.c to the wrapper below. */
 #define sqlite3_step tsw_step
@@ -47,6 +48,7 @@ static int tsw_step(sqlite3_stmt *st) {
     if (is_qb && g_fail_qb_after >= 0 && g_qb_steps++ >= g_fail_qb_after)
         return SQLITE_INTERRUPT;
     maybe_delete_oldest(st);
+    maybe_insert_behind_the_walk(st);
     return sqlite3_step(st);
 }
 
@@ -284,6 +286,77 @@ static void test_the_injection_seam_does_not_reach_the_payout_query(void) {
            " (qb_steps=%d)\n", g_qb_steps);
 }
 
+/* Shares landing between the boundary search and the payout query must NOT be
+ * swept into this window.
+ *
+ * They are two statements in two implicit read transactions, so a bare
+ * `sh.id >= cutoff` pays out work that arrived after the window was measured:
+ * 550 difficulty served against a configured 500, with 50 shares landing in
+ * between, growing with the share rate. The single statement they replaced was
+ * atomic for free. The boundary query now reports MAX(id) as well, so the
+ * payout query is bounded at both ends and describes exactly the rows the walk
+ * read. (Raised by Wired4ncer on #81.)
+ *
+ * Injected on the PAYOUT query's step rather than the boundary query's,
+ * because "between the two" is precisely where the rows have to land. */
+static sqlite3 *g_side = NULL;
+static int g_insert_behind = 0;
+
+static void maybe_insert_behind_the_walk(sqlite3_stmt *st) {
+    const char *sql = sqlite3_sql(st);
+    /* The payout query: joins workers and takes the id range. The boundary
+     * query has neither. */
+    if (!g_insert_behind || !sql) return;
+    if (!strstr(sql, "JOIN workers") || !strstr(sql, "sh.id >= ?")) return;
+    g_insert_behind = 0;
+    for (int i = 0; i < 50; ++i)
+        assert(sqlite3_exec(g_side,
+            "INSERT INTO shares (worker_id,ts,difficulty) VALUES (1,9999,1.0)",
+            NULL, NULL, NULL) == SQLITE_OK);
+}
+
+static void test_shares_landing_mid_walk_are_not_swept_in(void) {
+    const char *path = fresh_path();
+    store_t *s = open_with_shares(path, 5000, 1.0);
+    assert(sqlite3_open(path, &g_side) == SQLITE_OK);
+    sqlite3_busy_timeout(g_side, 5000);
+
+    store_window_entry_t win[16];
+    size_t n = 0; double total = 0; int tr = 0; char err[256] = {0};
+
+    /* Quiet pool: exactly the configured window. */
+    g_insert_behind = 0;
+    assert(store_pplns_window(s, 500.0, win, 16, &n, &total, &tr,
+                              err, sizeof err) > 0);
+    assert(total == 500.0);
+
+    /* Same window, with 50 shares committed between the two statements. */
+    g_insert_behind = 1;
+    assert(store_pplns_window(s, 500.0, win, 16, &n, &total, &tr,
+                              err, sizeof err) > 0);
+    if (total != 500.0) {
+        printf("FAIL: shares landed mid-walk and %.0f difficulty was served "
+               "against a configured 500\n", total);
+        exit(1);
+    }
+    assert(g_insert_behind == 0);   /* the injection really fired */
+
+    /* And they really were committed, so this did not pass for the wrong
+     * reason. */
+    sqlite3_stmt *c = NULL;
+    assert(sqlite3_prepare_v2(g_side, "SELECT COUNT(*) FROM shares", -1, &c,
+                              NULL) == SQLITE_OK);
+    assert(sqlite3_step(c) == SQLITE_ROW);
+    sqlite3_int64 rows = sqlite3_column_int64(c, 0);
+    sqlite3_finalize(c);
+    assert(rows == 5050);
+
+    sqlite3_close(g_side); g_side = NULL;
+    store_close(s);
+    printf("  ok test_shares_landing_mid_walk_are_not_swept_in "
+           "(%lld rows in the table, window still 500)\n", (long long)rows);
+}
+
 int main(void) {
     test_the_walk_serves_the_configured_window_when_nothing_fails();
     test_a_walk_that_fails_immediately_does_not_serve_the_whole_table();
@@ -292,6 +365,7 @@ int main(void) {
     test_a_pool_younger_than_its_window_still_returns_a_window();
     test_an_empty_table_is_not_an_error();
     test_the_injection_seam_does_not_reach_the_payout_query();
+    test_shares_landing_mid_walk_are_not_swept_in();
     printf("test_store_walk: all tests passed\n");
     return 0;
 }

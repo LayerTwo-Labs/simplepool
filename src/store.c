@@ -1486,13 +1486,28 @@ int store_pplns_window(store_t *s, double window_diff,
      * matching store_pplns_distribute() exactly. If these two ever disagree a
      * block pays out differently from what its template promised. */
     static const char *QB =
-        "SELECT MIN(id), MAX(running), COUNT(*) FROM ("
+        "SELECT MIN(id), MAX(running), COUNT(*), MAX(id) FROM ("
         "  SELECT id, difficulty,"
         "         SUM(difficulty) OVER (ORDER BY id DESC ROWS UNBOUNDED PRECEDING) AS running"
         "    FROM (SELECT id, difficulty FROM shares ORDER BY id DESC LIMIT ?)"
         ") WHERE running - difficulty < ?";
 
     sqlite3_int64 cutoff_id = 0;
+    /* The newest row the boundary search actually read.
+     *
+     * The payout query below is a second statement in a second implicit read
+     * transaction, so shares committed between the two would be swept in by a
+     * bare `sh.id >= cutoff` and paid out of this block -- work that arrived
+     * after the window was measured. Measured at 550 difficulty served against
+     * a configured 500 with 50 shares landing mid-walk, and it grows with the
+     * share rate.
+     *
+     * Pinning the top as well makes the two statements describe exactly the
+     * same rows, which is what the single statement they replaced did for
+     * free. INT64_MAX so an empty table -- the one path that never assigns it
+     * -- still produces a well-formed query rather than an empty range.
+     * (Raised by Wired4ncer on #81.) */
+    sqlite3_int64 top_id = INT64_MAX;
     {
         sqlite3_stmt *b = NULL;
         if (sqlite3_prepare_v2(s->db, QB, -1, &b, NULL) != SQLITE_OK) {
@@ -1538,6 +1553,7 @@ int store_pplns_window(store_t *s, double window_diff,
             /* No shares at all: no work, no window, no payees. Not an error. */
             if (got == 0) { settled = 1; break; }
             cutoff_id = sqlite3_column_int64(b, 0);
+            top_id    = sqlite3_column_int64(b, 3);
             double covered = sqlite3_column_double(b, 1);
             /* Covered means the batch reached past the window. */
             if (covered >= window_diff) { settled = 1; break; }
@@ -1571,7 +1587,7 @@ int store_pplns_window(store_t *s, double window_diff,
         "  FROM shares sh "
         "  JOIN workers w ON w.id = sh.worker_id "
         "  LEFT JOIN pplns_fractions f ON f.worker_id = w.id "
-        " WHERE sh.id >= ? "
+        " WHERE sh.id >= ? AND sh.id <= ? "
         "   AND w.payout_address IS NOT NULL AND w.payout_address <> '' "
         " GROUP BY w.id "
         " HAVING wd > 0 "
@@ -1584,6 +1600,7 @@ int store_pplns_window(store_t *s, double window_diff,
         return -2;
     }
     sqlite3_bind_int64(st, 1, cutoff_id);
+    sqlite3_bind_int64(st, 2, top_id);
 
     size_t n = 0;
     double total = 0.0;

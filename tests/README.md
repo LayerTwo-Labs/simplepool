@@ -17,6 +17,21 @@ test, sitting in a `static` function inside `main.c`:
   difficulty is clamped to network difficulty), so a chain cannot produce a
   window of wildly different claim sizes without help.
 
+One is white-box rather than linked:
+
+- `test_store_walk.c` — the PPLNS boundary walk's ERROR paths. It `#include`s
+  `src/store.c` as source with `sqlite3_step` redirected, so a sqlite failure
+  can be injected part-way through the widening loop and production code
+  carries no test seam. A progress handler was no good: it also fires for the
+  store's commit thread on the same connection, so it cannot single out one
+  statement.
+
+  What it pins is that a walk which cannot PROVE it covered the window returns
+  an error rather than a window. Before that fix, an injected failure served a
+  window 40x too wide on one path and 12x too narrow on another, both with a
+  success code — and in `pplns-coinbase` a wrong window is mined into a
+  coinbase and published, so nothing downstream can notice.
+
 `make asan` runs a subset under AddressSanitizer + UBSan; `make coverage`
 reports line and function coverage of the unit suites only.
 

@@ -1502,10 +1502,13 @@ static void test_the_payout_floor_is_published_for_the_dashboard(void) {
  * thread. A production pool reported a 5.5 GB database, where that is half a
  * minute per template and the pool simply stops publishing work.
  *
- * The replacement walks back in bounded batches, doubling until the batch
- * covers the window. These tests exist for the doubling, because that is the
+ * The replacement walks back in bounded batches, growing x4 until the batch
+ * covers the window. These tests exist for that widening, because it is the
  * part that can silently return a PARTIAL window -- which would not error, it
- * would just pay the wrong people. */
+ * would just pay the wrong people.
+ *
+ * The error paths through the same loop are covered separately, in
+ * tests/test_store_walk.c, which injects sqlite failures. */
 static void test_the_window_reads_past_the_first_batch(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg = {0};
@@ -1545,13 +1548,13 @@ static void test_the_window_reads_past_the_first_batch(void) {
                               err, sizeof err) > 0);
     assert(total == 1000.0);
 
-    /* Past it — this is the case the doubling exists for. */
+    /* Past it — this is the case the widening exists for. */
     assert(store_pplns_window(s, 6000.0, win, 16, &n, &total, &truncated,
                               err, sizeof err) > 0);
     assert(total == 6000.0);
 
     /* Wider than the entire history: every share, and no infinite loop
-     * doubling past the end of the table. */
+     * growing past the end of the table. */
     assert(store_pplns_window(s, 999999.0, win, 16, &n, &total, &truncated,
                               err, sizeof err) > 0);
     assert(total == 10000.0);

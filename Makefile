@@ -215,6 +215,8 @@ coverage:
 	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_thunder tests/test_thunder.c src/thunder.c
 	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_config tests/test_config.c \
 		src/config.c src/log.c src/coinbase.c src/sha256.c
+	$(CC) $(COV_CFLAGS) -Wno-unused-function -o $(COV_DIR)/test_store_walk \
+		tests/test_store_walk.c src/log.c -lsqlite3 -lpthread
 	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_pplns tests/test_pplns.c \
 		src/pplns.c src/coinbase.c src/sha256.c
 	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_reconcile tests/test_reconcile.c \
@@ -229,7 +231,7 @@ coverage:
 		$(addprefix -object ,$(COV_DIR)/test_store $(COV_DIR)/test_coinbase \
 		$(COV_DIR)/test_share $(COV_DIR)/test_bitcoind $(COV_DIR)/test_broadcast \
 		$(COV_DIR)/test_thunder $(COV_DIR)/test_config $(COV_DIR)/test_reconcile \
-		$(COV_DIR)/test_pplns) \
+		$(COV_DIR)/test_pplns $(COV_DIR)/test_store_walk) \
 		-instr-profile=$(COV_DIR)/all.profdata $(COV_IGNORE)
 
 format:
