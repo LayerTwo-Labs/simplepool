@@ -2052,7 +2052,8 @@ SELECT (SELECT COALESCE(SUM(reward_sats),0) + COALESCE(SUM(fee_sats),0)
             <td><code>pplns-coinbase</code> only. What a FOUND block did to those fractions, held
                 against its hash until the confirmation pass decides. A found block is a candidate:
                 applying it there would rotate a miner down the queue for a payment an orphan never
-                made</td></tr>
+                made. Applied at one confirmation and not reversed by a later reorg &mdash; that
+                costs a turn out of order, never a satoshi</td></tr>
       </tbody>
     </table>
   </div>

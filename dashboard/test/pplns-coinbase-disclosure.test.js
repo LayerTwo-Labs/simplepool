@@ -1,11 +1,15 @@
 /* What a pplns-coinbase pool tells the people it costs.
  *
- * This mode forfeits a claim below the payout floor to the operator and never
- * settles it. That is defensible as a stated rule and indefensible as a
- * discovery, and the whole case for the policy rests on the miner being able
- * to see it BEFORE pointing a rig at the pool. The operator's log is the one
- * place they cannot look, so these tests treat the disclosure as part of the
- * feature rather than as decoration.
+ * This mode pays a claim below the payout floor nothing from that block: its
+ * share goes to the other miners in the window (never the operator) and the
+ * miner is owed a turn in the payout queue, so being small costs frequency
+ * rather than money. That is defensible as a stated rule and indefensible as
+ * a discovery, and the whole case for the policy rests on the miner being
+ * able to see it BEFORE pointing a rig at the pool. The operator's log is the
+ * one place they cannot look, so these tests treat the disclosure as part of
+ * the feature rather than as decoration. The header of this file said the
+ * old rule -- forfeited to the operator -- for a while after the tests below
+ * started asserting the page must not say that.
  *
  * They also pin the mislabels this mode exposed. The dashboard used to answer
  * "not pps-classic" with the word "solo" in three places, so every pplns pool

@@ -139,13 +139,16 @@ CREATE TABLE IF NOT EXISTS pool_meta (
   pool_btc_address    TEXT,     /* pps-classic only; NULL in solo */
   pool_mode           TEXT,
   /* pplns-coinbase only; NULL in every other mode. The least a claim must be
-   * worth to get a coinbase output at all -- below it a miner is not paid and
-   * the amount goes to the operator, permanently.
+   * worth to get a coinbase output at all -- below it a miner is not paid BY
+   * THAT BLOCK. Its share goes to the other miners in the window, never to
+   * the operator, and the miner is recorded in pplns_fractions as owed a
+   * turn, so a later block with room reaches it first. Being small costs
+   * frequency, not money.
    *
    * Published here because the miner it costs reads the dashboard, not the
-   * operator's log. A forfeit policy nobody can see from outside is not a
-   * policy, it is a surprise, and the whole case for having one is that it is
-   * stated up front. */
+   * operator's log. A floor nobody can see from outside is not a policy, it
+   * is a surprise, and the whole case for having one is that it is stated up
+   * front. */
   pplns_payout_floor_sats INTEGER,
   fee_bps             INTEGER,
   rate_source         TEXT,     /* 'derived' | 'override' */
@@ -368,6 +371,12 @@ CREATE TABLE IF NOT EXISTS pplns_fractions (
 -- received. The confirmation pass applies these when the block is confirmed
 -- and deletes them when it is orphaned -- the same rule, and the same reason,
 -- as PPLNS distribution.
+--
+-- "Confirmed" here is ONE block deep, not the distributor's hundred: the queue
+-- must describe the last block before the next one is built, and nothing here
+-- is money. So a block reorged out after that first confirmation keeps its
+-- rotation. That is one turn out of order, corrected by the next block found,
+-- and never a satoshi.
 CREATE TABLE IF NOT EXISTS pplns_pending_fractions (
   block_hash TEXT    NOT NULL,
   worker_id  INTEGER NOT NULL,

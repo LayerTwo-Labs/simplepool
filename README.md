@@ -220,6 +220,13 @@ and what a stratum username is:
   only once it is confirmed, so an orphaned block — which paid nobody —
   rotates nobody.
 
+  "Confirmed" means one block deep, not a hundred: the queue has to reflect
+  the last block before the next one is built, and money is not at stake. The
+  cost is that a block reorged out *after* that first confirmation keeps its
+  rotation — the miners it paid stay at the back of the queue and the ones it
+  skipped stay at the front — for a payment that never stood. That is one turn
+  out of order, never a satoshi, and the next block found corrects it.
+
   **If the pool cannot measure the window, it publishes no job at all.** The
   window is read back over a bounded walk of the shares table; if that walk
   cannot prove it covered the configured window — an IO error, a lock held too

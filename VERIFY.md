@@ -551,7 +551,9 @@ homework. `bitcoin-cli getblock <hash> 2 | jq '.tx[0].vout'`:
 - [ ] After a block is found but before it confirms, its rows are in
       `pplns_pending_fractions` and **not** in `pplns_fractions`. An orphaned
       block paid nobody and must rotate nobody; the confirmation pass is what
-      applies them.
+      applies them. It applies them at ONE confirmation, so a block reorged
+      out after that has already rotated the queue and is not reversed — a
+      turn out of order, not money, and the next block corrects it.
 
 ### 13.4 · The byte budget
 

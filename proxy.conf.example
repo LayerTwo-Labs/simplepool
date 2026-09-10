@@ -264,7 +264,9 @@ pool_mode = solo
 # the reward followed by one paying more, and the second is invalid. Delete the
 # table and nobody is owed a payment; the pool just forgets whose turn it was.
 # Rows are staged when a block is found and applied only once it confirms, so
-# an orphaned block rotates nobody.
+# an orphaned block rotates nobody. Confirmed means one block deep, so a block
+# reorged out AFTER that keeps its rotation: one turn out of order, never a
+# satoshi, and corrected by the next block found.
 #
 # So being small here costs a miner FREQUENCY, not money. Say that on your
 # pool page — the proxy states the floor at startup, per template, per block,

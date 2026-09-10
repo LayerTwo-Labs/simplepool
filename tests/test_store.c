@@ -1452,11 +1452,13 @@ static void test_an_empty_window_returns_nothing_not_an_error(void) {
 
 /* The payout floor has to reach the DASHBOARD, not just the operator's log.
  *
- * pplns-coinbase forfeits a claim below the floor to the operator and never
- * settles it, and the entire case for that policy is that it is disclosed up
- * front. The miner it costs reads the dashboard; the operator's terminal is
- * the one place they cannot see. So the floor being in pool_meta is part of
- * the policy, not a nicety.
+ * pplns-coinbase pays a claim below the floor nothing from that block -- its
+ * share goes to the other miners in the window and the miner is owed a turn
+ * in the payout queue, so being small costs frequency rather than money --
+ * and the entire case for that policy is that it is disclosed up front. The
+ * miner it costs reads the dashboard; the operator's terminal is the one
+ * place they cannot see. So the floor being in pool_meta is part of the
+ * policy, not a nicety.
  *
  * NULL in every other mode, distinctly from 0: "this pool has no floor" and
  * "this pool's floor is zero sats" are different claims, and only the first
