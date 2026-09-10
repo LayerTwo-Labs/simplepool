@@ -263,6 +263,12 @@ int store_settle_block_fractions(store_t *s, int *out_applied,
                                  int *out_discarded,
                                  char *errbuf, size_t errlen);
 
+/* Test hooks: put the store's shared connection into a transaction, the way
+ * the commit thread does mid-batch, so a nested write can be exercised without
+ * racing a real one. Not for production use. */
+int store_begin_txn_for_test(store_t *s);
+int store_end_txn_for_test(store_t *s);
+
 int store_record_credit(store_t *s, const char *worker_name,
                         const char *payout_address,
                         uint64_t ts_ms, int64_t delta_sats);

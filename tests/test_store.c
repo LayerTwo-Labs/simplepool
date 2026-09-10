@@ -1718,6 +1718,67 @@ static void test_the_window_reports_each_workers_standing(void) {
     printf("  ok test_the_window_reports_each_workers_standing\n");
 }
 
+/* Writes that land while the commit thread holds a transaction.
+ *
+ * The store keeps ONE sqlite connection and shares it between the commit
+ * thread, the tip watcher and the stratum submit path. BEGIN IMMEDIATE fails
+ * outright when another thread is already mid-transaction — "cannot start a
+ * transaction within a transaction" — and because it is a race it shows up as
+ * an occasional lost write rather than as anything reproducible.
+ *
+ * It cost a real one: a block's payout-queue rotation was dropped with only a
+ * WARN, so the miner it skipped never moved up the queue. Caught by the
+ * regtest e2e, which had passed on the same code minutes earlier.
+ *
+ * Simulated deterministically here by opening a transaction on the store's own
+ * connection first, which is exactly the state the commit thread leaves it in.
+ * SAVEPOINT nests where BEGIN cannot. */
+static void test_writes_nest_inside_an_open_transaction(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_exec(db, "INSERT INTO workers (id,name,payout_address,first_seen,last_seen)"
+                     " VALUES (1,'a','bc1qa',1,1),(2,'b','bc1qb',1,1)", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status)"
+                     " VALUES (1,10,'h1',100,1,'confirmed')", NULL, NULL, NULL);
+    sqlite3_close(db);
+
+    /* Put the shared connection in the state the commit thread leaves it in. */
+    assert(store_begin_txn_for_test(s) == 0);
+
+    store_fraction_delta_t d[] = { {1, 0.25}, {2, -0.25} };
+    int rc = store_stage_block_fractions(s, "h1", d, 2, err, sizeof err);
+    if (rc < 0) {
+        printf("FAIL: staging inside an open transaction failed: %s\n", err);
+        assert(0 && "a nested write must not be refused");
+    }
+    assert(rc == 2);
+
+    int applied = 0, discarded = 0;
+    assert(store_settle_block_fractions(s, &applied, &discarded,
+                                        err, sizeof err) == 0);
+    assert(applied == 1);
+
+    assert(store_end_txn_for_test(s) == 0);
+
+    /* And it really committed, rather than being rolled back with the outer. */
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    char buf[64];
+    scalar_text(db, "SELECT CAST(ROUND(owed_fraction*100) AS INT) "
+                    "FROM pplns_fractions WHERE worker_id=1", buf, sizeof buf);
+    assert(strcmp(buf, "25") == 0);
+    sqlite3_close(db);
+
+    store_close(s);
+    printf("  ok test_writes_nest_inside_an_open_transaction\n");
+}
+
 /* The operator fee comes off the top, exactly as in solo and PPS. */
 static void test_pplns_takes_the_operator_fee(void) {
     const char *path = fresh_db_path();
@@ -1776,6 +1837,7 @@ int main(void) {
     test_fraction_deltas_must_sum_to_zero();
     test_only_a_confirmed_block_moves_the_queue();
     test_two_confirmed_blocks_both_count();
+    test_writes_nest_inside_an_open_transaction();
     test_the_window_reports_each_workers_standing();
     test_pplns_distributes_two_blocks_in_one_pass();
     test_an_empty_window_returns_nothing_not_an_error();

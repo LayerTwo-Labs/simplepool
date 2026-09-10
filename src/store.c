@@ -1271,6 +1271,40 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
 
 /* ---- PPLNS distribution ------------------------------------------------ */
 
+/* Transactions that may already be inside one.
+ *
+ * The store keeps ONE sqlite connection and shares it: the commit thread
+ * batches shares on it, while the tip watcher and the stratum submit path also
+ * write through it. BEGIN IMMEDIATE fails outright when the commit thread
+ * happens to be mid-batch -- "cannot start a transaction within a transaction"
+ * -- which is a race, so it shows up as an occasional lost write rather than
+ * as anything reproducible.
+ *
+ * SAVEPOINT nests. With no transaction open it starts one; inside another it
+ * is a nested unit that RELEASE folds into the outer commit. Either way the
+ * caller gets all-or-nothing, which is the property these writes actually
+ * need.
+ *
+ * Found when the coinbase-direct payout queue silently dropped a block's
+ * rotation under load (LayerTwo-Labs/simplepool#76). store_pplns_distribute()
+ * had the same bug and had been surviving on being retried each tip. */
+static int sp_begin(store_t *s, const char *name) {
+    char q[64];
+    snprintf(q, sizeof q, "SAVEPOINT %s", name);
+    return sqlite3_exec(s->db, q, NULL, NULL, NULL);
+}
+static void sp_release(store_t *s, const char *name) {
+    char q[64];
+    snprintf(q, sizeof q, "RELEASE %s", name);
+    sqlite3_exec(s->db, q, NULL, NULL, NULL);
+}
+static void sp_rollback(store_t *s, const char *name) {
+    char q[96];
+    snprintf(q, sizeof q, "ROLLBACK TO %s", name);
+    sqlite3_exec(s->db, q, NULL, NULL, NULL);
+    sp_release(s, name);
+}
+
 int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
                            int *out_blocks, int *out_workers,
                            char *errbuf, size_t errlen)
@@ -1367,7 +1401,7 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
          * and a failure leaves the latch clear so the next pass retries. A
          * partial distribution is the one outcome that cannot be corrected by
          * running again, because crediting is additive. */
-        if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        if (sp_begin(s, "sp_dist") != SQLITE_OK) {
             rc_out = -1;
             break;
         }
@@ -1411,7 +1445,7 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
         sqlite3_finalize(mark);
 
         if (ok) {
-            sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
+            sp_release(s, "sp_dist");
             blocks++;
             workers += credited_here;
             LOG_INFO("pplns: block %.16s… distributed %lld sats of %lld across "
@@ -1419,7 +1453,7 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
                      hbuf, (long long)distributed, (long long)payable,
                      credited_here, window);
         } else {
-            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+            sp_rollback(s, "sp_dist");
             if (errbuf && errlen)
                 snprintf(errbuf, errlen, "distribute %.16s: %s", hbuf,
                          sqlite3_errmsg(s->db));
@@ -1652,14 +1686,14 @@ int store_stage_block_fractions(store_t *s, const char *block_hash,
         "VALUES (?, ?, ?) "
         "ON CONFLICT(block_hash, worker_id) DO UPDATE SET delta = excluded.delta";
 
-    if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+    if (sp_begin(s, "sp_stage") != SQLITE_OK) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
         return -1;
     }
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
-        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        sp_rollback(s, "sp_stage");
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;
     }
@@ -1676,11 +1710,11 @@ int store_stage_block_fractions(store_t *s, const char *block_hash,
     sqlite3_finalize(st);
     if (!ok) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
-        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        sp_rollback(s, "sp_stage");
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;
     }
-    sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
+    sp_release(s, "sp_stage");
     return wrote;
 }
 
@@ -1698,7 +1732,7 @@ int store_settle_block_fractions(store_t *s, int *out_applied,
     /* One transaction for the whole settlement. A partially applied block
      * would leave the ledger not summing to zero, and unlike a failed payout
      * there is no later pass that could notice: the pending rows are gone. */
-    if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+    if (sp_begin(s, "sp_settle") != SQLITE_OK) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
         return -1;
     }
@@ -1719,7 +1753,7 @@ int store_settle_block_fractions(store_t *s, int *out_applied,
     sqlite3_stmt *sel = NULL;
     if (sqlite3_prepare_v2(s->db, ONE_HASH, -1, &sel, NULL) != SQLITE_OK) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
-        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        sp_rollback(s, "sp_settle");
         return -2;
     }
     while (nh < 64 && sqlite3_step(sel) == SQLITE_ROW) {
@@ -1764,14 +1798,25 @@ int store_settle_block_fractions(store_t *s, int *out_applied,
 
     if (!ok) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
-        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        sp_rollback(s, "sp_settle");
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;
     }
-    sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
+    sp_release(s, "sp_settle");
     if (out_applied)   *out_applied = applied;
     if (out_discarded) *out_discarded = discarded;
     return 0;
+}
+
+int store_begin_txn_for_test(store_t *s) {
+    if (!s || !s->db) return -1;
+    return sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK
+           ? 0 : -1;
+}
+
+int store_end_txn_for_test(store_t *s) {
+    if (!s || !s->db) return -1;
+    return sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
 }
 
 int store_record_credit(store_t *s, const char *worker_name,

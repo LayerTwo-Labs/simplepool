@@ -84,7 +84,7 @@ stage() { echo; echo "=== cbwin-e2e: $1"; }
 
 dump_logs() {
     echo "!!! cbwin-e2e FAILED — recent logs:" >&2
-    for f in "$REGTEST_DIR"/logs/*.log "$POOL_LOG"; do
+    for f in "$REGTEST_DIR"/logs/*.log "$POOL_LOG" /tmp/simplepool-cbmix.log; do
         [ -f "$f" ] || continue
         echo "--- tail $f" >&2
         tail -40 "$f" >&2
@@ -569,6 +569,12 @@ FROWS="$(sqlite3 "$MIX_DB" "SELECT COUNT(*) FROM pplns_fractions")"
 echo "  staged=$QROWS applied=$FROWS"
 [ "$QROWS" -ge 1 ] || [ "$FROWS" -ge 1 ] || {
     echo "FAIL: a block skipped a miner but nothing was recorded in the queue" >&2
+    echo "--- what the pool said about this block:" >&2
+    grep -E "pplns-coinbase: (block|staged|could not)" "$MIX_LOG" | tail -10 >&2
+    echo "--- window and payee state:" >&2
+    grep -oE "window of [0-9]+ miner\(s\)[^\"]*" "$MIX_LOG" | tail -3 >&2
+    echo "--- blocks recorded:" >&2
+    sqlite3 "$MIX_DB" "SELECT height, substr(hash,1,16), status FROM blocks_found" >&2
     exit 1; }
 
 # Zero-sum, across both the staged rows and any already applied. Rounded to
