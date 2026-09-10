@@ -1301,6 +1301,76 @@ static void test_the_template_reward_matches_what_the_builder_splits(void) {
     printf("ok: the template reward is exactly what the builder splits\n");
 }
 
+/* The slot estimate has to match what the builder actually admits.
+ *
+ * It decides how many payout slots are reserved for long-waiting miners, so
+ * being wrong shifts the rotation: too high reserves a share of a coinbase
+ * that does not exist, too low starves the queue. Neither breaks the
+ * arithmetic -- everyone still receives their own claim -- which is exactly
+ * why a drift here would go unnoticed without this.
+ *
+ * The first version assumed 31 bytes an output and was over by 24 slots on a
+ * window of taproot addresses at a 3000-byte budget: a third of the coinbase
+ * reserved where a quarter was meant. It now charges each address what it
+ * costs, and this pins the result to within a slot or two, ALWAYS on the
+ * conservative side. */
+static void test_the_slot_estimate_tracks_what_the_builder_admits(void) {
+    static const struct { const char *addr; const char *name; } KINDS[] = {
+        { WA, "P2WPKH" },
+        { "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297", "P2TR" },
+        { "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", "P2PKH" },
+    };
+    static const size_t BUDGETS[] = { 300, 400, 600, 1000, 2000, 3000 };
+    const int64_t payable = 4950000000LL;
+
+    for (size_t b = 0; b < sizeof BUDGETS / sizeof BUDGETS[0]; ++b) {
+        for (size_t k = 0; k < sizeof KINDS / sizeof KINDS[0]; ++k) {
+            const char *addrs[150];
+            for (int i = 0; i < 150; ++i) addrs[i] = KINDS[k].addr;
+            size_t est = coinbase_expected_payout_slots(BUDGETS[b], NULL,
+                                                        addrs, 150);
+            /* The truth: grow the window until the builder starts cutting. */
+            size_t actual_slots = 0;
+            for (int n = 1; n <= 150; ++n) {
+                coinbase_payee_t p[150];
+                char err[256];
+                int64_t each = payable / n, tot = 0;
+                for (int i = 0; i < n; ++i) {
+                    p[i].address = KINDS[k].addr; p[i].sats = each; tot += each;
+                }
+                p[0].sats += payable - tot;
+                coinbase_parts_t parts;
+                coinbase_window_result_t r;
+                if (coinbase_build_window(800000, 5000000000LL, p, (size_t)n,
+                                          WOP, 100, NULL, "/sp/", 4, 8,
+                                          BUDGETS[b], 546, &parts, &r,
+                                          err, sizeof err) != 0) break;
+                coinbase_parts_free(&parts);
+                if (r.dropped_capped > 0) { actual_slots = r.paid_count; break; }
+                actual_slots = (size_t)n;
+            }
+            if (actual_slots == 0) continue;
+            long diff = (long)est - (long)actual_slots;
+            /* Never over: reserving slots a coinbase does not have would hand
+             * the rotation more of the block than the policy says. */
+            if (diff > 0) {
+                printf("FAIL: %s at %zu bytes — estimate %zu exceeds the %zu "
+                       "the builder admits\n",
+                       KINDS[k].name, BUDGETS[b], est, actual_slots);
+                assert(0);
+            }
+            /* And close enough that the reservation still means something. */
+            if (diff < -3) {
+                printf("FAIL: %s at %zu bytes — estimate %zu is %ld short of "
+                       "the %zu admitted\n",
+                       KINDS[k].name, BUDGETS[b], est, -diff, actual_slots);
+                assert(0);
+            }
+        }
+    }
+    printf("ok: the slot estimate tracks the builder within 3, never over\n");
+}
+
 /* The two builders must divide a window identically. They share a resolver
  * precisely so that a drivechain pool and a plain-bitcoind pool cannot pay
  * the same miners different amounts. */
@@ -1439,6 +1509,7 @@ int main(void) {
     test_p2pkh_address();
     test_the_built_coinbase_respects_its_budget();
     test_commitments_eat_the_payout_budget();
+    test_the_slot_estimate_tracks_what_the_builder_admits();
     test_the_template_reward_matches_what_the_builder_splits();
     test_both_window_builders_split_identically();
     test_window_from_template_preserves_commitments();

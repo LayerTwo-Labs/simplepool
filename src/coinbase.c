@@ -1456,7 +1456,9 @@ static int cb_reward_probe(void *ctx, int64_t reward_sats, size_t fixed_bytes,
                            char *errbuf, size_t errlen);
 
 size_t coinbase_expected_payout_slots(size_t max_coinbase_bytes,
-                                      const char *coinbase_tx_hex)
+                                      const char *coinbase_tx_hex,
+                                      const char *const *addresses,
+                                      size_t n_addresses)
 {
     size_t budget = max_coinbase_bytes ? max_coinbase_bytes
                                        : (size_t)COINBASE_DEFAULT_MAX_BYTES;
@@ -1477,8 +1479,35 @@ size_t coinbase_expected_payout_slots(size_t max_coinbase_bytes,
         if (fixed > 31) fixed -= 31;
     }
     if (budget <= fixed) return 1;
-    /* 31 bytes is a P2WPKH payout, the common case. */
-    size_t slots = (budget - fixed) / 31;
+    size_t room = budget - fixed;
+
+    /* Charge each address what it actually costs, in the order the caller
+     * means to pay them. Assuming a fixed 31 bytes was wrong by 24 slots on a
+     * window of taproot addresses. */
+    if (addresses && n_addresses > 0) {
+        size_t used = 0, slots = 0;
+        for (size_t i = 0; i < n_addresses; ++i) {
+            uint8_t spk[64];
+            size_t spk_len = 0;
+            size_t cost;
+            if (!addresses[i] ||
+                coinbase_address_to_script(addresses[i], spk, sizeof spk,
+                                           &spk_len, NULL, 0) < 0) {
+                cost = out_ser_size(22);       /* unreadable: assume P2WPKH */
+            } else {
+                cost = out_ser_size(spk_len);
+            }
+            if (used + cost > room) break;
+            used += cost;
+            slots++;
+        }
+        if (slots < 1) slots = 1;
+        if (slots > COINBASE_MAX_PAYOUT_OUTPUTS) slots = COINBASE_MAX_PAYOUT_OUTPUTS;
+        return slots;
+    }
+
+    /* No window in hand: assume the common case. */
+    size_t slots = room / 31;
     if (slots < 1) slots = 1;
     if (slots > COINBASE_MAX_PAYOUT_OUTPUTS) slots = COINBASE_MAX_PAYOUT_OUTPUTS;
     return slots;

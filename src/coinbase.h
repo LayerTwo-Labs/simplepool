@@ -199,20 +199,31 @@ void coinbase_parts_free(coinbase_parts_t *p);
  * enforcer (plus the mandatory BIP300/301 commitments), which is what tells an
  * observer whether a sidechain can be merge-mined into these blocks.
  * Returns 0 ok, negative on malformed input. */
-/* Roughly how many payouts a coinbase of `max_coinbase_bytes` will hold.
+/* How many payouts a coinbase of `max_coinbase_bytes` will hold.
  *
- * An estimate, and only used to decide how many payout slots to reserve for
- * long-waiting miners — the real limit is applied by the builder, against the
- * actual address types and the actual template. Getting this wrong changes the
- * fairness of the rotation and never the arithmetic: everyone still receives
- * their own claim, and whatever the budget cuts is still redistributed.
+ * Used to decide how many payout slots to reserve for long-waiting miners, so
+ * it wants to match what the builder will actually admit. It charges each
+ * address at its real serialized size rather than assuming one: a P2TR output
+ * is 43 bytes against a P2WPKH one's 31, and assuming 31 for a window of
+ * taproot addresses overestimated by 24 slots at a 3000-byte budget — enough
+ * to reserve a third of the coinbase for rotation where a quarter was meant.
  *
- * `coinbase_tx_hex` may be NULL, for a coinbase built from scratch; when it is
- * given, its existing outputs are charged against the budget the way the
- * builder charges them, because on a drivechain the commitment OP_RETURNs are
- * what actually decide how many miners fit. */
+ * `addresses` may be NULL, in which case it falls back to assuming P2WPKH;
+ * that is only for callers with no window in hand.
+ *
+ * `coinbase_tx_hex` may be NULL, for a coinbase built from scratch; when given,
+ * its existing outputs are charged against the budget the way the builder
+ * charges them, because on a drivechain the commitment OP_RETURNs are what
+ * actually decide how many miners fit.
+ *
+ * Still only an estimate of the builder's answer, and deliberately so: getting
+ * it wrong changes the fairness of the rotation and never the arithmetic.
+ * Everyone in the order still receives their own claim, and whatever the
+ * budget cuts is still redistributed. */
 size_t coinbase_expected_payout_slots(size_t max_coinbase_bytes,
-                                      const char *coinbase_tx_hex);
+                                      const char *coinbase_tx_hex,
+                                      const char *const *addresses,
+                                      size_t n_addresses);
 
 /* The reward a server-provided coinbasetxn actually pays, in sats: the value
  * of its single spendable output, which is the one the window replaces.

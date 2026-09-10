@@ -647,6 +647,64 @@ BAL2="$(sqlite3 "$MIX_DB" "SELECT CAST(ROUND((
     exit 1; }
 echo "  the applied queue still sums to zero"
 
+stage "assert a pool that cannot measure its window publishes NO job"
+# The safety property the bounded walk exists for. If the window cannot be
+# measured, the proxy must hold the template back rather than mine a window it
+# is not sure of: here the window is rendered into a coinbase and published, so
+# a wrong one is irreversible and nothing downstream can notice it.
+#
+# Reachable in regtest after all. Renaming `shares` from a second connection
+# makes the live pool's window query fail with "no such table" — a different
+# cause from the IO errors and lock timeouts the unit tests inject, but the
+# same path out of store_pplns_window(), and it exercises the real binary
+# rather than a redirected sqlite3_step.
+JOBS_BEFORE="$(grep -c 'new job: height=' "$MIX_LOG")"
+sqlite3 "$MIX_DB" "ALTER TABLE shares RENAME TO shares_hidden;"
+echo "  shares table hidden; forcing a rebuild with a new tip"
+
+# A new tip is when it matters most, and it forces a rebuild immediately
+# rather than waiting out the 30s refresh.
+mine_one() {
+    RPC_TIMEOUT=60 "$ROOT/scripts/enforcer-rpc.sh" \
+        cusf.mainchain.v1.MiningService/GenerateToAddress \
+        '{"blocks": 1, "address": "'"$OPERATOR_ADDR"'"}' >/dev/null 2>&1 || true
+}
+mine_one
+for _ in $(seq 1 20); do
+    grep -qE 'window query failed|did not cover' "$MIX_LOG" && break
+    sleep 1
+done
+grep -qE 'window query failed|did not cover' "$MIX_LOG" || {
+    echo "FAIL: the window became unreadable and the pool never said so" >&2
+    tail -20 "$MIX_LOG" >&2
+    sqlite3 "$MIX_DB" "ALTER TABLE shares_hidden RENAME TO shares;" 2>/dev/null
+    exit 1; }
+echo "  refused: $(grep -oE '(window query failed|pplns window walk did not cover)[^\"]{0,40}' "$MIX_LOG" | tail -1)"
+
+# And it published nothing on that tip. This is the assertion that matters:
+# holding the template back is the whole point, and a pool that logged the
+# failure but shipped a job anyway would be worse than one that crashed.
+JOBS_BROKEN="$(grep -c 'new job: height=' "$MIX_LOG")"
+[ "$JOBS_BROKEN" = "$JOBS_BEFORE" ] || {
+    echo "FAIL: the pool could not measure its window and published a job anyway" >&2
+    echo "      ($JOBS_BEFORE jobs before, $JOBS_BROKEN after)" >&2
+    sqlite3 "$MIX_DB" "ALTER TABLE shares_hidden RENAME TO shares;" 2>/dev/null
+    exit 1; }
+echo "  published no job while the window was unreadable ($JOBS_BEFORE, unchanged)"
+
+# Recovery: it is a hold, not a latch.
+sqlite3 "$MIX_DB" "ALTER TABLE shares_hidden RENAME TO shares;"
+mine_one
+for _ in $(seq 1 40); do
+    JOBS_AFTER="$(grep -c 'new job: height=' "$MIX_LOG")"
+    [ "${JOBS_AFTER:-0}" -gt "$JOBS_BROKEN" ] && break
+    sleep 1
+done
+[ "${JOBS_AFTER:-0}" -gt "$JOBS_BROKEN" ] || {
+    echo "FAIL: the window came back and the pool never resumed publishing" >&2
+    tail -20 "$MIX_LOG" >&2; exit 1; }
+echo "  resumed once the window was readable again ($JOBS_BROKEN -> $JOBS_AFTER)"
+
 echo
 echo "cbwin-e2e: PASS (the window was paid from the block's own coinbase,"
 echo "                 and the pool never held the reward)"

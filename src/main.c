@@ -328,8 +328,12 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
      * accumulate. A fraction of the slots is therefore reserved for whoever
      * has waited longest. Costs no bytes, changes nobody's total, changes only
      * how often people are paid. */
+    /* The real addresses, in claim order, so the estimate charges each output
+     * what it costs instead of assuming P2WPKH. */
+    const char *addrs[COINBASE_MAX_PAYOUT_OUTPUTS];
+    for (size_t i = 0; i < n; ++i) addrs[i] = claims[i].payout_address;
     size_t expected_slots = coinbase_expected_payout_slots(
-        (size_t)cfg->coinbase_max_bytes, t->coinbasetxn_hex);
+        (size_t)cfg->coinbase_max_bytes, t->coinbasetxn_hex, addrs, n);
     size_t order[COINBASE_MAX_PAYOUT_OUTPUTS];
     if (pplns_order_claims(claims, n, expected_slots, order) < 0) {
         LOG_WARN("pplns-coinbase: could not order the window for payment");
