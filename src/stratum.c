@@ -777,6 +777,22 @@ static int j_payees_missing(const stratum_job_t *job) {
     return !job->payees || job->n_payees == 0;
 }
 
+/* Did payees[i] actually receive a coinbase output?
+ *
+ * Never answerable from res.paid_count. The builder skips a payee it cannot
+ * pay and keeps going -- a later one may be a cheaper address type and still
+ * fit -- so the paid set is a SUBSEQUENCE of the window, not a prefix of it.
+ * Reading it as a prefix does not misreport a number, it names the wrong
+ * miners: the block's skipped payee gets recorded as paid and sent to the back
+ * of the payout queue, and a payee that WAS paid gets recorded as owed and
+ * promoted ahead of it. The floor drops the smallest claim, and
+ * pplns_order_claims() deliberately puts a reserved small claim first, so the
+ * dropped payee sits at index 0 in the commonest case there is
+ * (LayerTwo-Labs/simplepool#76). */
+static int cbwin_was_paid(const coinbase_window_result_t *res, size_t i) {
+    return i < COINBASE_MAX_PAYOUT_OUTPUTS && res->paid_payee[i];
+}
+
 /* The byte ceiling that applies to THIS connection: its listener's, or the
  * server-wide one when the listener did not set its own.
  *
@@ -791,6 +807,39 @@ static size_t conn_coinbase_budget(const stratum_server_t *s,
     return s->cfg.max_coinbase_bytes;
 }
 
+/* The solo shape: a coinbase paying THIS connection's miner, plus the
+ * operator fee. Its own function because two different modes need it and a
+ * verbatim second copy is how the two drift -- solo reaches it because that is
+ * what solo is, and pplns-coinbase reaches it when a job carries no window
+ * yet. It used to be a `goto` into an `else if (0)` block sitting beside an
+ * identical live branch, which meant a fix to one would silently not reach the
+ * other. */
+static int render_finder_coinbase(stratum_server_t *s, stratum_conn_t *c,
+                                  const stratum_job_t *job,
+                                  coinbase_parts_t *parts,
+                                  char *err, size_t errlen) {
+    if (job->coinbasetxn_hex) {
+        /* Backend dictated the coinbase (e.g. CUSF enforcer): build from it,
+         * redirecting the reward output to this miner and preserving the
+         * mandatory commitment outputs. The witness commitment is already in
+         * the server's coinbase, so job->wc_hex is not used here. */
+        return coinbase_build_from_template(job->coinbasetxn_hex,
+                                            c->payout_address,
+                                            s->cfg.operator_address,
+                                            s->cfg.fee_bps,
+                                            s->cfg.coinbase_tag,
+                                            job->en1_size, job->en2_size,
+                                            parts, NULL, NULL, NULL,
+                                            err, errlen);
+    }
+    return coinbase_build_split(job->height, job->value_sats,
+                                c->payout_address,
+                                s->cfg.operator_address, s->cfg.fee_bps,
+                                job->wc_hex, s->cfg.coinbase_tag,
+                                job->en1_size, job->en2_size,
+                                parts, NULL, NULL, err, errlen);
+}
+
 static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                 const stratum_job_t *job) {
     if (!c->authorized || c->payout_address[0] == '\0') return -1;
@@ -800,23 +849,19 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
     coinbase_parts_t parts = {0};
     char err[256] = {0};
     int rc;
-    if (s->cfg.coinbase_pays_window) {
+    /* Bootstrap: a pplns-coinbase job with no window has nobody to pay, so it
+     * renders the solo shape instead — this connection's own miner. See
+     * attach_pplns_window() in main.c: with no prior work the only party with
+     * a claim on the block is whoever finds it, and refusing to render would
+     * deadlock a new pool for ever (no coinbase, so no shares, so no window). */
+    if (s->cfg.coinbase_pays_window && !j_payees_missing(job)) {
         /* pplns-coinbase: the block pays the window that produced it, one
          * output per miner, and the pool never receives the reward. The
-         * window was snapshotted onto the job when the template was built —
-         * every connection therefore renders the SAME coinbase, exactly as
-         * the pooled modes do, because the outputs live in cb2 and only the
-         * extranonce differs per connection. */
-        if (j_payees_missing(job)) {
-            /* Bootstrap: no shares have been accepted yet, so there is no
-             * window to pay. Fall through to the solo shape — this
-             * connection's own coinbase, paying this miner. See
-             * attach_pplns_window() in main.c: with no prior work the only
-             * party with a claim on the block is whoever finds it, and
-             * refusing to render here instead would deadlock a new pool
-             * forever (no coinbase, so no shares, so no window). */
-            goto render_solo;
-        }
+         * window was snapshotted onto the job when the template was built, so
+         * every connection pays the same miners in the same order — but not
+         * necessarily the same NUMBER of them, because the byte ceiling is
+         * per-listener and cuts the tail of that order at a different point
+         * on a rented port than on a home one. */
         if (job->coinbasetxn_hex) {
             rc = coinbase_build_window_from_template(
                     job->coinbasetxn_hex, job->payees, job->n_payees,
@@ -854,43 +899,10 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                       job->en1_size, job->en2_size,
                                       &parts, NULL, NULL, err, sizeof err);
         }
-    } else if (0) {
-render_solo:
-        /* Reached either by solo mode or by a pplns-coinbase job that has no
-         * window yet. Both pay this one connection's miner. */
-        if (job->coinbasetxn_hex) {
-            rc = coinbase_build_from_template(job->coinbasetxn_hex,
-                                              c->payout_address,
-                                              s->cfg.operator_address, s->cfg.fee_bps,
-                                              s->cfg.coinbase_tag,
-                                              job->en1_size, job->en2_size,
-                                              &parts, NULL, NULL, NULL, err, sizeof err);
-        } else {
-            rc = coinbase_build_split(job->height, job->value_sats,
-                                      c->payout_address,
-                                      s->cfg.operator_address, s->cfg.fee_bps,
-                                      job->wc_hex, s->cfg.coinbase_tag,
-                                      job->en1_size, job->en2_size,
-                                      &parts, NULL, NULL, err, sizeof err);
-        }
-    } else if (job->coinbasetxn_hex) {
-        /* Backend dictated the coinbase (e.g. CUSF enforcer): build from it,
-         * redirecting the reward output to this miner and preserving the
-         * mandatory commitment outputs. The witness commitment is already in
-         * the server's coinbase, so job->wc_hex is not used here. */
-        rc = coinbase_build_from_template(job->coinbasetxn_hex,
-                                          c->payout_address,
-                                          s->cfg.operator_address, s->cfg.fee_bps,
-                                          s->cfg.coinbase_tag,
-                                          job->en1_size, job->en2_size,
-                                          &parts, NULL, NULL, NULL, err, sizeof err);
     } else {
-        rc = coinbase_build_split(job->height, job->value_sats,
-                                  c->payout_address,
-                                  s->cfg.operator_address, s->cfg.fee_bps,
-                                  job->wc_hex, s->cfg.coinbase_tag,
-                                  job->en1_size, job->en2_size,
-                                  &parts, NULL, NULL, err, sizeof err);
+        /* Solo, and the pplns-coinbase bootstrap: this connection's own
+         * miner. One implementation, shared. */
+        rc = render_finder_coinbase(s, c, job, &parts, err, sizeof err);
     }
     if (rc < 0) {
         LOG_WARN("stratum: coinbase render failed for %s: %s",
@@ -2227,13 +2239,11 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                 int64_t entitled_total = 0, survivors_own = 0;
                 for (size_t i = 0; i < job->n_payees; ++i) {
                     entitled_total += job->payees[i].sats;
-                    if (i < res.paid_count) survivors_own += job->payees[i].sats;
+                    if (cbwin_was_paid(&res, i))
+                        survivors_own += job->payees[i].sats;
                 }
                 if (entitled_total > 0 && survivors_own > 0) {
-                    /* The builder pays in job order, so the first paid_count
-                     * payees are the ones that got an output.
-                     *
-                     * `got` is a survivor's share of what was actually paid
+                    /* `got` is a survivor's share of what was actually paid
                      * out, which after redistribution is the WHOLE payable
                      * amount -- so it is their claim over the survivors' claims,
                      * not over the window's. Dividing by res.paid_sats instead
@@ -2244,7 +2254,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                                        nd < COINBASE_MAX_PAYOUT_OUTPUTS; ++i) {
                         double entitled = (double)job->payees[i].sats /
                                           (double)entitled_total;
-                        double got = i < res.paid_count
+                        double got = cbwin_was_paid(&res, i)
                                    ? (double)job->payees[i].sats /
                                      (double)survivors_own
                                    : 0.0;

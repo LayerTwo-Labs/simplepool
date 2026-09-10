@@ -119,6 +119,24 @@ typedef struct {
      * per-worker fraction ledger exists to even out over time. */
     int64_t redistributed_sats;
     int64_t fee_sats;            /* the operator's fee, and nothing else */
+    /* Which payees actually received an output: paid_payee[i] is 1 when
+     * payees[i] was paid, 0 when the floor or the byte budget dropped it.
+     * Indices past COINBASE_MAX_PAYOUT_OUTPUTS are not reported.
+     *
+     * The counts above are not enough to answer this, and reading paid_count
+     * as "the first paid_count payees" is wrong. The builder does not stop at
+     * the first payee it cannot pay -- it skips it and keeps going, because a
+     * later payee may be a cheaper address type and still fit -- so the paid
+     * set is a SUBSEQUENCE of the window, never a prefix of it.
+     *
+     * A caller that gets this wrong does not misreport a number, it credits
+     * the wrong miners: the ones the block SKIPPED are recorded as paid and
+     * sent to the back of the payout queue, and the ones it paid are recorded
+     * as owed and promoted. That is the exact inversion the queue exists to
+     * prevent, and it fires on the likeliest case there is -- a reserved
+     * small claim placed first by pplns_order_claims() and then dropped by
+     * the floor (LayerTwo-Labs/simplepool#76). */
+    uint8_t paid_payee[COINBASE_MAX_PAYOUT_OUTPUTS];
 } coinbase_window_result_t;
 
 
@@ -133,9 +151,12 @@ typedef struct {
  * fee_bps split every other builder applies. A caller whose arithmetic does
  * not add up is refused rather than silently underpaying the block.
  *
- * Payees are paid largest first, so the byte budget and the payout floor fall
- * on the smallest claims. Those are forfeited to the operator, not carried:
- * see coinbase_window_result_t.
+ * Payees are paid in the order the CALLER gives them, greedily, and the byte
+ * budget and the payout floor therefore fall on whoever it put last --
+ * largest claim first is pplns_order_claims()'s default, not this function's
+ * rule. Whatever cannot be paid is redistributed across the payees that WERE
+ * paid, never to the operator, which receives its fee and nothing else. See
+ * coinbase_window_result_t, and paid_payee for which those were.
  *
  * `payout_floor_sats` is clamped UP to COINBASE_DUST_SATS — below the dust
  * limit an output is not relayable, so there is no floor lower than that to

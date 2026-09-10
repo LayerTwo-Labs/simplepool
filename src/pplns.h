@@ -61,25 +61,53 @@ typedef struct {
  * `owed_fraction`, longest-waiting first.
  *
  * `expected_slots` is how many payouts the caller believes will fit. It only
- * decides how many slots are reserved; getting it wrong changes the fairness
- * of the rotation, never the arithmetic — everyone in `order` is still paid
- * their own claim, and anyone the budget cuts is still redistributed.
+ * decides how many slots are reserved. Erring LOW is safe -- a smaller
+ * reservation just rotates more slowly -- and erring high is not: reserve
+ * more positions than the coinbase has room for and every slot it does have
+ * goes to the queue, so the largest claims are paid nothing and immediately
+ * re-enter the queue themselves. A caller with several coinbase budgets in
+ * play (a per-listener ceiling) must therefore size this from the TIGHTEST
+ * of them.
+ *
+ * `amounts` is what each claim is worth, aligned with `claims`, as
+ * pplns_split_window() computed it; NULL means "assume every claim is
+ * payable". A claim worth less than `payout_floor_sats` (clamped up to
+ * COINBASE_DUST_SATS, as everywhere else) cannot be paid by this block at any
+ * position, so it is not given a reserved slot -- it would hold the slot
+ * against a miner that could actually use it, and a permanently sub-floor
+ * miner accumulates `owed_fraction` for ever while a byte-capped one is paid
+ * and resets, so over a long enough run the miners who can NEVER be paid
+ * crowd out the ones the rotation exists for (LayerTwo-Labs/simplepool#76).
+ * It still appears in `order` at its normal largest-first position: the
+ * permutation always covers every claim, because the ledger and the
+ * redistribution both need the ones that were skipped.
  *
  * Returns 0, or negative on bad input. */
 int pplns_order_claims(const pplns_claim_t *claims, size_t n_claims,
-                       size_t expected_slots, size_t *order);
+                       size_t expected_slots,
+                       const coinbase_payee_t *amounts,
+                       int64_t payout_floor_sats,
+                       size_t *order);
 
 typedef struct {
     int64_t fee_sats;            /* the operator's cut, off the top */
     int64_t payable_sats;        /* what the payees must sum to, exactly */
     /* How many claims are worth less than payout_floor_sats and will
-     * therefore be forfeited to the operator by the builder.
+     * therefore be skipped by the builder, their value going to the miners it
+     * could pay. (Not to the operator: that was the rule until #76, and the
+     * long note at the redistribution in coinbase.c has the measurement that
+     * ended it.)
      *
      * Computed here rather than left for the builder to discover because the
      * operator has to be told BEFORE a block makes it real -- a count after
      * the fact reports a loss, a count now is something they can act on. The
      * builder applies the floor itself; this only predicts it, using the same
-     * clamp so the two cannot disagree. */
+     * clamp so the two cannot disagree.
+     *
+     * When it reaches n_claims the builder will refuse the window outright:
+     * it has nobody to pay. A caller must not publish a template it predicts
+     * that for -- the refusal lands per connection, per job, and the pool
+     * simply stops serving work. See attach_pplns_window() in main.c. */
     size_t  below_floor;
 } pplns_split_t;
 
@@ -94,7 +122,17 @@ typedef struct {
  * less than it may forfeits the difference to nobody.
  *
  * `claims` must be ordered largest-difficulty-first, as store_pplns_window()
- * returns them, so the remainder lands on the strongest claim.
+ * returns them, so the truncation remainder lands on the strongest claim.
+ * Split FIRST and reorder afterwards: pplns_order_claims() needs these amounts
+ * to know which claims the floor will drop, and a reordering does not change
+ * a single one of them -- only which index carries the remainder. Splitting
+ * the reordered claims instead put the remainder on whoever the queue had
+ * promoted, which is at most a satoshi per claim but is also not what this
+ * says it does.
+ *
+ * Nothing downstream may assume out[0] is the largest payee once the caller
+ * has reordered: coinbase.c does not, and scans for the largest surviving
+ * output when it redistributes.
  *
  * `total_diff` is the window's total as the store reported it, passed in
  * rather than re-summed here.

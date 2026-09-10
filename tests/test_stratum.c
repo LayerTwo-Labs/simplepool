@@ -1,5 +1,6 @@
 #include "../src/stratum.h"
 #include "../src/share.h"
+#include "../src/store.h"   /* store_fraction_delta_t, for the payout-queue observer */
 #include "../src/cjson/cJSON.h"
 
 #include <assert.h>
@@ -41,6 +42,11 @@ typedef struct {
     int   found_calls;
     int   last_accepted;
     char  last_submit_error[128];
+    /* pplns-coinbase payout queue: the deltas the last found block staged. */
+    int     frac_calls;
+    size_t  frac_n;
+    int64_t frac_worker[8];
+    double  frac_delta[8];
 } obs_t;
 
 /* The callbacks run on whichever thread handled the share, and
@@ -93,6 +99,24 @@ static void on_block_found(void *ctx, const char *w, const char *addr,
     o->last_accepted = accepted;
     snprintf(o->last_submit_error, sizeof(o->last_submit_error), "%s",
              submit_error ? submit_error : "");
+}
+
+/* The payout-queue deltas a found block staged. Recorded rather than written,
+ * so a test can assert who the block decided it had skipped. */
+static void on_window_fractions(void *ctx, const char *block_hash,
+                                const struct store_fraction_delta *d, size_t n) {
+    (void)block_hash;
+    obs_t *o = ctx;
+    if (!o) return;
+    pthread_mutex_lock(&obs_mu);
+    o->frac_calls++;
+    o->frac_n = n > 8 ? 8 : n;
+    for (size_t i = 0; i < o->frac_n; ++i) {
+        /* store_fraction_delta_t is {int64_t worker_id; double delta;} */
+        o->frac_worker[i] = ((const store_fraction_delta_t *)d)[i].worker_id;
+        o->frac_delta[i]  = ((const store_fraction_delta_t *)d)[i].delta;
+    }
+    pthread_mutex_unlock(&obs_mu);
 }
 
 /* Helper: parse the first line of an output buffer. Mutates buf (NUL terminator). */
@@ -2914,6 +2938,184 @@ static void test_a_windowless_job_pays_the_finder(void) {
     stratum_conn_free_for_test(c);
     stratum_server_free(s);}
 
+/* The payout queue must credit the miners the block ACTUALLY skipped.
+ *
+ * This is the only consumer of the builder's paid set, and it is the one place
+ * where getting it wrong is not a wrong number but a wrong person. A miner the
+ * coinbase skipped is owed a slot and must come out POSITIVE; a miner it paid
+ * has been served and must come out zero or negative. Invert that and the
+ * queue does the opposite of its job: the skipped miner goes to the back and
+ * is skipped again, for ever, while the miner that was paid is promoted into
+ * the reserved slots ahead of it.
+ *
+ * The case is the likeliest one there is. pplns_order_claims() deliberately
+ * places a reserved small claim FIRST so it survives the byte budget, and a
+ * small claim is exactly what the payout floor drops — so the dropped payee is
+ * at index 0, and any reading of "the first paid_count payees were paid" is
+ * wrong from the very first entry (LayerTwo-Labs/simplepool#76).
+ */
+static void test_the_queue_credits_the_miners_the_block_actually_skipped(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2, .initial_diff = 1e12,
+                          .coinbase_pays_window = 1,
+                          .payout_floor_sats = 100000000LL,  /* 1 BTC */
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block,
+                          .on_window_fractions = on_window_fractions };
+    snprintf(cfg.bind_addr, sizeof cfg.bind_addr, "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    CHECK(s != NULL); if (!s) return;
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    uint8_t net[32]; memset(net, 0xff, 32);   /* every hash is a block */
+    stratum_job_t *job = make_test_job("JQ", net);
+    /* Worker 101 is under the 1-BTC floor and will be dropped. 102 and 103
+     * are not. They sum to make_test_job's 50-BTC value exactly. */
+    const coinbase_payee_t win[] = {
+        { TEST_ADDR,   50000000LL },   /* worker 101 — dropped by the floor */
+        { TEST_ADDR,  3000000000LL },  /* worker 102 — paid */
+        { TEST_ADDR2, 1950000000LL },  /* worker 103 — paid */
+    };
+    const int64_t ids[] = { 101, 102, 103 };
+    CHECK(stratum_job_set_window(job, win, ids, 3) == 0);
+    stratum_server_set_job(s, job, 1);
+
+    char *out = NULL; size_t olen = 0;
+    CHECK(stratum_handle_message(s, c,
+        "{\"id\":9,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"JQ\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
+        &out, &olen) == 0);
+    free(out);
+    CHECK(obs.blocks == 1);
+
+    /* The block staged a rotation, and it named all three workers. */
+    CHECK(obs.frac_calls == 1);
+    CHECK(obs.frac_n == 3);
+
+    double d101 = 0, d102 = 0, d103 = 0;
+    int seen = 0;
+    for (size_t i = 0; i < obs.frac_n; ++i) {
+        if (obs.frac_worker[i] == 101) { d101 = obs.frac_delta[i]; seen |= 1; }
+        if (obs.frac_worker[i] == 102) { d102 = obs.frac_delta[i]; seen |= 2; }
+        if (obs.frac_worker[i] == 103) { d103 = obs.frac_delta[i]; seen |= 4; }
+    }
+    CHECK(seen == 7);
+
+    /* 101 was skipped: it is owed, so its delta is positive. Under the
+     * prefix reading this came out NEGATIVE — the skipped miner was recorded
+     * as having been paid early, which sends it to the back of the queue. */
+    CHECK(d101 > 0.0);
+    /* 102 and 103 were both paid, out of 101's share as well as their own,
+     * so neither is owed anything. Under the prefix reading 103 came out
+     * strongly positive despite having received an output. */
+    CHECK(d102 <= 0.0);
+    CHECK(d103 <= 0.0);
+    /* The set still cancels: redistribution moves value between miners and
+     * never in or out. store_stage_block_fractions() refuses one that does
+     * not, so a set that fails here would be dropped on the floor at runtime. */
+    CHECK(fabs(d101 + d102 + d103) < 1e-9);
+    /* And 101's claim is what moved: it was entitled to 1% of the block. */
+    CHECK(fabs(d101 - 0.01) < 1e-6);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: the payout queue credits the miner the block actually skipped\n");
+}
+
+/* A window nothing was dropped from stages nothing.
+ *
+ * The deltas are "who did this block treat differently from their claim", so a
+ * block that paid everyone exactly their share has no rotation to record. Not
+ * a nicety: staging a row per worker per block on a healthy pool would grow
+ * the queue table without ever changing anybody's standing. */
+static void test_a_block_that_pays_everyone_stages_no_rotation(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2, .initial_diff = 1e12,
+                          .coinbase_pays_window = 1,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block,
+                          .on_window_fractions = on_window_fractions };
+    snprintf(cfg.bind_addr, sizeof cfg.bind_addr, "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    CHECK(s != NULL); if (!s) return;
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_job_t *job = make_test_job("JQ2", net);
+    const coinbase_payee_t win[] = {
+        { TEST_ADDR,  3000000000LL }, { TEST_ADDR2, 2000000000LL },
+    };
+    const int64_t ids[] = { 201, 202 };
+    CHECK(stratum_job_set_window(job, win, ids, 2) == 0);
+    stratum_server_set_job(s, job, 1);
+
+    char *out = NULL; size_t olen = 0;
+    CHECK(stratum_handle_message(s, c,
+        "{\"id\":9,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"JQ2\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
+        &out, &olen) == 0);
+    free(out);
+    CHECK(obs.blocks == 1);
+    CHECK(obs.frac_calls == 0);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: a block that pays the whole window stages no rotation\n");
+}
+
+/* A candidate the node REFUSED rotates nobody.
+ *
+ * Its coinbase paid no one, so recording that it skipped somebody would move a
+ * miner down the queue for a payment that never happened — the same reason the
+ * staged rows are discarded when a block is orphaned. */
+static void test_a_rejected_candidate_stages_no_rotation(void) {
+    obs_t obs = {0};
+    obs.submit_rejects = 1;
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2, .initial_diff = 1e12,
+                          .coinbase_pays_window = 1,
+                          .payout_floor_sats = 100000000LL,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block,
+                          .on_window_fractions = on_window_fractions };
+    snprintf(cfg.bind_addr, sizeof cfg.bind_addr, "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    CHECK(s != NULL); if (!s) return;
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_job_t *job = make_test_job("JQ3", net);
+    const coinbase_payee_t win[] = {
+        { TEST_ADDR,   50000000LL },
+        { TEST_ADDR,  3000000000LL },
+        { TEST_ADDR2, 1950000000LL },
+    };
+    const int64_t ids[] = { 301, 302, 303 };
+    CHECK(stratum_job_set_window(job, win, ids, 3) == 0);
+    stratum_server_set_job(s, job, 1);
+
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":9,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"JQ3\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    free(out);
+    CHECK(obs.submits == 1);
+    CHECK(obs.frac_calls == 0);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: a candidate the node refused rotates nobody\n");
+}
+
 /* The share-dedupe index under churn. The ring holds SHARE_DEDUPE_RING keys
  * and the index must answer for exactly those: a key inside the window is a
  * duplicate, a key that fell out of it is not, and after any amount of
@@ -3048,6 +3250,9 @@ int main(void) {
     test_a_listener_ceiling_changes_how_many_the_coinbase_pays();
     test_a_listener_without_a_ceiling_uses_the_server_wide_one();
     test_pplns_coinbase_pays_every_miner_in_the_window();
+    test_the_queue_credits_the_miners_the_block_actually_skipped();
+    test_a_block_that_pays_everyone_stages_no_rotation();
+    test_a_rejected_candidate_stages_no_rotation();
     test_pplns_btc_takes_a_bitcoin_username();
     test_pplns_thunder_takes_a_thunder_username();
     test_pplns_is_never_gated();

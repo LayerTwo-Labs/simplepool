@@ -207,6 +207,35 @@ static void on_window_fractions_cb(void *ctx, const char *block_hash,
               rc, block_hash ? block_hash : "?");
 }
 
+/* The tightest coinbase byte ceiling any connection can be subject to.
+ *
+ * The window and its payment order are decided ONCE, per template, on the tip
+ * watcher — but the ceiling that cuts that order short is per-listener, and a
+ * rented port's is deliberately far tighter than a home port's. One order has
+ * to serve both, so the reservation has to be sized for the tightest of them.
+ *
+ * The two errors are not symmetric. Size it from a generous ceiling and the
+ * tight port reserves more positions than it has slots, so every slot it does
+ * have goes to the queue: the largest claims are paid nothing, immediately
+ * re-enter the queue themselves, and the rotation oscillates instead of
+ * rotating. Size it from the tight one and the generous port simply reserves
+ * fewer slots than it could have — it rotates more slowly and nothing else
+ * changes. So: the minimum, and never the configured server-wide figure on
+ * its own (LayerTwo-Labs/simplepool#76).
+ *
+ * bind_port is always served on the server-wide ceiling, so that is always in
+ * the running. */
+static size_t tightest_coinbase_budget(const proxy_config_t *cfg) {
+    size_t b = cfg->coinbase_max_bytes > 0
+             ? (size_t)cfg->coinbase_max_bytes
+             : (size_t)COINBASE_DEFAULT_MAX_BYTES;
+    for (int i = 0; i < cfg->listener_count; ++i) {
+        int lb = cfg->listeners[i].max_coinbase_bytes;
+        if (lb > 0 && (size_t)lb < b) b = (size_t)lb;
+    }
+    return b;
+}
+
 /* Snapshot the PPLNS window onto a freshly built job, for pplns-coinbase.
  *
  * The window is taken from the template that is about to go out, so the
@@ -319,43 +348,95 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
         claims[i].owed_fraction  = win[i].owed_fraction;
     }
 
-    /* Decide who gets the slots before deciding what they are worth.
+    /* What each claim is worth, BEFORE deciding who gets a slot.
      *
-     * A coinbase has room for a bounded number of payouts, and paying the
-     * largest claims first — which is what the builder used to do on its own —
-     * hands the same addresses the same slots every block, because a large
-     * miner's share of the window beats any priority a small one can
-     * accumulate. A fraction of the slots is therefore reserved for whoever
-     * has waited longest. Costs no bytes, changes nobody's total, changes only
-     * how often people are paid. */
-    /* The real addresses, in claim order, so the estimate charges each output
-     * what it costs instead of assuming P2WPKH. */
-    const char *addrs[COINBASE_MAX_PAYOUT_OUTPUTS];
-    for (size_t i = 0; i < n; ++i) addrs[i] = claims[i].payout_address;
-    size_t expected_slots = coinbase_expected_payout_slots(
-        (size_t)cfg->coinbase_max_bytes, t->coinbasetxn_hex, addrs, n);
-    size_t order[COINBASE_MAX_PAYOUT_OUTPUTS];
-    if (pplns_order_claims(claims, n, expected_slots, order) < 0) {
-        LOG_WARN("pplns-coinbase: could not order the window for payment");
-        return -1;
-    }
-    pplns_claim_t ordered[COINBASE_MAX_PAYOUT_OUTPUTS];
-    for (size_t i = 0; i < n; ++i) ordered[i] = claims[order[i]];
-
-    coinbase_payee_t payees[COINBASE_MAX_PAYOUT_OUTPUTS];
+     * This used to run the other way round -- order, then split the reordered
+     * claims -- which cost two things. The splitter's truncation remainder
+     * lands on claims[0], which it documents as the largest claim, and after a
+     * reordering that was whoever the queue had promoted. And, more to the
+     * point, the ordering had no idea what anybody was worth, so it could
+     * reserve a slot for a claim the floor was about to drop.
+     *
+     * Splitting first fixes both. The split is proportional, so the order does
+     * not change a single amount -- only which index carries the remainder --
+     * and the permutation below moves the payees with their claims. */
+    coinbase_payee_t by_claim[COINBASE_MAX_PAYOUT_OUTPUTS];
     pplns_split_t split;
     char serr[256] = {0};
     if (pplns_split_window(value, cfg->fee_bps, cfg->operator_address[0] != 0,
-                           ordered, n, total, cfg->pplns_payout_floor_sats,
-                           payees, COINBASE_MAX_PAYOUT_OUTPUTS,
+                           claims, n, total, cfg->pplns_payout_floor_sats,
+                           by_claim, COINBASE_MAX_PAYOUT_OUTPUTS,
                            &split, serr, sizeof serr) < 0) {
         LOG_WARN("pplns-coinbase: cannot split this block across the window: "
                  "%s", serr);
         return -1;
     }
 
+    /* If NOTHING clears the floor there is no coinbase to render from this
+     * window at all -- the builder refuses a window it cannot pay anybody
+     * from, on the same reasoning as the splitter above. Catch it here, where
+     * it can be said once with a cause, rather than letting it surface as a
+     * render failure on every connection for every job: that is a pool that
+     * publishes no work while logging a warning per miner per template, which
+     * is precisely the shape of failure the template-reward check above exists
+     * to avoid.
+     *
+     * Reachable without anything exotic. A small block reward divided across
+     * enough miners puts every claim under the dust limit -- 5000 sats across
+     * 20 miners is 250 each -- and a configured floor reaches it far sooner.
+     * The numbers are in the message because the fix is arithmetic the
+     * operator can do: raise the reward, lower the floor, or accept fewer
+     * miners. */
+    if (split.below_floor >= n) {
+        LOG_WARN("pplns-coinbase: not one of the %zu miner(s) in the window "
+                 "clears the %lld-sat payout floor — %lld sats split %zu ways "
+                 "pays nobody, so this template is skipped and NO WORK IS "
+                 "PUBLISHED from it. Lower pplns_payout_floor_sats, or accept "
+                 "fewer miners in the window (pplns_window_diff_multiple).",
+                 n, (long long)(cfg->pplns_payout_floor_sats < COINBASE_DUST_SATS
+                                ? COINBASE_DUST_SATS
+                                : cfg->pplns_payout_floor_sats),
+                 (long long)split.payable_sats, n);
+        return -1;
+    }
+
+    /* Now decide who gets the slots the coinbase has room for.
+     *
+     * Paying the largest claims first — which is what the builder used to do
+     * on its own — hands the same addresses the same slots every block,
+     * because a large miner's share of the window beats any priority a small
+     * one can accumulate. A fraction of the slots is therefore reserved for
+     * whoever has waited longest. Costs no bytes, changes nobody's total,
+     * changes only how often people are paid.
+     *
+     * `by_claim` goes in so the reservation is not spent on a claim the floor
+     * is about to drop: it could not be paid from a reserved slot either, and
+     * a permanently sub-floor miner's owed_fraction only ever grows, so it
+     * would crowd out the byte-capped miners the rotation is for. */
+    /* The real addresses, in claim order, so the estimate charges each output
+     * what it costs instead of assuming P2WPKH. */
+    const char *addrs[COINBASE_MAX_PAYOUT_OUTPUTS];
+    for (size_t i = 0; i < n; ++i) addrs[i] = claims[i].payout_address;
+    size_t expected_slots = coinbase_expected_payout_slots(
+        tightest_coinbase_budget(cfg), t->coinbasetxn_hex, addrs, n);
+    size_t order[COINBASE_MAX_PAYOUT_OUTPUTS];
+    if (pplns_order_claims(claims, n, expected_slots, by_claim,
+                           cfg->pplns_payout_floor_sats, order) < 0) {
+        LOG_WARN("pplns-coinbase: could not order the window for payment");
+        return -1;
+    }
+
+    /* Permute the payees and their workers into payment order together. The
+     * amounts are unchanged by this -- a permutation moves who is paid first,
+     * never what anybody is paid -- and the pair has to stay aligned because
+     * stratum.c reads the worker out of the same index the builder reports as
+     * paid or skipped. */
+    coinbase_payee_t payees[COINBASE_MAX_PAYOUT_OUTPUTS];
     int64_t worker_ids[COINBASE_MAX_PAYOUT_OUTPUTS];
-    for (size_t i = 0; i < n; ++i) worker_ids[i] = ordered[i].worker_id;
+    for (size_t i = 0; i < n; ++i) {
+        payees[i]     = by_claim[order[i]];
+        worker_ids[i] = claims[order[i]].worker_id;
+    }
 
     if (stratum_job_set_window(job, payees, worker_ids, n) < 0) {
         LOG_WARN("pplns-coinbase: could not attach the window to the job");
@@ -382,9 +463,11 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
         if (below > 0) {
             LOG_INFO("pplns-coinbase: %zu of %zu miner(s) in the window are "
                      "below the %lld-sat payout floor and will earn NOTHING "
-                     "from the next block — their share is forfeited to the "
-                     "operator, not carried. Tell them, or lower "
-                     "pplns_payout_floor_sats.",
+                     "from the next block — their share goes to the miners "
+                     "the block CAN pay, and they move to the front of the "
+                     "payout queue for a later one. Nothing reaches the "
+                     "operator, which takes its fee and nothing else. Tell "
+                     "them, or lower pplns_payout_floor_sats.",
                      below, n, (long long)floor_sats);
         } else {
             LOG_INFO("pplns-coinbase: every miner in the window clears the "
@@ -1231,11 +1314,14 @@ int main(int argc, char **argv) {
          * saw it stated cannot disclose it to the miners it costs. */
         if (strcmp(cfg.pool_mode, "pplns-coinbase") == 0) {
             LOG_INFO("pplns-coinbase: payout floor %lld sats — a miner whose "
-                     "share of a block is worth less than that is NOT PAID, "
-                     "and the amount goes to the operator. Nothing is carried "
-                     "and nothing settles later. The dashboard states this to "
-                     "miners; publish it on your pool page too.",
-                     (long long)cfg.pplns_payout_floor_sats);
+                     "share of a block is worth less than that is NOT PAID BY "
+                     "THAT BLOCK. The amount goes to the other miners in the "
+                     "same window, never to the operator, and the miner moves "
+                     "to the front of the payout queue for a later block. It "
+                     "is a rotation, not a balance: the pool holds nothing "
+                     "against it and no payment settles later. The dashboard "
+                     "states this to miners; publish it on your pool page "
+                     "too.", (long long)cfg.pplns_payout_floor_sats);
         }
         /* Publish the ports so the dashboard can tell a miner which one to
          * dial. Labels are constrained to [A-Za-z0-9_-] at config parse time,

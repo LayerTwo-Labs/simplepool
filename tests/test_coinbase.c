@@ -828,6 +828,136 @@ static void window_outputs(const coinbase_parts_t *p, size_t en_total,
     *sum_out = sum;
 }
 
+/* Which of WA/WB/WC an output pays, or -1. Reads the transaction, so the
+ * assertion is about what the block does rather than what the builder said. */
+static int window_payee_at(const coinbase_parts_t *p, uint64_t idx) {
+    static const char *addrs[3] = { WA, WB, WC };
+    uint8_t spk[3][64]; size_t spk_len[3];
+    for (int i = 0; i < 3; ++i)
+        assert(coinbase_address_to_script(addrs[i], spk[i], sizeof spk[i],
+                                          &spk_len[i], NULL, 0) == 0);
+    const uint8_t *b = p->cb2;
+    size_t off = 4;
+    uint64_t n = b[off++];
+    for (uint64_t i = 0; i < n; ++i) {
+        off += 8;
+        size_t sl = b[off++];
+        if (i == idx) {
+            for (int k = 0; k < 3; ++k)
+                if (sl == spk_len[k] && memcmp(b + off, spk[k], sl) == 0) return k;
+            return -1;
+        }
+        off += sl;
+    }
+    return -1;
+}
+
+/* The paid set is a SUBSEQUENCE of the window, not a prefix of it.
+ *
+ * The builder skips a payee it cannot pay and keeps going, because a later one
+ * may be a cheaper address type and still fit. So `paid_count` says how many
+ * were paid and says nothing about which, and a caller reconstructing the set
+ * as "the first paid_count payees" gets a different set entirely the moment
+ * anything but the tail is dropped.
+ *
+ * That is not a reporting nit. stratum.c feeds exactly this set into the
+ * payout queue, so getting it wrong records the SKIPPED miner as paid --
+ * sending it to the back of the queue for a payment it never received -- and
+ * the paid one as owed. The case that triggers it is the likeliest one there
+ * is: pplns_order_claims() deliberately puts a reserved small claim FIRST, and
+ * a small claim is exactly what the floor drops (LayerTwo-Labs/simplepool#76).
+ */
+static void test_the_result_names_which_payees_were_paid(void) {
+    coinbase_parts_t parts; char err[256];
+    coinbase_window_result_t res;
+    /* payee[0] is below the dust floor; the two behind it are not. */
+    const coinbase_payee_t payees[] = {
+        { WA,       100LL },
+        { WB, 50000000LL },
+        { WC, 49999900LL },
+    };
+    assert(coinbase_build_window(800000, 100000000LL, payees, 3,
+                                 NULL, 0, NULL, NULL, 4, 8,
+                                 0, 0, &parts, &res, err, sizeof err) == 0);
+    assert(res.paid_count == 2);
+    assert(res.dropped_below_floor == 1);
+
+    /* The transaction pays WB and WC. It does NOT pay WA, which is what
+     * "the first paid_count payees" would have claimed. */
+    uint64_t n = 0; int64_t sum = 0;
+    window_outputs(&parts, 12, &n, &sum);
+    assert(n == 2);
+    assert(window_payee_at(&parts, 0) == 1);   /* WB */
+    assert(window_payee_at(&parts, 1) == 2);   /* WC */
+
+    /* And the mask says so, index by index. */
+    assert(res.paid_payee[0] == 0);
+    assert(res.paid_payee[1] == 1);
+    assert(res.paid_payee[2] == 1);
+    coinbase_parts_free(&parts);
+
+    /* The same, one level harder: a drop in the MIDDLE, and a drop that the
+     * byte budget rather than the floor causes. A budget with room for two
+     * P2WPKH payouts, three payees, the middle one under the floor -- so the
+     * survivors are index 0 and index 2 and the prefix reading is wrong at
+     * both ends. */
+    const coinbase_payee_t mid[] = {
+        { WA, 40000000LL },
+        { WB,      500LL },      /* under dust */
+        { WC, 59999500LL },
+    };
+    assert(coinbase_build_window(800000, 100000000LL, mid, 3,
+                                 NULL, 0, NULL, NULL, 4, 8,
+                                 0, 0, &parts, &res, err, sizeof err) == 0);
+    assert(res.paid_count == 2);
+    assert(res.paid_payee[0] == 1);
+    assert(res.paid_payee[1] == 0);
+    assert(res.paid_payee[2] == 1);
+    assert(window_payee_at(&parts, 0) == 0);   /* WA */
+    assert(window_payee_at(&parts, 1) == 2);   /* WC */
+    coinbase_parts_free(&parts);
+
+    /* Nothing dropped: every payee is marked, and only those. */
+    const coinbase_payee_t all[] = { { WA, 60000000LL }, { WB, 40000000LL } };
+    assert(coinbase_build_window(800000, 100000000LL, all, 2,
+                                 NULL, 0, NULL, NULL, 4, 8,
+                                 0, 0, &parts, &res, err, sizeof err) == 0);
+    assert(res.paid_payee[0] == 1 && res.paid_payee[1] == 1);
+    assert(res.paid_payee[2] == 0);
+    coinbase_parts_free(&parts);
+    printf("ok: the result names which payees were paid, not just how many\n");
+}
+
+/* The same mask, on the drivechain path. The two builders share one resolver
+ * precisely so they cannot disagree; this pins that the reporting is shared
+ * too, because stratum.c reads it from whichever one ran. */
+static void test_the_template_builder_reports_the_same_paid_set(void) {
+    coinbase_parts_t parts; char err[256];
+    coinbase_window_result_t res;
+    int64_t reward = 0;
+    assert(coinbase_template_reward(ENF_COINBASE_HEX, &reward) == 0);
+    assert(reward > 200000);
+
+    /* payee[0] is under the dust floor; the two behind it share the rest. */
+    int64_t b = (reward - 100) / 2;
+    const coinbase_payee_t payees[] = {
+        { WA, 100LL },
+        { WB, b },
+        { WC, reward - 100 - b },
+    };
+    assert(coinbase_build_window_from_template(ENF_COINBASE_HEX, payees, 3,
+                                               NULL, 0, NULL, 4, 4, 0, 0,
+                                               &parts, NULL, &res,
+                                               err, sizeof err) == 0);
+    assert(res.paid_count == 2);
+    assert(res.dropped_below_floor == 1);
+    assert(res.paid_payee[0] == 0);
+    assert(res.paid_payee[1] == 1);
+    assert(res.paid_payee[2] == 1);
+    coinbase_parts_free(&parts);
+    printf("ok: the template builder reports the same paid set\n");
+}
+
 static void test_window_pays_each_miner_its_own_output(void) {
     coinbase_parts_t parts; char err[256];
     coinbase_window_result_t res;
@@ -1514,6 +1644,8 @@ int main(void) {
     test_both_window_builders_split_identically();
     test_window_from_template_preserves_commitments();
     test_window_pays_each_miner_its_own_output();
+    test_the_result_names_which_payees_were_paid();
+    test_the_template_builder_reports_the_same_paid_set();
     test_a_split_that_does_not_add_up_is_refused();
     test_a_payee_below_the_floor_is_shared_out_not_given_to_the_operator();
     test_the_operator_cannot_profit_by_shrinking_the_coinbase();

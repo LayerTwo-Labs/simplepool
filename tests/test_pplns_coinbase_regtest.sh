@@ -26,10 +26,10 @@
 #   4. NOTHING is owed off-chain, ever. pps_credits must be empty: this mode
 #      writes no ledger row at all, so a row of any size means some other
 #      rail's code path ran.
-#   5. the policy is stated in the log. A claim below the payout floor is
-#      forfeited to the operator and never settled, which is a trap unless
-#      the operator can see it — so the disclosure lines are asserted here
-#      exactly like the money is.
+#   5. the policy is stated in the log. A claim below the payout floor earns
+#      that miner nothing from that block — its value goes to the miners the
+#      coinbase could pay — which is a trap unless the operator can see it, so
+#      the disclosure lines are asserted here exactly like the money is.
 #   6. a MIXED window really does redistribute, on chain. Claims of
 #      100 : 10 : 1 with a floor between the last two: the first two are paid
 #      in the coinbase, the third gets no output, and its satoshis turn up
@@ -49,8 +49,16 @@
 # An earlier version of this file had a stage that squeezed the byte budget
 # and printed how much had carried. It printed 0 every time and passed
 # regardless, which is worse than no stage at all. This one asserts the
-# amounts: 1 share in 111 of the payable reward, forfeited, and the operator
-# holding strictly more than its fee.
+# amounts: 1 share in 111 of the payable reward moving to the other two
+# miners, and the operator holding its fee to the satoshi and nothing more.
+#
+# What it CANNOT reach: a window whose dropped claim is not the LAST entry.
+# Order is largest-first until somebody is owed a turn, so a fresh pool always
+# drops the tail, and any reading of the paid set as "the first N payees" is
+# right by coincidence here. The non-tail case — a reserved small claim placed
+# FIRST and then dropped by the floor — is exercised in tests/test_stratum.c
+# (test_the_queue_credits_the_miners_the_block_actually_skipped), which is
+# where that bug was caught.
 #
 # Env:
 #   REGTEST_DIR      data dir, WIPED each run (default: <repo>/.regtest-cbwin)
@@ -323,10 +331,12 @@ print(f"  miner {paid[miner]} sats, operator {paid.get(op, 0)} sats")
 PY
 
 stage "assert NOTHING is owed off-chain"
-# The payment was the block, so there is no ledger at all in this mode: not
+# The payment was the block, so there is no BALANCE ledger in this mode: not
 # for the miners the coinbase paid, and not for the ones it could not. A claim
-# below the payout floor is forfeited to the operator outright — it is income,
-# not a debt, and nothing records it.
+# below the payout floor goes to the other miners in the same window, and the
+# skipped worker gets a row in the payout queue — a memory of whose turn is
+# next, against which the pool holds no money. pps_credits is the ledger that
+# must stay empty.
 #
 # So this is unconditional, which is what makes it worth asserting. Any row
 # here means some other rail's crediting path ran against a pplns-coinbase

@@ -858,6 +858,12 @@ static int resolve_window_outputs(int64_t value_sats,
         payout_bytes += cost;
         out[n].sats = pe->sats;
         r.paid_sats += pe->sats;
+        /* Record WHICH payee this was, not just that one more was paid. The
+         * loop above `continue`s past a payee it cannot pay, so the paid set
+         * is a subsequence of `payees` rather than a prefix, and a caller
+         * reconstructing it from paid_count alone credits the wrong miners.
+         * See coinbase_window_result_t.paid_payee. */
+        if (k < COINBASE_MAX_PAYOUT_OUTPUTS) r.paid_payee[k] = 1;
         n++; r.paid_count++;
     }
 

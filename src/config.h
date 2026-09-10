@@ -128,15 +128,23 @@ typedef struct {
      * headroom on that. 0 = COINBASE_DEFAULT_MAX_BYTES. */
     int coinbase_max_bytes;                  /* default 1000 */
 
-    /* pplns-coinbase: a claim worth less than this is not paid at all. It is
-     * forfeited to the operator output, and there is no ledger entry and no
-     * later settlement -- see the long note in proxy.conf.example.
+    /* pplns-coinbase: a claim worth less than this is not paid BY THIS BLOCK.
+     * Its value goes to the other miners in the same window -- not to the
+     * operator, which receives its fee and nothing else -- and the worker is
+     * recorded as owed a slot in the payout queue, so a later block whose
+     * coinbase has room reaches it first. See pplns_fractions in schema.sql.
+     *
+     * This comment said the opposite until the mode was measured: the value
+     * was forfeited to the operator and nothing was carried. That rule paid
+     * the operator MORE the tighter the coinbase (46%% of the block at a
+     * 400-byte budget against 2%% at 3000) and excluded the same miners every
+     * block, because a miner's window share tracks its hashrate. See the long
+     * note at the redistribution in coinbase.c
+     * (LayerTwo-Labs/simplepool#76).
      *
      * Deliberate policy, not a rounding artefact: coinbase-direct pays out of
      * the block itself, so every extra output is bytes an operator may not
-     * have. Rather than carry a debt no one can see, the floor is stated up
-     * front and a miner too small to clear it is better off solo mining.
-     * Clamped up to COINBASE_DUST_SATS (546); below that no output is
+     * have. Clamped up to COINBASE_DUST_SATS (546); below that no output is
      * relayable anyway. */
     int64_t pplns_payout_floor_sats;         /* default 546 (dust) */
 

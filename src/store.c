@@ -1698,9 +1698,25 @@ int store_stage_block_fractions(store_t *s, const char *block_hash,
      * writing it would put the ledger permanently out of balance -- the one
      * invariant that makes "nobody is owed money" checkable. Floating point
      * means "zero" is a tolerance, sized well below the smallest rotation
-     * anyone could notice. */
+     * anyone could notice.
+     *
+     * Summed over the rows that will actually be WRITTEN, not over everything
+     * passed in. A delta whose worker_id is unknown has no row to live in --
+     * pplns_claim_t documents 0 as exactly that -- and the loop below skips
+     * it. Checking the total first and skipping afterwards would let a set
+     * that balances only WITH the orphan reach the table without it, which is
+     * the imbalance this check exists to prevent, arrived at by PASSING the
+     * check rather than failing it. */
     double sum = 0.0;
-    for (size_t i = 0; i < n; ++i) sum += deltas[i].delta;
+    size_t writable = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (deltas[i].worker_id <= 0) continue;
+        sum += deltas[i].delta;
+        writable++;
+    }
+    /* Nothing to stage. Not an error: no rotation was recorded and none was
+     * lost, because nothing in the set names a worker. */
+    if (writable == 0) return 0;
     if (sum > 1e-9 || sum < -1e-9) {
         if (errbuf && errlen)
             snprintf(errbuf, errlen,
@@ -1754,6 +1770,35 @@ int store_settle_block_fractions(store_t *s, int *out_applied,
     if (!s || !s->db) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "bad arg");
         return -1;
+    }
+
+    /* Is there anything staged at all? A read, outside any transaction, and
+     * on the overwhelmingly common path the answer is no.
+     *
+     * Worth asking first because this runs on EVERY reconcile pass in EVERY
+     * mode -- a pool that has never been pplns-coinbase still comes through
+     * here once per tip -- and the transaction below is BEGIN IMMEDIATE, which
+     * takes the database's write lock and txn_mu with it. That stalls the
+     * commit thread's share batch for the length of a write transaction, to
+     * settle a table that is empty and always will be.
+     *
+     * Racy by construction and harmlessly so: a row staged between this check
+     * and the next statement is simply settled by the next pass, which is
+     * already the cadence the whole mechanism runs at. It can only ever cause
+     * a settlement to happen one tip later, never one that should not have. */
+    {
+        sqlite3_stmt *any = NULL;
+        int have = 0;
+        if (sqlite3_prepare_v2(s->db,
+                "SELECT 1 FROM pplns_pending_fractions LIMIT 1",
+                -1, &any, NULL) != SQLITE_OK) {
+            if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -2;
+        }
+        have = (sqlite3_step(any) == SQLITE_ROW);
+        sqlite3_finalize(any);
+        if (!have) return 0;
     }
 
     /* One transaction for the whole settlement. A partially applied block

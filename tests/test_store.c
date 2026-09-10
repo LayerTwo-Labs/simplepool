@@ -18,7 +18,7 @@
  * no stated reason, which is how a 17th test spent its first run looking like a
  * store bug. The assert turns the next overrun into an immediate, named
  * failure; the count is deliberately well clear of the current call sites. */
-#define MAX_TEST_DBS 32
+#define MAX_TEST_DBS 48
 static char g_db_paths[MAX_TEST_DBS][256];
 static int  g_db_count = 0;
 
@@ -1590,8 +1590,66 @@ static void test_fraction_deltas_must_sum_to_zero(void) {
     assert(store_stage_block_fractions(s, "bb", bad, 2, err, sizeof err) < 0);
     assert(strstr(err, "sum to") != NULL);
 
+    /* A delta with no worker behind it cannot be staged — there is no row to
+     * hold it. It must not be silently dropped from a set that balances only
+     * WITH it: what reaches the table would then not cancel, which is the
+     * exact state the check above exists to make impossible, arrived at by
+     * passing the check rather than failing it.
+     *
+     * pplns_claim_t documents worker_id 0 as "unknown", so this is a shape the
+     * callers can produce rather than a hypothetical. */
+    err[0] = '\0';
+    store_fraction_delta_t orphan[] = { {0, 0.25}, {2, -0.25} };
+    assert(store_stage_block_fractions(s, "cc", orphan, 2, err, sizeof err) < 0);
+    assert(strstr(err, "sum to") != NULL);
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM pplns_pending_fractions "
+                          "WHERE block_hash='cc'") == 0);
+
+    /* A set that is entirely worker-less writes nothing and is not an error:
+     * there is no rotation to record, and nothing about the ledger changed. */
+    store_fraction_delta_t none[] = { {0, 0.0} };
+    assert(store_stage_block_fractions(s, "dd", none, 1, err, sizeof err) == 0);
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM pplns_pending_fractions "
+                          "WHERE block_hash='dd'") == 0);
+
+    sqlite3_close(db);
     store_close(s);
     printf("  ok test_fraction_deltas_must_sum_to_zero\n");
+}
+
+/* With nothing staged, settling must not open a write transaction.
+ *
+ * This runs on every reconcile pass in every mode, including the four that can
+ * never stage a row, and BEGIN IMMEDIATE takes the database's write lock and
+ * txn_mu with it — stalling the commit thread's share batch to settle a table
+ * that is empty and always will be.
+ *
+ * Asserted by holding the write lock from ANOTHER connection. A settle that
+ * needs a transaction of its own cannot get one and fails after busy_timeout;
+ * one that checks first sails past, because it only ever read. */
+static void test_settling_nothing_takes_no_write_lock(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+
+    sqlite3 *writer = NULL;
+    assert(sqlite3_open(path, &writer) == SQLITE_OK);
+    assert(sqlite3_exec(writer, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK);
+
+    int applied = -1, discarded = -1;
+    assert(store_settle_block_fractions(s, &applied, &discarded,
+                                        err, sizeof err) == 0);
+    assert(applied == 0 && discarded == 0);
+
+    assert(sqlite3_exec(writer, "ROLLBACK", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(writer);
+    store_close(s);
+    printf("  ok test_settling_nothing_takes_no_write_lock\n");
 }
 
 /* Staged rows do nothing until the block they came from is CONFIRMED — and
@@ -1924,6 +1982,7 @@ int main(void) {
     test_the_payout_floor_is_published_for_the_dashboard();
     test_the_window_reads_past_the_first_batch();
     test_fraction_deltas_must_sum_to_zero();
+    test_settling_nothing_takes_no_write_lock();
     test_only_a_confirmed_block_moves_the_queue();
     test_two_confirmed_blocks_both_count();
     test_concurrent_writers_do_not_lose_each_other();

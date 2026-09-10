@@ -110,9 +110,16 @@ static int rank_desc(const void *a, const void *b) {
 }
 
 int pplns_order_claims(const pplns_claim_t *claims, size_t n_claims,
-                       size_t expected_slots, size_t *order)
+                       size_t expected_slots,
+                       const coinbase_payee_t *amounts,
+                       int64_t payout_floor_sats,
+                       size_t *order)
 {
     if (!claims || !order || n_claims == 0) return -1;
+
+    /* Same clamp as the builder's, so "can this be paid" has one answer. */
+    int64_t floor_sats = payout_floor_sats < COINBASE_DUST_SATS
+                       ? COINBASE_DUST_SATS : payout_floor_sats;
 
     rank_t *by_size = calloc(n_claims, sizeof *by_size);
     rank_t *by_owed = calloc(n_claims, sizeof *by_owed);
@@ -143,8 +150,14 @@ int pplns_order_claims(const pplns_claim_t *claims, size_t n_claims,
      * largest-first, as it was before the ledger existed. */
     for (size_t k = 0; k < n_claims && n < reserved; ++k) {
         if (by_owed[k].key <= 0.0) break;
-        order[n++] = by_owed[k].idx;
-        placed[by_owed[k].idx] = 1;
+        size_t i = by_owed[k].idx;
+        /* A claim the floor will drop cannot be paid from a reserved slot any
+         * more than from an unreserved one, so giving it one pays nobody and
+         * denies a miner that could have used it. `continue`, not `break`:
+         * the next-longest-waiting claim behind it may well be payable. */
+        if (amounts && amounts[i].sats < floor_sats) continue;
+        order[n++] = i;
+        placed[i] = 1;
     }
     /* Then everyone else, largest claim first. */
     for (size_t k = 0; k < n_claims; ++k) {

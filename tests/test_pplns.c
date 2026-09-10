@@ -305,6 +305,63 @@ static void test_the_builder_accepts_what_the_splitter_produces(void) {
  * rounding artefact: dividing by it would pay out MORE than the block holds.
  * Refuse rather than hand the builder a split it will reject on every
  * connection. */
+/* A floor that nobody clears stalls the POOL, not just a block.
+ *
+ * The builder refuses a window in which every claim is below the floor -- it
+ * has nothing to pay and paying the operator the whole block would be the
+ * worst available outcome. That refusal happens per connection, per job, at
+ * render time, so the visible symptom is a pool that publishes no work and
+ * repeats a warning, with no single event to trace it to. It is the exact
+ * failure the template-reward check upstream was added to prevent, arrived at
+ * from the other direction.
+ *
+ * Nothing exotic is needed to reach it: a small block reward spread across
+ * enough miners puts every claim under the 546-sat dust floor. 5000 sats
+ * across 20 miners is 250 each. A caller therefore has to notice BEFORE
+ * publishing, which is what below_floor is for -- and this pins that the
+ * splitter's prediction and the builder's refusal agree on the same window,
+ * so a caller checking one is protected from the other. */
+static void test_a_window_nobody_clears_is_predicted_and_refused(void) {
+    enum { N = 20 };
+    pplns_claim_t claims[N];
+    coinbase_payee_t out[N];
+    pplns_split_t r;
+    char err[256] = {0};
+    for (int i = 0; i < N; ++i) {
+        claims[i].payout_address = (i % 2) ? A : B;
+        claims[i].difficulty = 1.0;
+        claims[i].worker_id = i + 1;
+        claims[i].owed_fraction = 0.0;
+    }
+    /* 5000 sats, no fee, 20 equal claims: 250 sats each, under dust. */
+    CHECK(pplns_split_window(5000, 0, 0, claims, N, (double)N, 0,
+                             out, N, &r, err, sizeof err) == 0);
+    CHECK(r.payable_sats == 5000);
+    /* The splitter predicts it: every single claim is below the floor. */
+    CHECK(r.below_floor == (size_t)N);
+
+    /* And the builder refuses exactly that window, so a caller that published
+     * it would render nothing on every connection. */
+    coinbase_parts_t parts;
+    char berr[256] = {0};
+    CHECK(coinbase_build_window(800000, 5000, out, N, NULL, 0, NULL, NULL,
+                                4, 8, 0, 0, &parts, NULL,
+                                berr, sizeof berr) < 0);
+    CHECK(strstr(berr, "no payee fits") != NULL);
+
+    /* One claim large enough to clear the floor is all it takes: the
+     * prediction drops to N-1 and the builder builds. */
+    claims[0].difficulty = 100.0;
+    CHECK(pplns_split_window(5000, 0, 0, claims, N, 100.0 + (N - 1), 0,
+                             out, N, &r, err, sizeof err) == 0);
+    CHECK(r.below_floor == (size_t)(N - 1));
+    CHECK(coinbase_build_window(800000, 5000, out, N, NULL, 0, NULL, NULL,
+                                4, 8, 0, 0, &parts, NULL,
+                                berr, sizeof berr) == 0);
+    coinbase_parts_free(&parts);
+    printf("ok: a window nobody clears is predicted before it is refused\n");
+}
+
 static void test_a_window_total_that_is_too_small_is_refused(void) {
     const pplns_claim_t claims[] = { { A, 60.0, 0, 0.0 }, { B, 60.0, 0, 0.0 } };
     coinbase_payee_t out[2];
@@ -342,7 +399,7 @@ static void test_with_nothing_owed_the_order_is_largest_first(void) {
         c[i].difficulty = sizes[i]; c[i].owed_fraction = 0.0;
     }
     size_t order[5];
-    CHECK(pplns_order_claims(c, 5, 5, order) == 0);
+    CHECK(pplns_order_claims(c, 5, 5, NULL, 0, order) == 0);
     CHECK(c[order[0]].difficulty == 50);
     CHECK(c[order[1]].difficulty == 30);
     CHECK(c[order[2]].difficulty == 20);
@@ -373,7 +430,7 @@ static void test_a_long_waiting_small_miner_reaches_a_slot(void) {
     c[N - 1].owed_fraction = 0.004;
 
     size_t order[N];
-    CHECK(pplns_order_claims(c, N, SLOTS, order) == 0);
+    CHECK(pplns_order_claims(c, N, SLOTS, NULL, 0, order) == 0);
     /* One slot of four is reserved, and it goes to the waiting miner. */
     CHECK(order[0] == N - 1);
     /* The rest of the slots still go to the largest claims, in order, so the
@@ -382,6 +439,167 @@ static void test_a_long_waiting_small_miner_reaches_a_slot(void) {
     CHECK(order[2] == 1);
     CHECK(order[3] == 2);
     printf("ok: a long-waiting small miner reaches a reserved slot\n");
+}
+
+/* Sizing `expected_slots` too HIGH starves the largest claims outright.
+ *
+ * The reservation is a fraction of the slots the caller says the coinbase will
+ * have. Tell it 40 when the coinbase fits 9 and it reserves 10 positions at
+ * the head of the order — more than the block has room for — so every output
+ * goes to the queue and not one of the largest claims is paid. They then enter
+ * the queue themselves and the rotation oscillates instead of rotating.
+ *
+ * The opposite error costs nothing but time: reserve too few and the queue
+ * moves more slowly. That asymmetry is the whole reason main.c sizes this from
+ * the TIGHTEST byte ceiling any listener can impose rather than the
+ * server-wide one — a rented port's ceiling is deliberately far lower, and one
+ * payment order has to serve every port (LayerTwo-Labs/simplepool#76). */
+static void test_oversizing_the_slot_estimate_starves_the_largest_claims(void) {
+    enum { N = 60 };
+    /* 400 bytes fits ten payouts. A generous ceiling's estimate reserves
+     * fifteen, so five of them do not exist and the ten that do are all
+     * queue picks. */
+    const size_t TIGHT = 400;
+    pplns_claim_t c[N];
+    double total = 0.0;
+    for (int i = 0; i < N; ++i) {
+        c[i].payout_address = A; c[i].worker_id = i + 1;
+        c[i].difficulty = 1000.0 / (i + 1);
+        /* The tail has been waiting; the big claims have not. */
+        c[i].owed_fraction = i >= N / 2 ? 0.001 * (i + 1) : 0.0;
+        total += c[i].difficulty;
+    }
+    coinbase_payee_t by_claim[N];
+    pplns_split_t split;
+    char err[256] = {0};
+    CHECK(pplns_split_window(5000000000LL, 0, 0, c, N, total, 546,
+                             by_claim, N, &split, err, sizeof err) == 0);
+    CHECK(split.below_floor == 0);      /* everyone is payable; only slots bind */
+
+    const char *addrs[N];
+    for (int i = 0; i < N; ++i) addrs[i] = c[i].payout_address;
+
+    /* How many the TIGHT coinbase really fits, and what a generous ceiling
+     * would have claimed. */
+    size_t right = coinbase_expected_payout_slots(TIGHT, NULL, addrs, N);
+    size_t wrong = coinbase_expected_payout_slots(3000, NULL, addrs, N);
+    CHECK(wrong > right * 2);
+
+    /* Build under both sizings against the SAME tight coinbase, and ask the
+     * transaction which claims got an output. */
+    int big_paid[2];
+    size_t sizings[2] = { wrong, right };
+    for (int v = 0; v < 2; ++v) {
+        size_t order[N];
+        CHECK(pplns_order_claims(c, N, sizings[v], by_claim, 546, order) == 0);
+        coinbase_payee_t payees[N];
+        for (int i = 0; i < N; ++i) payees[i] = by_claim[order[i]];
+
+        coinbase_parts_t parts;
+        coinbase_window_result_t res;
+        char berr[256] = {0};
+        CHECK(coinbase_build_window(800000, 5000000000LL, payees, N, NULL, 0,
+                                    NULL, NULL, 4, 8, TIGHT, 546,
+                                    &parts, &res, berr, sizeof berr) == 0);
+        /* Claim 0 is the largest in the window. Where did it land, and was
+         * that position paid? */
+        big_paid[v] = 0;
+        for (int i = 0; i < N; ++i) {
+            if (order[i] == 0) { big_paid[v] = res.paid_payee[i]; break; }
+        }
+        coinbase_parts_free(&parts);
+    }
+
+    /* Oversized: the queue took every slot the block had, and the biggest
+     * miner in the window was paid nothing. */
+    CHECK(big_paid[0] == 0);
+    /* Sized from the ceiling that actually applies: it is paid. */
+    CHECK(big_paid[1] == 1);
+    printf("ok: oversizing the slot estimate starves the largest claims\n");
+}
+
+/* A reserved slot must not go to a claim the floor is about to drop.
+ *
+ * The slot would pay nobody -- the builder drops a sub-floor claim whatever
+ * position it sits in -- and it is taken from a miner who could have used it.
+ * That matters over time rather than per block: a miner permanently below the
+ * floor is skipped by every block, so its owed_fraction only ever GROWS, while
+ * a byte-capped miner is paid periodically and resets. Run long enough and the
+ * miners who can never be paid sit at the top of the queue for ever, and the
+ * rotation stops reaching the miners it exists for
+ * (LayerTwo-Labs/simplepool#76).
+ *
+ * The dropped claim still appears in the order at its own size: the
+ * permutation covers every claim, because the redistribution and the payout
+ * queue both need the ones that were skipped. */
+static void test_a_reserved_slot_skips_a_claim_the_floor_will_drop(void) {
+    enum { N = 20, SLOTS = 8 };   /* 8/4 = two reserved slots */
+    pplns_claim_t c[N];
+    coinbase_payee_t amounts[N];
+    for (int i = 0; i < N; ++i) {
+        c[i].payout_address = A; c[i].worker_id = i + 1;
+        c[i].difficulty = 1000.0 / (i + 1);
+        c[i].owed_fraction = 0.0;
+        amounts[i].address = A;
+        amounts[i].sats = 100000;                  /* comfortably payable */
+    }
+    /* Two miners are waiting. The one owed MORE is worth 100 sats -- under the
+     * 546-sat dust floor, so no block can pay it. The other is payable. */
+    c[N - 1].owed_fraction = 0.900;  amounts[N - 1].sats = 100;
+    c[N - 2].owed_fraction = 0.004;  amounts[N - 2].sats = 100000;
+
+    size_t order[N];
+
+    /* Without the amounts, the sub-floor miner takes the first reserved slot
+     * and the block pays it nothing -- the behaviour being fixed. */
+    CHECK(pplns_order_claims(c, N, SLOTS, NULL, 0, order) == 0);
+    CHECK(order[0] == N - 1);
+
+    /* With them, it is passed over and the payable waiting miner is promoted
+     * instead. `continue`, not `break`: one unpayable claim at the head of the
+     * queue must not close the reservation for everyone behind it. */
+    CHECK(pplns_order_claims(c, N, SLOTS, amounts, 546, order) == 0);
+    CHECK(order[0] == N - 2);
+    /* Then the largest claims, as usual. */
+    CHECK(order[1] == 0);
+    CHECK(order[2] == 1);
+
+    /* And the skipped claim is still in the order, at its own size: it is the
+     * smallest, so it is last. */
+    CHECK(order[N - 1] == N - 1);
+
+    /* A permutation, still: every claim exactly once. */
+    int seen[N] = {0};
+    for (int i = 0; i < N; ++i) { CHECK(order[i] < N); seen[order[i]]++; }
+    for (int i = 0; i < N; ++i) CHECK(seen[i] == 1);
+
+    /* The floor is clamped up to dust the same way the builder clamps it, so
+     * asking for floor 0 does not resurrect a 100-sat claim. */
+    CHECK(pplns_order_claims(c, N, SLOTS, amounts, 0, order) == 0);
+    CHECK(order[0] == N - 2);
+    printf("ok: a reserved slot skips a claim the floor will drop\n");
+}
+
+/* Every claim payable and somebody waiting: the reservation behaves exactly as
+ * it did before it learned about the floor. The amounts are meant to EXCLUDE,
+ * never to reorder. */
+static void test_amounts_change_nothing_when_everyone_is_payable(void) {
+    enum { N = 20, SLOTS = 4 };
+    pplns_claim_t c[N];
+    coinbase_payee_t amounts[N];
+    for (int i = 0; i < N; ++i) {
+        c[i].payout_address = A; c[i].worker_id = i + 1;
+        c[i].difficulty = 1000.0 / (i + 1);
+        c[i].owed_fraction = 0.0;
+        amounts[i].address = A; amounts[i].sats = 100000;
+    }
+    c[N - 1].owed_fraction = 0.004;
+
+    size_t with_[N], without[N];
+    CHECK(pplns_order_claims(c, N, SLOTS, NULL, 0, without) == 0);
+    CHECK(pplns_order_claims(c, N, SLOTS, amounts, 546, with_) == 0);
+    for (int i = 0; i < N; ++i) CHECK(with_[i] == without[i]);
+    printf("ok: the amounts exclude, they do not reorder\n");
 }
 
 /* Reserved slots are a minority of the coinbase, always. The biggest claims
@@ -397,7 +615,7 @@ static void test_the_reservation_never_takes_every_slot(void) {
     }
     size_t order[N];
     for (size_t slots = 1; slots <= N; ++slots) {
-        CHECK(pplns_order_claims(c, N, slots, order) == 0);
+        CHECK(pplns_order_claims(c, N, slots, NULL, 0, order) == 0);
         /* Every claim appears exactly once, whatever the reservation did. */
         int seen[N] = {0};
         for (size_t i = 0; i < N; ++i) { CHECK(order[i] < N); seen[order[i]]++; }
@@ -422,7 +640,7 @@ static void test_being_paid_early_does_not_win_a_reserved_slot(void) {
         c[i].owed_fraction = -0.5;      /* everyone has been paid early */
     }
     size_t order[N];
-    CHECK(pplns_order_claims(c, N, 4, order) == 0);
+    CHECK(pplns_order_claims(c, N, 4, NULL, 0, order) == 0);
     /* Nobody is owed, so nothing is reserved and it is pure largest-first. */
     for (size_t i = 0; i < N; ++i) CHECK(order[i] == i);
     printf("ok: a negative balance does not win a reserved slot\n");
@@ -495,10 +713,14 @@ int main(void) {
     test_the_fee_matches_what_the_builder_will_expect();
     test_the_floor_and_dust_boundaries_are_exact();
     test_the_builder_accepts_what_the_splitter_produces();
+    test_a_window_nobody_clears_is_predicted_and_refused();
     test_a_window_total_that_is_too_small_is_refused();
     test_the_degenerate_inputs_are_refused();
     test_with_nothing_owed_the_order_is_largest_first();
     test_a_long_waiting_small_miner_reaches_a_slot();
+    test_oversizing_the_slot_estimate_starves_the_largest_claims();
+    test_a_reserved_slot_skips_a_claim_the_floor_will_drop();
+    test_amounts_change_nothing_when_everyone_is_payable();
     test_the_reservation_never_takes_every_slot();
     test_being_paid_early_does_not_win_a_reserved_slot();
     test_conservation_holds_for_random_windows();
