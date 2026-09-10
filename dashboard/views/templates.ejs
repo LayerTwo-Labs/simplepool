@@ -20,6 +20,31 @@
     <% } else {
          const cur = templates.current;
          const age = cur ? Math.max(0, Math.floor(Date.now() / 1000) - cur.ts) : 0;
+         /* Only pps-classic puts a price on a share the moment it arrives, so
+            in every other mode this column is 0 by construction. That much was
+            right; the wording was not. It used to answer with "only pps-classic
+            prices a share on arrival", which explains a mode this pool is not
+            in and leaves a pplns operator reading it as something broken. Name
+            the mode we are actually in, the way /health and the worker page
+            already do.
+
+            Guarded like the nav partial: the server sets res.locals.pool on
+            every render, but a caller that renders this view directly has no
+            such local and a bare reference throws rather than degrading. */
+         const mode   = (typeof pool !== 'undefined' && pool && pool.pool_mode)
+                      || null;
+         const priced = mode === 'pps-classic';
+         const pplns  = mode === 'pplns-coinbase' || mode === 'pplns-thunder'
+                     || mode === 'pplns-btc';
+         const noRate =
+               !mode           ? 'n/a — this pool has not published its mode yet'
+             : mode === 'solo' ? 'n/a — solo: the block pays the pool, not the share'
+             : pplns           ? 'n/a — ' + mode + ': a share is priced when a block is found'
+             :                   'n/a — ' + mode + ': shares are not priced on arrival';
+         /* A pool that has since switched modes still has priced rows behind
+            it, so the history column follows the data rather than the mode. */
+         const anyRate = (cur && cur.rate_sats_per_diff > 0)
+                      || templates.history.some(t => t.rate_sats_per_diff > 0);
     %>
 
     <section class="card info">
@@ -45,9 +70,10 @@
             <div><label>Transaction fees</label><strong><%= fmtSats(cur.tx_fees_sats) %></strong></div>
             <div><label>Transactions</label><strong><%= fmtN(cur.tx_count) %></strong></div>
             <div><label>nBits</label><strong class="mono"><%= cur.bits %></strong></div>
-            <div><label>PPS rate</label><strong><%= cur.rate_sats_per_diff > 0
+            <div><label><%= priced ? 'PPS rate' : 'Share pricing' %></label><strong><%= cur.rate_sats_per_diff > 0
                     ? fmtF(cur.rate_sats_per_diff, 4) + ' sats/diff'
-                    : 'n/a (only pps-classic prices a share on arrival)' %></strong></div>
+                    : (priced ? '0 sats/diff — nothing is accruing right now'
+                              : noRate) %></strong></div>
             <div><label>Received</label><strong title="<%= fmtTs(cur.ts) %>"><%= ago(cur.ts) %></strong></div>
             <div><label>Last polled</label><strong title="<%= fmtTs(cur.last_seen) %>"><%= ago(cur.last_seen) %>
                 <span class="muted small">(<%= fmtN(cur.polls) %> poll<%= cur.polls === 1 ? '' : 's' %>)</span></strong></div>
@@ -61,6 +87,15 @@
                 its backend</span>
             <% } %>
         </p>
+        <% if (pplns) { %>
+        <p class="muted small" style="margin-top:0.75em">
+            A share on this pool is not priced when it arrives, so there is no
+            per-share rate to quote in advance. The <em>block value</em> above
+            is the amount that gets divided — among the shares in the PPLNS
+            window at the moment a block is found<%= mode === 'pplns-coinbase'
+                ? ", and paid in that block's own coinbase" : '' %>.
+        </p>
+        <% } %>
     </section>
 
     <section class="card">
@@ -116,7 +151,7 @@
             <thead><tr>
                 <th>When</th><th>Held</th><th>Height</th><th>Difficulty</th>
                 <th>Block value</th><th>Fees</th><th>Txs</th>
-                <th>Source</th><th>Commitments</th><th>PPS rate</th>
+                <th>Source</th><th>Commitments</th><% if (anyRate) { %><th>PPS rate</th><% } %>
             </tr></thead>
             <tbody>
                 <% templates.history.forEach(t => { %>
@@ -138,7 +173,7 @@
                             <span class="muted">(<%= fmtN(t.cb_op_returns) %> OP_RETURN)</span>
                         <% } %>
                     </td>
-                    <td class="small"><%= t.rate_sats_per_diff > 0 ? fmtF(t.rate_sats_per_diff, 4) : '—' %></td>
+                    <% if (anyRate) { %><td class="small"><%= t.rate_sats_per_diff > 0 ? fmtF(t.rate_sats_per_diff, 4) : '—' %></td><% } %>
                 </tr>
                 <% }) %>
             </tbody>

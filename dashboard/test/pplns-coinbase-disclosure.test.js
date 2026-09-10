@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import ejs from 'ejs';
 
-import { poolMeta, fmtHashrate } from '../lib/stats.js';
+import { poolMeta, fmtHashrate, templates as statsTemplates } from '../lib/stats.js';
 import { health as runHealth } from '../lib/health.js';
 import * as fmt from '../lib/fmt.js';
 
@@ -179,4 +179,77 @@ test('a mode with no balance does not report one as owed', async () => {
     assert.doesNotMatch(html, /solo mode/,
                         'a pplns-coinbase worker page must not claim solo');
     assert.match(html, /paid in the coinbase/);
+});
+
+/* The fourth place. templates.ejs answered a zero rate with "only pps-classic
+ * prices a share on arrival" -- true of pps-classic, and no answer at all to
+ * the pplns operator who is looking at their own pool and wondering what is
+ * n/a and why. Same bug as the three above, one page later. */
+function withTemplate(db, { rate = 0, height = 997058 } = {}) {
+    db.prepare(`INSERT INTO templates
+                  (ts, height, prev_hash, bits, network_difficulty,
+                   coinbase_value_sats, tx_count, tx_fees_sats, source,
+                   cb_spendable, cb_op_returns, longpoll, rate_sats_per_diff,
+                   last_seen, polls)
+                VALUES (@ts, @height, @prev, '1900ffff', 4294967296,
+                        313374735, 1158, 874735, 'enforcer', 1, 8, 1, @rate,
+                        @ts, 62)`)
+      .run({ ts: Math.floor(Date.now() / 1000), height, rate,
+             prev: '00'.repeat(32) });
+    return db;
+}
+
+const templatesPage = db => render('templates.ejs', {
+    templates: statsTemplates(db), pool: poolMeta(db),
+    health: { ok: true, checks: [] },
+    stratumUrl: 'stratum+tcp://x:3334', sidechainId: 9,
+});
+
+test('the templates page names the mode it is in, not pps-classic', async () => {
+    for (const mode of ['pplns-coinbase', 'pplns-btc', 'pplns-thunder', 'solo']) {
+        const html = await templatesPage(withTemplate(makeDb({ mode })));
+        assert.doesNotMatch(html, /only pps-classic prices a share on arrival/,
+                            `${mode} was told about a mode it is not in`);
+        assert.match(html, new RegExp(mode), `${mode} should name itself`);
+        /* And the label must stop claiming a PPS rate this pool has none of. */
+        assert.doesNotMatch(html, /<label>PPS rate<\/label>/,
+                            `${mode} has no PPS rate to label`);
+    }
+});
+
+test('a pplns pool is told where the price does come from', async () => {
+    const html = await templatesPage(withTemplate(makeDb()));
+    assert.match(html, /priced when a block is found/i);
+    assert.match(html, /own coinbase/i);
+});
+
+test('pps-classic still shows its rate, and its zero means something else', async () => {
+    const priced = await templatesPage(
+        withTemplate(makeDb({ mode: 'pps-classic' }), { rate: 1036.8368 }));
+    assert.match(priced, /<label>PPS rate<\/label>/);
+    assert.match(priced, /1036\.8368 sats\/diff/);
+
+    /* Zero under pps-classic is not "this mode has no rate" -- it is accrual
+     * that has stopped, which is the one case where the operator must not be
+     * reassured by an "n/a". */
+    const gated = await templatesPage(
+        withTemplate(makeDb({ mode: 'pps-classic' }), { rate: 0 }));
+    assert.match(gated, /nothing is accruing/i);
+    assert.doesNotMatch(gated, /n\/a/);
+});
+
+test('the history rate column disappears when no row was ever priced', async () => {
+    const db = makeDb();
+    withTemplate(db, { height: 1 });
+    withTemplate(db, { height: 2 });
+    const html = await templatesPage(db);
+    assert.doesNotMatch(html, /<th>PPS rate<\/th>/,
+                        'a dead column of em-dashes on a table that scrolls');
+
+    /* But a pool that switched away from pps-classic keeps its priced
+     * history legible -- the column follows the data, not the current mode. */
+    const switched = makeDb();
+    withTemplate(switched, { height: 1, rate: 1036.8368 });
+    withTemplate(switched, { height: 2 });
+    assert.match(await templatesPage(switched), /<th>PPS rate<\/th>/);
 });

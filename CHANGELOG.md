@@ -92,8 +92,16 @@ listener = port=3335 label=rental min_diff=500000 initial_diff=500000 max_coinba
   all three PPLNS modes fell through to *"this pool has not published its mode
   yet"*, directly beneath a header that named the mode correctly.
 - Three places answered "not `pps-classic`" with the word *solo*: the worker
-  page's **Owed** field, the templates page's PPS rate, and the
+  page's **Owed** field, the "About the numbers" card, and the
   `pps_difficulty` health check.
+- The templates page's **PPS rate** row was the fourth, and this bullet used
+  to claim it fixed. It answered a zero rate with *"only pps-classic prices a
+  share on arrival"* — a true sentence about a mode the pool is not in, on the
+  page an operator opens when something looks wrong. It now names the pool's
+  own mode, and for the PPLNS rails says where the price does come from: the
+  block value above it is what gets divided, among the window, when a block is
+  found. The label stops calling itself a PPS rate on a pool that has none,
+  and the history table drops the rate column when no row was ever priced.
 - **Pool solvency** counted `blocks_found.reward_sats` as pool revenue in
   `pplns-coinbase`, where that is what the block paid the *miners* — reporting
   a healthy margin for a pool that holds nothing. Now skipped, with the reason.
