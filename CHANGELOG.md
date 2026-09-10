@@ -79,11 +79,12 @@ listener = port=3335 label=rental min_diff=500000 initial_diff=500000 max_coinba
   bytes was over by 24 slots on a window of taproot addresses at a 3000-byte
   budget, reserving a third of the coinbase where a quarter was meant. Now
   within 2 slots across every budget and address type tested, and never over.
-- **Store writes use savepoints.** The store shares one SQLite connection
-  across three threads, and `BEGIN IMMEDIATE` failed outright when another was
-  mid-transaction — dropping the write with only a warning. This affected
-  `store_pplns_distribute` as well, which had been surviving on being retried
-  each tip.
+- **Store transactions are serialised.** The store shares one SQLite connection
+  across three threads and nothing guarded it: `BEGIN IMMEDIATE` failed
+  outright when another was mid-transaction, dropping the write with only a
+  warning. `store_pplns_distribute` was affected too, surviving on being
+  retried each tip. A single mutex is now held across each transaction, so a
+  write waits for at most one batch instead of losing to it.
 
 ### Dashboard
 

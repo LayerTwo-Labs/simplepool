@@ -436,6 +436,30 @@ struct store {
     sqlite3_stmt *st_upsert_node_tip;
     sqlite3_stmt *st_upsert_credit;
     pthread_mutex_t node_tip_mu;   /* serialise binds on st_upsert_node_tip */
+    /* Held across a WHOLE transaction on `db`, by every thread that opens one.
+     *
+     * One connection is shared by the commit thread, the tip watcher and the
+     * stratum submit path, and none of the other locks covers this: `mu`
+     * guards the ring buffer and is released before commit_batch() runs, and
+     * node_tip_mu guards a single statement. So two transactions could
+     * overlap, and BEGIN IMMEDIATE simply failed for the loser -- a race, so
+     * it showed up as an occasional lost write rather than anything
+     * reproducible.
+     *
+     * Savepoints look like the fix and are worse. A savepoint nests into
+     * whatever is already open, which on this connection is usually the
+     * commit thread's share batch -- so RELEASE does not commit the write (a
+     * failed batch discards it after its caller was told it succeeded), and
+     * ROLLBACK TO rewinds the connection past the caller's own boundary,
+     * taking the commit thread's shares with it. Verified both in plain
+     * sqlite; see the tests. That trades a lost payout-queue row for lost
+     * SHARES, which is what every window is measured from.
+     *
+     * Serialising is what these writes actually need. A stratum-path write
+     * waits for at most one batch, bounded by commit_window_ms. Not recursive:
+     * nothing reachable from commit_batch() opens one of these transactions,
+     * which is checked by the tests rather than assumed. */
+    pthread_mutex_t txn_mu;
 
     /* Ring buffer */
     event_t  *ring;
@@ -693,7 +717,17 @@ static void process_event(store_t *s, const event_t *ev) {
 static int commit_batch(store_t *s, event_t *batch, size_t take) {
     for (int attempt = 1; attempt <= STORE_COMMIT_ATTEMPTS; ++attempt) {
         char *err = NULL;
+        /* Held for the whole transaction, so nothing else on this connection
+         * can open one inside it. writer_main() releases `mu` before calling
+         * here -- that lock guards the ring buffer, not the database -- so
+         * without this the tip watcher and the stratum submit path could and
+         * did overlap a batch. See txn_mu.
+         *
+         * Taken per attempt rather than around the retry loop, so a backoff
+         * does not hold every other writer off for the sleep. */
+        pthread_mutex_lock(&s->txn_mu);
         if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, &err) != SQLITE_OK) {
+            pthread_mutex_unlock(&s->txn_mu);
             LOG_WARN("store: BEGIN failed (attempt %d/%d): %s",
                      attempt, STORE_COMMIT_ATTEMPTS, err ? err : "?");
             sqlite3_free(err);
@@ -705,6 +739,7 @@ static int commit_batch(store_t *s, event_t *batch, size_t take) {
         for (size_t i = 0; i < take; ++i) process_event(s, &batch[i]);
 
         if (sqlite3_exec(s->db, "COMMIT", NULL, NULL, &err) == SQLITE_OK) {
+            pthread_mutex_unlock(&s->txn_mu);
             atomic_fetch_add(&s->batches, 1);
             return 0;
         }
@@ -715,6 +750,7 @@ static int commit_batch(store_t *s, event_t *batch, size_t take) {
          * per-event counters process_event() bumped are lost accuracy we
          * accept: they describe attempts, the ledger describes reality. */
         sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        pthread_mutex_unlock(&s->txn_mu);
         atomic_fetch_add(&s->pg_errors, 1);
         backoff_sleep(attempt);
     }
@@ -914,6 +950,7 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         "  last_updated = excluded.last_updated";
 
     pthread_mutex_init(&s->node_tip_mu, NULL);
+    pthread_mutex_init(&s->txn_mu, NULL);
 
     if (sqlite3_prepare_v2(s->db, Q_UPSERT, -1, &s->st_upsert_worker, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(s->db, Q_INS_SHARE, -1, &s->st_insert_share, NULL) != SQLITE_OK ||
@@ -957,6 +994,7 @@ void store_close(store_t *s) {
     if (s->st_upsert_node_tip) sqlite3_finalize(s->st_upsert_node_tip);
     if (s->st_upsert_credit) sqlite3_finalize(s->st_upsert_credit);
     if (s->db) sqlite3_close(s->db);
+    pthread_mutex_destroy(&s->txn_mu);
     pthread_mutex_destroy(&s->node_tip_mu);
     pthread_mutex_destroy(&s->mu);
     pthread_cond_destroy(&s->cv_not_empty);
@@ -1271,38 +1309,27 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
 
 /* ---- PPLNS distribution ------------------------------------------------ */
 
-/* Transactions that may already be inside one.
+/* One transaction, serialised against every other on this connection.
  *
- * The store keeps ONE sqlite connection and shares it: the commit thread
- * batches shares on it, while the tip watcher and the stratum submit path also
- * write through it. BEGIN IMMEDIATE fails outright when the commit thread
- * happens to be mid-batch -- "cannot start a transaction within a transaction"
- * -- which is a race, so it shows up as an occasional lost write rather than
- * as anything reproducible.
- *
- * SAVEPOINT nests. With no transaction open it starts one; inside another it
- * is a nested unit that RELEASE folds into the outer commit. Either way the
- * caller gets all-or-nothing, which is the property these writes actually
- * need.
- *
- * Found when the coinbase-direct payout queue silently dropped a block's
- * rotation under load (LayerTwo-Labs/simplepool#76). store_pplns_distribute()
- * had the same bug and had been surviving on being retried each tip. */
-static int sp_begin(store_t *s, const char *name) {
-    char q[64];
-    snprintf(q, sizeof q, "SAVEPOINT %s", name);
-    return sqlite3_exec(s->db, q, NULL, NULL, NULL);
+ * txn_begin() takes txn_mu and opens a real BEGIN IMMEDIATE; commit and
+ * rollback close it and release the lock. Pairing the lock with the
+ * transaction in one place is the point -- an unlock that can be forgotten on
+ * an error path is how this class of bug gets back in. See txn_mu. */
+static int txn_begin(store_t *s) {
+    pthread_mutex_lock(&s->txn_mu);
+    if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->txn_mu);
+        return -1;
+    }
+    return 0;
 }
-static void sp_release(store_t *s, const char *name) {
-    char q[64];
-    snprintf(q, sizeof q, "RELEASE %s", name);
-    sqlite3_exec(s->db, q, NULL, NULL, NULL);
+static void txn_commit(store_t *s) {
+    sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
+    pthread_mutex_unlock(&s->txn_mu);
 }
-static void sp_rollback(store_t *s, const char *name) {
-    char q[96];
-    snprintf(q, sizeof q, "ROLLBACK TO %s", name);
-    sqlite3_exec(s->db, q, NULL, NULL, NULL);
-    sp_release(s, name);
+static void txn_rollback(store_t *s) {
+    sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+    pthread_mutex_unlock(&s->txn_mu);
 }
 
 int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
@@ -1401,7 +1428,7 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
          * and a failure leaves the latch clear so the next pass retries. A
          * partial distribution is the one outcome that cannot be corrected by
          * running again, because crediting is additive. */
-        if (sp_begin(s, "sp_dist") != SQLITE_OK) {
+        if (txn_begin(s) != 0) {
             rc_out = -1;
             break;
         }
@@ -1445,7 +1472,7 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
         sqlite3_finalize(mark);
 
         if (ok) {
-            sp_release(s, "sp_dist");
+            txn_commit(s);
             blocks++;
             workers += credited_here;
             LOG_INFO("pplns: block %.16s… distributed %lld sats of %lld across "
@@ -1453,7 +1480,7 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
                      hbuf, (long long)distributed, (long long)payable,
                      credited_here, window);
         } else {
-            sp_rollback(s, "sp_dist");
+            txn_rollback(s);
             if (errbuf && errlen)
                 snprintf(errbuf, errlen, "distribute %.16s: %s", hbuf,
                          sqlite3_errmsg(s->db));
@@ -1686,14 +1713,14 @@ int store_stage_block_fractions(store_t *s, const char *block_hash,
         "VALUES (?, ?, ?) "
         "ON CONFLICT(block_hash, worker_id) DO UPDATE SET delta = excluded.delta";
 
-    if (sp_begin(s, "sp_stage") != SQLITE_OK) {
+    if (txn_begin(s) != 0) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
         return -1;
     }
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
-        sp_rollback(s, "sp_stage");
+        txn_rollback(s);
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;
     }
@@ -1710,11 +1737,11 @@ int store_stage_block_fractions(store_t *s, const char *block_hash,
     sqlite3_finalize(st);
     if (!ok) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
-        sp_rollback(s, "sp_stage");
+        txn_rollback(s);
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;
     }
-    sp_release(s, "sp_stage");
+    txn_commit(s);
     return wrote;
 }
 
@@ -1732,7 +1759,7 @@ int store_settle_block_fractions(store_t *s, int *out_applied,
     /* One transaction for the whole settlement. A partially applied block
      * would leave the ledger not summing to zero, and unlike a failed payout
      * there is no later pass that could notice: the pending rows are gone. */
-    if (sp_begin(s, "sp_settle") != SQLITE_OK) {
+    if (txn_begin(s) != 0) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
         return -1;
     }
@@ -1753,7 +1780,7 @@ int store_settle_block_fractions(store_t *s, int *out_applied,
     sqlite3_stmt *sel = NULL;
     if (sqlite3_prepare_v2(s->db, ONE_HASH, -1, &sel, NULL) != SQLITE_OK) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
-        sp_rollback(s, "sp_settle");
+        txn_rollback(s);
         return -2;
     }
     while (nh < 64 && sqlite3_step(sel) == SQLITE_ROW) {
@@ -1798,11 +1825,11 @@ int store_settle_block_fractions(store_t *s, int *out_applied,
 
     if (!ok) {
         if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
-        sp_rollback(s, "sp_settle");
+        txn_rollback(s);
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;
     }
-    sp_release(s, "sp_settle");
+    txn_commit(s);
     if (out_applied)   *out_applied = applied;
     if (out_discarded) *out_discarded = discarded;
     return 0;
@@ -1810,13 +1837,19 @@ int store_settle_block_fractions(store_t *s, int *out_applied,
 
 int store_begin_txn_for_test(store_t *s) {
     if (!s || !s->db) return -1;
-    return sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK
-           ? 0 : -1;
+    return txn_begin(s);
 }
 
 int store_end_txn_for_test(store_t *s) {
     if (!s || !s->db) return -1;
-    return sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+    txn_commit(s);
+    return 0;
+}
+
+int store_rollback_txn_for_test(store_t *s) {
+    if (!s || !s->db) return -1;
+    txn_rollback(s);
+    return 0;
 }
 
 int store_record_credit(store_t *s, const char *worker_name,

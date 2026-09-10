@@ -1718,22 +1718,118 @@ static void test_the_window_reports_each_workers_standing(void) {
     printf("  ok test_the_window_reports_each_workers_standing\n");
 }
 
-/* Writes that land while the commit thread holds a transaction.
+/* Writes from three threads on one connection must not overlap, and none may
+ * be lost.
  *
- * The store keeps ONE sqlite connection and shares it between the commit
- * thread, the tip watcher and the stratum submit path. BEGIN IMMEDIATE fails
- * outright when another thread is already mid-transaction — "cannot start a
- * transaction within a transaction" — and because it is a race it shows up as
- * an occasional lost write rather than as anything reproducible.
+ * The store shares a single sqlite connection between the commit thread, the
+ * tip watcher and the stratum submit path, and none of the other locks covers
+ * that: `mu` guards the ring buffer and writer_main() releases it BEFORE
+ * calling commit_batch(), which takes no lock at all. Two transactions could
+ * therefore overlap, and BEGIN IMMEDIATE simply failed for the loser. Being a
+ * race, it surfaced as an occasional dropped write with a WARN rather than
+ * anything reproducible — a block's payout-queue rotation, in the case that
+ * caught it.
  *
- * It cost a real one: a block's payout-queue rotation was dropped with only a
- * WARN, so the miner it skipped never moved up the queue. Caught by the
- * regtest e2e, which had passed on the same code minutes earlier.
+ * Savepoints were the first fix and were worse: RELEASE does not commit a
+ * nested write (a failed batch discards it after its caller returned success)
+ * and ROLLBACK TO rewinds past the caller's own boundary, taking the commit
+ * thread's shares with it. So a lost queue row became lost SHARES, silently.
+ * Caught in review by Wired4ncer, on #76.
  *
- * Simulated deterministically here by opening a transaction on the store's own
- * connection first, which is exactly the state the commit thread leaves it in.
- * SAVEPOINT nests where BEGIN cannot. */
-static void test_writes_nest_inside_an_open_transaction(void) {
+ * This drives the actual race: shares stream in — so the commit thread is
+ * opening and closing real batches throughout — while the queue is written
+ * from this thread. Every call must succeed, and every row must be there at
+ * the end. */
+static void test_concurrent_writers_do_not_lose_each_other(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    /* Small window and batch, so the commit thread is busy rather than idle. */
+    cfg.commit_window_ms = 1;
+    cfg.commit_max_shares = 4;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+
+    enum { ROUNDS = 120 };
+    int staged_ok = 0;
+    for (int i = 0; i < ROUNDS; ++i) {
+        /* Keep the writer thread in and out of transactions underneath us. */
+        for (int k = 0; k < 8; ++k) {
+            char nm[32];
+            snprintf(nm, sizeof nm, "w%d", k % 4);
+            assert(store_record_share_addr(s, nm, "addr_x",
+                                           1000ULL + (uint64_t)(i * 8 + k),
+                                           1.0, 0, NULL, 0, 0.0) == 0);
+        }
+        char hash[32];
+        snprintf(hash, sizeof hash, "blk_%d", i);
+        store_fraction_delta_t d[] = { {1, 0.25}, {2, -0.25} };
+        int rc = store_stage_block_fractions(s, hash, d, 2, err, sizeof err);
+        if (rc < 0) {
+            printf("FAIL: staging lost to the commit thread on round %d: %s\n",
+                   i, err);
+            assert(0 && "a write must not be refused because a batch was open");
+        }
+        staged_ok++;
+    }
+    assert(store_flush(s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    /* Every staged round is present: nothing was silently discarded by a
+     * batch that rolled back underneath it. */
+    int64_t staged_rows = scalar_i64(db, "SELECT COUNT(*) FROM pplns_pending_fractions");
+    if (staged_rows != (int64_t)ROUNDS * 2) {
+        printf("FAIL: %d rounds staged 2 rows each, %lld survive\n",
+               staged_ok, (long long)staged_rows);
+        assert(0 && "staged rows were lost");
+    }
+    /* And the shares the commit thread was writing all the while are intact —
+     * this is the half a ROLLBACK TO would have eaten. */
+    int64_t share_rows = scalar_i64(db, "SELECT COUNT(*) FROM shares");
+    if (share_rows != (int64_t)ROUNDS * 8) {
+        printf("FAIL: %d shares recorded, %lld survive\n",
+               ROUNDS * 8, (long long)share_rows);
+        assert(0 && "shares were lost");
+    }
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_concurrent_writers_do_not_lose_each_other "
+           "(%d rounds, %lld shares, %lld staged rows)\n",
+           staged_ok, (long long)share_rows, (long long)staged_rows);
+}
+
+/* A write must not be discarded by somebody else's rollback.
+ *
+ * This is the failure the savepoint version had, and the reason the fix is a
+ * mutex rather than nesting. A savepoint joins whatever transaction is already
+ * open — on this connection, usually the commit thread's share batch — and
+ * RELEASE does not commit it. So when commit_batch() hits a failed COMMIT and
+ * runs ROLLBACK to replay the batch, the nested write goes with it, after its
+ * caller was already told it succeeded. The shares are replayed; nothing
+ * replays the nested row.
+ *
+ * Played out here with the commit thread's half on a second thread: it opens a
+ * transaction, and rolls it back exactly as commit_batch() does on a failed
+ * COMMIT. The staged rows must survive, which they only do if staging waited
+ * for that transaction instead of joining it. */
+typedef struct { store_t *s; int started; int done; } rollback_ctx_t;
+
+static void *rollback_thread(void *arg) {
+    rollback_ctx_t *c = (rollback_ctx_t *)arg;
+    assert(store_begin_txn_for_test(c->s) == 0);
+    __atomic_store_n(&c->started, 1, __ATOMIC_SEQ_CST);
+    /* Hold it long enough that a staging call made now would have to make a
+     * choice: wait, or nest into this. */
+    struct timespec ts = { 0, 150 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    assert(store_rollback_txn_for_test(c->s) == 0);
+    __atomic_store_n(&c->done, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+
+static void test_a_write_survives_another_threads_rollback(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg = {0};
     snprintf(cfg.path, sizeof(cfg.path), "%s", path);
@@ -1741,74 +1837,35 @@ static void test_writes_nest_inside_an_open_transaction(void) {
     assert(store_open(&cfg, &s) == 0);
     char err[256] = {0};
 
+    rollback_ctx_t ctx = { s, 0, 0 };
+    pthread_t th;
+    assert(pthread_create(&th, NULL, rollback_thread, &ctx) == 0);
+    while (!__atomic_load_n(&ctx.started, __ATOMIC_SEQ_CST)) { }
+
+    /* The transaction that is about to be rolled back is open right now. */
+    store_fraction_delta_t d[] = { {1, 0.25}, {2, -0.25} };
+    int rc = store_stage_block_fractions(s, "blk_rb", d, 2, err, sizeof err);
+    assert(rc == 2);
+    /* If staging joined that transaction rather than waiting for it, this
+     * returned success and the rollback below eats the rows. */
+    assert(__atomic_load_n(&ctx.done, __ATOMIC_SEQ_CST) == 1 &&
+           "staging returned before the other transaction ended, so it nested");
+
+    pthread_join(th, NULL);
+    assert(store_flush(s) == 0);
+
     sqlite3 *db = NULL;
     assert(sqlite3_open(path, &db) == SQLITE_OK);
-    sqlite3_exec(db, "INSERT INTO workers (id,name,payout_address,first_seen,last_seen)"
-                     " VALUES (1,'a','bc1qa',1,1),(2,'b','bc1qb',1,1)", NULL, NULL, NULL);
-    sqlite3_exec(db, "INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status)"
-                     " VALUES (1,10,'h1',100,1,'confirmed')", NULL, NULL, NULL);
-    sqlite3_close(db);
-
-    /* Put the shared connection in the state the commit thread leaves it in. */
-    assert(store_begin_txn_for_test(s) == 0);
-
-    store_fraction_delta_t d[] = { {1, 0.25}, {2, -0.25} };
-    int rc = store_stage_block_fractions(s, "h1", d, 2, err, sizeof err);
-    if (rc < 0) {
-        printf("FAIL: staging inside an open transaction failed: %s\n", err);
-        assert(0 && "a nested write must not be refused");
+    int64_t rows = scalar_i64(db, "SELECT COUNT(*) FROM pplns_pending_fractions");
+    if (rows != 2) {
+        printf("FAIL: staging reported success and %lld of 2 rows survive — "
+               "the write was discarded by another thread's rollback\n",
+               (long long)rows);
+        assert(0);
     }
-    assert(rc == 2);
-
-    int applied = 0, discarded = 0;
-    assert(store_settle_block_fractions(s, &applied, &discarded,
-                                        err, sizeof err) == 0);
-    assert(applied == 1);
-
-    assert(store_end_txn_for_test(s) == 0);
-
-    /* store_pplns_distribute() has the same shape and had the same bug — it
-     * was surviving on being retried every tip, which is why it never looked
-     * like one. Its savepoint only runs when there is a matured block to
-     * distribute, so give it one and drive it nested too. */
-    assert(store_record_share_addr(s, "alice", "addr_a", 2000, 50.0,
-                                   0, NULL, 0, 0.0) == 0);
-    assert(store_record_share_addr(s, "bob", "addr_b", 2001, 50.0,
-                                   0, NULL, 0, 0.0) == 0);
-    /* The block-finding share the distributor anchors its window on, at
-     * difficulty 0 so it does not shift the split. */
-    assert(store_record_share_addr(s, "alice", "addr_a", 2002, 0.0,
-                                   1, "blk_nest", 0, 0.0) == 0);
-    assert(store_record_block(s, 3000, 800100, "blk_nest", "alice", "addr_a",
-                              90000, 10000, STORE_BLOCK_PENDING, NULL,
-                              100.0) == 0);
-    assert(store_flush(s) == 0);
-    assert(store_set_block_status(s, "blk_nest", STORE_BLOCK_CONFIRMED,
-                                  100, "node") == 0);
-
-    assert(store_begin_txn_for_test(s) == 0);
-    int nblocks = 0, nworkers = 0;
-    char derr[256] = {0};
-    int drc = store_pplns_distribute(s, 100, 0, &nblocks, &nworkers,
-                                     derr, sizeof derr);
-    if (drc < 0) {
-        printf("FAIL: distribute inside an open transaction failed: %s\n", derr);
-        assert(0 && "a nested distribute must not be refused");
-    }
-    assert(nblocks == 1);
-    assert(nworkers == 2);
-    assert(store_end_txn_for_test(s) == 0);
-
-    /* And it really committed, rather than being rolled back with the outer. */
-    assert(sqlite3_open(path, &db) == SQLITE_OK);
-    char buf[64];
-    scalar_text(db, "SELECT CAST(ROUND(owed_fraction*100) AS INT) "
-                    "FROM pplns_fractions WHERE worker_id=1", buf, sizeof buf);
-    assert(strcmp(buf, "25") == 0);
     sqlite3_close(db);
-
     store_close(s);
-    printf("  ok test_writes_nest_inside_an_open_transaction\n");
+    printf("  ok test_a_write_survives_another_threads_rollback\n");
 }
 
 /* The operator fee comes off the top, exactly as in solo and PPS. */
@@ -1869,7 +1926,8 @@ int main(void) {
     test_fraction_deltas_must_sum_to_zero();
     test_only_a_confirmed_block_moves_the_queue();
     test_two_confirmed_blocks_both_count();
-    test_writes_nest_inside_an_open_transaction();
+    test_concurrent_writers_do_not_lose_each_other();
+    test_a_write_survives_another_threads_rollback();
     test_the_window_reports_each_workers_standing();
     test_pplns_distributes_two_blocks_in_one_pass();
     test_an_empty_window_returns_nothing_not_an_error();

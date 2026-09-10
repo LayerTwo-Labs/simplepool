@@ -268,6 +268,7 @@ int store_settle_block_fractions(store_t *s, int *out_applied,
  * racing a real one. Not for production use. */
 int store_begin_txn_for_test(store_t *s);
 int store_end_txn_for_test(store_t *s);
+int store_rollback_txn_for_test(store_t *s);
 
 int store_record_credit(store_t *s, const char *worker_name,
                         const char *payout_address,
