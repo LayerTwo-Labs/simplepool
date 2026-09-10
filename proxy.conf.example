@@ -244,24 +244,33 @@ pool_mode = solo
 # coinbase_max_bytes = 1000
 
 # pplns-coinbase — the payout floor, in satoshis. A miner whose share of a
-# block comes to less than this is NOT PAID. The money goes to the operator
-# output, there is no ledger entry, and it is not settled later.
+# block is worth less than this gets no output in THAT block.
 #
-# This is a deliberate policy and it needs stating to your miners, because it
-# is the one place this pool is harsher than a custodial one. A custodial
-# pool can hold a tiny balance until it is worth a transaction. Coinbase-direct
-# has nowhere to hold it: the payment IS the block, so the only alternatives
-# are to pay an output that costs more in bytes than it is worth, or to carry
-# a debt against a block that may never come. We do neither.
+# What it was owed is not lost and does not go to you: it is shared out among
+# the miners that block could pay, and the skipped miner goes first in the
+# queue for the next one. You take your fee and nothing else, at every byte
+# budget.
 #
-# The practical effect is a hashrate floor. With a 3.125 BTC block and a 2x
-# window, a miner needs roughly a 546/312500000 share of the window — about
-# 0.0002% — to clear the default. Anyone below that will mine here, produce
-# valid shares, and receive nothing, which is worse for them than solo mining
-# where they at least hold a lottery ticket. Say so on your pool page.
+# That queue is `pplns_fractions` in the database — a signed fraction of one
+# block reward per worker, positive if skipped and negative if paid early out
+# of someone else's skipped share, summing to zero. A quarter of every
+# coinbase's payout slots are reserved for whoever has waited longest, because
+# a miner's share of the window tracks its hashrate: without that, the largest
+# claims take the same slots in every block and the same addresses are never
+# paid at all.
 #
-# Raising it makes blocks cheaper in bytes and the floor harsher. Clamped up
-# to 546 (the dust limit) — no smaller output is relayable anyway.
+# It is NOT a balance and you hold nothing against it. Nothing is ever withheld
+# from a coinbase and released later — that would need a block paying less than
+# the reward followed by one paying more, and the second is invalid. Delete the
+# table and nobody is owed a payment; the pool just forgets whose turn it was.
+# Rows are staged when a block is found and applied only once it confirms, so
+# an orphaned block rotates nobody.
+#
+# So being small here costs a miner FREQUENCY, not money. Say that on your
+# pool page — the proxy states the floor at startup, per template, per block,
+# and on the dashboard, but only you can put it where a miner looks first.
+#
+# Clamped up to 546 (the dust limit) — no smaller output is relayable anyway.
 # pplns_payout_floor_sats = 546
 
 # pps-classic — OPTIONAL rate override, sats credited per unit of share

@@ -147,7 +147,26 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          # This release's section of CHANGELOG.md, if it has one. Notes live
+          # in the repo and are reviewed in the PR that writes them, for the
+          # same reason the binary is: a release note pasted into the web UI
+          # traces back to nothing.
           {
+            if [ -f CHANGELOG.md ]; then
+              awk -v v="## ${version}" '
+                index($0, v) == 1 { on = 1; print; next }
+                on && /^## / { exit }
+                on { print }
+              ' CHANGELOG.md > section.md
+              if [ -s section.md ]; then
+                cat section.md
+                echo
+                echo "---"
+                echo
+              else
+                echo "> No CHANGELOG.md section for ${version}." >&2
+              fi
+            fi
             echo "## Install"
             echo
             echo '```sh'

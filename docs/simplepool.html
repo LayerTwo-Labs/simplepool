@@ -515,6 +515,18 @@ footer .wrap > p { max-width: 46rem; }
       dashboard before a miner connects, because the operator's log is the one
       place the miner it affects cannot look.
     </p>
+    <p>
+      <strong>If the pool cannot measure the window, it publishes no job at
+      all.</strong> The window is read over a bounded walk of the shares table;
+      when that walk cannot prove it covered the configured window — an IO
+      error, a lock held past its timeout — it errors rather than returning a
+      short answer, and the template is held back. Miners keep working the last
+      job until it recovers. That costs hashrate on a new tip and is still the
+      only safe direction: here the window is rendered into a coinbase and
+      published, so a wrong one is mined, irreversible, and invisible
+      afterwards. <code>pplns window walk did not cover …</code> in the log is
+      that guard firing, not a crash.
+    </p>
   </div>
 
   <div class="note">
@@ -2030,6 +2042,17 @@ SELECT (SELECT COALESCE(SUM(reward_sats),0) + COALESCE(SUM(fee_sats),0)
             <td>settled payouts, and every transaction attempt with its stage and raw bytes for forensics</td></tr>
         <tr><td><code>deposits</code></td><td>dashboard</td>
             <td>one row per operator-triggered BTC → Thunder deposit, with Ctip sequence before and after</td></tr>
+        <tr><td><code>pplns_fractions</code></td><td>proxy</td>
+            <td><code>pplns-coinbase</code> only. A signed fraction of ONE block reward per worker:
+                positive means skipped by a block that had no room and first in the queue for the
+                next, negative means paid early out of somebody else's skipped share. Sums to zero.
+                <strong>Not a balance</strong> — nothing is held against it, and deleting the table
+                costs nobody a payment, it only forgets whose turn it was</td></tr>
+        <tr><td><code>pplns_pending_fractions</code></td><td>proxy</td>
+            <td><code>pplns-coinbase</code> only. What a FOUND block did to those fractions, held
+                against its hash until the confirmation pass decides. A found block is a candidate:
+                applying it there would rotate a miner down the queue for a payment an orphan never
+                made</td></tr>
       </tbody>
     </table>
   </div>

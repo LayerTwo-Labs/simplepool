@@ -179,8 +179,14 @@ and what a stratum username is:
     marketplace rule enforced on the port the rented hashrate connects to, and
     every byte of it costs a payout — a 100-miner window pays 9 at 400 bytes
     and 93 at 3000 — so there is no reason to make your own miners live under a
-    limit their port is never measured against. Set it tight on the rental
-    listener and leave the rest alone.
+    limit their port is never measured against:
+
+    ```
+    coinbase_max_bytes = 3000
+    listener = port=3335 label=rental min_diff=500000 initial_diff=500000 max_coinbase_bytes=900
+    ```
+
+    A listener that sets none uses the server-wide value.
   - `pplns_payout_floor_sats` (default 546, the dust limit) is the minimum
     a claim must be worth to get an output at all.
 
@@ -213,6 +219,16 @@ and what a stratum username is:
   forgets whose turn it was. Rows are staged when a block is found and applied
   only once it is confirmed, so an orphaned block — which paid nobody —
   rotates nobody.
+
+  **If the pool cannot measure the window, it publishes no job at all.** The
+  window is read back over a bounded walk of the shares table; if that walk
+  cannot prove it covered the configured window — an IO error, a lock held too
+  long — it returns an error rather than a short answer, and the template is
+  held back. Miners keep working the last job until it recovers, which costs
+  hashrate on a new tip but is the only safe direction: in this mode the window
+  is rendered into a coinbase and published, so a wrong one is mined,
+  irreversible, and invisible afterwards. `pplns window walk did not cover …`
+  in the log is that guard firing, not a crash.
 
   The floor is disclosed in four places: the proxy states it at startup, logs
   how many miners in the current window fall below it, reports per block what
@@ -691,7 +707,8 @@ mode, each mining a real chain:
 | `tests/test_payout_regtest.sh` | the Thunder payout rail settles and confirms |
 
 All of them run in CI. For the verification checklist behind each mode, see
-[`VERIFY.md`](VERIFY.md).
+[`VERIFY.md`](VERIFY.md); for what changed in each release, see
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ## Layout
 

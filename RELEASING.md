@@ -8,7 +8,7 @@ to a commit anyone can check out.** Nothing is uploaded by hand.
 PR (bump VERSION)  →  merge  →  git tag vX.Y.Z  →  CI builds + publishes
 ```
 
-## 1. Bump the version in a PR
+## 1. Write the notes, and bump the version, in a PR
 
 `VERSION` lives in the [Makefile](Makefile) and is compiled into the binary —
 `simplepool --version` reports it, and so does `/api/versions` on the
@@ -17,11 +17,29 @@ because a release whose own binary reports a different version is worse than
 no release: it makes every later "which version is this box running?" answer
 untrustworthy.
 
+Add a `## X.Y.Z` section at the top of [CHANGELOG.md](CHANGELOG.md) in the
+same PR. The release job publishes that section verbatim above the install
+boilerplate, so the notes are reviewed like everything else — a release note
+pasted into the web UI traces back to nothing, which is the one thing this
+process exists to prevent. A tag with no matching section still releases; it
+just ships the boilerplate alone.
+
+Lead with anything that changes **what a miner is paid** or **what an operator
+has to tell their miners**. Those are the lines that cost somebody money if
+they go unread.
+
 ```sh
 git checkout -b release-0.2.0
 sed -i 's/^VERSION    := .*/VERSION    := 0.2.0/' Makefile
+$EDITOR CHANGELOG.md          # add the 0.2.0 section
 git commit -am "Release 0.2.0"
 gh pr create --fill
+```
+
+Preview exactly what the release job will publish:
+
+```sh
+awk -v v="## 0.2.0" 'index($0,v)==1{on=1;print;next} on&&/^## /{exit} on{print}' CHANGELOG.md
 ```
 
 Merge it. Everything below runs against `main`.

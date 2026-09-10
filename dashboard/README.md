@@ -127,7 +127,9 @@ do the one thing that cannot work.
 That mode does not pay a claim worth less than `pplns_payout_floor_sats` — it
 shares it out among the miners that block could pay — never the operator, who
 takes only its fee — and puts the skipped miner first in the queue for the next
-block. The card states the number before anyone connects, because the
+block. The card says all three things, because a miner deciding whether to
+point a rig here needs to know that being small costs them frequency rather
+than money, and that nothing is being held on their behalf. The card states the number before anyone connects, because the
 operator's log is the one place the miner it costs cannot look. It renders
 only when the proxy published a floor (`pool_meta.pplns_payout_floor_sats`);
 an older proxy stores NULL, and printing a default there would be stating some
