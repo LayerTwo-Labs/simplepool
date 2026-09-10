@@ -22,13 +22,37 @@
 #include <unistd.h>
 
 static int tsw_step(sqlite3_stmt *st);
+static int tsw_exec(sqlite3 *db, const char *sql,
+                    int (*cb)(void *, int, char **, char **), void *arg,
+                    char **errmsg);
 static void maybe_delete_oldest(sqlite3_stmt *st);
 static void maybe_insert_behind_the_walk(sqlite3_stmt *st);
 
-/* Redirect every sqlite3_step() inside store.c to the wrapper below. */
+/* Redirect every sqlite3_step() and sqlite3_exec() inside store.c to the
+ * wrappers below. exec is where BEGIN/COMMIT/ROLLBACK go, so it is the seam
+ * for failing a COMMIT. */
 #define sqlite3_step tsw_step
+#define sqlite3_exec tsw_exec
 #include "../src/store.c"
 #undef sqlite3_step
+#undef sqlite3_exec
+
+/* When set, the next COMMIT is refused with SQLITE_BUSY and NOT executed, so
+ * the transaction genuinely stays open on the connection -- the case sqlite
+ * documents as "might not be rolled back automatically", and the one that
+ * used to leave every later BEGIN failing. Cleared once it fires. */
+static int g_fail_commit_once = 0;
+
+static int tsw_exec(sqlite3 *db, const char *sql,
+                    int (*cb)(void *, int, char **, char **), void *arg,
+                    char **errmsg) {
+    if (g_fail_commit_once && sql && strcmp(sql, "COMMIT") == 0) {
+        g_fail_commit_once = 0;
+        if (errmsg) *errmsg = sqlite3_mprintf("database is locked (injected)");
+        return SQLITE_BUSY;
+    }
+    return sqlite3_exec(db, sql, cb, arg, errmsg);
+}
 
 /* -1 disables injection. Otherwise: let the boundary query succeed this many
  * times, then fail it. 0 fails its very first step. */
@@ -357,8 +381,91 @@ static void test_shares_landing_mid_walk_are_not_swept_in(void) {
            "(%lld rows in the table, window still 500)\n", (long long)rows);
 }
 
+/* A COMMIT that fails must be reported as a failure, and must leave the
+ * connection OUT of the transaction.
+ *
+ * txn_commit() used to ignore the rc. A failed COMMIT that sqlite does not
+ * roll back itself left the connection inside the transaction after the
+ * caller had returned success; every BEGIN after that failed with "cannot
+ * start a transaction within a transaction", commit_batch() gave up after
+ * three, and every share batch from then on was logged as LOST until restart.
+ * The write that "succeeded" was never there either.
+ *
+ * Injected on COMMIT and nowhere else: the rows are bound and stepped for
+ * real, so this is exactly the moment the old code told the caller "wrote 2"
+ * with nothing durable behind it. */
+static void test_a_failed_commit_is_reported_and_leaves_no_open_transaction(void) {
+    const char *path = fresh_path();
+    store_t *s = open_with_shares(path, 8, 1.0);
+    char err[256] = {0};
+
+    store_fraction_delta_t d[] = { {1, 0.25}, {2, -0.25} };
+    g_fail_commit_once = 1;
+    int rc = store_stage_block_fractions(s, "blk_commit_fails", d, 2,
+                                         err, sizeof err);
+    assert(g_fail_commit_once == 0 && "the injection did not fire");
+    if (rc >= 0) {
+        fprintf(stderr, "  FAIL: COMMIT failed and staging returned %d "
+                        "(success) anyway\n", rc);
+        assert(rc < 0);
+    }
+    assert(err[0] != '\0');
+    /* The connection is back in autocommit: nothing is left open for the
+     * next BEGIN to trip over. */
+    if (!sqlite3_get_autocommit(s->db)) {
+        fprintf(stderr, "  FAIL: the connection is still inside the failed "
+                        "transaction\n");
+        assert(0);
+    }
+
+    /* Everything after it works: the share batches the old bug lost... */
+    for (int i = 0; i < 40; ++i) {
+        assert(store_record_share_addr(s, "w_after", "addr_after",
+                                       5000ULL + (uint64_t)i, 1.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_flush(s) == 0);
+    /* ...and the staging path itself. */
+    assert(store_stage_block_fractions(s, "blk_after", d, 2,
+                                       err, sizeof err) == 2);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_stmt *c = NULL;
+    assert(sqlite3_prepare_v2(db,
+        "SELECT (SELECT COUNT(*) FROM shares sh JOIN workers w ON w.id = sh.worker_id"
+        "         WHERE w.name = 'w_after'),"
+        "       (SELECT COUNT(*) FROM pplns_pending_fractions WHERE block_hash='blk_commit_fails'),"
+        "       (SELECT COUNT(*) FROM pplns_pending_fractions WHERE block_hash='blk_after')",
+        -1, &c, NULL) == SQLITE_OK);
+    assert(sqlite3_step(c) == SQLITE_ROW);
+    sqlite3_int64 shares_after = sqlite3_column_int64(c, 0);
+    sqlite3_int64 rows_failed  = sqlite3_column_int64(c, 1);
+    sqlite3_int64 rows_after   = sqlite3_column_int64(c, 2);
+    sqlite3_finalize(c);
+    sqlite3_close(db);
+
+    if (shares_after != 40) {
+        fprintf(stderr, "  FAIL: %lld of 40 shares survived the batches after "
+                        "the failed COMMIT\n", (long long)shares_after);
+        assert(0);
+    }
+    /* The failed staging wrote nothing -- it said so -- and the later one
+     * wrote everything. */
+    assert(rows_failed == 0);
+    assert(rows_after == 2);
+    /* pg_errors counted it, so the dashboard's health check sees it too. */
+    assert(atomic_load(&s->pg_errors) >= 1);
+
+    store_close(s);
+    unlink(path);
+    printf("  ok test_a_failed_commit_is_reported_and_leaves_no_open_transaction "
+           "(reason: %s)\n", err);
+}
+
 int main(void) {
     test_the_walk_serves_the_configured_window_when_nothing_fails();
+    test_a_failed_commit_is_reported_and_leaves_no_open_transaction();
     test_a_walk_that_fails_immediately_does_not_serve_the_whole_table();
     test_a_walk_that_fails_after_widening_does_not_serve_a_short_window();
     test_a_row_deleted_during_the_walk_still_terminates();

@@ -1323,9 +1323,34 @@ static int txn_begin(store_t *s) {
     }
     return 0;
 }
-static void txn_commit(store_t *s) {
-    sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
+/* Returns 0 when the transaction is durable, -1 when it is not -- in which
+ * case it has been rolled back and the connection is back in autocommit.
+ *
+ * The result of COMMIT has to be read. It used to be ignored, and a failed
+ * COMMIT that sqlite does not roll back on its own (BUSY is the documented
+ * case) left the connection INSIDE the transaction after the caller had been
+ * told its write succeeded. From then on every BEGIN on this connection fails
+ * with "cannot start a transaction within a transaction": commit_batch()
+ * retries three times per batch and then logs the batch as LOST, so one
+ * unread rc turned into every share being dropped until restart. Rare under
+ * WAL with BEGIN IMMEDIATE, and the blast radius is the whole pool.
+ *
+ * The ROLLBACK is issued whether or not sqlite already did it -- on a
+ * connection that is already in autocommit it fails harmlessly with "no
+ * transaction is active", and sqlite3_get_autocommit() is the check the
+ * tests use to prove the connection came out clean either way. */
+static int txn_commit(store_t *s) {
+    char *err = NULL;
+    if (sqlite3_exec(s->db, "COMMIT", NULL, NULL, &err) == SQLITE_OK) {
+        pthread_mutex_unlock(&s->txn_mu);
+        return 0;
+    }
+    LOG_WARN("store: COMMIT failed: %s -- rolling back", err ? err : "?");
+    sqlite3_free(err);
+    sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
     pthread_mutex_unlock(&s->txn_mu);
+    atomic_fetch_add(&s->pg_errors, 1);
+    return -1;
 }
 static void txn_rollback(store_t *s) {
     sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
@@ -1472,7 +1497,17 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
         sqlite3_finalize(mark);
 
         if (ok) {
-            txn_commit(s);
+            /* A commit that did not land is a distribution that did not
+             * happen: the latch is rolled back with it, so the next pass
+             * retries the block. Nothing was credited, so nothing is owed
+             * twice. */
+            if (txn_commit(s) != 0) {
+                if (errbuf && errlen)
+                    snprintf(errbuf, errlen, "distribute %.16s: commit failed",
+                             hbuf);
+                rc_out = -1;
+                break;
+            }
             blocks++;
             workers += credited_here;
             LOG_INFO("pplns: block %.16s… distributed %lld sats of %lld across "
@@ -1757,7 +1792,14 @@ int store_stage_block_fractions(store_t *s, const char *block_hash,
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;
     }
-    txn_commit(s);
+    /* Reported as a failure, not as `wrote`: the caller logs that the
+     * rotation for this block is lost, which is true, and which is far better
+     * than believing rows are staged that are not. */
+    if (txn_commit(s) != 0) {
+        if (errbuf && errlen)
+            snprintf(errbuf, errlen, "commit failed; nothing was staged");
+        return -2;
+    }
     return wrote;
 }
 
@@ -1874,7 +1916,14 @@ int store_settle_block_fractions(store_t *s, int *out_applied,
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;
     }
-    txn_commit(s);
+    /* The staged rows are still there, so the next pass settles them; the
+     * caller's WARN says exactly that. Reporting applied=N here would say the
+     * rotation happened when it did not. */
+    if (txn_commit(s) != 0) {
+        if (errbuf && errlen)
+            snprintf(errbuf, errlen, "commit failed; the staged rows stay");
+        return -2;
+    }
     if (out_applied)   *out_applied = applied;
     if (out_discarded) *out_discarded = discarded;
     return 0;
@@ -1887,8 +1936,7 @@ int store_begin_txn_for_test(store_t *s) {
 
 int store_end_txn_for_test(store_t *s) {
     if (!s || !s->db) return -1;
-    txn_commit(s);
-    return 0;
+    return txn_commit(s);
 }
 
 int store_rollback_txn_for_test(store_t *s) {
