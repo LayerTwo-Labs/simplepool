@@ -1767,6 +1767,38 @@ static void test_writes_nest_inside_an_open_transaction(void) {
 
     assert(store_end_txn_for_test(s) == 0);
 
+    /* store_pplns_distribute() has the same shape and had the same bug — it
+     * was surviving on being retried every tip, which is why it never looked
+     * like one. Its savepoint only runs when there is a matured block to
+     * distribute, so give it one and drive it nested too. */
+    assert(store_record_share_addr(s, "alice", "addr_a", 2000, 50.0,
+                                   0, NULL, 0, 0.0) == 0);
+    assert(store_record_share_addr(s, "bob", "addr_b", 2001, 50.0,
+                                   0, NULL, 0, 0.0) == 0);
+    /* The block-finding share the distributor anchors its window on, at
+     * difficulty 0 so it does not shift the split. */
+    assert(store_record_share_addr(s, "alice", "addr_a", 2002, 0.0,
+                                   1, "blk_nest", 0, 0.0) == 0);
+    assert(store_record_block(s, 3000, 800100, "blk_nest", "alice", "addr_a",
+                              90000, 10000, STORE_BLOCK_PENDING, NULL,
+                              100.0) == 0);
+    assert(store_flush(s) == 0);
+    assert(store_set_block_status(s, "blk_nest", STORE_BLOCK_CONFIRMED,
+                                  100, "node") == 0);
+
+    assert(store_begin_txn_for_test(s) == 0);
+    int nblocks = 0, nworkers = 0;
+    char derr[256] = {0};
+    int drc = store_pplns_distribute(s, 100, 0, &nblocks, &nworkers,
+                                     derr, sizeof derr);
+    if (drc < 0) {
+        printf("FAIL: distribute inside an open transaction failed: %s\n", derr);
+        assert(0 && "a nested distribute must not be refused");
+    }
+    assert(nblocks == 1);
+    assert(nworkers == 2);
+    assert(store_end_txn_for_test(s) == 0);
+
     /* And it really committed, rather than being rolled back with the outer. */
     assert(sqlite3_open(path, &db) == SQLITE_OK);
     char buf[64];

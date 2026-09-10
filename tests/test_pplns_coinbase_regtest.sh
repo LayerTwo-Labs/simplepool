@@ -600,6 +600,53 @@ OWED="$(sqlite3 "$MIX_DB" "SELECT CAST(ROUND(COALESCE((
     exit 1; }
 echo "  the skipped miner is owed $OWED/1000 of a block reward, and is next in line"
 
+stage "assert the queue is APPLIED once the block confirms, not before"
+# Everything above proves rows were STAGED. Staging is the easy half: the
+# rotation only becomes real when the confirmation pass applies it, and until
+# then a block that gets orphaned must rotate nobody.
+#
+# This stage exists because the assertion above passes on staging alone — it
+# would still pass if settling never worked at all, which is exactly the shape
+# of vacuous stage this file has been caught with once before.
+BEFORE_APPLIED="$(sqlite3 "$MIX_DB" "SELECT COUNT(*) FROM pplns_fractions")"
+[ "$BEFORE_APPLIED" = "0" ] || {
+    echo "FAIL: the queue was applied while the block was still pending" >&2
+    exit 1; }
+echo "  before: staged only, applied=0 (the block is still pending)"
+
+# A block is confirmed once a template at height+1 is seen building on it, so
+# one more block gives the confirmation pass something to decide with.
+NEXT=$(( $(cli getblockcount) + 1 ))
+for _ in $(seq 1 40); do
+    grep -q "new job: height=${NEXT} " "$MIX_LOG" && break
+    sleep 1
+done
+node "$ROOT/scripts/regtest/cpuminer.js" --port "$POOL_PORT" --user "$MINER_ADDR" --timeout 180 >/dev/null 2>&1 || true
+
+for _ in $(seq 1 40); do
+    APPLIED="$(sqlite3 "$MIX_DB" "SELECT COUNT(*) FROM pplns_fractions")"
+    [ "${APPLIED:-0}" -gt 0 ] && break
+    sleep 1
+done
+CONF="$(sqlite3 "$MIX_DB" "SELECT COUNT(*) FROM blocks_found WHERE status='confirmed'")"
+echo "  after:  confirmed_blocks=$CONF applied_rows=${APPLIED:-0}"
+[ "${APPLIED:-0}" -gt 0 ] || {
+    echo "FAIL: a block confirmed but the payout queue was never applied — the" >&2
+    echo "      rotation is staged forever and nobody's turn ever comes" >&2
+    sqlite3 "$MIX_DB" "SELECT height, substr(hash,1,16), status FROM blocks_found" >&2
+    grep -E "payout queue settled|could not settle" "$MIX_LOG" | tail -5 >&2
+    exit 1; }
+
+# Still zero-sum after applying, and the staged rows for the applied block are
+# gone rather than applied twice.
+BAL2="$(sqlite3 "$MIX_DB" "SELECT CAST(ROUND((
+        COALESCE((SELECT SUM(delta) FROM pplns_pending_fractions),0) +
+        COALESCE((SELECT SUM(owed_fraction) FROM pplns_fractions),0)) * 1000000) AS INT)")"
+[ "$BAL2" = "0" ] || {
+    echo "FAIL: after applying, the queue sums to $BAL2 (x1e-6), not zero" >&2
+    exit 1; }
+echo "  the applied queue still sums to zero"
+
 echo
 echo "cbwin-e2e: PASS (the window was paid from the block's own coinbase,"
 echo "                 and the pool never held the reward)"
