@@ -263,11 +263,10 @@ stage "assert the FIRST block took the bootstrap path"
 # Worth pinning explicitly, because it is the path that used to deadlock: a
 # pool with no shares has no window, and refusing to render there meant no
 # coinbase, so no share, so no window, forever.
-# Deterministic, unlike the tip-watcher's own empty-window message: on a fast
-# chain the first block can be found before the first tip change, so whether
-# the watcher ever SEES an empty window is a race. The initial job always
-# carries none, and always says so.
-grep -q "the first job of a process carries no window" "$POOL_LOG" || {
+# Deterministic: the initial job goes through attach_pplns_window() like every
+# other, and on a pool with no shares that always finds an empty window and
+# always says so -- before any miner connects, so before any tip can change.
+grep -q "no shares yet, so no window" "$POOL_LOG" || {
     echo "FAIL: expected the first job to be announced as windowless" >&2
     exit 1; }
 echo "  bootstrap path announced, as it must be on a pool with no shares"
@@ -458,11 +457,14 @@ kill -0 "$POOL_PID" 2>/dev/null || {
 # The pool must SAY the small miner is about to earn nothing, before a block
 # makes it true. That warning is the operator's only chance to act.
 #
-# Up to 60s, because the FIRST job of a process carries no window -- network
-# difficulty is unread until a template arrives -- and the tip watcher only
-# rebuilds on a new tip or its 30-second refresh. A 20-second wait looked like
-# "the pool never warned" when it simply had not built a second job yet.
-for _ in $(seq 1 60); do
+# And it must say so from the FIRST job. This is a restart with a full shares
+# table -- exactly the shape of a production restart -- and the first job used
+# to carry no window on the premise that a fresh process has no shares to pay.
+# It stood for up to 30 seconds, the tip watcher's refresh interval, and a
+# block found in that gap paid its finder alone. So the warning has to appear
+# before the watcher has built a single job: if the first "new job:" line
+# precedes it, the initial job went out windowless and the bug is back.
+for _ in $(seq 1 20); do
     grep -q "below the ${MIX_FLOOR}-sat payout floor" "$MIX_LOG" && break
     sleep 1
 done
@@ -470,6 +472,17 @@ grep -q "below the ${MIX_FLOOR}-sat payout floor" "$MIX_LOG" || {
     echo "FAIL: the pool never warned that a miner falls below the floor" >&2
     grep -i "floor" "$MIX_LOG" | tail -5 >&2; exit 1; }
 echo "  warned: $(grep -o '[0-9]* of [0-9]* miner(s) in the window are below' "$MIX_LOG" | tail -1)"
+FIRST_WARN=$(grep -n "below the ${MIX_FLOOR}-sat payout floor" "$MIX_LOG" | head -1 | cut -d: -f1)
+# No rebuild yet is the expected case, and under pipefail an empty grep is
+# exit 1, so it must not take the script down with it.
+FIRST_JOB=$( (grep -n "new job: height=" "$MIX_LOG" || true) | head -1 | cut -d: -f1)
+if [ -n "$FIRST_JOB" ] && [ "$FIRST_JOB" -lt "$FIRST_WARN" ]; then
+    echo "FAIL: the tip watcher built a job (log line $FIRST_JOB) before the" >&2
+    echo "      initial job's window was measured (line $FIRST_WARN) -- the" >&2
+    echo "      first job after a restart went out without a window" >&2
+    exit 1
+fi
+echo "  the initial job carried the window (warned at line $FIRST_WARN, first rebuild at line ${FIRST_JOB:-none})"
 
 MIX_BEFORE=$(cli getblockcount)
 node "$ROOT/scripts/regtest/cpuminer.js" --port "$POOL_PORT" --user "$MINER_ADDR" --timeout 180

@@ -450,7 +450,8 @@ static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
      * operator can act on -- by telling those miners, or by lowering the
      * floor. Rate-limited to changes in the count, because it is recomputed
      * on every template and a steady state is not news -- the static needs no
-     * lock, this runs only on the template-poller thread.
+     * lock: main() calls this once for the initial job before the
+     * template-poller thread exists, and only that thread calls it after.
      *
      * The clamp mirrors coinbase.c's: below the dust limit there is no floor
      * to have, so reporting an unclamped one would understate who loses. */
@@ -1557,23 +1558,39 @@ int main(int argc, char **argv) {
     /* First job of the process: nobody is connected yet, so the flag reaches
      * no one, but a new tip is what it describes.
      *
-     * Under pplns-coinbase this one deliberately carries no window. Network
-     * difficulty has not been read yet, and a process that has just started
-     * has no shares to pay anyway — so the window would be empty even if it
-     * could be sized. conn_render_coinbase refuses to render from a
-     * windowless job rather than paying nobody, and the tip watcher publishes
-     * a job with a real window within one poll interval. */
+     * Under pplns-coinbase it carries the window like every other job. This
+     * used to be skipped on the premise that a process which has just started
+     * has no shares to pay and no difficulty to size a window with. Neither
+     * holds on a RESTART: the shares table persists, and refresh_pps_rate()
+     * above has already read the difficulty out of this same template. The
+     * tip watcher only rebuilds on a new tip or after its 30-second refresh,
+     * so a windowless first job stood for up to 30 seconds after every
+     * restart, and a block found in that gap paid its finder alone -- the
+     * whole window skipped, and nothing staged in the payout queue to say so.
+     *
+     * The bootstrap case is unchanged and now lives in one place: a pool with
+     * no shares yet gets a job with no window from attach_pplns_window(),
+     * which says so, and conn_render_coinbase() pays the finder from it. A
+     * template that cannot carry a window is not published, on the same rule
+     * the tip watcher applies; the watcher rebuilds on its first poll and the
+     * pool starts serving work from the first template that can. */
     if (strcmp(cfg.pool_mode, "pplns-coinbase") == 0) {
-        /* Said out loud because it is otherwise invisible: this job renders a
-         * solo-shaped coinbase, and an operator watching the first block of a
-         * new pool get paid entirely to its finder deserves to know that was
-         * deliberate rather than the window silently failing. */
-        LOG_INFO("pplns-coinbase: the first job of a process carries no "
-                 "window — network difficulty is unread and a fresh pool has "
-                 "no shares — so it pays whoever finds it, as solo would. "
-                 "Every job after the first accepted share carries a window.");
+        double nd = atomic_load_explicit(&sctx.net_difficulty,
+                                         memory_order_relaxed);
+        if (attach_pplns_window(store, &cfg, nd, tmpl, initial_job) != 0) {
+            LOG_WARN("pplns-coinbase: the first template cannot carry a "
+                     "window, so no job is published from it; the tip "
+                     "watcher retries on its next poll");
+            stratum_job_free(initial_job);
+            initial_job = NULL;
+            /* Make the watcher's first poll a rebuild rather than a 30-second
+             * wait: last_built_ms is what the periodic refresh keys on. */
+            pthread_mutex_lock(&sctx.lock);
+            sctx.last_built_ms = 0;
+            pthread_mutex_unlock(&sctx.lock);
+        }
     }
-    stratum_server_set_job(srv, initial_job, 1);
+    if (initial_job) stratum_server_set_job(srv, initial_job, 1);
 
     /* A port's promised floor and the chain can disagree, and the floor wins
      * (see clamp_assigned_difficulty). When it does, every miner on that port
