@@ -125,12 +125,14 @@ include tests/test_thunder.mk
 include tests/test_config.mk
 include tests/test_reconcile.mk
 include tests/test_pplns.mk
+include tests/test_store_walk.mk
 
-test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_config build/test_reconcile build/test_pplns
+test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_store_walk build/test_coinbase build/test_broadcast build/test_thunder build/test_config build/test_reconcile build/test_pplns
 	./build/test_share
 	./build/test_bitcoind
 	./build/test_stratum
 	./build/test_store
+	./build/test_store_walk
 	./build/test_coinbase
 	./build/test_broadcast
 	./build/test_thunder
@@ -159,6 +161,8 @@ asan:
 		src/log.c src/cjson/cJSON.c -lpthread
 	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_store tests/test_store.c \
 		src/store.c src/log.c $(PLATFORM_LDFLAGS) -lsqlite3 -lpthread
+	$(CC) $(ASAN_CFLAGS) -Wno-unused-function -o $(ASAN_DIR)/test_store_walk \
+		tests/test_store_walk.c src/log.c $(PLATFORM_LDFLAGS) -lsqlite3 -lpthread
 	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_coinbase tests/test_coinbase.c \
 		src/coinbase.c src/sha256.c
 	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_share tests/test_share.c \
@@ -167,6 +171,7 @@ asan:
 		src/pplns.c src/coinbase.c src/sha256.c
 	./$(ASAN_DIR)/test_stratum
 	./$(ASAN_DIR)/test_store
+	./$(ASAN_DIR)/test_store_walk
 	./$(ASAN_DIR)/test_coinbase
 	./$(ASAN_DIR)/test_share
 	./$(ASAN_DIR)/test_pplns

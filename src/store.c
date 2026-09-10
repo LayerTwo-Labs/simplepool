@@ -11,6 +11,8 @@
 #include "store.h"
 #include "log.h"
 
+#include <stdint.h>   /* INT64_MAX */
+
 #include <sqlite3.h>
 
 #include <errno.h>
@@ -1472,8 +1474,8 @@ int store_pplns_window(store_t *s, double window_diff,
      * of a hundred million rows and half a minute per template -- the pool
      * would simply stop publishing work (LayerTwo-Labs/simplepool#76).
      *
-     * So walk backwards in bounded batches instead, doubling until the batch
-     * covers the window, and let the main query use the primary-key index from
+     * So walk backwards in bounded batches instead, growing x4 until the
+     * batch covers the window, and let the main query use the primary-key index from
      * the boundary id. A window is a small multiple of one block's expected
      * work, so the first batch almost always covers it; the loop exists for
      * the pathological cases (a difficulty crash, a freshly-lowered window)
@@ -1484,7 +1486,7 @@ int store_pplns_window(store_t *s, double window_diff,
      * matching store_pplns_distribute() exactly. If these two ever disagree a
      * block pays out differently from what its template promised. */
     static const char *QB =
-        "SELECT MIN(id), MAX(running) FROM ("
+        "SELECT MIN(id), MAX(running), COUNT(*) FROM ("
         "  SELECT id, difficulty,"
         "         SUM(difficulty) OVER (ORDER BY id DESC ROWS UNBOUNDED PRECEDING) AS running"
         "    FROM (SELECT id, difficulty FROM shares ORDER BY id DESC LIMIT ?)"
@@ -1498,35 +1500,69 @@ int store_pplns_window(store_t *s, double window_diff,
             atomic_fetch_add(&s->pg_errors, 1);
             return -2;
         }
-        /* 4096 covers a 2x window at any sane share difficulty; the cap stops
-         * a pool whose entire history is smaller than one window from looping
-         * forever doubling past the end of the table. */
+        /* 4096 covers a 2x window at any sane share difficulty; growth is x4.
+         *
+         * The walk must end having PROVED one of two things: that it covered
+         * the window, or that it read the whole table. Anything else -- an IO
+         * error, NOMEM, a corrupt page, or a cross-process BUSY outlasting the
+         * busy timeout (dashboard/ and payout/ open this file read-write) --
+         * means the rows behind `cutoff_id` were never read, and `cutoff_id`
+         * still holds a boundary already known to be short of the window.
+         *
+         * ⛔ Returning that as a window is the one failure this function must
+         * never have. The caller renders it into a coinbase and publishes it;
+         * the payment IS the block, so nothing downstream can notice, and the
+         * block pays out differently from what its template promised -- the
+         * divergence the boundary rule above exists to prevent. So: error out,
+         * and let the caller keep its last good template.
+         *
+         * `got` is how many rows the batch actually returned. In the only
+         * branch that reads it (covered < window_diff) every row in the batch
+         * passes the filter -- if any row were excluded, the row before it
+         * would have a running total at or past the window, and `covered`
+         * would already have ended the walk -- so `got < batch` means the
+         * table ran out, exactly and from the SAME query. Asking a separate
+         * COUNT(*) instead would re-read the rows, and would answer about the
+         * table as it is at that instant rather than the batch just read: with
+         * rows being deleted concurrently the two disagree, and a stale
+         * end-of-table test can leave this loop unable to terminate. */
         sqlite3_int64 batch = 4096;
+        int settled = 0, step_rc = SQLITE_OK;
         for (;;) {
             sqlite3_reset(b);
             sqlite3_bind_int64(b, 1, batch);
             sqlite3_bind_double(b, 2, window_diff);
-            if (sqlite3_step(b) != SQLITE_ROW) break;
-            if (sqlite3_column_type(b, 0) == SQLITE_NULL) break;   /* no shares */
+            step_rc = sqlite3_step(b);
+            if (step_rc != SQLITE_ROW) break;
+            sqlite3_int64 got = sqlite3_column_int64(b, 2);
+            /* No shares at all: no work, no window, no payees. Not an error. */
+            if (got == 0) { settled = 1; break; }
             cutoff_id = sqlite3_column_int64(b, 0);
             double covered = sqlite3_column_double(b, 1);
-            /* Covered means the batch reached past the window. If it did not,
-             * the window extends further back than we read and the answer
-             * would silently be a partial window -- so widen and retry. */
-            if (covered >= window_diff) break;
-            sqlite3_int64 seen = 0;
-            sqlite3_stmt *c = NULL;
-            if (sqlite3_prepare_v2(s->db,
-                    "SELECT COUNT(*) FROM (SELECT 1 FROM shares LIMIT ?)",
-                    -1, &c, NULL) == SQLITE_OK) {
-                sqlite3_bind_int64(c, 1, batch);
-                if (sqlite3_step(c) == SQLITE_ROW) seen = sqlite3_column_int64(c, 0);
-                sqlite3_finalize(c);
-            }
-            if (seen < batch) break;      /* read the whole table already */
+            /* Covered means the batch reached past the window. */
+            if (covered >= window_diff) { settled = 1; break; }
+            /* The batch could not be filled, so there is nothing further back
+             * to read: the pool is younger than its own window and pays across
+             * everything it has, as store_pplns_distribute() does. A complete
+             * answer, not a truncated one. */
+            if (got < batch) { settled = 1; break; }
+            /* Refuse rather than overflow. Unreachable on any real table --
+             * it would need more than 2^61 rows -- but `batch` is signed and
+             * multiplying past the maximum is undefined, not merely large. */
+            if (batch > INT64_MAX / 4) break;
             batch *= 4;
         }
         sqlite3_finalize(b);
+        if (!settled) {
+            if (errbuf && errlen)
+                snprintf(errbuf, errlen,
+                         "pplns window walk did not cover %.0f (stopped at id %lld): %s",
+                         window_diff, (long long)cutoff_id,
+                         step_rc == SQLITE_ROW ? "batch limit exhausted"
+                                               : sqlite3_errstr(step_rc));
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -2;
+        }
     }
 
     static const char *Q =
