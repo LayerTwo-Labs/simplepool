@@ -492,6 +492,15 @@ function parseListeners(raw) {
             label:        (typeof l.label === 'string' && l.label) ? l.label : null,
             min_diff:     Number.isFinite(Number(l.min_diff))     ? Number(l.min_diff)     : null,
             initial_diff: Number.isFinite(Number(l.initial_diff)) ? Number(l.initial_diff) : null,
+            /* Carried for the same reason health.js reads it: min_diff is the
+             * rate-loop bound, which the network difficulty still clamps,
+             * while promised_min_diff is KEPT when the chain is easier. Only
+             * the second one costs a miner blocks, so only the second one
+             * earns the warning the connect card prints. A proxy predating
+             * the field publishes nothing, which reads as 0 — no promise. */
+            promised_min_diff:
+                Number.isFinite(Number(l.promised_min_diff))
+                    ? Number(l.promised_min_diff) : 0,
         }));
     return out.length ? out : null;
 }

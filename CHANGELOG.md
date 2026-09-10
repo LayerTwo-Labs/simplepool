@@ -97,6 +97,18 @@ listener = port=3335 label=rental min_diff=500000 initial_diff=500000 max_coinba
 - **Pool solvency** counted `blocks_found.reward_sats` as pool revenue in
   `pplns-coinbase`, where that is what the block paid the *miners* — reporting
   a healthy margin for a pool that holds nothing. Now skipped, with the reason.
+- The connect card now says **which port to point which miner at**. Every
+  published port is listed as a dialable URL with the difficulty behind it and
+  who it is for, because a stratum URL says nothing about either and a rented
+  fleet on the home-miner port is one connection submitting hundreds of
+  thousands of shares a second — the pool limits it and the marketplace
+  cancels the order for work the pool appears to be rejecting.
+- **What a held floor costs is now disclosed to the miner paying for it.** A
+  port holding difficulty 500 000 over a chain at 1 200 makes its miners
+  discard roughly 416 of every 417 blocks they solve, since a miner filters
+  locally at the difficulty it was assigned. That arithmetic was already in
+  the operator's *"Stratum ports can hold their difficulty"* health check;
+  nobody mining on the port ever saw it.
 
 ### Testing
 

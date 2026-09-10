@@ -315,4 +315,10 @@ password:  (ignored — any value)</pre>
 username:  &lt;address&gt;[.&lt;rig_label&gt;]   (see above)
 password:  (ignored — any value)</pre>
 <% } %>
+
+<%# Which port, appended to every mode's connect block rather than repeated
+    inside each of them: the choice is about difficulty, and difficulty is the
+    one thing the five modes agree on. Renders nothing unless the proxy
+    published more than one port. %>
+<%- include('connect-ports', { pool: _p, stratumUrl: _url }) %>
 </section>
