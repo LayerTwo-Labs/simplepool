@@ -1,0 +1,141 @@
+<%# Which port to point which machine at, and what the high-difficulty one costs.
+
+    A stratum URL says nothing about the difficulty behind it, and the two
+    ports are not interchangeable: a marketplace does not arrive as many small
+    miners, it aggregates a whole fleet behind ONE connection, so the same
+    hashrate that is 12 shares a minute from a home ASIC is hundreds of
+    thousands of submits per second on the port meant for that ASIC. That is
+    not a subtle failure — the pool rate-limits the connection, the rejects
+    look like a broken pool, and the order is cancelled.
+
+    The card the identity strip cannot be: the strip has room to name the
+    ports, not to say why there are two of them or what the floor on the
+    second one costs the miner who uses it.
+
+    Rendered only when the proxy published more than one port. A single-port
+    pool has no choice to explain, and inventing a second port's advice for it
+    would be worse than silence.
+
+    Locals: pool, stratumUrl. %>
+<%
+const _p  = (typeof pool !== 'undefined' && pool) ? pool : null;
+const _ls = (_p && Array.isArray(_p.listeners)) ? _p.listeners : null;
+%>
+<% if (_ls && _ls.length > 1) { %>
+<%
+/* Each port is printed as a whole URL rather than a bare number, because the
+ * line is meant to be copied into a miner's config, not transcribed. The host
+ * comes from the same PUBLIC_STRATUM_URL the card above prints, so a pool
+ * that has not set one gets the same <pool-host> placeholder here instead of
+ * a confident URL pointing nowhere. */
+const _raw = (typeof stratumUrl !== 'undefined' && stratumUrl) ? String(stratumUrl) : '';
+const _u   = _raw.match(/^([A-Za-z0-9+.\-]+:\/\/)?([^\s\/:]+)/);
+const _sch = (_u && _u[1]) ? _u[1] : 'stratum+tcp://';
+const _host = (_u && _u[2]) ? _u[2] : '<pool-host>';
+
+/* What the port asks the chain for is the higher of its starting difficulty
+ * and its vardiff floor — a port that starts at 1 but is floored at 500000
+ * still ends up serving 500000, and that is the confusing configuration to
+ * debug, not the obvious one. */
+const _asks     = l => Math.max(Number(l.initial_diff || 0), Number(l.min_diff || 0));
+const _promised = l => Number(l.promised_min_diff || 0);
+
+/* Difficulty is not necessarily >= 1: on a forknet these are values like
+ * 3e-10, and rounding every one of them to "0" would make the whole list
+ * meaningless. Whole numbers print plainly, small ones in the exponent form
+ * they were configured with. */
+const _d = x => (x >= 1 ? Math.round(x).toLocaleString('en-US')
+                        : String(Number(Number(x).toPrecision(3))));
+
+const _rows = _ls.map(l => {
+    const url  = _sch + _host + ':' + l.port;
+    const held = _promised(l) > 0;
+    const ask  = _asks(l);
+    let what;
+    if (ask <= 0)   what = 'default difficulty';
+    else if (held)  what = 'difficulty ' + _d(ask) + ', held';
+    else            what = 'difficulty from ' + _d(ask) + ', vardiff follows your rig';
+    const who = held || ask >= 1024
+              ? 'rented or aggregated hashrate'
+              : 'individual miners';
+    /* Who the port is for comes first: that is the word a miner is scanning
+     * this list for, and the difficulty is what they check afterwards. */
+    return { url, text: who + (l.label ? ' (' + l.label + ')' : '') + ' — ' + what };
+});
+const _w = _rows.reduce((m, r) => Math.max(m, r.url.length), 0);
+
+/* The disclosure a miner is owed before they point a rig at a floored port,
+ * and it can only be made when the chain is actually easier than the floor —
+ * which is a live comparison, not a property of the config. Same arithmetic
+ * as the operator-facing health check, addressed to the other party. */
+const _net  = Number(_p.network_difficulty || 0);
+const _kept = _net > 0 ? _ls.filter(l => _promised(l) > _net) : [];
+const _worst = _kept.length
+             ? _kept.reduce((a, b) => (_promised(a) > _promised(b) ? a : b))
+             : null;
+const _ratio = _worst ? _promised(_worst) / _net : 0;
+/* A pool with no floored port at all gets neither paragraph. Explaining what
+ * a held floor costs, on a pool where nothing holds one, is noise dressed as
+ * disclosure. */
+const _anyFloor = _ls.some(l => _promised(l) > 0);
+%>
+    <h3 class="about-h3">Which port to connect to</h3>
+    <pre class="about-pre"><% _rows.forEach(r => { %><%= r.url.padEnd(_w) %>   <%= r.text %>
+<% }) %></pre>
+    <p class="muted small about-note">
+        <strong>Which port you use does not change what you earn.</strong>
+        <% if (_p.pool_mode === 'solo') { %>
+            Nothing is credited between blocks in this mode — only a block
+            pays — and being served a larger difficulty does not make one
+            harder to find. It changes how often your miner reports in, not
+            how often it wins.
+        <% } else { %>
+            Work is credited by its difficulty, so one share at 65,536 counts
+            exactly as 65,536 shares at difficulty 1. The ports differ in the
+            size of the unit, not in its price.
+        <% } %>
+    </p>
+    <p class="muted small">
+        They exist because one difficulty cannot serve both kinds of miner.
+        Rented hashrate does not arrive as a crowd of small rigs — a
+        marketplace aggregates a whole fleet behind a <em>single</em>
+        connection, and 1&nbsp;PH/s at difficulty 1,024 is already about 227
+        shares per second down that one socket. On a port meant for a home
+        ASIC the same fleet is hundreds of thousands per second: the pool
+        limits the connection, and what the marketplace sees is a pool
+        rejecting its work.
+    </p>
+    <p class="muted small">
+        Vardiff cannot repair that after the fact. It moves by at most 4× per
+        window, so climbing from 1 to 65,536 takes eight windows — around four
+        minutes — and the rejects on the way up are what gets an order
+        cancelled. The connection has to <em>arrive</em> at the right
+        difficulty, which is what the second port is for.
+    </p>
+    <% if (_worst) { %>
+    <p class="muted small" style="border-left:3px solid #b5651d;padding-left:0.75em">
+        <strong>A held floor costs blocks, and it is your blocks it
+        costs.</strong> Port <strong><%= _worst.port %></strong><% if (_worst.label) { %>
+        (<%= _worst.label %>)<% } %> holds difficulty
+        <strong><%= _d(_promised(_worst)) %></strong> while the network is at
+        only <strong><%= _d(_net) %></strong>. Your miner filters locally
+        against the difficulty it was given, so it throws away roughly
+        <strong><%= (_ratio - 1).toFixed(0) %> of every
+        <%= _ratio.toFixed(0) %></strong> blocks it solves before this pool
+        ever sees them. The floor is held deliberately — a marketplace
+        measures the difficulty on the wire and cancels an order served under
+        what the port advertised — but if you are not mining under a
+        marketplace rule, connect on a port without a floor and keep every
+        block you find.
+    </p>
+    <% } else if (_anyFloor) { %>
+    <p class="muted small">
+        A port with a held floor keeps it even when the chain is easier than
+        the floor, because a marketplace measures the difficulty on the wire
+        and cancels an order served under what the port advertised. When that
+        happens your miner discards solutions the chain would have accepted,
+        so mine on a floored port only if something is actually requiring it
+        of you. This pool is not in that position right now.
+    </p>
+    <% } %>
+<% } %>

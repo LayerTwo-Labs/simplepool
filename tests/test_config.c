@@ -205,6 +205,137 @@ static void test_the_window_defaults_to_two(void) {
     CHECK(cfg.pplns_window_diff_multiple == 2.0);
 }
 
+/* pplns-coinbase pays the window out of the block's own coinbase, so the pool
+ * never receives the reward. */
+static void test_pplns_coinbase_is_accepted_without_a_pool_wallet(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(strcmp(cfg.pool_mode, "pplns-coinbase") == 0);
+    CHECK(cfg.pplns_window_diff_multiple == 2.0);
+}
+
+/* A configured pool wallet is refused rather than ignored. The whole claim of
+ * this mode is that the pool never holds the reward, and a pool_btc_address is
+ * the shape of a pool that does — most likely a mode switched in place without
+ * the rest of the config following. Running a custodial-looking pool that
+ * quietly is not one is worse than refusing to start. */
+static void test_pplns_coinbase_refuses_a_pool_wallet(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "pool_btc_address = %s\n", VALID_ADDR, VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "must not be set") != NULL);
+    CHECK(strstr(err, "pays miners directly from the coinbase") != NULL);
+}
+
+/* It is a pplns mode, so the window knob applies to it too. */
+static void test_pplns_coinbase_validates_the_window(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "pplns_window_diff_multiple = 0\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "pplns_window_diff_multiple") != NULL);
+}
+
+/* The byte budget is what limits how many miners a block can pay, so a value
+ * too small to hold even one payout is a pool that cannot run at all. */
+static void test_a_tiny_coinbase_budget_is_refused(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "coinbase_max_bytes = 150\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "coinbase_max_bytes") != NULL);
+}
+
+static void test_the_coinbase_budget_defaults_and_parses(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.coinbase_max_bytes == 1000);
+
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "coinbase_max_bytes = 820\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.coinbase_max_bytes == 820);
+}
+
+/* A per-listener coinbase ceiling.
+ *
+ * The ceiling that actually binds is a marketplace rule, enforced by whoever
+ * rents you hashrate, and it applies only to the port they connect to. Since
+ * every byte of ceiling costs a payout, imposing a rental market's limit on
+ * your own miners' port cuts their slots for nothing. */
+static void test_a_listener_can_carry_its_own_coinbase_ceiling(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[640];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "coinbase_max_bytes = 4000\n"
+             "listener = port=3335 label=rental min_diff=1000 initial_diff=1000 max_coinbase_bytes=900\n"
+             "listener = port=3336 label=home\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.coinbase_max_bytes == 4000);
+    CHECK(cfg.listener_count == 2);
+    /* The rented port takes the tight ceiling... */
+    CHECK(cfg.listeners[0].max_coinbase_bytes == 900);
+    /* ...and a port that did not ask for one stays at 0, which means "use the
+     * server-wide setting" rather than "no payouts". */
+    CHECK(cfg.listeners[1].max_coinbase_bytes == 0);
+
+    /* Too small to hold one payout is refused, exactly as the server-wide
+     * setting is — a port that can pay nobody is not a port. */
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "listener = port=3335 max_coinbase_bytes=150\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "max_coinbase_bytes") != NULL);
+}
+
+/* The payout floor decides who this pool refuses to serve, so it has to parse
+ * exactly and default to something an operator can defend. It is the harshest
+ * knob in the file: above it a miner is paid out of the block, below it a
+ * miner mines here and earns nothing. */
+static void test_the_payout_floor_defaults_and_parses(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.pplns_payout_floor_sats == 546);   /* the dust limit */
+
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "pplns_payout_floor_sats = 25000\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.pplns_payout_floor_sats == 25000);
+
+    /* Zero is legitimate: it means "pay anything the dust limit allows", and
+     * coinbase.c clamps it up. Only a negative is a typo. */
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "pplns_payout_floor_sats = 0\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.pplns_payout_floor_sats == 0);
+
+    snprintf(body, sizeof body,
+             "operator_address = %s\npool_mode = pplns-coinbase\n"
+             "pplns_payout_floor_sats = -1\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "pplns_payout_floor_sats") != NULL);
+}
+
 /* ---- listener lines ------------------------------------------------------
  *
  * A `listener` line is how rented hashrate is served its own difficulty. A
@@ -295,6 +426,13 @@ int main(void) {
     test_quoted_value_keeps_hash();
     test_inline_comment_still_strips();
     test_rejects_bad_operator_address();
+    test_the_coinbase_budget_defaults_and_parses();
+    test_the_payout_floor_defaults_and_parses();
+    test_a_listener_can_carry_its_own_coinbase_ceiling();
+    test_a_tiny_coinbase_budget_is_refused();
+    test_pplns_coinbase_validates_the_window();
+    test_pplns_coinbase_refuses_a_pool_wallet();
+    test_pplns_coinbase_is_accepted_without_a_pool_wallet();
     test_a_nonsense_log_level_warns_and_keeps_the_default();
     test_log_level_accepts_names_and_numbers();
     test_a_listener_without_a_port_is_refused();

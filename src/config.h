@@ -117,6 +117,36 @@ typedef struct {
      * 4x that turns the window into something four times longer or shorter
      * than the operator chose, without anything in the config changing. */
     double pplns_window_diff_multiple;        /* default 2.0 */
+    /* pplns-coinbase: the whole serialized coinbase's byte budget, which is
+     * what actually limits how many miners a block can pay.
+     *
+     * Not a consensus limit. A rented-hashrate marketplace verifies the
+     * coinbase and refuses a job whose coinbase it considers oversized, and
+     * the number that matters therefore belongs to whichever marketplace an
+     * operator sells to. A coinbase-direct pool in production reports whole
+     * coinbases of 721-817 bytes paying up to 16 miners; the default leaves
+     * headroom on that. 0 = COINBASE_DEFAULT_MAX_BYTES. */
+    int coinbase_max_bytes;                  /* default 1000 */
+
+    /* pplns-coinbase: a claim worth less than this is not paid BY THIS BLOCK.
+     * Its value goes to the other miners in the same window -- not to the
+     * operator, which receives its fee and nothing else -- and the worker is
+     * recorded as owed a slot in the payout queue, so a later block whose
+     * coinbase has room reaches it first. See pplns_fractions in schema.sql.
+     *
+     * This comment said the opposite until the mode was measured: the value
+     * was forfeited to the operator and nothing was carried. That rule paid
+     * the operator MORE the tighter the coinbase (46%% of the block at a
+     * 400-byte budget against 2%% at 3000) and excluded the same miners every
+     * block, because a miner's window share tracks its hashrate. See the long
+     * note at the redistribution in coinbase.c
+     * (LayerTwo-Labs/simplepool#76).
+     *
+     * Deliberate policy, not a rounding artefact: coinbase-direct pays out of
+     * the block itself, so every extra output is bytes an operator may not
+     * have. Clamped up to COINBASE_DUST_SATS (546); below that no output is
+     * relayable anyway. */
+    int64_t pplns_payout_floor_sats;         /* default 546 (dust) */
 
     /* pooled modes: coinbase pays this BTC address (P2WPKH/P2PKH/P2SH) for
      * the net-of-fee reward. Required when pool_mode = pps-classic;

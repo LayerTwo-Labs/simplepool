@@ -10,7 +10,7 @@ only writer of `accrued_sats`; this worker is the only writer of
 `paid_sats`. SQLite WAL + a 5-second busy timeout keep them out of each
 other's way.
 
-## Two rails
+## Two rails, and two modes that need none
 
 The worker drains `pps_credits` and pays whoever is owed. **Which chain it
 pays on** is `PAYOUT_RAIL`, and it must match the proxy's `pool_mode` — a pool
@@ -21,6 +21,21 @@ username even is.
 | --- | --- | --- | --- |
 | `pps-classic`, `pplns-thunder` | `thunder` (default) | Thunder address | Thunder `create_transfer` |
 | `pplns-btc` | `btc` | Bitcoin address | enforcer `WalletService/SendTransaction` |
+| `solo`, `pplns-coinbase` | **do not run this worker** | Bitcoin address | the block's own coinbase |
+
+> **Two modes need no payout worker at all.** In `solo` and `pplns-coinbase`
+> the coinbase *is* the payment — the pool never receives the reward, holds no
+> wallet and writes no `pps_credits` row, so there is nothing for this worker
+> to drain. Running it against one of those pools is harmless (it finds an
+> empty ledger and pays nobody) but it is a service to monitor, alert on and
+> misdiagnose for no reason. Do not install it.
+>
+> If you are looking for where a `pplns-coinbase` miner gets paid: in the
+> block, at the moment it is found, one coinbase output per miner. See the
+> mode's section in [../README.md](../README.md#the-five-modes) — including
+> the payout floor, below which a claim is shared among the miners that block
+> could pay rather than accrued here. Nothing is ever owed, so there is still
+> nothing for this worker to settle.
 
 Everything that makes a payout safe is written once and shared: the
 write-ahead `payouts_in_flight` row, one transaction per batch, and crediting

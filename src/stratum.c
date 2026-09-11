@@ -21,6 +21,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "stratum.h"
 #include "coinbase.h"
+#include "store.h"
 #include "share.h"
 #include "log.h"
 #include "thunder.h"
@@ -138,6 +139,17 @@ struct stratum_job {
     char   **tx_hex_list;   /* owned */
     size_t   tx_count;
 
+    /* pplns-coinbase: who this job's block pays, snapshotted at build time.
+     * `payees[i].address` points into the arena so the whole window is two
+     * allocations rather than one per miner. */
+    coinbase_payee_t *payees;
+    char             *payee_addrs;
+    /* Who each payee is, so a found block can name who it skipped. An address
+     * is not enough: two rigs can share one, and the fraction ledger is per
+     * worker. */
+    int64_t          *payee_worker_ids;
+    size_t            n_payees;
+
     uint64_t created_ms;    /* for retention ring */
 
     /* References held. The server holds one for current_job and one for each
@@ -238,7 +250,42 @@ void stratum_job_free(stratum_job_t *j) {
         for (size_t i = 0; i < j->tx_count; ++i) free(j->tx_hex_list[i]);
         free(j->tx_hex_list);
     }
+    free(j->payees);
+    free(j->payee_addrs);
+    free(j->payee_worker_ids);
     free(j);
+}
+
+/* Copy a window onto the job. Two allocations for the whole thing: one array
+ * of payees and one arena the addresses live in, so a 200-miner window is not
+ * 200 strdups that have to be unwound on every job retirement. */
+int stratum_job_set_window(stratum_job_t *j,
+                           const coinbase_payee_t *payees,
+                           const int64_t *worker_ids, size_t n_payees) {
+    if (!j) return -1;
+    free(j->payees);           j->payees = NULL;
+    free(j->payee_addrs);      j->payee_addrs = NULL;
+    free(j->payee_worker_ids); j->payee_worker_ids = NULL;
+    j->n_payees = 0;
+    if (!payees || n_payees == 0) return 0;
+
+    enum { ADDR_STRIDE = 128 };
+    coinbase_payee_t *arr = calloc(n_payees, sizeof *arr);
+    char *arena = calloc(n_payees, ADDR_STRIDE);
+    int64_t *ids = calloc(n_payees, sizeof *ids);
+    if (!arr || !arena || !ids) { free(arr); free(arena); free(ids); return -1; }
+    for (size_t i = 0; i < n_payees; ++i) {
+        char *dst = arena + i * ADDR_STRIDE;
+        snprintf(dst, ADDR_STRIDE, "%s", payees[i].address ? payees[i].address : "");
+        arr[i].address = dst;
+        arr[i].sats = payees[i].sats;
+        ids[i] = worker_ids ? worker_ids[i] : 0;
+    }
+    j->payees = arr;
+    j->payee_addrs = arena;
+    j->payee_worker_ids = ids;
+    j->n_payees = n_payees;
+    return 0;
 }
 
 /* ============================================================ server ==== */
@@ -325,6 +372,9 @@ struct stratum_conn {
      * its hashrate is split. */
     double   requested_min_diff;
 
+    /* This connection's coinbase byte ceiling, from its listener; 0 means the
+     * server-wide one. See stratum_listener_t.max_coinbase_bytes. */
+    int    pol_max_coinbase_bytes;
     /* Difficulty policy inherited from the listener this connection was
      * accepted on, resolved once at accept time so nothing downstream has to
      * know which port it came in on. Seeded from the server-wide defaults,
@@ -720,6 +770,76 @@ static cJSON *make_notify_params(const stratum_job_t *j,
  *
  * Caller must hold c->cb_lock, and must keep holding it for as long as it
  * reads the cb1/cb2 this leaves behind. */
+/* A pplns-coinbase job with no window pays nobody, and a coinbase that pays
+ * nobody forfeits the whole block. Better to render nothing and let the miner
+ * wait for the next template. */
+static int j_payees_missing(const stratum_job_t *job) {
+    return !job->payees || job->n_payees == 0;
+}
+
+/* Did payees[i] actually receive a coinbase output?
+ *
+ * Never answerable from res.paid_count. The builder skips a payee it cannot
+ * pay and keeps going -- a later one may be a cheaper address type and still
+ * fit -- so the paid set is a SUBSEQUENCE of the window, not a prefix of it.
+ * Reading it as a prefix does not misreport a number, it names the wrong
+ * miners: the block's skipped payee gets recorded as paid and sent to the back
+ * of the payout queue, and a payee that WAS paid gets recorded as owed and
+ * promoted ahead of it. The floor drops the smallest claim, and
+ * pplns_order_claims() deliberately puts a reserved small claim first, so the
+ * dropped payee sits at index 0 in the commonest case there is
+ * (LayerTwo-Labs/simplepool#76). */
+static int cbwin_was_paid(const coinbase_window_result_t *res, size_t i) {
+    return i < COINBASE_MAX_PAYOUT_OUTPUTS && res->paid_payee[i];
+}
+
+/* The byte ceiling that applies to THIS connection: its listener's, or the
+ * server-wide one when the listener did not set its own.
+ *
+ * One accessor rather than two lookups, because the coinbase is rendered in
+ * one place and re-derived in another (to work out what a found block paid),
+ * and those two disagreeing would mean the payout queue recorded a rotation
+ * that did not happen. */
+static size_t conn_coinbase_budget(const stratum_server_t *s,
+                                   const stratum_conn_t *c) {
+    if (c && c->pol_max_coinbase_bytes > 0)
+        return (size_t)c->pol_max_coinbase_bytes;
+    return s->cfg.max_coinbase_bytes;
+}
+
+/* The solo shape: a coinbase paying THIS connection's miner, plus the
+ * operator fee. Its own function because two different modes need it and a
+ * verbatim second copy is how the two drift -- solo reaches it because that is
+ * what solo is, and pplns-coinbase reaches it when a job carries no window
+ * yet. It used to be a `goto` into an `else if (0)` block sitting beside an
+ * identical live branch, which meant a fix to one would silently not reach the
+ * other. */
+static int render_finder_coinbase(stratum_server_t *s, stratum_conn_t *c,
+                                  const stratum_job_t *job,
+                                  coinbase_parts_t *parts,
+                                  char *err, size_t errlen) {
+    if (job->coinbasetxn_hex) {
+        /* Backend dictated the coinbase (e.g. CUSF enforcer): build from it,
+         * redirecting the reward output to this miner and preserving the
+         * mandatory commitment outputs. The witness commitment is already in
+         * the server's coinbase, so job->wc_hex is not used here. */
+        return coinbase_build_from_template(job->coinbasetxn_hex,
+                                            c->payout_address,
+                                            s->cfg.operator_address,
+                                            s->cfg.fee_bps,
+                                            s->cfg.coinbase_tag,
+                                            job->en1_size, job->en2_size,
+                                            parts, NULL, NULL, NULL,
+                                            err, errlen);
+    }
+    return coinbase_build_split(job->height, job->value_sats,
+                                c->payout_address,
+                                s->cfg.operator_address, s->cfg.fee_bps,
+                                job->wc_hex, s->cfg.coinbase_tag,
+                                job->en1_size, job->en2_size,
+                                parts, NULL, NULL, err, errlen);
+}
+
 static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                 const stratum_job_t *job) {
     if (!c->authorized || c->payout_address[0] == '\0') return -1;
@@ -729,7 +849,36 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
     coinbase_parts_t parts = {0};
     char err[256] = {0};
     int rc;
-    if (s->cfg.coinbase_pays_pool) {
+    /* Bootstrap: a pplns-coinbase job with no window has nobody to pay, so it
+     * renders the solo shape instead — this connection's own miner. See
+     * attach_pplns_window() in main.c: with no prior work the only party with
+     * a claim on the block is whoever finds it, and refusing to render would
+     * deadlock a new pool for ever (no coinbase, so no shares, so no window). */
+    if (s->cfg.coinbase_pays_window && !j_payees_missing(job)) {
+        /* pplns-coinbase: the block pays the window that produced it, one
+         * output per miner, and the pool never receives the reward. The
+         * window was snapshotted onto the job when the template was built, so
+         * every connection pays the same miners in the same order — but not
+         * necessarily the same NUMBER of them, because the byte ceiling is
+         * per-listener and cuts the tail of that order at a different point
+         * on a rented port than on a home one. */
+        if (job->coinbasetxn_hex) {
+            rc = coinbase_build_window_from_template(
+                    job->coinbasetxn_hex, job->payees, job->n_payees,
+                    s->cfg.operator_address, s->cfg.fee_bps,
+                    s->cfg.coinbase_tag, job->en1_size, job->en2_size,
+                    conn_coinbase_budget(s, c), s->cfg.payout_floor_sats,
+                    &parts, NULL, NULL,
+                    err, sizeof err);
+        } else {
+            rc = coinbase_build_window(
+                    job->height, job->value_sats, job->payees, job->n_payees,
+                    s->cfg.operator_address, s->cfg.fee_bps, job->wc_hex,
+                    s->cfg.coinbase_tag, job->en1_size, job->en2_size,
+                    conn_coinbase_budget(s, c), s->cfg.payout_floor_sats,
+                    &parts, NULL, err, sizeof err);
+        }
+    } else if (s->cfg.coinbase_pays_pool) {
         /* PPS-classic: every miner's coinbase is identical, paying the
          * pool's BTC wallet for the net-of-fee reward and the operator
          * address for the fee. The operator later moves accumulated BTC
@@ -750,24 +899,10 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                       job->en1_size, job->en2_size,
                                       &parts, NULL, NULL, err, sizeof err);
         }
-    } else if (job->coinbasetxn_hex) {
-        /* Backend dictated the coinbase (e.g. CUSF enforcer): build from it,
-         * redirecting the reward output to this miner and preserving the
-         * mandatory commitment outputs. The witness commitment is already in
-         * the server's coinbase, so job->wc_hex is not used here. */
-        rc = coinbase_build_from_template(job->coinbasetxn_hex,
-                                          c->payout_address,
-                                          s->cfg.operator_address, s->cfg.fee_bps,
-                                          s->cfg.coinbase_tag,
-                                          job->en1_size, job->en2_size,
-                                          &parts, NULL, NULL, NULL, err, sizeof err);
     } else {
-        rc = coinbase_build_split(job->height, job->value_sats,
-                                  c->payout_address,
-                                  s->cfg.operator_address, s->cfg.fee_bps,
-                                  job->wc_hex, s->cfg.coinbase_tag,
-                                  job->en1_size, job->en2_size,
-                                  &parts, NULL, NULL, err, sizeof err);
+        /* Solo, and the pplns-coinbase bootstrap: this connection's own
+         * miner. One implementation, shared. */
+        rc = render_finder_coinbase(s, c, job, &parts, err, sizeof err);
     }
     if (rc < 0) {
         LOG_WARN("stratum: coinbase render failed for %s: %s",
@@ -2046,6 +2181,126 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         c->vd_window_max_assigned = assigned_diff;
     }
     vardiff_maybe_retarget(s, c, now_ms(), buf, len);
+    /* What this block's coinbase actually paid, and what it forfeited.
+     *
+     * Recomputed rather than remembered: the split is deterministic from the
+     * job and the config, so running the same builder again reproduces
+     * exactly what was rendered, and a found block is rare enough that the
+     * cost does not matter.
+     *
+     * This is a log line rather than a ledger row on purpose. Forfeits are
+     * not a debt -- see coinbase_window_result_t -- but they ARE somebody's
+     * lost claim, and the one thing that makes a hard floor a rule instead of
+     * a trap is that it is visible. So every block that forfeits says so, in
+     * sats, at INFO. */
+    if (is_block && block_accepted && s->cfg.coinbase_pays_window &&
+        job->payees && job->n_payees > 0) {
+        coinbase_parts_t throwaway;
+        coinbase_window_result_t res;
+        char werr[256] = {0};
+        int wrc;
+        if (job->coinbasetxn_hex) {
+            wrc = coinbase_build_window_from_template(
+                    job->coinbasetxn_hex, job->payees, job->n_payees,
+                    s->cfg.operator_address, s->cfg.fee_bps,
+                    s->cfg.coinbase_tag, job->en1_size, job->en2_size,
+                    conn_coinbase_budget(s, c), s->cfg.payout_floor_sats,
+                    &throwaway, NULL, &res, werr, sizeof werr);
+        } else {
+            wrc = coinbase_build_window(
+                    job->height, job->value_sats, job->payees, job->n_payees,
+                    s->cfg.operator_address, s->cfg.fee_bps, job->wc_hex,
+                    s->cfg.coinbase_tag, job->en1_size, job->en2_size,
+                    conn_coinbase_budget(s, c), s->cfg.payout_floor_sats,
+                    &throwaway, &res, werr, sizeof werr);
+        }
+        if (wrc == 0) {
+            coinbase_parts_free(&throwaway);
+            /* Record who this block skipped, and who absorbed their share.
+             *
+             * Expressed as a signed fraction of one block reward: what a
+             * worker was ENTITLED to out of this block, minus what the
+             * coinbase actually paid it. Positive means skipped and owed a
+             * slot; negative means paid early out of somebody else's share.
+             * The set sums to zero by construction, because redistribution
+             * moves value between miners and never in or out.
+             *
+             * Fractions rather than sats or difficulty, because this is
+             * consulted blocks later: shares stay in the window across several
+             * blocks, so rolling unpaid difficulty forward double-counts the
+             * same work, and difficulty is not comparable across a retarget.
+             *
+             * Staged against the block hash, not applied — this block is a
+             * candidate and its coinbase has paid nobody yet. */
+            if (s->cfg.on_window_fractions && job->payee_worker_ids &&
+                res.paid_sats > 0) {
+                struct store_fraction_delta d[COINBASE_MAX_PAYOUT_OUTPUTS];
+                size_t nd = 0;
+                int64_t entitled_total = 0, survivors_own = 0;
+                for (size_t i = 0; i < job->n_payees; ++i) {
+                    entitled_total += job->payees[i].sats;
+                    if (cbwin_was_paid(&res, i))
+                        survivors_own += job->payees[i].sats;
+                }
+                if (entitled_total > 0 && survivors_own > 0) {
+                    /* `got` is a survivor's share of what was actually paid
+                     * out, which after redistribution is the WHOLE payable
+                     * amount -- so it is their claim over the survivors' claims,
+                     * not over the window's. Dividing by res.paid_sats instead
+                     * looks equivalent and is not: redistribution sets that to
+                     * the full payable amount, so every delta came out as
+                     * exactly zero and the queue never recorded anybody. */
+                    for (size_t i = 0; i < job->n_payees &&
+                                       nd < COINBASE_MAX_PAYOUT_OUTPUTS; ++i) {
+                        double entitled = (double)job->payees[i].sats /
+                                          (double)entitled_total;
+                        double got = cbwin_was_paid(&res, i)
+                                   ? (double)job->payees[i].sats /
+                                     (double)survivors_own
+                                   : 0.0;
+                        double delta = entitled - got;
+                        if (delta > 1e-12 || delta < -1e-12) {
+                            d[nd].worker_id = job->payee_worker_ids[i];
+                            d[nd].delta = delta;
+                            nd++;
+                        }
+                    }
+                }
+                if (nd > 0)
+                    s->cfg.on_window_fractions(s->cfg.ctx, block_hash_hex, d, nd);
+            }
+            size_t dropped = res.dropped_below_floor + res.dropped_capped;
+            if (dropped > 0) {
+                LOG_INFO("pplns-coinbase: block %s paid %zu miner(s) %lld "
+                         "sats directly; %zu claim(s) worth %lld sats had no "
+                         "room and were REDISTRIBUTED across the miners who "
+                         "did fit (%zu below the %lld-sat floor, %zu past the "
+                         "%zu-byte coinbase). The operator took its fee and "
+                         "nothing more. A large figure here means the byte "
+                         "budget is too tight for this many miners.",
+                         block_hash_hex, res.paid_count,
+                         (long long)res.paid_sats, dropped,
+                         (long long)res.redistributed_sats,
+                         res.dropped_below_floor,
+                         (long long)s->cfg.payout_floor_sats,
+                         res.dropped_capped,
+                         conn_coinbase_budget(s, c)
+                             ? conn_coinbase_budget(s, c)
+                             : (size_t)COINBASE_DEFAULT_MAX_BYTES);
+            } else {
+                LOG_INFO("pplns-coinbase: block %s paid all %zu miner(s) in "
+                         "the window %lld sats directly",
+                         block_hash_hex, res.paid_count,
+                         (long long)res.paid_sats);
+            }
+        } else {
+            /* The block stands either way -- it was already accepted -- but
+             * an operator who cannot see what a block paid cannot answer a
+             * miner asking why it was not paid. */
+            LOG_WARN("stratum: could not determine what block %s paid: %s",
+                     block_hash_hex, werr);
+        }
+    }
     if (is_block && s->cfg.on_block_found) {
         int64_t fee_sats = 0;
         if (s->cfg.fee_bps > 0 && s->cfg.operator_address[0]) {
@@ -2209,6 +2464,7 @@ static void conn_apply_listener(stratum_conn_t *c,
     if (pol->vardiff_min  > 0.0) c->pol_vardiff_min  = pol->vardiff_min;
     if (pol->vardiff_max  > 0.0) c->pol_vardiff_max  = pol->vardiff_max;
     c->pol_min_diff = pol->min_diff;   /* 0 unless the port promised one */
+    c->pol_max_coinbase_bytes = pol->max_coinbase_bytes;  /* 0 = server-wide */
     c->pol_port = pol->port;
     snprintf(c->pol_label, sizeof c->pol_label, "%s", pol->label);
     /* Before authorize the connection has no assigned difficulty yet, so
@@ -2220,6 +2476,14 @@ static void conn_apply_listener(stratum_conn_t *c,
 void stratum_conn_apply_listener_for_test(stratum_conn_t *c,
                                           const stratum_listener_t *pol) {
     conn_apply_listener(c, pol);
+}
+
+/* Put a test connection on a listener's policy, the way accept() does for a
+ * real one. Only the coinbase ceiling is exposed: it is the one piece of
+ * listener policy that changes what a block PAYS rather than how hard the
+ * work is, so it is the one a test has to be able to drive. */
+void stratum_conn_set_coinbase_budget_for_test(stratum_conn_t *c, int bytes) {
+    if (c) c->pol_max_coinbase_bytes = bytes;
 }
 
 stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {

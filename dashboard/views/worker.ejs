@@ -31,7 +31,18 @@ if (n > 1) {
                 <div><label>Shares (24h)</label><strong><%= fmtN(worker.window_shares) %></strong></div>
                 <div><label>First seen</label><strong title="<%= fmtTs(worker.first_seen) %>"><%= ago(worker.first_seen) %></strong></div>
                 <div><label>Last seen</label><strong title="<%= fmtTs(worker.last_seen) %>"><%= ago(worker.last_seen) %></strong></div>
-                <div><label>Owed</label><strong><%= pps_audit ? fmtSats(pps_audit.owed) : 'N/A (solo mode)' %></strong></div>
+                <%# "N/A (solo mode)" was shown on every mode without a
+                    pps_credits row -- including all three pplns rails, and
+                    including a pplns pool that simply has not distributed yet.
+                    A page telling a miner they are on a solo pool, directly
+                    under a header saying pplns-coinbase, is worse than saying
+                    nothing. Name the real reason instead. %>
+                <div><label>Owed</label><strong><%= pps_audit ? fmtSats(pps_audit.owed)
+                    : (pool && pool.pool_mode === 'pplns-coinbase'
+                        ? 'N/A — paid in the coinbase'
+                        : (pool && pool.pool_mode === 'solo'
+                            ? 'N/A — paid in the coinbase'
+                            : 'nothing owed yet')) %></strong></div>
             </div>
         </section>
 

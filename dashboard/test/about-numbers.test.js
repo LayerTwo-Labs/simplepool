@@ -139,10 +139,14 @@ test('an unknown mode describes both and commits to neither', async () => {
     for (const pool of [null, { pool_mode: null, fee_bps: 0 }]) {
         const html = await card(pool);
         assert.match(html, /has not published its mode/);
-        /* Both named, so a miner knows what to ask the operator — but no
-         * username form is asserted, because guessing costs them time. */
-        assert.match(html, /solo/);
-        assert.match(html, /pps-classic/);
+        /* Every mode named, so a miner knows what to ask the operator — but
+         * no username form is asserted, because guessing costs them time.
+         * The list grew from two to five; a page that names only the two it
+         * was written for is a page that quietly stopped being complete. */
+        for (const m of ['solo', 'pps-classic', 'pplns-thunder',
+                         'pplns-btc', 'pplns-coinbase']) {
+            assert.match(html, new RegExp(m), `${m} should be named`);
+        }
         assert.doesNotMatch(html, /your-Thunder-address/);
         assert.doesNotMatch(html, /your-bitcoin-address/);
     }

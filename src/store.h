@@ -158,6 +158,52 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
                            int *out_blocks, int *out_workers,
                            char *errbuf, size_t errlen);
 
+/* ---- the PPLNS window, as it stands NOW --------------------------------
+ *
+ * store_pplns_distribute() reads the window of a block that has already
+ * matured, anchored on that block's own share. This reads the window a block
+ * found RIGHT NOW would pay, anchored on the newest share there is — which is
+ * what a coinbase-direct pool needs when it builds a template, ~100 blocks
+ * before the other one would run.
+ *
+ * Only workers with a payout address are returned, and the total is summed
+ * over exactly those. A worker with no address cannot be given a coinbase
+ * output, and leaving it in the denominator would shrink everyone else's
+ * share to fund an output that is never created — value quietly destroyed
+ * rather than merely unpaid. */
+typedef struct {
+    int64_t worker_id;
+    char    payout_address[128];
+    double  difficulty;          /* this worker's difficulty inside the window */
+    /* Signed fraction of one block reward this worker is owed from blocks
+     * whose coinbase had no room for it, or has been overpaid from absorbing
+     * somebody else's skipped share. Zero on a pool that has always been able
+     * to pay everyone. See pplns_fractions in schema.sql -- it is a memory of
+     * whose turn it is, not a balance, and the pool holds nothing against it. */
+    double  owed_fraction;
+} store_window_entry_t;
+
+/* Fill `out` with the window's payable workers, largest first, and set
+ * *out_total_diff to the difficulty summed across the ones returned.
+ *
+ * `window_diff` is the window size in difficulty units, the same quantity
+ * blocks_found.pplns_window_diff stores. The boundary rule matches the
+ * distributor exactly: the share that crosses it is counted whole, because
+ * the window chooses which work is paid rather than claiming that precisely N
+ * difficulty was performed.
+ *
+ * *out_truncated is set when more payable workers were in the window than
+ * `cap` could hold. The tail is then absent from both the entries and the
+ * total, so their claim is redistributed rather than carried — the caller
+ * must decide whether that is acceptable rather than discovering it in the
+ * amounts.
+ *
+ * Returns the number written, or negative on error. */
+int store_pplns_window(store_t *s, double window_diff,
+                       store_window_entry_t *out, size_t cap,
+                       size_t *out_n, double *out_total_diff,
+                       int *out_truncated, char *errbuf, size_t errlen);
+
 /* Record an accepted share with the miner's payout_address so the worker
  * row can be tagged. payout_address may be NULL (legacy/tests). The
  * share_hash semantics match store_record_share() above.
@@ -181,6 +227,49 @@ int store_record_share_addr(store_t *s, const char *worker_name,
 /* PPS credit: add delta_sats to the worker's accrued_sats in pps_credits.
  * Async (writer thread). delta_sats must be > 0. payout_address (the
  * miner's Thunder address) is tagged onto the workers row as usual. */
+/* One worker's change in standing from a block's coinbase. */
+typedef struct store_fraction_delta {
+    int64_t worker_id;
+    double  delta;      /* + skipped and owed; - paid early and owes back */
+} store_fraction_delta_t;
+
+/* Stage what a found block's coinbase did to the fraction ledger.
+ *
+ * Held against `block_hash` rather than applied, because a found block is a
+ * CANDIDATE: submitblock may have refused it and the chain may still reorg it
+ * away, and in either case its coinbase paid nobody. Applying here would
+ * record a rotation that never happened and move a miner down the queue for a
+ * payment it never got.
+ *
+ * The deltas must sum to zero, which the caller computes and this checks: a
+ * ledger that does not is one that has invented or destroyed somebody's turn.
+ *
+ * Returns the number of rows staged, or negative on error. */
+int store_stage_block_fractions(store_t *s, const char *block_hash,
+                                const store_fraction_delta_t *deltas, size_t n,
+                                char *errbuf, size_t errlen);
+
+/* Apply the staged deltas for every block that has since been CONFIRMED, and
+ * discard them for every block that has been ORPHANED.
+ *
+ * Called from the confirmation pass, on the same schedule and for the same
+ * reason as PPLNS distribution: this is the only place that knows whether a
+ * block is still in the chain. Idempotent -- staged rows are deleted as they
+ * are applied, so a second pass over the same block does nothing.
+ *
+ * *out_applied / *out_discarded receive the block counts (either may be NULL).
+ * Returns 0 ok, negative on error. */
+int store_settle_block_fractions(store_t *s, int *out_applied,
+                                 int *out_discarded,
+                                 char *errbuf, size_t errlen);
+
+/* Test hooks: put the store's shared connection into a transaction, the way
+ * the commit thread does mid-batch, so a nested write can be exercised without
+ * racing a real one. Not for production use. */
+int store_begin_txn_for_test(store_t *s);
+int store_end_txn_for_test(store_t *s);
+int store_rollback_txn_for_test(store_t *s);
+
 int store_record_credit(store_t *s, const char *worker_name,
                         const char *payout_address,
                         uint64_t ts_ms, int64_t delta_sats);
@@ -210,7 +299,8 @@ int store_record_pool_identity(store_t *s, const char *network,
                                const char *coinbase_tag,
                                const char *operator_address,
                                const char *pool_btc_address,
-                               const char *listeners_json);
+                               const char *listeners_json,
+                               int64_t pplns_payout_floor_sats);
 
 int store_record_pool_meta(store_t *s, const char *pool_mode, int fee_bps,
                            const char *rate_source,

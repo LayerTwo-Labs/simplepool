@@ -736,3 +736,84 @@ test('the templates page renders on a DB with no template history', async () => 
     });
     assert.match(html, /has not recorded any templates yet/);
 });
+
+/* ---------- template staleness (the two clocks) -------------------------- */
+
+/* The warning under the current template claims the proxy may not be reaching
+ * its backend. It used to measure that from `ts` — first seen — which stopped
+ * advancing once repeat polls began folding into the row they match (a578a48).
+ * From then on it was reading chain speed and reporting it as a proxy fault:
+ * on a chain averaging ~30 minutes a block against a 10-minute target, the
+ * 900 s threshold fired on roughly every second block, permanently, while the
+ * backend was being polled every 30 seconds. */
+async function tipHeldFor(db, { heldSec, polledSecAgo, polls }) {
+    const now = Math.floor(Date.now() / 1000);
+    addTemplate(db, { height: 997058, ts: now - heldSec });
+    db.prepare('UPDATE templates SET last_seen = ?, polls = ? WHERE height = 997058')
+      .run(now - polledSecAgo, polls);
+    const html = await render('templates.ejs', {
+        templates: stats.templates(db), fmtBtc: stats.fmtBtc,
+    });
+    /* The markup wraps these sentences across source lines, so match them
+     * the way the reader sees them rather than the way EJS emits them. */
+    return html.replace(/\s+/g, ' ');
+}
+
+test('a long-standing tip is not reported as an unreachable backend', async () => {
+    /* The alphanet case: 30 minutes on one template, polled 10 s ago. */
+    const { db } = makeDb();
+    const html = await tipHeldFor(db, { heldSec: 1830, polledSecAgo: 10, polls: 62 });
+    assert.doesNotMatch(html, /may not be reaching/,
+                        'a slow chain is not a broken proxy');
+    /* The wait is still stated — just as chain speed, and not in the error
+     * colour. Losing the information would trade one wrong answer for none. */
+    assert.match(html, /mining this tip for 30 min/);
+    assert.doesNotMatch(html, /#c66"> mining this tip/);
+});
+
+test('a backend that has stopped answering is reported, on the right clock', async () => {
+    const { db } = makeDb();
+    const html = await tipHeldFor(db, { heldSec: 1800, polledSecAgo: 1200, polls: 20 });
+    assert.match(html, /no word from the backend for 20 min/);
+    assert.match(html, /may not be reaching it/);
+});
+
+test('the stall threshold follows the cadence the pool actually polls at', async () => {
+    /* A pool with bitcoind_poll_interval_ms = 300000 polls every 5 minutes.
+     * A fixed two-minute threshold would call it unreachable between every
+     * pair of polls — the same false alarm one layer down. The dashboard
+     * cannot read that config, so it measures the cadence off the row. */
+    const slow = makeDb().db;
+    const html = await tipHeldFor(slow, { heldSec: 3000, polledSecAgo: 300, polls: 11 });
+    assert.doesNotMatch(html, /may not be reaching/);
+
+    /* Six missed polls at that cadence is a genuine stall, and still caught. */
+    const stalled = makeDb().db;
+    const bad = await tipHeldFor(stalled, { heldSec: 3000, polledSecAgo: 2100, polls: 11 });
+    assert.match(bad, /may not be reaching it/);
+});
+
+test('a fresh template with one poll falls back to the two-minute floor', async () => {
+    /* polls = 1 spans no interval, so there is no cadence to measure. */
+    const { db } = makeDb();
+    const ok = await tipHeldFor(db, { heldSec: 0, polledSecAgo: 30, polls: 1 });
+    assert.doesNotMatch(ok, /may not be reaching/);
+
+    const { db: db2 } = makeDb();
+    const bad = await tipHeldFor(db2, { heldSec: 0, polledSecAgo: 400, polls: 1 });
+    assert.match(bad, /may not be reaching it/);
+});
+
+test('a DB predating the fold measures staleness from its inserted rows', async () => {
+    /* Before a578a48 every poll inserted its own row, so the newest row's ts
+     * IS the last backend contact. stats.templates() coalesces last_seen to ts
+     * there, which keeps this correct rather than silently never warning. */
+    const { db } = makeDb();
+    db.exec('ALTER TABLE templates DROP COLUMN last_seen');
+    db.exec('ALTER TABLE templates DROP COLUMN polls');
+    addTemplate(db, { height: 997058, ts: Math.floor(Date.now() / 1000) - 1800 });
+    const html = (await render('templates.ejs', {
+        templates: stats.templates(db), fmtBtc: stats.fmtBtc,
+    })).replace(/\s+/g, ' ');
+    assert.match(html, /may not be reaching it/);
+});

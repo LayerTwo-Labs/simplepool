@@ -60,14 +60,14 @@ BIN       := $(BUILD_DIR)/simplepool
 # different question: a tree gets patched or moves on past the last `make`,
 # and from then on its HEAD is not what the running process was built from.
 # Empty outside a git checkout (release tarball) — reported as "unknown".
-VERSION    := 0.3.0
+VERSION    := 0.4.0
 GIT_COMMIT := $(shell git rev-parse HEAD 2>/dev/null)
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null)
 GIT_DIRTY  := $(shell git status --porcelain --untracked-files=no 2>/dev/null | head -1)
 VERSION_H  := $(BUILD_DIR)/version_gen.h
 
 # Sources compiled in this wave. More modules land in later waves.
-SRCS := src/main.c src/log.c src/config.c src/coinbase.c \
+SRCS := src/main.c src/log.c src/config.c src/coinbase.c src/pplns.c \
         src/share.c src/sha256.c src/stratum.c src/store.c \
         src/bitcoind.c src/broadcast.c src/thunder.c src/version.c \
         src/reconcile.c src/cjson/cJSON.c
@@ -124,17 +124,21 @@ include tests/test_broadcast.mk
 include tests/test_thunder.mk
 include tests/test_config.mk
 include tests/test_reconcile.mk
+include tests/test_pplns.mk
+include tests/test_store_walk.mk
 
-test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_config build/test_reconcile
+test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_store_walk build/test_coinbase build/test_broadcast build/test_thunder build/test_config build/test_reconcile build/test_pplns
 	./build/test_share
 	./build/test_bitcoind
 	./build/test_stratum
 	./build/test_store
+	./build/test_store_walk
 	./build/test_coinbase
 	./build/test_broadcast
 	./build/test_thunder
 	./build/test_config
 	./build/test_reconcile
+	./build/test_pplns
 
 # Run the suites under AddressSanitizer + UndefinedBehaviorSanitizer.
 #
@@ -157,14 +161,20 @@ asan:
 		src/log.c src/cjson/cJSON.c -lpthread
 	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_store tests/test_store.c \
 		src/store.c src/log.c $(PLATFORM_LDFLAGS) -lsqlite3 -lpthread
+	$(CC) $(ASAN_CFLAGS) -Wno-unused-function -o $(ASAN_DIR)/test_store_walk \
+		tests/test_store_walk.c src/log.c $(PLATFORM_LDFLAGS) -lsqlite3 -lpthread
 	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_coinbase tests/test_coinbase.c \
 		src/coinbase.c src/sha256.c
 	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_share tests/test_share.c \
 		src/share.c src/sha256.c
+	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_pplns tests/test_pplns.c \
+		src/pplns.c src/coinbase.c src/sha256.c
 	./$(ASAN_DIR)/test_stratum
 	./$(ASAN_DIR)/test_store
+	./$(ASAN_DIR)/test_store_walk
 	./$(ASAN_DIR)/test_coinbase
 	./$(ASAN_DIR)/test_share
+	./$(ASAN_DIR)/test_pplns
 
 # Line and function coverage of the C suites, via LLVM source-based coverage.
 #
@@ -205,6 +215,10 @@ coverage:
 	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_thunder tests/test_thunder.c src/thunder.c
 	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_config tests/test_config.c \
 		src/config.c src/log.c src/coinbase.c src/sha256.c
+	$(CC) $(COV_CFLAGS) -Wno-unused-function -o $(COV_DIR)/test_store_walk \
+		tests/test_store_walk.c src/log.c -lsqlite3 -lpthread
+	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_pplns tests/test_pplns.c \
+		src/pplns.c src/coinbase.c src/sha256.c
 	$(CC) $(COV_CFLAGS) -o $(COV_DIR)/test_reconcile tests/test_reconcile.c \
 		src/reconcile.c src/store.c src/log.c $(PLATFORM_LDFLAGS) -lsqlite3 -lpthread
 	@set -e; for t in stratum store coinbase share bitcoind broadcast thunder config reconcile; do \
@@ -216,7 +230,8 @@ coverage:
 	@xcrun llvm-cov report $(COV_DIR)/test_stratum \
 		$(addprefix -object ,$(COV_DIR)/test_store $(COV_DIR)/test_coinbase \
 		$(COV_DIR)/test_share $(COV_DIR)/test_bitcoind $(COV_DIR)/test_broadcast \
-		$(COV_DIR)/test_thunder $(COV_DIR)/test_config $(COV_DIR)/test_reconcile) \
+		$(COV_DIR)/test_thunder $(COV_DIR)/test_config $(COV_DIR)/test_reconcile \
+		$(COV_DIR)/test_pplns $(COV_DIR)/test_store_walk) \
 		-instr-profile=$(COV_DIR)/all.profdata $(COV_IGNORE)
 
 format:

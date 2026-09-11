@@ -76,11 +76,11 @@ report that a check is failing was still produced successfully. Watch
 ## Pool identity
 
 Every page carries a strip under the header naming what this pool actually
-is: the **network** its coinbases are built for, the **mode** (`solo` or
-`pps-classic`) and fee, the **coinbase tag**, the **operator address** the
-fee is paid to, and — under `pps-classic` — the **pool wallet** the
-net-of-fee reward goes to. `/api/status` returns the same five fields under
-`pool`.
+is: the **network** its coinbases are built for, the **mode** (one of `solo`,
+`pps-classic`, `pplns-thunder`, `pplns-btc` or `pplns-coinbase`) and fee, the
+**coinbase tag**, the **operator address** the fee is paid to, and — in the
+modes that pool the reward — the **pool wallet** the net-of-fee reward goes
+to. `/api/status` returns the same fields under `pool`.
 
 None of it is derivable from the stratum URL a miner was handed. The port
 looks identical whether the pool is mining mainnet or regtest, whether a
@@ -110,17 +110,39 @@ question.
 The explanatory card on `/` branches on `pool_mode`, because almost nothing
 in it is shared between the modes:
 
-| | `solo` | `pps-classic` |
-| --- | --- | --- |
-| A share that isn't a block | worth nothing | credited at the live rate |
-| Block reward goes to | the finder, in the coinbase | the pool's BTC wallet |
-| Stratum username | a **Bitcoin** address (P2WPKH / P2PKH / P2SH — **not** taproot) | a **Thunder** address |
-| Rejection if you get it wrong | `invalid payout address in stratum username` | `invalid thunder address` |
+| | `solo` | `pps-classic` | `pplns-thunder` | `pplns-btc` | `pplns-coinbase` |
+| --- | --- | --- | --- | --- | --- |
+| A share that isn't a block | worth nothing | credited at the live rate | a claim on the next block found | a claim on the next block found | a claim on the next block found |
+| Block reward goes to | the finder, in the coinbase | the pool's BTC wallet | the pool's BTC wallet | the pool's BTC wallet | **the whole window, in the coinbase** |
+| A balance moves | never | as each share arrives | on maturity, over Thunder | on maturity, on L1 | never — the block is the payment |
+| Stratum username | a **Bitcoin** address (P2WPKH / P2PKH / P2SH — **not** taproot) | a **Thunder** address | a **Thunder** address | a **Bitcoin** address | a **Bitcoin** address |
+| Rejection if you get it wrong | `invalid payout address in stratum username` | `invalid thunder address` | `invalid thunder address` | `invalid payout address in stratum username` | `invalid payout address in stratum username` |
 
-That last row is why this is not cosmetic. `src/stratum.c` branches on
-`pps_enabled` at authorize, so the card's instructions are load-bearing: a
-solo pool that tells miners to use a Thunder address is telling them to do
-the one thing that cannot work.
+The username row is why this is not cosmetic. `src/stratum.c` branches at
+authorize, so the card's instructions are load-bearing: a pool that tells
+miners to use a Thunder address when it wants a Bitcoin one is telling them to
+do the one thing that cannot work.
+
+**`pplns-coinbase` gets one more thing the others do not: the payout floor.**
+That mode does not pay a claim worth less than `pplns_payout_floor_sats` — it
+shares it out among the miners that block could pay — never the operator, who
+takes only its fee — and puts the skipped miner first in the queue for the next
+block. The card says all three things, because a miner deciding whether to
+point a rig here needs to know that being small costs them frequency rather
+than money, and that nothing is being held on their behalf. The card states the number before anyone connects, because the
+operator's log is the one place the miner it costs cannot look. It renders
+only when the proxy published a floor (`pool_meta.pplns_payout_floor_sats`);
+an older proxy stores NULL, and printing a default there would be stating some
+other operator's policy for them.
+
+A note on what this card used to do: it branched on `solo` / `pps-classic`
+only, so all three PPLNS modes fell through to *"this pool has not published
+its mode yet"* — directly beneath an identity strip that named the mode
+correctly — followed by connection guidance for two modes, neither of which
+was theirs. Three other places answered "not `pps-classic`" with the word
+*solo*: the worker page's **Owed** field, the templates page's PPS rate, and
+the `pps_difficulty` health check. If you add a sixth mode, those are the
+places to check.
 
 Every figure comes from `pool_meta` — rate, gross, fee, operator address,
 pool wallet, network — and the address examples follow the pool's network, so

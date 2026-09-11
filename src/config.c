@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "config.h"
+#include "coinbase.h"
 #include "log.h"
 
 #include <ctype.h>
@@ -67,6 +68,8 @@ void proxy_config_defaults(proxy_config_t *cfg) {
 
     snprintf(cfg->pool_mode, sizeof cfg->pool_mode, "%s", "solo");
     cfg->pplns_window_diff_multiple = 2.0;
+    cfg->coinbase_max_bytes = 1000;
+    cfg->pplns_payout_floor_sats = COINBASE_DUST_SATS;
     cfg->pool_btc_address[0] = '\0';
     cfg->pps_sats_per_diff = 0.0;
     cfg->pps_min_network_difficulty = 0.0;
@@ -155,11 +158,22 @@ static int parse_listener(const char *v, stratum_listener_t *out,
         else if (strcmp(fk, "min_diff")     == 0) min_diff = atof(fv);
         else if (strcmp(fk, "initial_diff") == 0) initial = atof(fv);
         else if (strcmp(fk, "max_diff")     == 0) out->vardiff_max = atof(fv);
+        else if (strcmp(fk, "max_coinbase_bytes") == 0) out->max_coinbase_bytes = atoi(fv);
         else if (strcmp(fk, "label")        == 0) copy_str(out->label, sizeof out->label, fv);
         else {
             set_err(errbuf, errlen, "unknown listener field '%s'", fk);
             return -1;
         }
+    }
+    /* Same floor as the server-wide setting: below this no coinbase can hold
+     * even one payout, so the port could not pay anybody at all. 0 means "use
+     * the server-wide one" and is always fine. */
+    if (out->max_coinbase_bytes != 0 && out->max_coinbase_bytes < 200) {
+        set_err(errbuf, errlen,
+                "listener max_coinbase_bytes = %d is too small to hold a "
+                "coinbase and a single payout; omit it to use the server-wide "
+                "coinbase_max_bytes", out->max_coinbase_bytes);
+        return -1;
     }
     if (out->port <= 0 || out->port > 65535) {
         set_err(errbuf, errlen, "listener needs a port between 1 and 65535");
@@ -282,6 +296,8 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "pool_mode")                 == 0) copy_str(cfg->pool_mode, sizeof cfg->pool_mode, v);
         else if (strcmp(k, "pool_btc_address")          == 0) copy_str(cfg->pool_btc_address, sizeof cfg->pool_btc_address, v);
         else if (strcmp(k, "pplns_window_diff_multiple") == 0) cfg->pplns_window_diff_multiple = atof(v);
+        else if (strcmp(k, "coinbase_max_bytes")         == 0) cfg->coinbase_max_bytes = atoi(v);
+        else if (strcmp(k, "pplns_payout_floor_sats")    == 0) cfg->pplns_payout_floor_sats = strtoll(v, NULL, 10);
         else if (strcmp(k, "pps_sats_per_diff")         == 0) cfg->pps_sats_per_diff = atof(v);
         else if (strcmp(k, "pps_min_network_difficulty") == 0) cfg->pps_min_network_difficulty = atof(v);
         else if (strcmp(k, "block_interval_sec")        == 0) cfg->block_interval_sec = atoi(v);
@@ -331,22 +347,41 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
     if (strcmp(cfg->pool_mode, "pplns") == 0) {
         set_err(errbuf, errlen,
                 "config: 'pool_mode = pplns' does not say which rail pays. "
-                "Use 'pplns-thunder' or 'pplns-btc' — an operator runs one or "
-                "the other, and the rail decides what a stratum username is");
+                "Use 'pplns-thunder', 'pplns-btc' or 'pplns-coinbase' — an "
+                "operator runs one, and the rail decides what a stratum "
+                "username is and who ever holds the reward");
         return -5;
     }
+    /* Pays the window straight out of the coinbase of the block that produced
+     * it. Same accounting as the other two, and the pool never receives the
+     * reward at all — so there is no wallet, no payout worker and no maturity
+     * gate, because a reorged block simply never paid. */
+    int mode_cb_window = strcmp(cfg->pool_mode, "pplns-coinbase") == 0;
     int mode_pplns = strcmp(cfg->pool_mode, "pplns-thunder") == 0 ||
-                     strcmp(cfg->pool_mode, "pplns-btc")     == 0;
+                     strcmp(cfg->pool_mode, "pplns-btc")     == 0 ||
+                     mode_cb_window;
     if (strcmp(cfg->pool_mode, "solo")        != 0 &&
         strcmp(cfg->pool_mode, "pps-classic") != 0 &&
         !mode_pplns) {
         set_err(errbuf, errlen,
                 "config: 'pool_mode' must be 'solo', 'pps-classic', "
-                "'pplns-thunder' or 'pplns-btc', got '%s'",
+                "'pplns-thunder', 'pplns-btc' or 'pplns-coinbase', got '%s'",
                 cfg->pool_mode);
         return -5;
     }
-    if (mode_pplns) {
+    if (mode_cb_window && cfg->pool_btc_address[0] != '\0') {
+        /* Not a harmless leftover. The whole claim of this mode is that the
+         * pool never holds the reward, and a configured pool wallet is the
+         * shape of a pool that does — most likely a mode switched in place
+         * without the rest of the config following. Refusing beats running a
+         * custodial-looking pool that quietly is not one. */
+        set_err(errbuf, errlen,
+                "config: 'pool_btc_address' must not be set when "
+                "pool_mode=pplns-coinbase — this mode pays miners directly "
+                "from the coinbase and the pool never receives the reward");
+        return -9;
+    }
+    if (mode_pplns && !mode_cb_window) {
         /* Same custody shape as pps-classic: the coinbase pays the pool, and
          * the payout worker distributes. Without an address every rendered
          * coinbase would fail at runtime instead of here. */
@@ -356,6 +391,32 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                     cfg->pool_mode);
             return -9;
         }
+    }
+    if (mode_cb_window) {
+        /* The coinbase must have room for the transaction, the commitments
+         * and at least one payout. Below that no block can pay anyone, which
+         * is a pool that cannot run rather than one that runs badly. */
+        if (cfg->coinbase_max_bytes < 200) {
+            set_err(errbuf, errlen,
+                    "config: 'coinbase_max_bytes' = %d is too small to hold a "
+                    "coinbase and a single payout; 1000 is the default and a "
+                    "production coinbase-direct pool reports 721-817 bytes "
+                    "paying up to 16 miners",
+                    cfg->coinbase_max_bytes);
+            return -14;
+        }
+        /* A negative floor is a typo, not a policy. Zero is legitimate -- it
+         * means "pay anything the dust limit allows" -- so only reject below
+         * that, and let coinbase.c do the clamp up to the dust limit so the
+         * floor has one definition. */
+        if (cfg->pplns_payout_floor_sats < 0) {
+            set_err(errbuf, errlen,
+                    "config: 'pplns_payout_floor_sats' = %lld must be >= 0",
+                    (long long)cfg->pplns_payout_floor_sats);
+            return -15;
+        }
+    }
+    if (mode_pplns) {
         if (!(cfg->pplns_window_diff_multiple > 0.0)) {
             set_err(errbuf, errlen,
                     "config: 'pplns_window_diff_multiple' must be > 0, got %g",

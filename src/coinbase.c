@@ -500,7 +500,6 @@ int coinbase_network_is_mainnet(const char *network) {
 /* Bitcoin's standard relay dust threshold for legacy outputs. Below this
  * the operator fee output would not be relayed; we collapse to a single
  * miner-only output in that case. */
-#define COINBASE_DUST_SATS 546
 
 void coinbase_parts_free(coinbase_parts_t *p) {
     if (!p) return;
@@ -712,27 +711,401 @@ static int rd_u64(const uint8_t *buf, size_t len, size_t *off, uint64_t *val) {
     return 0;
 }
 
-int coinbase_build_from_template(const char *coinbase_tx_hex,
-                                 const char *miner_address,
-                                 const char *operator_address,
-                                 int fee_bps,
-                                 const char *coinbase_tag,
-                                 size_t extranonce1_size,
-                                 size_t extranonce2_size,
-                                 coinbase_parts_t *out,
-                                 int *out_has_witness,
-                                 int64_t *out_miner_sats,
-                                 int64_t *out_fee_sats,
-                                 char *errbuf, size_t errlen) {
-    if (!out || !coinbase_tx_hex || !miner_address) {
+/* ---------- coinbase-direct PPLNS ---------- */
+
+/* One concrete output the reward is being replaced with. */
+typedef struct {
+    uint8_t spk[64];
+    size_t  spk_len;
+    int64_t sats;
+} cb_repl_out_t;
+
+/* Turn a template's reward into the outputs that replace it.
+ *
+ * A callback rather than an argument because the split depends on the reward,
+ * and the reward is only known once the template has been parsed -- so the
+ * caller cannot compute it up front, and the parser should not have to know
+ * whether it is paying one miner or a whole window. */
+typedef int (*cb_repl_fn)(void *ctx, int64_t reward_sats, size_t fixed_bytes,
+                          cb_repl_out_t *out, size_t cap, size_t *out_n,
+                          char *errbuf, size_t errlen);
+
+/* Serialized size of one output: value + the scriptPubKey's length prefix +
+ * the script itself. */
+static size_t out_ser_size(size_t spk_len) {
+    size_t vi = spk_len < 253 ? 1 : (spk_len <= 0xffff ? 3 : 5);
+    return 8 + vi + spk_len;
+}
+
+/* Payees plus the operator. */
+#define CB_MAX_REPL_OUTS (COINBASE_MAX_PAYOUT_OUTPUTS + 1)
+
+/* Turn a window into concrete outputs: fee off the top, the payout floor and
+ * the byte budget applied largest-first, and whatever cannot be paid
+ * redistributed across the miners who could be.
+ *
+ * Shared by the from-scratch and from-template builders precisely so the two
+ * cannot drift. A pool mining a drivechain template and one mining plain
+ * bitcoind must split a window identically; the only difference between them
+ * is which outputs are preserved around the payout, and that is not this
+ * function's business. */
+static int resolve_window_outputs(int64_t value_sats,
+                                  const coinbase_payee_t *payees, size_t n_payees,
+                                  const char *operator_address, int fee_bps,
+                                  size_t max_coinbase_bytes, size_t fixed_bytes,
+                                  int64_t payout_floor_sats,
+                                  cb_repl_out_t *out, size_t cap, size_t *out_n,
+                                  coinbase_window_result_t *res,
+                                  char *errbuf, size_t errlen) {
+    coinbase_window_result_t r;
+    memset(&r, 0, sizeof r);
+    if (res) *res = r;
+    if (out_n) *out_n = 0;
+    if (!out || cap < 2 || !payees || n_payees == 0) {
+        set_err(errbuf, errlen, "window is empty: nobody to pay");
+        return -1;
+    }
+    if (value_sats <= 0) {
+        set_err(errbuf, errlen, "value_sats must be positive");
+        return -1;
+    }
+    if (max_coinbase_bytes == 0) max_coinbase_bytes = COINBASE_DEFAULT_MAX_BYTES;
+    /* Never below the relay dust limit, whatever the operator configured: an
+     * output under it would not be relayed, so "paying" it pays nobody. */
+    if (payout_floor_sats < COINBASE_DUST_SATS)
+        payout_floor_sats = COINBASE_DUST_SATS;
+    /* What is left for payouts once everything that is not a payout has been
+     * paid for: the transaction envelope, the scriptSig, the operator output
+     * and — the term that actually binds on a drivechain pool — the
+     * commitment OP_RETURNs the template already carries. */
+    size_t payout_budget = max_coinbase_bytes > fixed_bytes
+                         ? max_coinbase_bytes - fixed_bytes : 0;
+
+    int64_t fee_sats = 0;
+    cb_repl_out_t op;
+    memset(&op, 0, sizeof op);
+    int has_operator = 0;
+    if (operator_address && operator_address[0] && fee_bps > 0) {
+        int64_t f = (value_sats * (int64_t)fee_bps) / 10000;
+        if (f >= COINBASE_DUST_SATS) {
+            if (coinbase_address_to_script(operator_address, op.spk,
+                                           sizeof op.spk, &op.spk_len,
+                                           errbuf, errlen) < 0) return -1;
+            fee_sats = f;
+            has_operator = 1;
+        }
+    }
+
+    int64_t payable = value_sats - fee_sats;
+    int64_t claimed = 0;
+    for (size_t i = 0; i < n_payees; ++i) {
+        if (!payees[i].address || !payees[i].address[0]) {
+            set_err(errbuf, errlen, "payee %zu has no address", i);
+            return -1;
+        }
+        if (payees[i].sats < 0) {
+            set_err(errbuf, errlen, "payee %zu has a negative amount", i);
+            return -1;
+        }
+        claimed += payees[i].sats;
+    }
+    if (claimed != payable) {
+        set_err(errbuf, errlen,
+                "payees sum to %lld but the block pays %lld after a %lld fee",
+                (long long)claimed, (long long)payable, (long long)fee_sats);
+        return -1;
+    }
+
+    /* Paid in the order the CALLER gave, not in one chosen here.
+     *
+     * This used to sort largest-first internally, so the floor and the byte
+     * budget always fell on the smallest claims. That is the right default and
+     * it is still what pplns.c hands over -- but it can only ever be a
+     * default, because "who gets the slots a coinbase has room for" is policy,
+     * and a policy fixed inside the builder cannot be changed without changing
+     * the builder. Specifically it made the slots unwinnable: a large miner's
+     * share of the window beats any priority a small one can accumulate, so
+     * the same addresses take the same slots every block for ever.
+     *
+     * The caller now owns the order and this pays greedily down it. See
+     * pplns_order_claims(). */
+    size_t  n = 0;
+    size_t  payout_bytes = 0;
+    int64_t dropped = 0;
+    for (size_t k = 0; k < n_payees; ++k) {
+        const coinbase_payee_t *pe = &payees[k];
+        if (pe->sats < payout_floor_sats) {
+            r.dropped_below_floor++; dropped += pe->sats; continue;
+        }
+        if (n + 1 >= cap) {          /* storage, not policy */
+            r.dropped_capped++; dropped += pe->sats; continue;
+        }
+        /* Resolve first: an output's cost depends on its address type, and a
+         * P2TR payout is 43 bytes against a P2WPKH one's 31. Budgeting at a
+         * fixed per-output figure would let more through than actually fit. */
+        if (coinbase_address_to_script(pe->address, out[n].spk,
+                                       sizeof out[n].spk, &out[n].spk_len,
+                                       errbuf, errlen) < 0) {
+            return -1;
+        }
+        size_t cost = out_ser_size(out[n].spk_len);
+        if (payout_bytes + cost > payout_budget) {
+            /* No room. Keep going rather than breaking: a later payee may be
+             * a cheaper address type and still fit, and dropping it would
+             * forfeit money that could have been paid. */
+            r.dropped_capped++; dropped += pe->sats; continue;
+        }
+        payout_bytes += cost;
+        out[n].sats = pe->sats;
+        r.paid_sats += pe->sats;
+        /* Record WHICH payee this was, not just that one more was paid. The
+         * loop above `continue`s past a payee it cannot pay, so the paid set
+         * is a subsequence of `payees` rather than a prefix, and a caller
+         * reconstructing it from paid_count alone credits the wrong miners.
+         * See coinbase_window_result_t.paid_payee. */
+        if (k < COINBASE_MAX_PAYOUT_OUTPUTS) r.paid_payee[k] = 1;
+        n++; r.paid_count++;
+    }
+
+    if (r.paid_count == 0) {
+        set_err(errbuf, errlen,
+                "no payee fits: %zu-byte coinbase budget leaves %zu bytes for "
+                "payouts after %zu bytes of transaction and commitments, and "
+                "nothing clears the %lld-sat payout floor",
+                max_coinbase_bytes, payout_budget, fixed_bytes,
+                (long long)payout_floor_sats);
+        return -1;
+    }
+
+    /* Whatever could not be paid is REDISTRIBUTED ACROSS THE MINERS WHO COULD.
+     *
+     * It used to go to the operator, on the reasoning that value not paid out
+     * is value destroyed and the operator output is the only place left. The
+     * first half is true; the second was wrong, and the measurement that
+     * settled it is worth keeping. With 100 miners on a 1/n hashrate spread
+     * and the default 1000-byte budget, 28 are paid, 72 are cut by the byte
+     * cap, NONE by the dust floor -- and the operator received 25% of the
+     * block on a 1% fee. The rule was defended as a dust policy and dust was
+     * never involved.
+     *
+     * Two things made it indefensible rather than merely harsh. A miner's
+     * window share tracks its hashrate, so the same miners fall below the
+     * cut every block: it pays them nothing ever, rather than occasionally.
+     * And it paid the operator MORE the smaller the coinbase, so an operator
+     * maximised revenue by starving its own miners -- 46% of the block at a
+     * 400-byte budget against 2% at 3000.
+     *
+     * Redistributing keeps every property the forfeit had. The block still
+     * pays out to the satoshi, the pool still holds nothing, and no ledger
+     * appears. What changes is only who receives what the coinbase had no
+     * room for: the other miners, not the house.
+     *
+     * (LayerTwo-Labs/simplepool#76, and Wired4ncer, who ran the pool that
+     * showed it.) */
+    if (dropped > 0) {
+        /* Scale the survivors up to spend `payable` exactly. Amounts do not
+         * affect an output's size -- a value is 8 bytes whatever it holds --
+         * so this cannot break the byte budget just measured. */
+        int64_t assigned = 0;
+        for (size_t i = 0; i < n; ++i) {
+            out[i].sats = (int64_t)((double)payable *
+                                    ((double)out[i].sats / (double)r.paid_sats));
+            assigned += out[i].sats;
+        }
+        /* Truncation again, and the same rule as everywhere else: the
+         * remainder goes to the largest surviving claim. Found by scanning
+         * rather than assumed to be out[0] -- that was only true while this
+         * function did its own largest-first sort, and a caller-supplied
+         * order can put anyone first. */
+        if (assigned < payable) {
+            size_t big = 0;
+            for (size_t i = 1; i < n; ++i)
+                if (out[i].sats > out[big].sats) big = i;
+            out[big].sats += payable - assigned;
+        }
+        else if (assigned > payable) {
+            set_err(errbuf, errlen, "internal: redistribution overshot");
+            return -1;
+        }
+        r.redistributed_sats = dropped;
+        r.paid_sats = payable;
+    }
+
+    /* The operator now receives its fee and nothing else. */
+    int64_t operator_out = fee_sats;
+    if (operator_out > 0 && !has_operator) {
+        if (!operator_address || !operator_address[0]) {
+            set_err(errbuf, errlen,
+                    "a %lld-sat operator fee has no operator_address to "
+                    "receive it", (long long)operator_out);
+            return -1;
+        }
+        if (coinbase_address_to_script(operator_address, op.spk, sizeof op.spk,
+                                       &op.spk_len, errbuf, errlen) < 0) return -1;
+        has_operator = 1;
+    }
+    if (has_operator && operator_out > 0) {
+        if (n >= cap) { set_err(errbuf, errlen, "internal: repl cap"); return -1; }
+        op.sats = operator_out;
+        out[n++] = op;
+    }
+
+    r.fee_sats = fee_sats;
+    if (out_n) *out_n = n;
+    if (res) *res = r;
+    return 0;
+}
+
+int coinbase_build_window(uint32_t height, int64_t value_sats,
+                          const coinbase_payee_t *payees, size_t n_payees,
+                          const char *operator_address, int fee_bps,
+                          const char *witness_commitment_hex,
+                          const char *coinbase_tag,
+                          size_t extranonce1_size, size_t extranonce2_size,
+                          size_t max_coinbase_bytes,
+                          int64_t payout_floor_sats,
+                          coinbase_parts_t *out,
+                          coinbase_window_result_t *res,
+                          char *errbuf, size_t errlen) {
+    if (res) { coinbase_window_result_t z; memset(&z, 0, sizeof z); *res = z; }
+    if (!out) { set_err(errbuf, errlen, "null arg"); return -1; }
+    out->cb1 = NULL; out->cb1_len = 0;
+    out->cb2 = NULL; out->cb2_len = 0;
+
+    /* Everything the coinbase costs before a single miner is paid. The byte
+     * budget is the whole transaction, so the payouts get what is left. */
+    size_t wc_probe_len = 0;
+    if (witness_commitment_hex && *witness_commitment_hex)
+        wc_probe_len = strlen(witness_commitment_hex) / 2;
+    size_t tag_len_probe = 0;
+    if (coinbase_tag && *coinbase_tag) {
+        size_t t = strlen(coinbase_tag);
+        tag_len_probe = (t > 75 ? 75 : t) + 1;
+    }
+    uint8_t hp_probe[8];
+    size_t ss_probe = bip34_height_push(height, hp_probe) + tag_len_probe
+                    + extranonce1_size + extranonce2_size;
+    size_t fixed = 4 + 1 + 36 + (ss_probe < 253 ? 1 : 3) + ss_probe
+                 + 4 + 3 /* output-count varint, conservatively */ + 4;
+    if (wc_probe_len) fixed += out_ser_size(wc_probe_len);
+    /* Reserve the operator output whether or not it turns out to be needed:
+     * forfeits land on it, and forfeits are exactly what happens when the
+     * budget bites. Conservative by ~31 bytes if it is absent. */
+    if (operator_address && operator_address[0]) fixed += out_ser_size(34);
+
+    /* Same resolver the template builder uses: the split is one rule, in one
+     * place, whatever kind of coinbase it ends up in. */
+    cb_repl_out_t repl[CB_MAX_REPL_OUTS];
+    size_t n_repl = 0;
+    if (resolve_window_outputs(value_sats, payees, n_payees, operator_address,
+                               fee_bps, max_coinbase_bytes, fixed,
+                               payout_floor_sats, repl,
+                               CB_MAX_REPL_OUTS, &n_repl, res,
+                               errbuf, errlen) < 0) {
+        return -1;
+    }
+
+    bbuf_t outs;
+    bbuf_init(&outs);
+    uint64_t n_outputs = 0;
+    int64_t  emitted = 0;
+    for (size_t i = 0; i < n_repl; ++i) {
+        if (bbuf_push_u64_le(&outs, (uint64_t)repl[i].sats) < 0) goto oom;
+        if (bbuf_push_varint(&outs, repl[i].spk_len) < 0) goto oom;
+        if (bbuf_push(&outs, repl[i].spk, repl[i].spk_len) < 0) goto oom;
+        n_outputs++;
+        emitted += repl[i].sats;
+    }
+
+    uint8_t wc_buf[256];
+    size_t  wc_len = 0;
+    if (witness_commitment_hex && *witness_commitment_hex) {
+        if (hex_decode(witness_commitment_hex, wc_buf, sizeof wc_buf, &wc_len) < 0) {
+            bbuf_free(&outs);
+            set_err(errbuf, errlen, "bad witness commitment hex");
+            return -1;
+        }
+        if (bbuf_push_u64_le(&outs, 0) < 0) goto oom;
+        if (bbuf_push_varint(&outs, wc_len) < 0) goto oom;
+        if (bbuf_push(&outs, wc_buf, wc_len) < 0) goto oom;
+        n_outputs++;
+    }
+
+    /* Every satoshi is accounted for, or the block burns the difference. */
+    if (emitted != value_sats) {
+        bbuf_free(&outs);
+        set_err(errbuf, errlen, "internal: outputs sum to %lld, block pays %lld",
+                (long long)emitted, (long long)value_sats);
+        return -1;
+    }
+
+    uint8_t height_push[8];
+    size_t  height_push_len = bip34_height_push(height, height_push);
+    uint8_t tag_push[80];
+    size_t  tag_push_len = 0;
+    if (coinbase_tag && *coinbase_tag) {
+        size_t tlen = strlen(coinbase_tag);
+        if (tlen > 75) tlen = 75;
+        tag_push[0] = (uint8_t)tlen;
+        memcpy(tag_push + 1, coinbase_tag, tlen);
+        tag_push_len = tlen + 1;
+    }
+    size_t en_total = extranonce1_size + extranonce2_size;
+    size_t script_sig_len = height_push_len + tag_push_len + en_total;
+    if (script_sig_len < 2 || script_sig_len > 100) {
+        bbuf_free(&outs);
+        set_err(errbuf, errlen, "coinbase scriptSig length %zu out of range "
+                "(height %zu + tag %zu + extranonce %zu)",
+                script_sig_len, height_push_len, tag_push_len, en_total);
+        return -1;
+    }
+
+    bbuf_t c1, c2;
+    bbuf_init(&c1);
+    bbuf_init(&c2);
+    if (bbuf_push_u32_le(&c1, 2) < 0) goto oom2;
+    if (bbuf_push_varint(&c1, 1) < 0) goto oom2;
+    for (int i = 0; i < 32; ++i) if (bbuf_push_u8(&c1, 0) < 0) goto oom2;
+    if (bbuf_push_u32_le(&c1, 0xffffffffu) < 0) goto oom2;
+    if (bbuf_push_varint(&c1, script_sig_len) < 0) goto oom2;
+    if (bbuf_push(&c1, height_push, height_push_len) < 0) goto oom2;
+    if (tag_push_len && bbuf_push(&c1, tag_push, tag_push_len) < 0) goto oom2;
+    if (bbuf_push_u32_le(&c2, 0xffffffffu) < 0) goto oom2;
+    if (bbuf_push_varint(&c2, n_outputs) < 0) goto oom2;
+    if (bbuf_push(&c2, outs.data, outs.len) < 0) goto oom2;
+    if (bbuf_push_u32_le(&c2, 0) < 0) goto oom2;
+
+    bbuf_free(&outs);
+    out->cb1 = c1.data; out->cb1_len = c1.len;
+    out->cb2 = c2.data; out->cb2_len = c2.len;
+    return 0;
+
+oom2:
+    bbuf_free(&c1); bbuf_free(&c2);
+oom:
+    bbuf_free(&outs);
+    set_err(errbuf, errlen, "oom");
+    return -1;
+}
+
+static int build_from_template_impl(const char *coinbase_tx_hex,
+                                    cb_repl_fn repl_fn, void *repl_ctx,
+                                    const char *coinbase_tag,
+                                    size_t extranonce1_size,
+                                    size_t extranonce2_size,
+                                    coinbase_parts_t *out,
+                                    int *out_has_witness,
+                                    char *errbuf, size_t errlen) {
+    if (!out || !coinbase_tx_hex || !repl_fn) {
         set_err(errbuf, errlen, "null arg");
         return -1;
     }
     out->cb1 = NULL; out->cb1_len = 0;
     out->cb2 = NULL; out->cb2_len = 0;
     if (out_has_witness) *out_has_witness = 0;
-    if (out_miner_sats)  *out_miner_sats  = 0;
-    if (out_fee_sats)    *out_fee_sats    = 0;
+
+    cb_repl_out_t repl[CB_MAX_REPL_OUTS];
+    size_t n_repl = 0;
 
     struct cb_out { uint64_t value; size_t spk_off; size_t spk_len; int op_return; };
 
@@ -827,25 +1200,43 @@ int coinbase_build_from_template(const char *coinbase_tx_hex,
     }
     int64_t reward = (int64_t)outs[reward_idx].value;
 
-    /* Resolve miner scriptPubKey + fee split (mirrors coinbase_build_split). */
-    uint8_t miner_spk[64]; size_t miner_spk_len = 0;
-    if (coinbase_address_to_script(miner_address, miner_spk, sizeof miner_spk,
-                                   &miner_spk_len, errbuf, errlen) < 0) goto done;
+    /* What this coinbase costs before any miner is paid, so the resolver can
+     * spend what is left. On a drivechain pool the dominant term here is the
+     * commitment OP_RETURNs the enforcer put in the template: they are why
+     * the same 16 payouts can fit under one budget and not another, and why
+     * a cap counted in outputs cannot express the limit at all. */
+    size_t tag_probe = 0;
+    if (coinbase_tag && *coinbase_tag) {
+        size_t t = strlen(coinbase_tag);
+        tag_probe = (t > 75 ? 75 : t) + 1;
+    }
+    size_t ss_probe = (size_t)ss_len + tag_probe
+                    + extranonce1_size + extranonce2_size;
+    size_t fixed_bytes = 4 + 1 + 36 + (ss_probe < 253 ? 1 : 3) + ss_probe
+                       + 4 + 3 /* output-count varint, conservatively */ + 4;
+    for (uint64_t i = 0; i < vout; i++) {
+        if ((int64_t)i == reward_idx) continue;
+        fixed_bytes += out_ser_size(outs[i].spk_len);
+    }
 
-    int64_t fee_sats = 0, miner_sats = reward;
-    uint8_t operator_spk[64]; size_t operator_spk_len = 0;
-    int has_operator = 0;
-    if (operator_address && operator_address[0] && fee_bps > 0 && reward > 0) {
-        fee_sats = (reward * (int64_t)fee_bps) / 10000;
-        if (fee_sats >= COINBASE_DUST_SATS) {
-            if (coinbase_address_to_script(operator_address, operator_spk,
-                                           sizeof operator_spk, &operator_spk_len,
-                                           errbuf, errlen) < 0) goto done;
-            miner_sats = reward - fee_sats;
-            has_operator = 1;
-        } else {
-            fee_sats = 0;
-        }
+    /* Hand the reward to the caller's resolver: one miner and a fee, or a
+     * whole PPLNS window. Either way it comes back as concrete outputs, and
+     * this function does not care which it was. */
+    if (repl_fn(repl_ctx, reward, fixed_bytes, repl, CB_MAX_REPL_OUTS, &n_repl,
+                errbuf, errlen) < 0) goto done;
+    if (n_repl == 0) {
+        set_err(errbuf, errlen, "resolver produced no outputs");
+        goto done;
+    }
+    /* Whatever the split, it must spend the reward exactly: paying out less
+     * than the template allows forfeits the difference to nobody. */
+    int64_t repl_total = 0;
+    for (size_t i = 0; i < n_repl; ++i) repl_total += repl[i].sats;
+    if (repl_total != reward) {
+        set_err(errbuf, errlen,
+                "replacement outputs sum to %lld, template reward is %lld",
+                (long long)repl_total, (long long)reward);
+        goto done;
     }
 
     /* Optional coinbase tag, appended into the scriptSig. */
@@ -878,16 +1269,13 @@ int coinbase_build_from_template(const char *coinbase_tx_hex,
     if (tag_push_len && bbuf_push(&c1, tag_push, tag_push_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
 
     /* Outputs: replace the reward output, preserve everything else in order. */
-    uint64_t new_vout = vout + (has_operator ? 1u : 0u);
+    uint64_t new_vout = vout - 1u + (uint64_t)n_repl;
     for (uint64_t i = 0; i < vout; i++) {
         if ((int64_t)i == reward_idx) {
-            if (bbuf_push_u64_le(&ob, (uint64_t)miner_sats) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
-            if (bbuf_push_varint(&ob, miner_spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
-            if (bbuf_push(&ob, miner_spk, miner_spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
-            if (has_operator) {
-                if (bbuf_push_u64_le(&ob, (uint64_t)fee_sats) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
-                if (bbuf_push_varint(&ob, operator_spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
-                if (bbuf_push(&ob, operator_spk, operator_spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+            for (size_t k = 0; k < n_repl; ++k) {
+                if (bbuf_push_u64_le(&ob, (uint64_t)repl[k].sats) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+                if (bbuf_push_varint(&ob, repl[k].spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+                if (bbuf_push(&ob, repl[k].spk, repl[k].spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
             }
         } else {
             if (bbuf_push_u64_le(&ob, outs[i].value) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
@@ -906,8 +1294,6 @@ int coinbase_build_from_template(const char *coinbase_tx_hex,
     out->cb1 = c1.data; out->cb1_len = c1.len; c1.data = NULL;
     out->cb2 = c2.data; out->cb2_len = c2.len; c2.data = NULL;
     if (out_has_witness) *out_has_witness = has_witness;
-    if (out_miner_sats)  *out_miner_sats  = miner_sats;
-    if (out_fee_sats)    *out_fee_sats    = fee_sats;
     ret = 0;
 
 done:
@@ -919,6 +1305,138 @@ done:
     return ret;
 }
 
+
+/* ---- resolvers ---------------------------------------------------------- */
+
+/* One miner and an optional operator fee: the original behaviour, unchanged. */
+typedef struct {
+    const char *miner_address;
+    const char *operator_address;
+    int         fee_bps;
+    int64_t    *out_miner_sats;
+    int64_t    *out_fee_sats;
+} repl_single_ctx_t;
+
+static int repl_single(void *vctx, int64_t reward, size_t fixed_bytes,
+                       cb_repl_out_t *out, size_t cap, size_t *out_n,
+                       char *errbuf, size_t errlen) {
+    repl_single_ctx_t *c = vctx;
+    (void)fixed_bytes;   /* one miner and a fee always fit */
+    if (cap < 2) { set_err(errbuf, errlen, "internal: repl cap"); return -1; }
+    size_t n = 0;
+    int64_t fee_sats = 0, miner_sats = reward;
+    cb_repl_out_t op;
+    memset(&op, 0, sizeof op);
+    if (c->operator_address && c->operator_address[0] && c->fee_bps > 0 && reward > 0) {
+        int64_t f = (reward * (int64_t)c->fee_bps) / 10000;
+        if (f >= COINBASE_DUST_SATS) {
+            if (coinbase_address_to_script(c->operator_address, op.spk,
+                                           sizeof op.spk, &op.spk_len,
+                                           errbuf, errlen) < 0) return -1;
+            fee_sats = f;
+            miner_sats = reward - f;
+            op.sats = f;
+        }
+    }
+    if (coinbase_address_to_script(c->miner_address, out[n].spk,
+                                   sizeof out[n].spk, &out[n].spk_len,
+                                   errbuf, errlen) < 0) return -1;
+    out[n].sats = miner_sats;
+    n++;
+    if (fee_sats > 0) out[n++] = op;
+    *out_n = n;
+    if (c->out_miner_sats) *c->out_miner_sats = miner_sats;
+    if (c->out_fee_sats)   *c->out_fee_sats   = fee_sats;
+    return 0;
+}
+
+/* A whole PPLNS window, on exactly the terms coinbase_build_window() uses --
+ * the same resolver, so a drivechain pool and a plain-bitcoind pool cannot
+ * split a window differently. */
+typedef struct {
+    const coinbase_payee_t   *payees;
+    size_t                    n_payees;
+    const char               *operator_address;
+    int                       fee_bps;
+    size_t                    max_coinbase_bytes;
+    int64_t                   payout_floor_sats;
+    coinbase_window_result_t *res;
+} repl_window_ctx_t;
+
+static int repl_window(void *vctx, int64_t reward, size_t fixed_bytes,
+                       cb_repl_out_t *out, size_t cap, size_t *out_n,
+                       char *errbuf, size_t errlen) {
+    repl_window_ctx_t *c = vctx;
+    return resolve_window_outputs(reward, c->payees, c->n_payees,
+                                  c->operator_address, c->fee_bps,
+                                  c->max_coinbase_bytes, fixed_bytes,
+                                  c->payout_floor_sats,
+                                  out, cap, out_n, c->res, errbuf, errlen);
+}
+
+/* ---- public template builders ------------------------------------------- */
+
+int coinbase_build_from_template(const char *coinbase_tx_hex,
+                                 const char *miner_address,
+                                 const char *operator_address,
+                                 int fee_bps,
+                                 const char *coinbase_tag,
+                                 size_t extranonce1_size,
+                                 size_t extranonce2_size,
+                                 coinbase_parts_t *out,
+                                 int *out_has_witness,
+                                 int64_t *out_miner_sats,
+                                 int64_t *out_fee_sats,
+                                 char *errbuf, size_t errlen) {
+    if (!miner_address) { set_err(errbuf, errlen, "null arg"); return -1; }
+    if (out_miner_sats) *out_miner_sats = 0;
+    if (out_fee_sats)   *out_fee_sats   = 0;
+    repl_single_ctx_t ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.miner_address = miner_address;
+    ctx.operator_address = operator_address;
+    ctx.fee_bps = fee_bps;
+    ctx.out_miner_sats = out_miner_sats;
+    ctx.out_fee_sats = out_fee_sats;
+    return build_from_template_impl(coinbase_tx_hex, repl_single, &ctx,
+                                    coinbase_tag, extranonce1_size,
+                                    extranonce2_size, out, out_has_witness,
+                                    errbuf, errlen);
+}
+
+int coinbase_build_window_from_template(const char *coinbase_tx_hex,
+                                        const coinbase_payee_t *payees,
+                                        size_t n_payees,
+                                        const char *operator_address,
+                                        int fee_bps,
+                                        const char *coinbase_tag,
+                                        size_t extranonce1_size,
+                                        size_t extranonce2_size,
+                                        size_t max_coinbase_bytes,
+                                        int64_t payout_floor_sats,
+                                        coinbase_parts_t *out,
+                                        int *out_has_witness,
+                                        coinbase_window_result_t *res,
+                                        char *errbuf, size_t errlen) {
+    if (res) { coinbase_window_result_t z; memset(&z, 0, sizeof z); *res = z; }
+    if (!payees || n_payees == 0) {
+        set_err(errbuf, errlen, "window is empty: nobody to pay");
+        return -1;
+    }
+    repl_window_ctx_t ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.payees = payees;
+    ctx.n_payees = n_payees;
+    ctx.operator_address = operator_address;
+    ctx.fee_bps = fee_bps;
+    ctx.max_coinbase_bytes = max_coinbase_bytes;
+    ctx.payout_floor_sats = payout_floor_sats;
+    ctx.res = res;
+    return build_from_template_impl(coinbase_tx_hex, repl_window, &ctx,
+                                    coinbase_tag, extranonce1_size,
+                                    extranonce2_size, out, out_has_witness,
+                                    errbuf, errlen);
+}
 
 /* Count the outputs of a serialized coinbase, split into spendable and
  * OP_RETURN.
@@ -932,6 +1450,116 @@ done:
  *
  * Parses only far enough to walk the output list. Returns 0 on success,
  * negative on malformed input; counts are untouched on failure. */
+/* The reward the template's coinbase actually pays. See coinbase.h for why a
+ * caller must divide this rather than the node's `coinbasevalue` field.
+ *
+ * Implemented on top of the replacement parser rather than a second walk of
+ * the transaction, so it cannot disagree with the builder about which output
+ * is the spendable one -- disagreeing there is the entire failure this
+ * function exists to prevent. */
+static int cb_reward_probe(void *ctx, int64_t reward_sats, size_t fixed_bytes,
+                           cb_repl_out_t *out, size_t cap, size_t *out_n,
+                           char *errbuf, size_t errlen);
+
+size_t coinbase_expected_payout_slots(size_t max_coinbase_bytes,
+                                      const char *coinbase_tx_hex,
+                                      const char *const *addresses,
+                                      size_t n_addresses)
+{
+    size_t budget = max_coinbase_bytes ? max_coinbase_bytes
+                                       : (size_t)COINBASE_DEFAULT_MAX_BYTES;
+    /* The envelope the builder always pays: version, input, scriptSig with a
+     * generous extranonce and tag, output count, locktime, and a reserved
+     * operator output. Deliberately on the pessimistic side -- reserving one
+     * slot too few costs a rotation, reserving one too many costs a payout. */
+    size_t fixed = 160;
+    if (coinbase_tx_hex) {
+        /* Everything the template already spends: its commitments, and the
+         * output being replaced. Counted from the transaction rather than
+         * guessed, because the same 16 payouts cost 817 bytes against four
+         * drivechain OP_RETURNs and 769 against three. */
+        size_t hexlen = strlen(coinbase_tx_hex);
+        fixed += hexlen / 2;
+        /* The spendable output goes away as the payouts arrive, so do not
+         * charge for it twice. One P2WPKH-shaped output, approximately. */
+        if (fixed > 31) fixed -= 31;
+    }
+    if (budget <= fixed) return 1;
+    size_t room = budget - fixed;
+
+    /* Charge each address what it actually costs, in the order the caller
+     * means to pay them. Assuming a fixed 31 bytes was wrong by 24 slots on a
+     * window of taproot addresses. */
+    if (addresses && n_addresses > 0) {
+        size_t used = 0, slots = 0;
+        for (size_t i = 0; i < n_addresses; ++i) {
+            uint8_t spk[64];
+            size_t spk_len = 0;
+            size_t cost;
+            if (!addresses[i] ||
+                coinbase_address_to_script(addresses[i], spk, sizeof spk,
+                                           &spk_len, NULL, 0) < 0) {
+                cost = out_ser_size(22);       /* unreadable: assume P2WPKH */
+            } else {
+                cost = out_ser_size(spk_len);
+            }
+            if (used + cost > room) break;
+            used += cost;
+            slots++;
+        }
+        if (slots < 1) slots = 1;
+        if (slots > COINBASE_MAX_PAYOUT_OUTPUTS) slots = COINBASE_MAX_PAYOUT_OUTPUTS;
+        return slots;
+    }
+
+    /* No window in hand: assume the common case. */
+    size_t slots = room / 31;
+    if (slots < 1) slots = 1;
+    if (slots > COINBASE_MAX_PAYOUT_OUTPUTS) slots = COINBASE_MAX_PAYOUT_OUTPUTS;
+    return slots;
+}
+
+int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_sats) {
+    if (!coinbase_tx_hex || !out_sats) return -1;
+    int spendable = 0;
+    if (coinbase_count_outputs(coinbase_tx_hex, &spendable, NULL) < 0) return -1;
+    if (spendable != 1) return -1;
+
+    int64_t reward = -1;
+    coinbase_parts_t throwaway;
+    char err[256] = {0};
+    /* The replacement machinery hands the callback the reward it computed;
+     * we keep the number and put the output back unchanged. */
+    if (build_from_template_impl(coinbase_tx_hex, cb_reward_probe, &reward,
+                                 NULL, 4, 4, &throwaway, NULL,
+                                 err, sizeof err) < 0) {
+        return -1;
+    }
+    coinbase_parts_free(&throwaway);
+    if (reward < 0) return -1;
+    *out_sats = reward;
+    return 0;
+}
+
+/* Records the reward and re-emits the output the builder would have replaced,
+ * so the throwaway coinbase this produces is byte-identical to the input. */
+static int cb_reward_probe(void *ctx, int64_t reward_sats, size_t fixed_bytes,
+                           cb_repl_out_t *out, size_t cap, size_t *out_n,
+                           char *errbuf, size_t errlen) {
+    (void)fixed_bytes;
+    if (!ctx || !out || cap < 1) {
+        set_err(errbuf, errlen, "reward probe: bad arg");
+        return -1;
+    }
+    *(int64_t *)ctx = reward_sats;
+    /* An OP_TRUE output: never broadcast, only measured. */
+    out[0].sats = reward_sats;
+    out[0].spk[0] = 0x51;
+    out[0].spk_len = 1;
+    if (out_n) *out_n = 1;
+    return 0;
+}
+
 int coinbase_count_outputs(const char *tx_hex, int *spendable_out,
                            int *op_return_out) {
     if (!tx_hex) return -1;

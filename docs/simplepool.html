@@ -267,14 +267,17 @@ footer .wrap > p { max-width: 46rem; }
     <p class="lede">
       A single-binary stratum server in pure C11. It hands work to your ASICs,
       checks every submission itself, submits found blocks, and records the whole
-      thing in a SQLite file you are allowed to read. It runs in four modes,
-      which differ in who carries the variance — <strong>solo</strong>, where the
+      thing in a SQLite file you are allowed to read. It runs in five modes,
+      which differ in who carries the variance and who holds the money in
+      between — <strong>solo</strong>, where the
       miner who finds a block is paid in that block's own coinbase;
       <strong>pps-classic</strong>, where every accepted share earns a fixed,
       derivable amount and the operator absorbs the difference out of a reserve;
-      and <strong>pplns-thunder</strong> / <strong>pplns-btc</strong>, where a
+      <strong>pplns-thunder</strong> / <strong>pplns-btc</strong>, where a
       matured block is divided among the shares that produced it, so the pool
-      never owes more than it has just been paid.
+      never owes more than it has just been paid; and
+      <strong>pplns-coinbase</strong>, the same accounting with the custody
+      taken out — the block's own coinbase pays the whole window directly.
     </p>
     <div class="badges">
       <span class="badge">C11 · no runtime dependencies beyond libc, sqlite3, libcurl, hiredis</span>
@@ -292,15 +295,16 @@ footer .wrap > p { max-width: 46rem; }
   <div class="toc-title">Contents</div>
   <ol>
     <li><a href="#what">What it is</a></li>
-    <li><a href="#modes">The four modes</a></li>
+    <li><a href="#modes">The five modes</a></li>
     <li><a href="#stack">The stack</a></li>
     <li><a href="#lifecycle">Life of a share</a></li>
     <li><a href="#nonce">Dividing the search space</a></li>
     <li><a href="#difficulty">Difficulty &amp; vardiff</a></li>
     <li><a href="#solo">Solo mode</a></li>
     <li><a href="#pps">pps-classic mode</a></li>
+    <li><a href="#sequences">How each mode pays</a></li>
     <li><a href="#fees">Where the fee lands</a></li>
-    <li><a href="#payouts">Payouts over Thunder</a></li>
+    <li><a href="#payouts">Payouts</a></li>
     <li><a href="#audit">Auditing every number</a></li>
     <li><a href="#data">The data model</a></li>
     <li><a href="#connect">Connect a miner</a></li>
@@ -369,7 +373,7 @@ footer .wrap > p { max-width: 46rem; }
 
 <!-- ========================================================= 2. the modes == -->
 <section id="modes">
-  <h2>The four modes</h2>
+  <h2>The five modes</h2>
   <p class="section-sub">
     One config key — <code>pool_mode</code> — decides the shape of the coinbase,
     what a stratum username must be, when any off-chain balance moves, and
@@ -449,70 +453,150 @@ footer .wrap > p { max-width: 46rem; }
         <dt>Needs</dt><dd><code>bitcoind</code>, and the enforcer with <code>--enable-wallet</code></dd>
       </dl>
     </div>
+
+    <div class="mode">
+      <h3><code>pool_mode = pplns-coinbase</code></h3>
+      <p>
+        The same accounting again, with the custody taken out. There is no pool
+        wallet, no payout worker, no ledger row and no maturity wait: the
+        block's own coinbase pays the whole window directly, one output per
+        miner, largest claim first. A reorged block simply never paid, so there
+        is nothing to claw back.
+      </p>
+      <p>
+        The window is snapshotted onto the job when the template is built, so
+        the coinbase pays the work that exists <em>now</em>. On a drivechain
+        the coinbase comes from the enforcer and its BIP300/301 commitment
+        <code>OP_RETURN</code>s are preserved byte-for-byte — only the
+        enforcer's own reward output is replaced, by the window.
+      </p>
+      <dl>
+        <dt>Stratum username</dt><dd>your Bitcoin address, <code>bc1q…</code> or base58</dd>
+        <dt>Who gets paid</dt><dd>everyone in the window who clears the payout floor</dd>
+        <dt>When</dt><dd>in the block itself — there is no "when"</dd>
+        <dt>Variance</dt><dd>the miners'</dd>
+        <dt>Shares are</dt><dd>a claim on the next block this pool finds</dd>
+        <dt>Needs</dt><dd><code>bitcoind</code>, or the enforcer for a drivechain</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="warnbox">
+    <span class="label">pplns-coinbase pays what one block cannot fit to the other miners</span>
+    <p>
+      A coinbase is a fixed budget of bytes, and every payout spends some of
+      it. Two limits follow: <code>coinbase_max_bytes</code> (default 1000)
+      budgets the whole serialized coinbase, commitments included, because that
+      is what a rented-hashrate marketplace measures when it refuses a job as
+      oversized — settable per listener, since the ceiling only binds on the
+      port the rented hashrate connects to. And
+      <code>pplns_payout_floor_sats</code> (default 546, the dust limit) is the
+      least a claim must be worth to get an output at all.
+    </p>
+    <p>
+      A claim that clears neither is <strong>shared out among the miners that
+      block could pay</strong> — never given to the operator, which still takes
+      only its fee. The block pays out to the satoshi and the pool holds
+      nothing.
+    </p>
+    <p>
+      Being small therefore costs you <strong>frequency, not money</strong>. A
+      miner's share of the window tracks its hashrate, so without help the
+      largest claims would take the same slots in every block and the same
+      addresses would never be paid at all. A quarter of each coinbase's slots
+      are reserved for whoever has waited longest, tracked as a signed fraction
+      of one block reward per worker that sums to zero. That is
+      <strong>not a balance</strong>: nothing is withheld from a coinbase and
+      released later, and deleting the table would cost nobody a payment — the
+      pool would just forget whose turn it was.
+    </p>
+    <p>
+      The floor is stated at startup, per template, per block, and on the
+      dashboard before a miner connects, because the operator's log is the one
+      place the miner it affects cannot look.
+    </p>
+    <p>
+      <strong>If the pool cannot measure the window, it publishes no job at
+      all.</strong> The window is read over a bounded walk of the shares table;
+      when that walk cannot prove it covered the configured window — an IO
+      error, a lock held past its timeout — it errors rather than returning a
+      short answer, and the template is held back. Miners keep working the last
+      job until it recovers. That costs hashrate on a new tip and is still the
+      only safe direction: here the window is rendered into a coinbase and
+      published, so a wrong one is mined, irreversible, and invisible
+      afterwards. <code>pplns window walk did not cover …</code> in the log is
+      that guard firing, not a crash.
+    </p>
   </div>
 
   <div class="note">
-    <span class="label">Why a fourth mode at all</span>
+    <span class="label">This was the other way round, and measurement changed it</span>
     <p>
-      PPS prices a share the moment it arrives, whether or not it ever becomes
-      a block. Somebody has to fund the gap between what has been promised and
-      what has been mined, and that somebody is the operator — who therefore
-      needs a reserve measured in block rewards, and who is ruined by a long
-      enough run of bad luck. That is a real barrier: a pool that cannot fund
-      the reserve cannot honestly run PPS.
-    </p>
-    <p>
-      PPLNS removes it by never promising anything in advance. A block is
-      divided among the work that produced it, so <strong>the pool never owes
-      more than it has just been paid</strong>. There is no reserve to size and
-      operator ruin is not a failure mode. The miners carry the variance
-      instead — which is the trade, stated plainly, and the reason the operator
-      fee is normally set lower here: there is no risk premium to charge for.
+      Until <a href="https://github.com/LayerTwo-Labs/simplepool/pull/76">#76</a>
+      a dropped claim rode on the <em>operator's</em> output, defended as a dust
+      policy. With 100 miners on a 1/n hashrate spread and the default budget,
+      28 were paid, <strong>72 were cut by the byte cap and none by the dust
+      floor</strong>, and the operator received <strong>25% of the block on a
+      1% fee</strong>. The take also rose as the coinbase shrank — 46% at 400
+      bytes against 2% at 3000 — so starving your own miners was the
+      revenue-maximising move. Neither the dust framing nor the incentive
+      survived contact with the numbers.
     </p>
   </div>
 
   <div class="tablewrap">
     <table>
-      <thead><tr><th>&nbsp;</th><th>solo</th><th>pps-classic</th><th>pplns-thunder</th><th>pplns-btc</th></tr></thead>
+      <thead><tr><th>&nbsp;</th><th>solo</th><th>pps-classic</th><th>pplns-thunder</th><th>pplns-btc</th><th>pplns-coinbase</th></tr></thead>
       <tbody>
         <tr><td>Coinbase outputs</td>
             <td>miner's address + operator fee</td>
             <td><code>pool_btc_address</code> + operator fee</td>
-            <td colspan="2"><code>pool_btc_address</code> + operator fee</td></tr>
+            <td colspan="2"><code>pool_btc_address</code> + operator fee</td>
+            <td>one per miner in the window + operator</td></tr>
         <tr><td>Per-connection coinbase</td>
             <td>yes — each miner's <code>cb1</code>/<code>cb2</code> pay <em>that</em> miner</td>
             <td>no — every miner's coinbase pays the pool</td>
-            <td colspan="2">no — every miner's coinbase pays the pool</td></tr>
+            <td colspan="2">no — every miner's coinbase pays the pool</td>
+            <td>no — every miner's coinbase pays the whole window</td></tr>
         <tr><td>Stratum username</td><td>Bitcoin address</td><td>Thunder address</td>
-            <td>Thunder address</td><td>Bitcoin address</td></tr>
+            <td>Thunder address</td><td>Bitcoin address</td><td>Bitcoin address</td></tr>
         <tr><td>Off-chain accounting</td><td>none</td><td><code>pps_credits</code></td>
-            <td colspan="2"><code>pps_credits</code>, same table</td></tr>
+            <td colspan="2"><code>pps_credits</code>, same table</td>
+            <td>none — the block is the ledger</td></tr>
         <tr><td>When a balance moves</td><td>never — the coinbase is the payment</td>
             <td>as each share arrives</td>
-            <td colspan="2">when a block matures, 100 deep</td></tr>
+            <td colspan="2">when a block matures, 100 deep</td>
+            <td>never — the coinbase is the payment</td></tr>
         <tr><td>Paid for work that found nothing</td><td>no</td><td>yes</td>
-            <td colspan="2">no</td></tr>
+            <td colspan="3">no</td></tr>
         <tr><td>Transaction fees shared</td><td>yes, to the finder</td><td>no — subsidy-derived rate</td>
-            <td colspan="2">yes, to the window</td></tr>
+            <td colspan="3">yes, to the window</td></tr>
         <tr><td>Pool custodies BTC</td><td>never</td><td>yes, between mining and deposit</td>
-            <td>yes, between mining and deposit</td><td>yes, in the enforcer wallet</td></tr>
+            <td>yes, between mining and deposit</td><td>yes, in the enforcer wallet</td>
+            <td>never</td></tr>
         <tr><td>Operator reserve needed</td><td>none</td><td>yes — measured in block rewards</td>
-            <td colspan="2">none</td></tr>
+            <td colspan="3">none</td></tr>
         <tr><td>Payout asset</td><td>BTC, on the mainchain</td><td>BTC on Thunder, a BIP300 sidechain</td>
-            <td>BTC on Thunder</td><td>BTC, on the mainchain</td></tr>
+            <td>BTC on Thunder</td><td>BTC, on the mainchain</td>
+            <td>BTC, on the mainchain</td></tr>
         <tr><td>Payout worker</td><td>not installed</td><td><code>simplepool-payout.service</code></td>
             <td><code>simplepool-payout.service</code></td>
-            <td>same, with <code>PAYOUT_RAIL=btc</code></td></tr>
+            <td>same, with <code>PAYOUT_RAIL=btc</code></td>
+            <td>not installed</td></tr>
+        <tr><td>A claim one block cannot pay</td><td colspan="2">cannot arise</td>
+            <td colspan="2">accrues until the payout worker can batch it</td>
+            <td><strong>shared out among the miners that block could pay</strong>; you go first in the queue for the next one</td></tr>
         <tr><td>Miner's income</td><td>lumpy and rare, but complete</td><td>smooth and proportional</td>
-            <td colspan="2">proportional, but only when the pool finds a block</td></tr>
+            <td colspan="2">proportional, but only when the pool finds a block</td>
+            <td>the same, above the payout floor — nothing below it</td></tr>
         <tr><td>Who eats bad luck</td><td>the miner</td><td>the pool operator</td>
-            <td colspan="2">the miners, together</td></tr>
+            <td colspan="3">the miners, together</td></tr>
       </tbody>
     </table>
   </div>
 
   <div class="warnbox">
-    <span class="label">A fifth mode existed and was removed</span>
+    <span class="label">A sixth mode existed and was removed</span>
     <p>
       <code>pool_mode = pps</code> put a BIP300 drivechain deposit directly in
       each coinbase, so the pool would never custody BTC at all. It does not
@@ -531,9 +615,13 @@ footer .wrap > p { max-width: 46rem; }
 <section id="stack">
   <h2>The stack</h2>
   <p class="section-sub">
-    In solo mode everything to the right of <code>bitcoind</code> is optional.
-    In pps-classic the enforcer and a Thunder node join the picture, because
-    that is where miners actually get paid.
+    How much of this you run depends on the mode. In <code>solo</code> and
+    <code>pplns-coinbase</code> everything to the right of <code>bitcoind</code>
+    is optional — the coinbase is the payment, so there is no worker and no
+    wallet. <code>pps-classic</code> and <code>pplns-thunder</code> add the
+    payout worker and a Thunder node, because that is where miners actually get
+    paid; <code>pplns-btc</code> adds the worker but pays on L1 through the
+    enforcer's wallet instead, so no Thunder node appears at all.
   </p>
 
   <figure>
@@ -595,7 +683,7 @@ footer .wrap > p { max-width: 46rem; }
 
         <rect class="bx side" x="410" y="252" width="160" height="60"/>
         <text class="t"  x="490" y="277" text-anchor="middle">payout worker</text>
-        <text class="ts" x="490" y="294" text-anchor="middle">pps-classic only</text>
+        <text class="ts" x="490" y="294" text-anchor="middle">3 of 5 modes</text>
 
         <rect class="bx side" x="620" y="252" width="150" height="60"/>
         <text class="t"  x="695" y="277" text-anchor="middle">Thunder node</text>
@@ -1311,9 +1399,14 @@ elsewhere until it retargets.</code></pre>
       are working for nothing.
     </p>
     <p>
-      The gate applies to <strong>pps-classic only</strong>. Solo has no
-      accrual to suspend — it pays each miner from their own coinbase — so the
-      gate never touches it, whatever the chain's difficulty is doing.
+      The gate applies to <strong>pps-classic only</strong>, because it is the
+      only mode that prices a share on arrival. Nothing else has an accrual to
+      suspend: <code>solo</code> and <code>pplns-coinbase</code> pay out of the
+      coinbase itself, and the two custodial PPLNS rails value a share in
+      hindsight out of a block actually found — so a chain whose difficulty has
+      collapsed simply produces smaller claims rather than promises the pool
+      cannot keep. The gate never touches any of them, whatever the chain's
+      difficulty is doing.
     </p>
   </div>
 
@@ -1336,6 +1429,241 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
 </section>
 
 <!-- ============================================================ 9. fees ==== -->
+<!-- ============================================ 9b. how each mode pays === -->
+<section id="sequences">
+  <h2>How each mode pays, step by step</h2>
+  <p class="section-sub">
+    The same five modes as above, drawn as sequences rather than described.
+    What changes between them is <strong>when a miner's work turns into
+    money</strong> — and, in two of them, whether the pool ever holds that
+    money at all.
+  </p>
+
+  <h3><code>solo</code> — paid in the block you found</h3>
+  <p>
+    The coinbase is rendered <strong>per connection</strong>, so every miner is
+    served a job whose coinbase pays that miner. Finding a block and being paid
+    are the same event; there is nothing after it.
+  </p>
+  <!-- seq:solo -->
+<figure>
+  <div class="svgbox">
+    <svg viewBox="0 0 626 434" role="img"
+         aria-labelledby="sq69a9b7t sq69a9b7d" style="max-width: 626px; margin: 0 auto;">
+      <title id="sq69a9b7t">solo mode: the finder is paid in the block it found</title>
+      <desc id="sq69a9b7d">A miner subscribes, simplepool builds a coinbase paying that miner and hands out work. When the miner finds a block the coinbase already pays it, so no ledger and no payout step exist.</desc>
+      <style>
+        .abx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; }
+        .abx.accent { fill: var(--solo-bg); stroke: var(--solo); }
+        .at   { fill: var(--fg); font: 600 12px ui-sans-serif, system-ui, sans-serif; }
+        .as   { fill: var(--fg-faint); font: 400 10px ui-monospace, monospace; }
+        .life { stroke: var(--rule); stroke-width: 1.25; stroke-dasharray: 3 4; }
+        .ln   { stroke: var(--rule-firm); stroke-width: 1.5; fill: none; }
+        .ln.dash { stroke-dasharray: 5 4; }
+        .lbl  { fill: var(--fg-muted); font: 400 10.5px ui-monospace, monospace; }
+        .note { fill: var(--bg-sunk); stroke: var(--rule); stroke-width: 1; }
+        .note.win  { fill: var(--ok-bg, var(--pplns-bg)); stroke: var(--ok); }
+        .note.warn { fill: var(--warn-bg); stroke: var(--warn); }
+        .notet { fill: var(--fg-muted); font: 400 10.5px ui-sans-serif, system-ui, sans-serif; }
+      </style>
+      <defs>
+        <marker id="sqar" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--rule-firm)"/>
+        </marker>
+      </defs>
+      <rect class="abx" x="10.0" y="34" width="132" height="46" rx="7"/><text class="at" x="76" y="54" text-anchor="middle">Miner</text><text class="as" x="76" y="70" text-anchor="middle">ASIC</text><rect class="abx accent" x="168.0" y="34" width="132" height="46" rx="7"/><text class="at" x="234" y="54" text-anchor="middle">simplepool</text><text class="as" x="234" y="70" text-anchor="middle">:3334</text><rect class="abx" x="326.0" y="34" width="132" height="46" rx="7"/><text class="at" x="392" y="54" text-anchor="middle">bitcoind</text><text class="as" x="392" y="70" text-anchor="middle">+ enforcer</text><rect class="abx" x="484.0" y="34" width="132" height="46" rx="7"/><text class="at" x="550" y="54" text-anchor="middle">Bitcoin L1</text><text class="as" x="550" y="70" text-anchor="middle">the chain</text>
+      <line class="life" x1="76" y1="80" x2="76" y2="420"/><line class="life" x1="234" y1="80" x2="234" y2="420"/><line class="life" x1="392" y1="80" x2="392" y2="420"/><line class="life" x1="550" y1="80" x2="550" y2="420"/>
+      <line class="ln" x1="80" y1="118" x2="229" y2="118" marker-end="url(#sqar)"/><text class="lbl" x="154" y="112" text-anchor="middle">authorize  &lt;bitcoin-address&gt;</text><line class="ln" x1="238" y1="152" x2="387" y2="152" marker-end="url(#sqar)"/><text class="lbl" x="312" y="146" text-anchor="middle">getblocktemplate</text><line class="ln dash" x1="388" y1="186" x2="239" y2="186" marker-end="url(#sqar)"/><text class="lbl" x="314" y="180" text-anchor="middle">template</text><path class="ln" d="M238,220 h26 v16 h-26" marker-end="url(#sqar)"/><text class="lbl" x="270" y="224" text-anchor="start">build coinbase paying THIS miner</text><line class="ln" x1="230" y1="258" x2="81" y2="258" marker-end="url(#sqar)"/><text class="lbl" x="156" y="252" text-anchor="middle">notify  (cb1 / cb2)</text><line class="ln" x1="80" y1="292" x2="229" y2="292" marker-end="url(#sqar)"/><text class="lbl" x="154" y="286" text-anchor="middle">submit  (a block!)</text><line class="ln" x1="238" y1="326" x2="387" y2="326" marker-end="url(#sqar)"/><text class="lbl" x="312" y="320" text-anchor="middle">submitblock</text><line class="ln" x1="396" y1="360" x2="545" y2="360" marker-end="url(#sqar)"/><text class="lbl" x="470" y="354" text-anchor="middle">block accepted</text><rect class="note win" x="14" y="380" width="598" height="26" rx="5"/><text class="notet" x="313" y="397" text-anchor="middle">The miner is already paid — the coinbase is the payment. No ledger, no payout worker, no wait.</text>
+    </svg>
+  </div>
+</figure>
+<!-- /seq:solo -->
+
+  <h3><code>pps-classic</code> — paid on arrival, out of a reserve</h3>
+  <p>
+    A share is priced the moment it is accepted, whether or not it ever becomes
+    a block. That is the appeal and the cost: the pool owes money before it has
+    earned any, and the gap has to be funded by an operator reserve measured in
+    block rewards.
+  </p>
+  <!-- seq:pps -->
+<figure>
+  <div class="svgbox">
+    <svg viewBox="0 0 784 478" role="img"
+         aria-labelledby="sqa8556at sqa8556ad" style="max-width: 784px; margin: 0 auto;">
+      <title id="sqa8556at">pps-classic: every share is priced on arrival, the pool carries the risk</title>
+      <desc id="sqa8556ad">Each accepted share is credited immediately at a rate derived from the template. The coinbase pays the pool wallet, and a payout worker settles balances over Thunder on a daily batch.</desc>
+      <style>
+        .abx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; }
+        .abx.accent { fill: var(--pps-bg); stroke: var(--pps); }
+        .at   { fill: var(--fg); font: 600 12px ui-sans-serif, system-ui, sans-serif; }
+        .as   { fill: var(--fg-faint); font: 400 10px ui-monospace, monospace; }
+        .life { stroke: var(--rule); stroke-width: 1.25; stroke-dasharray: 3 4; }
+        .ln   { stroke: var(--rule-firm); stroke-width: 1.5; fill: none; }
+        .ln.dash { stroke-dasharray: 5 4; }
+        .lbl  { fill: var(--fg-muted); font: 400 10.5px ui-monospace, monospace; }
+        .note { fill: var(--bg-sunk); stroke: var(--rule); stroke-width: 1; }
+        .note.win  { fill: var(--ok-bg, var(--pplns-bg)); stroke: var(--ok); }
+        .note.warn { fill: var(--warn-bg); stroke: var(--warn); }
+        .notet { fill: var(--fg-muted); font: 400 10.5px ui-sans-serif, system-ui, sans-serif; }
+      </style>
+      <defs>
+        <marker id="sqar" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--rule-firm)"/>
+        </marker>
+      </defs>
+      <rect class="abx" x="10.0" y="34" width="132" height="46" rx="7"/><text class="at" x="76" y="54" text-anchor="middle">Miner</text><text class="as" x="76" y="70" text-anchor="middle">ASIC</text><rect class="abx accent" x="168.0" y="34" width="132" height="46" rx="7"/><text class="at" x="234" y="54" text-anchor="middle">simplepool</text><text class="as" x="234" y="70" text-anchor="middle">:3334</text><rect class="abx" x="326.0" y="34" width="132" height="46" rx="7"/><text class="at" x="392" y="54" text-anchor="middle">shares.db</text><text class="as" x="392" y="70" text-anchor="middle">SQLite</text><rect class="abx" x="484.0" y="34" width="132" height="46" rx="7"/><text class="at" x="550" y="54" text-anchor="middle">payout worker</text><text class="as" x="550" y="70" text-anchor="middle">systemd</text><rect class="abx" x="642.0" y="34" width="132" height="46" rx="7"/><text class="at" x="708" y="54" text-anchor="middle">Thunder</text><text class="as" x="708" y="70" text-anchor="middle">sidechain #9</text>
+      <line class="life" x1="76" y1="80" x2="76" y2="464"/><line class="life" x1="234" y1="80" x2="234" y2="464"/><line class="life" x1="392" y1="80" x2="392" y2="464"/><line class="life" x1="550" y1="80" x2="550" y2="464"/><line class="life" x1="708" y1="80" x2="708" y2="464"/>
+      <line class="ln" x1="80" y1="118" x2="229" y2="118" marker-end="url(#sqar)"/><text class="lbl" x="154" y="112" text-anchor="middle">authorize  &lt;thunder-address&gt;</text><line class="ln" x1="80" y1="152" x2="229" y2="152" marker-end="url(#sqar)"/><text class="lbl" x="154" y="146" text-anchor="middle">submit  (an ordinary share)</text><path class="ln" d="M238,186 h26 v16 h-26" marker-end="url(#sqar)"/><text class="lbl" x="270" y="190" text-anchor="start">price it: rate x difficulty</text><line class="ln" x1="238" y1="224" x2="387" y2="224" marker-end="url(#sqar)"/><text class="lbl" x="312" y="218" text-anchor="middle">credit NOW, block or not</text><rect class="note warn" x="14" y="244" width="756" height="26" rx="5"/><text class="notet" x="392" y="261" text-anchor="middle">The pool owes this miner before it has earned anything. That gap is the operator reserve.</text><line class="ln" x1="80" y1="296" x2="229" y2="296" marker-end="url(#sqar)"/><text class="lbl" x="154" y="290" text-anchor="middle">submit  (a block)</text><rect class="note plain" x="14" y="316" width="756" height="26" rx="5"/><text class="notet" x="392" y="333" text-anchor="middle">The coinbase pays the POOL wallet, not the miner.</text><line class="ln" x1="546" y1="374" x2="397" y2="374" marker-end="url(#sqar)"/><text class="lbl" x="472" y="368" text-anchor="middle">daily: who is owed?</text><line class="ln" x1="554" y1="408" x2="703" y2="408" marker-end="url(#sqar)"/><text class="lbl" x="628" y="402" text-anchor="middle">one batched transfer</text><line class="ln dash" x1="546" y1="442" x2="397" y2="442" marker-end="url(#sqar)"/><text class="lbl" x="472" y="436" text-anchor="middle">credit paid_sats on CONFIRMATION</text>
+    </svg>
+  </div>
+</figure>
+<!-- /seq:pps -->
+
+  <h3><code>pplns-thunder</code> / <code>pplns-btc</code> — paid when a block matures</h3>
+  <p>
+    Nothing is promised in advance. A share is a claim on blocks this pool
+    actually finds, so the pool never owes more than it has just been paid and
+    there is no reserve to size. The two rails differ only in where the balance
+    is finally settled, which is what a stratum username has to be.
+  </p>
+  <!-- seq:pplns_custodial -->
+<figure>
+  <div class="svgbox">
+    <svg viewBox="0 0 626 518" role="img"
+         aria-labelledby="sqc435b4t sqc435b4d" style="max-width: 626px; margin: 0 auto;">
+      <title id="sqc435b4t">pplns-thunder and pplns-btc: a matured block is split across the work that found it</title>
+      <desc id="sqc435b4d">Shares are recorded but not priced. When a block reaches 100 confirmations it is divided across the window of shares that produced it, and the payout worker settles the resulting balances over Thunder or on Bitcoin L1.</desc>
+      <style>
+        .abx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; }
+        .abx.accent { fill: var(--pplns-bg); stroke: var(--pplns); }
+        .at   { fill: var(--fg); font: 600 12px ui-sans-serif, system-ui, sans-serif; }
+        .as   { fill: var(--fg-faint); font: 400 10px ui-monospace, monospace; }
+        .life { stroke: var(--rule); stroke-width: 1.25; stroke-dasharray: 3 4; }
+        .ln   { stroke: var(--rule-firm); stroke-width: 1.5; fill: none; }
+        .ln.dash { stroke-dasharray: 5 4; }
+        .lbl  { fill: var(--fg-muted); font: 400 10.5px ui-monospace, monospace; }
+        .note { fill: var(--bg-sunk); stroke: var(--rule); stroke-width: 1; }
+        .note.win  { fill: var(--ok-bg, var(--pplns-bg)); stroke: var(--ok); }
+        .note.warn { fill: var(--warn-bg); stroke: var(--warn); }
+        .notet { fill: var(--fg-muted); font: 400 10.5px ui-sans-serif, system-ui, sans-serif; }
+      </style>
+      <defs>
+        <marker id="sqar" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--rule-firm)"/>
+        </marker>
+      </defs>
+      <rect class="abx" x="10.0" y="34" width="132" height="46" rx="7"/><text class="at" x="76" y="54" text-anchor="middle">Miner</text><text class="as" x="76" y="70" text-anchor="middle">ASIC</text><rect class="abx accent" x="168.0" y="34" width="132" height="46" rx="7"/><text class="at" x="234" y="54" text-anchor="middle">simplepool</text><text class="as" x="234" y="70" text-anchor="middle">:3334</text><rect class="abx" x="326.0" y="34" width="132" height="46" rx="7"/><text class="at" x="392" y="54" text-anchor="middle">shares.db</text><text class="as" x="392" y="70" text-anchor="middle">SQLite</text><rect class="abx" x="484.0" y="34" width="132" height="46" rx="7"/><text class="at" x="550" y="54" text-anchor="middle">payout worker</text><text class="as" x="550" y="70" text-anchor="middle">systemd</text>
+      <line class="life" x1="76" y1="80" x2="76" y2="504"/><line class="life" x1="234" y1="80" x2="234" y2="504"/><line class="life" x1="392" y1="80" x2="392" y2="504"/><line class="life" x1="550" y1="80" x2="550" y2="504"/>
+      <line class="ln" x1="80" y1="118" x2="229" y2="118" marker-end="url(#sqar)"/><text class="lbl" x="154" y="112" text-anchor="middle">submit  (an ordinary share)</text><line class="ln" x1="238" y1="152" x2="387" y2="152" marker-end="url(#sqar)"/><text class="lbl" x="312" y="146" text-anchor="middle">record it — credited 0</text><rect class="note win" x="14" y="172" width="598" height="26" rx="5"/><text class="notet" x="313" y="189" text-anchor="middle">Nothing is promised. The pool never owes more than it has just been paid.</text><line class="ln" x1="80" y1="224" x2="229" y2="224" marker-end="url(#sqar)"/><text class="lbl" x="154" y="218" text-anchor="middle">submit  (a block)</text><line class="ln" x1="238" y1="258" x2="387" y2="258" marker-end="url(#sqar)"/><text class="lbl" x="312" y="252" text-anchor="middle">row: hash + window size</text><rect class="note plain" x="14" y="282" width="598" height="26" rx="5"/><text class="notet" x="313" y="299" text-anchor="middle">...100 confirmations later, on a new tip...</text><path class="ln" d="M238,334 h26 v16 h-26" marker-end="url(#sqar)"/><text class="lbl" x="270" y="338" text-anchor="start">reconcile: still in the chain?</text><line class="ln" x1="238" y1="372" x2="387" y2="372" marker-end="url(#sqar)"/><text class="lbl" x="312" y="366" text-anchor="middle">split the block across the window</text><line class="ln" x1="546" y1="410" x2="397" y2="410" marker-end="url(#sqar)"/><text class="lbl" x="472" y="404" text-anchor="middle">daily: who is owed?</text><path class="ln" d="M546,444 h-26 v16 h26" marker-end="url(#sqar)"/><text class="lbl" x="514" y="448" text-anchor="end">pay: Thunder, or L1 via the enforcer</text><line class="ln dash" x1="546" y1="482" x2="397" y2="482" marker-end="url(#sqar)"/><text class="lbl" x="472" y="476" text-anchor="middle">paid_sats on confirmation</text>
+    </svg>
+  </div>
+</figure>
+<!-- /seq:pplns_custodial -->
+
+  <h3><code>pplns-coinbase</code> — the same accounting, no custody</h3>
+  <p>
+    The window is snapshotted onto the job when the template is built, so the
+    coinbase carries one output per miner it has room for. No pool wallet, no
+    ledger row, no maturity wait. A coinbase only fits so many payouts, so what
+    one block cannot pay is shared among the miners it could — never the
+    operator — and whoever was left out goes first in the queue for the next
+    block. See <a href="#modes">the five modes</a> for the policy in full.
+  </p>
+  <!-- seq:cbwin -->
+<figure>
+  <div class="svgbox">
+    <svg viewBox="0 0 626 490" role="img"
+         aria-labelledby="sq5b7c20t sq5b7c20d" style="max-width: 626px; margin: 0 auto;">
+      <title id="sq5b7c20t">pplns-coinbase: the block pays the whole window, directly</title>
+      <desc id="sq5b7c20d">The window is snapshotted onto the job when the template is built, so the coinbase carries one output per miner it has room for. There is no pool wallet, no ledger and no maturity wait. What one block cannot fit is shared among the miners it could pay, and those left out go first in the queue for the next block.</desc>
+      <style>
+        .abx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; }
+        .abx.accent { fill: var(--pplns-bg); stroke: var(--pplns); }
+        .at   { fill: var(--fg); font: 600 12px ui-sans-serif, system-ui, sans-serif; }
+        .as   { fill: var(--fg-faint); font: 400 10px ui-monospace, monospace; }
+        .life { stroke: var(--rule); stroke-width: 1.25; stroke-dasharray: 3 4; }
+        .ln   { stroke: var(--rule-firm); stroke-width: 1.5; fill: none; }
+        .ln.dash { stroke-dasharray: 5 4; }
+        .lbl  { fill: var(--fg-muted); font: 400 10.5px ui-monospace, monospace; }
+        .note { fill: var(--bg-sunk); stroke: var(--rule); stroke-width: 1; }
+        .note.win  { fill: var(--ok-bg, var(--pplns-bg)); stroke: var(--ok); }
+        .note.warn { fill: var(--warn-bg); stroke: var(--warn); }
+        .notet { fill: var(--fg-muted); font: 400 10.5px ui-sans-serif, system-ui, sans-serif; }
+      </style>
+      <defs>
+        <marker id="sqar" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--rule-firm)"/>
+        </marker>
+      </defs>
+      <rect class="abx" x="10.0" y="34" width="132" height="46" rx="7"/><text class="at" x="76" y="54" text-anchor="middle">Miner</text><text class="as" x="76" y="70" text-anchor="middle">ASIC</text><rect class="abx accent" x="168.0" y="34" width="132" height="46" rx="7"/><text class="at" x="234" y="54" text-anchor="middle">simplepool</text><text class="as" x="234" y="70" text-anchor="middle">:3334</text><rect class="abx" x="326.0" y="34" width="132" height="46" rx="7"/><text class="at" x="392" y="54" text-anchor="middle">shares.db</text><text class="as" x="392" y="70" text-anchor="middle">SQLite</text><rect class="abx" x="484.0" y="34" width="132" height="46" rx="7"/><text class="at" x="550" y="54" text-anchor="middle">Bitcoin L1</text><text class="as" x="550" y="70" text-anchor="middle">the chain</text>
+      <line class="life" x1="76" y1="80" x2="76" y2="476"/><line class="life" x1="234" y1="80" x2="234" y2="476"/><line class="life" x1="392" y1="80" x2="392" y2="476"/><line class="life" x1="550" y1="80" x2="550" y2="476"/>
+      <line class="ln" x1="238" y1="118" x2="387" y2="118" marker-end="url(#sqar)"/><text class="lbl" x="312" y="112" text-anchor="middle">who is in the window NOW?</text><line class="ln dash" x1="388" y1="152" x2="239" y2="152" marker-end="url(#sqar)"/><text class="lbl" x="314" y="146" text-anchor="middle">claims + who has waited longest</text><path class="ln" d="M238,186 h26 v16 h-26" marker-end="url(#sqar)"/><text class="lbl" x="270" y="190" text-anchor="start">order: biggest claims, plus reserved slots</text><rect class="note plain" x="14" y="210" width="598" height="40" rx="5"/><text class="notet" x="313" y="227" text-anchor="middle">A coinbase fits only so many outputs. What it cannot pay is shared among the miners it can — never the</text><text class="notet" x="313" y="241" text-anchor="middle">operator, who takes only its fee.</text><line class="ln" x1="230" y1="276" x2="81" y2="276" marker-end="url(#sqar)"/><text class="lbl" x="156" y="270" text-anchor="middle">notify — pays the whole window</text><line class="ln" x1="80" y1="310" x2="229" y2="310" marker-end="url(#sqar)"/><text class="lbl" x="154" y="304" text-anchor="middle">submit  (a block)</text><line class="ln" x1="238" y1="344" x2="545" y2="344" marker-end="url(#sqar)"/><text class="lbl" x="392" y="338" text-anchor="middle">submitblock</text><line class="ln" x1="238" y1="378" x2="387" y2="378" marker-end="url(#sqar)"/><text class="lbl" x="312" y="372" text-anchor="middle">stage who was skipped (sums to zero)</text><rect class="note warn" x="14" y="398" width="598" height="26" rx="5"/><text class="notet" x="313" y="415" text-anchor="middle">Staged, not applied: an orphaned block paid nobody and rotates nobody. The confirmation pass decides.</text><rect class="note win" x="14" y="436" width="598" height="26" rx="5"/><text class="notet" x="313" y="453" text-anchor="middle">Nobody is owed money — only a turn. Skipped miners go first in the next block.</text>
+    </svg>
+  </div>
+</figure>
+<!-- /seq:cbwin -->
+
+  <h3>The payout worker, in the three modes that have one</h3>
+  <p>
+    <code>solo</code> and <code>pplns-coinbase</code> never run this. For the
+    other three it is the same worker and the same protocol whichever rail it
+    is driving; only the client at the end differs. The ordering is the whole
+    design: the write-ahead row goes in <em>before</em> the money moves, and
+    <code>paid_sats</code> is credited only once the transaction confirms.
+  </p>
+  <!-- seq:payout -->
+<figure>
+  <div class="svgbox">
+    <svg viewBox="0 0 560 494" role="img"
+         aria-labelledby="sq96bd6dt sq96bd6dd" style="max-width: 560px; margin: 0 auto;">
+      <title id="sq96bd6dt">the payout worker: never pay twice, never claim to have paid</title>
+      <desc id="sq96bd6dd">A write-ahead in-flight row is written before the transaction is sent, so a crash mid-payout is recoverable; paid_sats is credited only once the transaction confirms.</desc>
+      <style>
+        .abx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; }
+        .abx.accent { fill: var(--pps-bg); stroke: var(--pps); }
+        .at   { fill: var(--fg); font: 600 12px ui-sans-serif, system-ui, sans-serif; }
+        .as   { fill: var(--fg-faint); font: 400 10px ui-monospace, monospace; }
+        .life { stroke: var(--rule); stroke-width: 1.25; stroke-dasharray: 3 4; }
+        .ln   { stroke: var(--rule-firm); stroke-width: 1.5; fill: none; }
+        .ln.dash { stroke-dasharray: 5 4; }
+        .lbl  { fill: var(--fg-muted); font: 400 10.5px ui-monospace, monospace; }
+        .note { fill: var(--bg-sunk); stroke: var(--rule); stroke-width: 1; }
+        .note.win  { fill: var(--ok-bg, var(--pplns-bg)); stroke: var(--ok); }
+        .note.warn { fill: var(--warn-bg); stroke: var(--warn); }
+        .notet { fill: var(--fg-muted); font: 400 10.5px ui-sans-serif, system-ui, sans-serif; }
+      </style>
+      <defs>
+        <marker id="sqar" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--rule-firm)"/>
+        </marker>
+      </defs>
+      <rect class="abx" x="10.0" y="34" width="132" height="46" rx="7"/><text class="at" x="76" y="54" text-anchor="middle">payout worker</text><text class="as" x="76" y="70" text-anchor="middle">systemd</text><rect class="abx" x="214.0" y="34" width="132" height="46" rx="7"/><text class="at" x="280" y="54" text-anchor="middle">shares.db</text><text class="as" x="280" y="70" text-anchor="middle">SQLite</text><rect class="abx" x="418.0" y="34" width="132" height="46" rx="7"/><text class="at" x="484" y="54" text-anchor="middle">the rail</text><text class="as" x="484" y="70" text-anchor="middle">Thunder / L1</text>
+      <line class="life" x1="76" y1="80" x2="76" y2="480"/><line class="life" x1="280" y1="80" x2="280" y2="480"/><line class="life" x1="484" y1="80" x2="484" y2="480"/>
+      <line class="ln" x1="80" y1="118" x2="275" y2="118" marker-end="url(#sqar)"/><text class="lbl" x="178" y="112" text-anchor="middle">who clears PAYOUT_MIN_SATS?</text><line class="ln" x1="80" y1="152" x2="275" y2="152" marker-end="url(#sqar)"/><text class="lbl" x="178" y="146" text-anchor="middle">write in-flight row FIRST</text><rect class="note warn" x="14" y="172" width="532" height="26" rx="5"/><text class="notet" x="280" y="189" text-anchor="middle">Written before the money moves. A crash here is recoverable; the reverse order is not.</text><line class="ln" x1="80" y1="224" x2="479" y2="224" marker-end="url(#sqar)"/><text class="lbl" x="280" y="218" text-anchor="middle">ONE transaction for the whole batch</text><line class="ln dash" x1="480" y1="258" x2="81" y2="258" marker-end="url(#sqar)"/><text class="lbl" x="280" y="252" text-anchor="middle">txid</text><line class="ln" x1="80" y1="292" x2="275" y2="292" marker-end="url(#sqar)"/><text class="lbl" x="178" y="286" text-anchor="middle">store txid against the in-flight row</text><rect class="note plain" x="14" y="316" width="532" height="26" rx="5"/><text class="notet" x="280" y="333" text-anchor="middle">...later ticks, until it confirms...</text><path class="ln" d="M80,368 h26 v16 h-26" marker-end="url(#sqar)"/><text class="lbl" x="112" y="372" text-anchor="start">is the txid confirmed yet?</text><line class="ln" x1="80" y1="406" x2="275" y2="406" marker-end="url(#sqar)"/><text class="lbl" x="178" y="400" text-anchor="middle">NOW credit paid_sats, clear in-flight</text><rect class="note win" x="14" y="426" width="532" height="40" rx="5"/><text class="notet" x="280" y="443" text-anchor="middle">Crediting on confirmation, not on send, is what makes a lost transaction a retry rather than a</text><text class="notet" x="280" y="457" text-anchor="middle">theft.</text>
+    </svg>
+  </div>
+</figure>
+<!-- /seq:payout -->
+
+  <div class="note">
+    <span class="label">Why the order matters more than the rail</span>
+    <p>
+      Crediting on <em>send</em> rather than on <em>confirmation</em> would
+      make a dropped transaction indistinguishable from a completed one: the
+      ledger would say paid, the chain would say nothing, and the miner would
+      be out of pocket with no way to demonstrate it. Writing the in-flight row
+      first costs one extra round trip and turns every crash into a retry
+      rather than a loss.
+    </p>
+  </div>
+</section>
+
 <section id="fees">
   <h2>Where the fee lands</h2>
   <p class="section-sub">
@@ -1390,11 +1718,31 @@ JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
 
 <!-- ========================================================= 10. payouts === -->
 <section id="payouts">
-  <h2>Payouts over Thunder</h2>
+  <h2>Payouts, and the modes that need none</h2>
   <p class="section-sub">
-    pps-classic only. The design goal is narrow and unglamorous:
-    <strong>never pay twice, and never claim to have paid when you haven't.</strong>
+    The design goal is narrow and unglamorous: <strong>never pay twice, and
+    never claim to have paid when you haven't.</strong>
   </p>
+
+  <div class="note">
+    <span class="label">Which modes this applies to</span>
+    <p>
+      Three of the five. <code>pps-classic</code> and
+      <code>pplns-thunder</code> settle over Thunder, described below;
+      <code>pplns-btc</code> runs the same worker and the same protocol with
+      <code>PAYOUT_RAIL=btc</code>, paying on Bitcoin L1 through the enforcer's
+      own wallet rather than a sidechain.
+    </p>
+    <p>
+      <strong><code>solo</code> and <code>pplns-coinbase</code> have no payout
+      worker at all</strong> — in both, the coinbase <em>is</em> the payment,
+      so there is no balance to hold and nothing to drain. Do not install it
+      for those: it would run, find an empty ledger, pay nobody, and give you a
+      service to monitor and misdiagnose for no reason. The
+      <a href="#sequences">sequence diagrams</a> above show why the step does
+      not exist there.
+    </p>
+  </div>
 
   <h3>Once a day, in one transaction</h3>
   <p>
@@ -1694,6 +2042,18 @@ SELECT (SELECT COALESCE(SUM(reward_sats),0) + COALESCE(SUM(fee_sats),0)
             <td>settled payouts, and every transaction attempt with its stage and raw bytes for forensics</td></tr>
         <tr><td><code>deposits</code></td><td>dashboard</td>
             <td>one row per operator-triggered BTC → Thunder deposit, with Ctip sequence before and after</td></tr>
+        <tr><td><code>pplns_fractions</code></td><td>proxy</td>
+            <td><code>pplns-coinbase</code> only. A signed fraction of ONE block reward per worker:
+                positive means skipped by a block that had no room and first in the queue for the
+                next, negative means paid early out of somebody else's skipped share. Sums to zero.
+                <strong>Not a balance</strong> — nothing is held against it, and deleting the table
+                costs nobody a payment, it only forgets whose turn it was</td></tr>
+        <tr><td><code>pplns_pending_fractions</code></td><td>proxy</td>
+            <td><code>pplns-coinbase</code> only. What a FOUND block did to those fractions, held
+                against its hash until the confirmation pass decides. A found block is a candidate:
+                applying it there would rotate a miner down the queue for a payment an orphan never
+                made. Applied at one confirmation and not reversed by a later reorg &mdash; that
+                costs a turn out of order, never a satoshi</td></tr>
       </tbody>
     </table>
   </div>
@@ -1843,19 +2203,34 @@ Password  (anything — it is discarded)</code></pre>
       <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
       <tbody>
         <tr><td><code>pool_mode</code></td><td><code>solo</code></td>
-            <td><code>solo</code>, <code>pps-classic</code>, <code>pplns-thunder</code> or <code>pplns-btc</code>.
+            <td><code>solo</code>, <code>pps-classic</code>, <code>pplns-thunder</code>, <code>pplns-btc</code> or <code>pplns-coinbase</code>.
                 Decides the coinbase shape, what a username must be, and when a balance moves.
                 Bare <code>pplns</code> is refused: it does not say which rail pays.</td></tr>
         <tr><td><code>pplns_window_diff_multiple</code></td><td><code>2.0</code></td>
             <td>PPLNS only. Window size as a multiple of the CURRENT network difficulty, so it
                 self-scales across retargets. Must be &gt; 0; below 1.0 a block pays out across
                 less work than it took to find, which rewards pool hopping, and the proxy warns.</td></tr>
+        <tr><td><code>coinbase_max_bytes</code></td><td><code>1000</code></td>
+            <td><code>pplns-coinbase</code> only. Byte budget for the WHOLE serialized coinbase,
+                commitments included — a rented-hashrate marketplace measures bytes, and drivechain
+                <code>OP_RETURN</code>s spend them before any payout does. Minimum 200. Settable
+                per listener (<code>max_coinbase_bytes=</code> on a <code>listener</code> line),
+                which is usually right: the ceiling binds only on the port rented hashrate
+                connects to, and every byte of it costs a payout.</td></tr>
+        <tr><td><code>pplns_payout_floor_sats</code></td><td><code>546</code></td>
+            <td><code>pplns-coinbase</code> only. A claim worth less than this is <strong>not paid,
+                in that block</strong>; what it was owed is shared among the miners the block
+                could pay, and it goes first in the queue for the next one. Clamped up to 546,
+                the dust limit. Disclose it to your miners.</td></tr>
         <tr><td><code>operator_address</code></td><td>—</td>
             <td><strong>Required.</strong> Receives the <code>fee_bps</code> cut. The proxy refuses to start without it.</td></tr>
         <tr><td><code>fee_bps</code></td><td><code>100</code></td>
             <td>Fee in basis points; 100 = 1%, hard cap 1000 = 10%. <code>0</code> drops the fee output entirely.</td></tr>
         <tr><td><code>pool_btc_address</code></td><td>—</td>
-            <td>pps-classic only, and required there: the coinbase pays here.</td></tr>
+            <td>Required by <code>pps-classic</code>, <code>pplns-thunder</code> and
+                <code>pplns-btc</code>: the coinbase pays here. Unused in <code>solo</code>,
+                and <strong>refused</strong> in <code>pplns-coinbase</code>, which has no
+                pool wallet at all — setting it there is a config error, not a no-op.</td></tr>
         <tr><td><code>pps_sats_per_diff</code></td><td><em>unset</em></td>
             <td>Leave it unset. See the warning in <a href="#pps">section 8</a>.</td></tr>
         <tr><td><code>listen_addr</code> / <code>listen_port</code></td><td><code>0.0.0.0</code> / <code>3334</code></td>

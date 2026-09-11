@@ -102,6 +102,31 @@ void reconcile_blocks_pass(const reconcile_cfg_t *cfg, int tip_height,
      * `return` above this without moving it.
      *
      * test_reconcile.c pins it from both directions. */
+    /* Settle the coinbase-direct fraction ledger on the same pass, and for
+     * the same reason: this is the only place that knows whether a block is
+     * still in the chain. A block whose coinbase skipped somebody moves them
+     * up the queue -- but only if that block actually stood. Orphaned ones
+     * have their staged rows discarded, because their coinbase paid nobody
+     * and rotated nobody.
+     *
+     * Runs whatever the mode, because a pool switched away from
+     * pplns-coinbase still has rows to settle or discard from when it was. */
+    {
+        int applied = 0, discarded = 0;
+        char ferr[256] = {0};
+        if (store_settle_block_fractions(cfg->store, &applied, &discarded,
+                                         ferr, sizeof ferr) < 0) {
+            LOG_WARN("pplns-coinbase: could not settle the payout queue: %s — "
+                     "the staged rows stay and the next tip retries",
+                     ferr[0] ? ferr : "unknown");
+        } else if (applied || discarded) {
+            LOG_INFO("pplns-coinbase: payout queue settled for %d confirmed "
+                     "block(s); discarded %d orphaned", applied, discarded);
+        }
+        r.fractions_applied = applied;
+        r.fractions_discarded = discarded;
+    }
+
     if (cfg->pplns) {
         int blocks = 0, workers = 0;
         char derr[256] = {0};

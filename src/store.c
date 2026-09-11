@@ -11,6 +11,8 @@
 #include "store.h"
 #include "log.h"
 
+#include <stdint.h>   /* INT64_MAX */
+
 #include <sqlite3.h>
 
 #include <errno.h>
@@ -151,6 +153,7 @@ static const char *SCHEMA_SQL_PARTS[] = {
     "  operator_address    TEXT,"    /* fee_bps recipient */
     "  pool_btc_address    TEXT,"    /* pps-classic only; NULL in solo */
     "  pool_mode           TEXT,"
+    "  pplns_payout_floor_sats INTEGER,"
     "  fee_bps             INTEGER,"
     "  rate_source         TEXT,"
     "  rate_sats_per_diff  REAL,"     /* effective, net of fee */
@@ -289,6 +292,9 @@ static const char *SCHEMA_SQL_PARTS[] = {
     ");"
     "CREATE INDEX IF NOT EXISTS payouts_worker_ts_idx ON payouts(worker_id, paid_at);"
     "CREATE INDEX IF NOT EXISTS payouts_paid_at_idx   ON payouts(paid_at);",
+    "CREATE TABLE IF NOT EXISTS pplns_fractions ( worker_id     INTEGER PRIMARY KEY REFERENCES workers(id), owed_fraction REAL    NOT NULL DEFAULT 0, updated_at    INTEGER )",
+    "CREATE TABLE IF NOT EXISTS pplns_pending_fractions ( block_hash TEXT    NOT NULL, worker_id  INTEGER NOT NULL, delta      REAL    NOT NULL, PRIMARY KEY (block_hash, worker_id) )",
+    "CREATE INDEX IF NOT EXISTS pplns_pending_hash_idx ON pplns_pending_fractions(block_hash)",
 };
 
 /* Forward-compat: ALTER existing DBs to add columns that didn't exist in
@@ -335,6 +341,7 @@ static const char *MIGRATIONS_SQL[] = {
      * until the proxy restarts, which the dashboard renders as "not
      * published yet" rather than claiming the pool has one port. */
     "ALTER TABLE pool_meta    ADD COLUMN listeners        TEXT",
+    "ALTER TABLE pool_meta    ADD COLUMN pplns_payout_floor_sats INTEGER",
     /* Block accounting. Every pre-existing row becomes 'pending' — which
      * counts as nothing — rather than being assumed good: the rows were
      * written unconditionally, including for candidates submitblock had
@@ -429,6 +436,30 @@ struct store {
     sqlite3_stmt *st_upsert_node_tip;
     sqlite3_stmt *st_upsert_credit;
     pthread_mutex_t node_tip_mu;   /* serialise binds on st_upsert_node_tip */
+    /* Held across a WHOLE transaction on `db`, by every thread that opens one.
+     *
+     * One connection is shared by the commit thread, the tip watcher and the
+     * stratum submit path, and none of the other locks covers this: `mu`
+     * guards the ring buffer and is released before commit_batch() runs, and
+     * node_tip_mu guards a single statement. So two transactions could
+     * overlap, and BEGIN IMMEDIATE simply failed for the loser -- a race, so
+     * it showed up as an occasional lost write rather than anything
+     * reproducible.
+     *
+     * Savepoints look like the fix and are worse. A savepoint nests into
+     * whatever is already open, which on this connection is usually the
+     * commit thread's share batch -- so RELEASE does not commit the write (a
+     * failed batch discards it after its caller was told it succeeded), and
+     * ROLLBACK TO rewinds the connection past the caller's own boundary,
+     * taking the commit thread's shares with it. Verified both in plain
+     * sqlite; see the tests. That trades a lost payout-queue row for lost
+     * SHARES, which is what every window is measured from.
+     *
+     * Serialising is what these writes actually need. A stratum-path write
+     * waits for at most one batch, bounded by commit_window_ms. Not recursive:
+     * nothing reachable from commit_batch() opens one of these transactions,
+     * which is checked by the tests rather than assumed. */
+    pthread_mutex_t txn_mu;
 
     /* Ring buffer */
     event_t  *ring;
@@ -686,7 +717,17 @@ static void process_event(store_t *s, const event_t *ev) {
 static int commit_batch(store_t *s, event_t *batch, size_t take) {
     for (int attempt = 1; attempt <= STORE_COMMIT_ATTEMPTS; ++attempt) {
         char *err = NULL;
+        /* Held for the whole transaction, so nothing else on this connection
+         * can open one inside it. writer_main() releases `mu` before calling
+         * here -- that lock guards the ring buffer, not the database -- so
+         * without this the tip watcher and the stratum submit path could and
+         * did overlap a batch. See txn_mu.
+         *
+         * Taken per attempt rather than around the retry loop, so a backoff
+         * does not hold every other writer off for the sleep. */
+        pthread_mutex_lock(&s->txn_mu);
         if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, &err) != SQLITE_OK) {
+            pthread_mutex_unlock(&s->txn_mu);
             LOG_WARN("store: BEGIN failed (attempt %d/%d): %s",
                      attempt, STORE_COMMIT_ATTEMPTS, err ? err : "?");
             sqlite3_free(err);
@@ -698,6 +739,7 @@ static int commit_batch(store_t *s, event_t *batch, size_t take) {
         for (size_t i = 0; i < take; ++i) process_event(s, &batch[i]);
 
         if (sqlite3_exec(s->db, "COMMIT", NULL, NULL, &err) == SQLITE_OK) {
+            pthread_mutex_unlock(&s->txn_mu);
             atomic_fetch_add(&s->batches, 1);
             return 0;
         }
@@ -708,6 +750,7 @@ static int commit_batch(store_t *s, event_t *batch, size_t take) {
          * per-event counters process_event() bumped are lost accuracy we
          * accept: they describe attempts, the ledger describes reality. */
         sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        pthread_mutex_unlock(&s->txn_mu);
         atomic_fetch_add(&s->pg_errors, 1);
         backoff_sleep(attempt);
     }
@@ -907,6 +950,7 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         "  last_updated = excluded.last_updated";
 
     pthread_mutex_init(&s->node_tip_mu, NULL);
+    pthread_mutex_init(&s->txn_mu, NULL);
 
     if (sqlite3_prepare_v2(s->db, Q_UPSERT, -1, &s->st_upsert_worker, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(s->db, Q_INS_SHARE, -1, &s->st_insert_share, NULL) != SQLITE_OK ||
@@ -950,6 +994,7 @@ void store_close(store_t *s) {
     if (s->st_upsert_node_tip) sqlite3_finalize(s->st_upsert_node_tip);
     if (s->st_upsert_credit) sqlite3_finalize(s->st_upsert_credit);
     if (s->db) sqlite3_close(s->db);
+    pthread_mutex_destroy(&s->txn_mu);
     pthread_mutex_destroy(&s->node_tip_mu);
     pthread_mutex_destroy(&s->mu);
     pthread_cond_destroy(&s->cv_not_empty);
@@ -1264,6 +1309,54 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
 
 /* ---- PPLNS distribution ------------------------------------------------ */
 
+/* One transaction, serialised against every other on this connection.
+ *
+ * txn_begin() takes txn_mu and opens a real BEGIN IMMEDIATE; commit and
+ * rollback close it and release the lock. Pairing the lock with the
+ * transaction in one place is the point -- an unlock that can be forgotten on
+ * an error path is how this class of bug gets back in. See txn_mu. */
+static int txn_begin(store_t *s) {
+    pthread_mutex_lock(&s->txn_mu);
+    if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->txn_mu);
+        return -1;
+    }
+    return 0;
+}
+/* Returns 0 when the transaction is durable, -1 when it is not -- in which
+ * case it has been rolled back and the connection is back in autocommit.
+ *
+ * The result of COMMIT has to be read. It used to be ignored, and a failed
+ * COMMIT that sqlite does not roll back on its own (BUSY is the documented
+ * case) left the connection INSIDE the transaction after the caller had been
+ * told its write succeeded. From then on every BEGIN on this connection fails
+ * with "cannot start a transaction within a transaction": commit_batch()
+ * retries three times per batch and then logs the batch as LOST, so one
+ * unread rc turned into every share being dropped until restart. Rare under
+ * WAL with BEGIN IMMEDIATE, and the blast radius is the whole pool.
+ *
+ * The ROLLBACK is issued whether or not sqlite already did it -- on a
+ * connection that is already in autocommit it fails harmlessly with "no
+ * transaction is active", and sqlite3_get_autocommit() is the check the
+ * tests use to prove the connection came out clean either way. */
+static int txn_commit(store_t *s) {
+    char *err = NULL;
+    if (sqlite3_exec(s->db, "COMMIT", NULL, NULL, &err) == SQLITE_OK) {
+        pthread_mutex_unlock(&s->txn_mu);
+        return 0;
+    }
+    LOG_WARN("store: COMMIT failed: %s -- rolling back", err ? err : "?");
+    sqlite3_free(err);
+    sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+    pthread_mutex_unlock(&s->txn_mu);
+    atomic_fetch_add(&s->pg_errors, 1);
+    return -1;
+}
+static void txn_rollback(store_t *s) {
+    sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+    pthread_mutex_unlock(&s->txn_mu);
+}
+
 int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
                            int *out_blocks, int *out_workers,
                            char *errbuf, size_t errlen)
@@ -1360,7 +1453,7 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
          * and a failure leaves the latch clear so the next pass retries. A
          * partial distribution is the one outcome that cannot be corrected by
          * running again, because crediting is additive. */
-        if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        if (txn_begin(s) != 0) {
             rc_out = -1;
             break;
         }
@@ -1404,7 +1497,17 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
         sqlite3_finalize(mark);
 
         if (ok) {
-            sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
+            /* A commit that did not land is a distribution that did not
+             * happen: the latch is rolled back with it, so the next pass
+             * retries the block. Nothing was credited, so nothing is owed
+             * twice. */
+            if (txn_commit(s) != 0) {
+                if (errbuf && errlen)
+                    snprintf(errbuf, errlen, "distribute %.16s: commit failed",
+                             hbuf);
+                rc_out = -1;
+                break;
+            }
             blocks++;
             workers += credited_here;
             LOG_INFO("pplns: block %.16s… distributed %lld sats of %lld across "
@@ -1412,7 +1515,7 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
                      hbuf, (long long)distributed, (long long)payable,
                      credited_here, window);
         } else {
-            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+            txn_rollback(s);
             if (errbuf && errlen)
                 snprintf(errbuf, errlen, "distribute %.16s: %s", hbuf,
                          sqlite3_errmsg(s->db));
@@ -1425,6 +1528,421 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
     if (out_blocks)  *out_blocks  = blocks;
     if (out_workers) *out_workers = workers;
     return rc_out < 0 ? rc_out : blocks;
+}
+
+/* ---- the PPLNS window, as it stands now --------------------------------- */
+
+int store_pplns_window(store_t *s, double window_diff,
+                       store_window_entry_t *out, size_t cap,
+                       size_t *out_n, double *out_total_diff,
+                       int *out_truncated, char *errbuf, size_t errlen)
+{
+    if (out_n)         *out_n = 0;
+    if (out_total_diff) *out_total_diff = 0.0;
+    if (out_truncated) *out_truncated = 0;
+    if (!s || !s->db || !out || cap == 0) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "bad arg");
+        return -1;
+    }
+    if (!(window_diff > 0.0)) {
+        if (errbuf && errlen)
+            snprintf(errbuf, errlen, "window_diff must be > 0");
+        return -1;
+    }
+
+    /* The same walk store_pplns_distribute() does, with two differences: it
+     * is anchored on the newest share rather than a particular block's, and
+     * it joins workers so the caller gets an address to pay.
+     *
+     * `running - difficulty < ?` compares against the total EXCLUDING the
+     * current row, which is what includes the share crossing the boundary
+     * whole instead of splitting it. Same rule, same reason, as the
+     * distributor -- if these two ever disagree, a block pays out differently
+     * from what the template promised. */
+    /* Find where the window starts, reading only as far back as it reaches.
+     *
+     * The obvious query -- a running SUM() OVER the whole shares table, with
+     * the window boundary in the WHERE -- computes the running total FIRST and
+     * filters afterwards, so there is no early exit and no bound: every
+     * template build re-reads every share the pool has ever recorded.
+     * Measured at 250ms per million rows, linear, on the template thread. A
+     * production pool reported a 5.5 GB shares database, which is on the order
+     * of a hundred million rows and half a minute per template -- the pool
+     * would simply stop publishing work (LayerTwo-Labs/simplepool#76).
+     *
+     * So walk backwards in bounded batches instead, growing x4 until the
+     * batch covers the window, and let the main query use the primary-key index from
+     * the boundary id. A window is a small multiple of one block's expected
+     * work, so the first batch almost always covers it; the loop exists for
+     * the pathological cases (a difficulty crash, a freshly-lowered window)
+     * rather than the normal one.
+     *
+     * The boundary rule is unchanged and must stay unchanged: `running -
+     * difficulty < window` counts the share that CROSSES the boundary whole,
+     * matching store_pplns_distribute() exactly. If these two ever disagree a
+     * block pays out differently from what its template promised. */
+    static const char *QB =
+        "SELECT MIN(id), MAX(running), COUNT(*), MAX(id) FROM ("
+        "  SELECT id, difficulty,"
+        "         SUM(difficulty) OVER (ORDER BY id DESC ROWS UNBOUNDED PRECEDING) AS running"
+        "    FROM (SELECT id, difficulty FROM shares ORDER BY id DESC LIMIT ?)"
+        ") WHERE running - difficulty < ?";
+
+    sqlite3_int64 cutoff_id = 0;
+    /* The newest row the boundary search actually read.
+     *
+     * The payout query below is a second statement in a second implicit read
+     * transaction, so shares committed between the two would be swept in by a
+     * bare `sh.id >= cutoff` and paid out of this block -- work that arrived
+     * after the window was measured. Measured at 550 difficulty served against
+     * a configured 500 with 50 shares landing mid-walk, and it grows with the
+     * share rate.
+     *
+     * Pinning the top as well makes the two statements describe exactly the
+     * same rows, which is what the single statement they replaced did for
+     * free. INT64_MAX so an empty table -- the one path that never assigns it
+     * -- still produces a well-formed query rather than an empty range.
+     * (Raised by Wired4ncer on #81.) */
+    sqlite3_int64 top_id = INT64_MAX;
+    {
+        sqlite3_stmt *b = NULL;
+        if (sqlite3_prepare_v2(s->db, QB, -1, &b, NULL) != SQLITE_OK) {
+            if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -2;
+        }
+        /* 4096 covers a 2x window at any sane share difficulty; growth is x4.
+         *
+         * The walk must end having PROVED one of two things: that it covered
+         * the window, or that it read the whole table. Anything else -- an IO
+         * error, NOMEM, a corrupt page, or a cross-process BUSY outlasting the
+         * busy timeout (dashboard/ and payout/ open this file read-write) --
+         * means the rows behind `cutoff_id` were never read, and `cutoff_id`
+         * still holds a boundary already known to be short of the window.
+         *
+         * ⛔ Returning that as a window is the one failure this function must
+         * never have. The caller renders it into a coinbase and publishes it;
+         * the payment IS the block, so nothing downstream can notice, and the
+         * block pays out differently from what its template promised -- the
+         * divergence the boundary rule above exists to prevent. So: error out,
+         * and let the caller keep its last good template.
+         *
+         * `got` is how many rows the batch actually returned. In the only
+         * branch that reads it (covered < window_diff) every row in the batch
+         * passes the filter -- if any row were excluded, the row before it
+         * would have a running total at or past the window, and `covered`
+         * would already have ended the walk -- so `got < batch` means the
+         * table ran out, exactly and from the SAME query. Asking a separate
+         * COUNT(*) instead would re-read the rows, and would answer about the
+         * table as it is at that instant rather than the batch just read: with
+         * rows being deleted concurrently the two disagree, and a stale
+         * end-of-table test can leave this loop unable to terminate. */
+        sqlite3_int64 batch = 4096;
+        int settled = 0, step_rc = SQLITE_OK;
+        for (;;) {
+            sqlite3_reset(b);
+            sqlite3_bind_int64(b, 1, batch);
+            sqlite3_bind_double(b, 2, window_diff);
+            step_rc = sqlite3_step(b);
+            if (step_rc != SQLITE_ROW) break;
+            sqlite3_int64 got = sqlite3_column_int64(b, 2);
+            /* No shares at all: no work, no window, no payees. Not an error. */
+            if (got == 0) { settled = 1; break; }
+            cutoff_id = sqlite3_column_int64(b, 0);
+            top_id    = sqlite3_column_int64(b, 3);
+            double covered = sqlite3_column_double(b, 1);
+            /* Covered means the batch reached past the window. */
+            if (covered >= window_diff) { settled = 1; break; }
+            /* The batch could not be filled, so there is nothing further back
+             * to read: the pool is younger than its own window and pays across
+             * everything it has, as store_pplns_distribute() does. A complete
+             * answer, not a truncated one. */
+            if (got < batch) { settled = 1; break; }
+            /* Refuse rather than overflow. Unreachable on any real table --
+             * it would need more than 2^61 rows -- but `batch` is signed and
+             * multiplying past the maximum is undefined, not merely large. */
+            if (batch > INT64_MAX / 4) break;
+            batch *= 4;
+        }
+        sqlite3_finalize(b);
+        if (!settled) {
+            if (errbuf && errlen)
+                snprintf(errbuf, errlen,
+                         "pplns window walk did not cover %.0f (stopped at id %lld): %s",
+                         window_diff, (long long)cutoff_id,
+                         step_rc == SQLITE_ROW ? "batch limit exhausted"
+                                               : sqlite3_errstr(step_rc));
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -2;
+        }
+    }
+
+    static const char *Q =
+        "SELECT w.id, COALESCE(w.payout_address,''), SUM(sh.difficulty) AS wd, "
+        "       COALESCE(f.owed_fraction, 0.0) "
+        "  FROM shares sh "
+        "  JOIN workers w ON w.id = sh.worker_id "
+        "  LEFT JOIN pplns_fractions f ON f.worker_id = w.id "
+        " WHERE sh.id >= ? AND sh.id <= ? "
+        "   AND w.payout_address IS NOT NULL AND w.payout_address <> '' "
+        " GROUP BY w.id "
+        " HAVING wd > 0 "
+        " ORDER BY wd DESC, w.id ASC";
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    sqlite3_bind_int64(st, 1, cutoff_id);
+    sqlite3_bind_int64(st, 2, top_id);
+
+    size_t n = 0;
+    double total = 0.0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (n >= cap) { if (out_truncated) *out_truncated = 1; break; }
+        out[n].worker_id = sqlite3_column_int64(st, 0);
+        const unsigned char *addr = sqlite3_column_text(st, 1);
+        snprintf(out[n].payout_address, sizeof out[n].payout_address, "%s",
+                 addr ? (const char *)addr : "");
+        out[n].difficulty = sqlite3_column_double(st, 2);
+        out[n].owed_fraction = sqlite3_column_double(st, 3);
+        total += out[n].difficulty;
+        n++;
+    }
+    sqlite3_finalize(st);
+
+    if (out_n)          *out_n = n;
+    if (out_total_diff) *out_total_diff = total;
+    return (int)n;
+}
+
+int store_stage_block_fractions(store_t *s, const char *block_hash,
+                                const store_fraction_delta_t *deltas, size_t n,
+                                char *errbuf, size_t errlen)
+{
+    if (!s || !s->db || !block_hash || !block_hash[0] || (!deltas && n)) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "bad arg");
+        return -1;
+    }
+    if (n == 0) return 0;
+
+    /* The deltas describe a redistribution, so they must cancel. A set that
+     * does not sum to zero has invented somebody's turn or destroyed it, and
+     * writing it would put the ledger permanently out of balance -- the one
+     * invariant that makes "nobody is owed money" checkable. Floating point
+     * means "zero" is a tolerance, sized well below the smallest rotation
+     * anyone could notice.
+     *
+     * Summed over the rows that will actually be WRITTEN, not over everything
+     * passed in. A delta whose worker_id is unknown has no row to live in --
+     * pplns_claim_t documents 0 as exactly that -- and the loop below skips
+     * it. Checking the total first and skipping afterwards would let a set
+     * that balances only WITH the orphan reach the table without it, which is
+     * the imbalance this check exists to prevent, arrived at by PASSING the
+     * check rather than failing it. */
+    double sum = 0.0;
+    size_t writable = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (deltas[i].worker_id <= 0) continue;
+        sum += deltas[i].delta;
+        writable++;
+    }
+    /* Nothing to stage. Not an error: no rotation was recorded and none was
+     * lost, because nothing in the set names a worker. */
+    if (writable == 0) return 0;
+    if (sum > 1e-9 || sum < -1e-9) {
+        if (errbuf && errlen)
+            snprintf(errbuf, errlen,
+                     "fraction deltas sum to %g, not zero", sum);
+        return -1;
+    }
+
+    static const char *Q =
+        "INSERT INTO pplns_pending_fractions (block_hash, worker_id, delta) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(block_hash, worker_id) DO UPDATE SET delta = excluded.delta";
+
+    if (txn_begin(s) != 0) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        txn_rollback(s);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    int wrote = 0, ok = 1;
+    for (size_t i = 0; i < n; ++i) {
+        if (deltas[i].worker_id <= 0) continue;
+        sqlite3_reset(st);
+        sqlite3_bind_text  (st, 1, block_hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64 (st, 2, (sqlite3_int64)deltas[i].worker_id);
+        sqlite3_bind_double(st, 3, deltas[i].delta);
+        if (sqlite3_step(st) != SQLITE_DONE) { ok = 0; break; }
+        wrote++;
+    }
+    sqlite3_finalize(st);
+    if (!ok) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        txn_rollback(s);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    /* Reported as a failure, not as `wrote`: the caller logs that the
+     * rotation for this block is lost, which is true, and which is far better
+     * than believing rows are staged that are not. */
+    if (txn_commit(s) != 0) {
+        if (errbuf && errlen)
+            snprintf(errbuf, errlen, "commit failed; nothing was staged");
+        return -2;
+    }
+    return wrote;
+}
+
+int store_settle_block_fractions(store_t *s, int *out_applied,
+                                 int *out_discarded,
+                                 char *errbuf, size_t errlen)
+{
+    if (out_applied)   *out_applied = 0;
+    if (out_discarded) *out_discarded = 0;
+    if (!s || !s->db) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "bad arg");
+        return -1;
+    }
+
+    /* Is there anything staged at all? A read, outside any transaction, and
+     * on the overwhelmingly common path the answer is no.
+     *
+     * Worth asking first because this runs on EVERY reconcile pass in EVERY
+     * mode -- a pool that has never been pplns-coinbase still comes through
+     * here once per tip -- and the transaction below is BEGIN IMMEDIATE, which
+     * takes the database's write lock and txn_mu with it. That stalls the
+     * commit thread's share batch for the length of a write transaction, to
+     * settle a table that is empty and always will be.
+     *
+     * Racy by construction and harmlessly so: a row staged between this check
+     * and the next statement is simply settled by the next pass, which is
+     * already the cadence the whole mechanism runs at. It can only ever cause
+     * a settlement to happen one tip later, never one that should not have. */
+    {
+        sqlite3_stmt *any = NULL;
+        int have = 0;
+        if (sqlite3_prepare_v2(s->db,
+                "SELECT 1 FROM pplns_pending_fractions LIMIT 1",
+                -1, &any, NULL) != SQLITE_OK) {
+            if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -2;
+        }
+        have = (sqlite3_step(any) == SQLITE_ROW);
+        sqlite3_finalize(any);
+        if (!have) return 0;
+    }
+
+    /* One transaction for the whole settlement. A partially applied block
+     * would leave the ledger not summing to zero, and unlike a failed payout
+     * there is no later pass that could notice: the pending rows are gone. */
+    if (txn_begin(s) != 0) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        return -1;
+    }
+
+    /* SQLite folds duplicate worker rows within one INSERT..SELECT rather than
+     * applying each, so settle one block at a time: two confirmed blocks that
+     * both moved the same worker must move it twice. */
+    static const char *ONE_HASH =
+        "SELECT DISTINCT p.block_hash, b.status "
+        "  FROM pplns_pending_fractions p "
+        "  JOIN blocks_found b ON b.hash = p.block_hash "
+        " WHERE b.status IN ('confirmed','orphaned') "
+        " LIMIT 64";
+
+    char hashes[64][80];
+    int  is_conf[64];
+    int  nh = 0;
+    sqlite3_stmt *sel = NULL;
+    if (sqlite3_prepare_v2(s->db, ONE_HASH, -1, &sel, NULL) != SQLITE_OK) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        txn_rollback(s);
+        return -2;
+    }
+    while (nh < 64 && sqlite3_step(sel) == SQLITE_ROW) {
+        const unsigned char *h = sqlite3_column_text(sel, 0);
+        const unsigned char *st_ = sqlite3_column_text(sel, 1);
+        if (!h) continue;
+        snprintf(hashes[nh], sizeof hashes[nh], "%s", (const char *)h);
+        is_conf[nh] = st_ && strcmp((const char *)st_, "confirmed") == 0;
+        nh++;
+    }
+    sqlite3_finalize(sel);
+
+    static const char *APPLY_ONE =
+        "INSERT INTO pplns_fractions (worker_id, owed_fraction, updated_at) "
+        "SELECT p.worker_id, p.delta, strftime('%s','now') "
+        "  FROM pplns_pending_fractions p WHERE p.block_hash = ? "
+        "ON CONFLICT(worker_id) DO UPDATE SET "
+        "  owed_fraction = pplns_fractions.owed_fraction + excluded.owed_fraction, "
+        "  updated_at = excluded.updated_at";
+    static const char *DROP_ONE =
+        "DELETE FROM pplns_pending_fractions WHERE block_hash = ?";
+
+    int applied = 0, discarded = 0, ok = 1;
+    for (int i = 0; i < nh && ok; ++i) {
+        if (is_conf[i]) {
+            sqlite3_stmt *a = NULL;
+            if (sqlite3_prepare_v2(s->db, APPLY_ONE, -1, &a, NULL) != SQLITE_OK) { ok = 0; break; }
+            sqlite3_bind_text(a, 1, hashes[i], -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(a) != SQLITE_DONE) ok = 0;
+            sqlite3_finalize(a);
+            if (ok) applied++;
+        } else {
+            discarded++;
+        }
+        if (!ok) break;
+        sqlite3_stmt *d = NULL;
+        if (sqlite3_prepare_v2(s->db, DROP_ONE, -1, &d, NULL) != SQLITE_OK) { ok = 0; break; }
+        sqlite3_bind_text(d, 1, hashes[i], -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(d) != SQLITE_DONE) ok = 0;
+        sqlite3_finalize(d);
+    }
+
+    if (!ok) {
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s", sqlite3_errmsg(s->db));
+        txn_rollback(s);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    /* The staged rows are still there, so the next pass settles them; the
+     * caller's WARN says exactly that. Reporting applied=N here would say the
+     * rotation happened when it did not. */
+    if (txn_commit(s) != 0) {
+        if (errbuf && errlen)
+            snprintf(errbuf, errlen, "commit failed; the staged rows stay");
+        return -2;
+    }
+    if (out_applied)   *out_applied = applied;
+    if (out_discarded) *out_discarded = discarded;
+    return 0;
+}
+
+int store_begin_txn_for_test(store_t *s) {
+    if (!s || !s->db) return -1;
+    return txn_begin(s);
+}
+
+int store_end_txn_for_test(store_t *s) {
+    if (!s || !s->db) return -1;
+    return txn_commit(s);
+}
+
+int store_rollback_txn_for_test(store_t *s) {
+    if (!s || !s->db) return -1;
+    txn_rollback(s);
+    return 0;
 }
 
 int store_record_credit(store_t *s, const char *worker_name,
@@ -1498,7 +2016,8 @@ int store_record_pool_identity(store_t *s, const char *network,
                                const char *coinbase_tag,
                                const char *operator_address,
                                const char *pool_btc_address,
-                               const char *listeners_json)
+                               const char *listeners_json,
+                               int64_t pplns_payout_floor_sats)
 {
     if (!s) return -1;
     /* Upserts the same id=1 row as store_record_pool_meta(), but only the
@@ -1513,15 +2032,17 @@ int store_record_pool_identity(store_t *s, const char *network,
      * blank". */
     static const char *Q =
         "INSERT INTO pool_meta (id, network, network_source, coinbase_tag,"
-        "  operator_address, pool_btc_address, listeners) "
-        "VALUES (1, ?, ?, ?, ?, ?, ?) "
+        "  operator_address, pool_btc_address, listeners,"
+        "  pplns_payout_floor_sats) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(id) DO UPDATE SET "
         "  network = excluded.network,"
         "  network_source = excluded.network_source,"
         "  coinbase_tag = excluded.coinbase_tag,"
         "  operator_address = excluded.operator_address,"
         "  pool_btc_address = excluded.pool_btc_address,"
-        "  listeners = excluded.listeners";
+        "  listeners = excluded.listeners,"
+        "  pplns_payout_floor_sats = excluded.pplns_payout_floor_sats";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
         atomic_fetch_add(&s->pg_errors, 1);
@@ -1544,6 +2065,14 @@ int store_record_pool_identity(store_t *s, const char *network,
         sqlite3_bind_text(st, 6, listeners_json, -1, SQLITE_TRANSIENT);
     } else {
         sqlite3_bind_null(st, 6);
+    }
+    /* NULL in every mode but pplns-coinbase, so a reader can tell "this pool
+     * forfeits nothing because it has no floor" from "this pool's floor is
+     * zero". Only the first is true of the other four modes. */
+    if (pplns_payout_floor_sats >= 0) {
+        sqlite3_bind_int64(st, 7, (sqlite3_int64)pplns_payout_floor_sats);
+    } else {
+        sqlite3_bind_null(st, 7);
     }
     int rc = sqlite3_step(st);
     pthread_mutex_unlock(&s->node_tip_mu);

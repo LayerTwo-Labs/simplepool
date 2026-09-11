@@ -6,14 +6,16 @@ connections on TCP `:3334`, builds block templates via `bitcoind`'s
 accepted share into a local SQLite database. A separate Node.js dashboard
 reads that file for stats.
 
-It runs in four modes, which differ in who carries the variance: **solo**,
-where the miner who finds a block is paid in that block's own coinbase;
-**pps-classic**, where every accepted share earns a derivable amount and the
-operator absorbs the variance out of a reserve; and **pplns-thunder** /
-**pplns-btc**, where a matured block is split across the shares that produced
-it, so the miners carry the variance and the pool never owes more than it has
-just been paid. All four ship in this repo — see [The four
-modes](#the-four-modes) below.
+It runs in five modes, which differ in who carries the variance and who holds
+the money in between: **solo**, where the miner who finds a block is paid in
+that block's own coinbase; **pps-classic**, where every accepted share earns a
+derivable amount and the operator absorbs the variance out of a reserve;
+**pplns-thunder** / **pplns-btc**, where a matured block is split across the
+shares that produced it, so the miners carry the variance and the pool never
+owes more than it has just been paid; and **pplns-coinbase**, which is that
+same PPLNS accounting with the custody removed — the block's own coinbase pays
+the whole window directly, one output per miner. All five ship in this repo —
+see [The five modes](#the-five-modes) below.
 
 Created by **Roberto Santacroce**.
 Canonical repository: <https://github.com/LayerTwo-Labs/simplepool>.
@@ -46,11 +48,11 @@ curl -fsSL https://raw.githubusercontent.com/LayerTwo-Labs/simplepool/main/scrip
 > audit every number — lives at [`docs/simplepool.html`](docs/simplepool.html).
 > Open it from disk or serve it next to the dashboard.
 
-### The four modes
+### The five modes
 
-This repository ships **all four**, selected by `pool_mode` in
-`proxy.conf`. They differ in two independent things — whether the coinbase
-pays the miner or the pool, and what a stratum username is:
+This repository ships **all five**, selected by `pool_mode` in
+`proxy.conf`. They differ in two independent things — who the coinbase pays,
+and what a stratum username is:
 
 | `pool_mode` | coinbase pays | username | who carries the variance |
 | --- | --- | --- | --- |
@@ -58,6 +60,7 @@ pays the miner or the pool, and what a stratum username is:
 | `pps-classic` | the pool | Thunder address | the operator, out of a reserve |
 | `pplns-thunder` | the pool | Thunder address | the miners |
 | `pplns-btc` | the pool | Bitcoin address | the miners |
+| `pplns-coinbase` | **the whole window, directly** | Bitcoin address | the miners |
 
 - **`pool_mode = solo`** (default) — every share lands in the local
   SQLite store, every accepted block is paid directly in its own
@@ -129,8 +132,10 @@ pays the miner or the pool, and what a stratum username is:
   recomputed when it is paid: those moments are ~100 blocks apart and the
   chain can retarget in between.
 
-  The two differ only in the rail the balance is finally paid over, and
-  that choice is what a stratum username has to be:
+  These two differ only in the rail the balance is finally paid over, and
+  that choice is what a stratum username has to be. (The third PPLNS mode,
+  `pplns-coinbase` below, has no balance and no rail at all — it pays out of
+  the block itself.)
 
   - **`pplns-thunder`** pays over Thunder, like `pps-classic`, and reuses
     the same payout worker draining the same `pps_credits` table. Username
@@ -146,6 +151,100 @@ pays the miner or the pool, and what a stratum username is:
   One rail per pool, encoded in `pool_mode` rather than a mode plus a
   separate rail knob, so the inconsistent configuration is unrepresentable
   rather than merely rejected.
+
+- **`pool_mode = pplns-coinbase`** — the same PPLNS accounting as the two
+  rails above, with the custody taken out. There is no pool wallet, no
+  payout worker, no `pps_credits` row and no maturity wait: the block's own
+  coinbase pays the entire window directly, one output per miner, largest
+  claim first. A reorged block simply never paid, so there is nothing to
+  claw back. Username is a Bitcoin address.
+
+  The window is snapshotted onto the job when the template is built, so the
+  coinbase pays the work that exists *now* rather than work from 100 blocks
+  ago. On a drivechain the coinbase comes from the CUSF enforcer, and its
+  BIP300/301 commitment `OP_RETURN`s are preserved byte-for-byte — only the
+  enforcer's own reward output is replaced, by the window.
+
+  **Two limits decide how many miners one block can pay:**
+
+  - `coinbase_max_bytes` (default 1000) budgets the *whole serialized
+    coinbase*, commitments included, because that is what a rented-hashrate
+    marketplace measures when it decides a job is oversized. A production
+    coinbase-direct pool reports whole coinbases of 721–817 bytes paying up
+    to 16 miners, where the same 16 payouts cost 817 bytes against four
+    drivechain `OP_RETURN`s and 769 against three. A cap counted in outputs
+    cannot see that; a byte budget can.
+
+    It is settable **per listener**, and usually should be. The ceiling is a
+    marketplace rule enforced on the port the rented hashrate connects to, and
+    every byte of it costs a payout — a 100-miner window pays 9 at 400 bytes
+    and 93 at 3000 — so there is no reason to make your own miners live under a
+    limit their port is never measured against:
+
+    ```
+    coinbase_max_bytes = 3000
+    listener = port=3335 label=rental min_diff=500000 initial_diff=500000 max_coinbase_bytes=900
+    ```
+
+    A listener that sets none uses the server-wide value.
+  - `pplns_payout_floor_sats` (default 546, the dust limit) is the minimum
+    a claim must be worth to get an output at all.
+
+  **A claim that clears neither is paid to the other miners in the window,
+  not to the operator.** The block still pays out to the satoshi, the pool
+  still holds nothing, and the operator still takes only its fee.
+
+  > This was the other way round until [#76][pr76]. A dropped claim used to
+  > ride on the operator's output, defended as a dust policy. Measurement
+  > killed it: with 100 miners on a 1/n hashrate spread and the default
+  > budget, 28 were paid, **72 were cut by the byte cap and none by the dust
+  > floor**, and the operator received **25% of the block on a 1% fee**. The
+  > take also rose as the coinbase shrank — 46% at 400 bytes against 2% at
+  > 3000 — so starving your own miners was the revenue-maximising move.
+  > Credit to [@Wired4ncer][pr76], who runs the pool that showed it.
+
+  **Being small costs you frequency, not money.** A miner's share of the
+  window tracks its hashrate, so without help the largest claims would take
+  the same slots every block and the same addresses would never be paid at
+  all. A quarter of each coinbase's slots are therefore reserved for whoever
+  has waited longest, tracked in `pplns_fractions`: a signed fraction of one
+  block reward per worker, positive if you were skipped and negative if you
+  were paid early out of someone else's skipped share. The column sums to
+  zero.
+
+  That is **not a balance and the pool holds nothing against it**. Nothing is
+  ever withheld from a coinbase and released later — that would need a block
+  paying less than the reward followed by one paying more, and the second is
+  invalid. Delete the table and nobody is owed a payment; the pool just
+  forgets whose turn it was. Rows are staged when a block is found and applied
+  only once it is confirmed, so an orphaned block — which paid nobody —
+  rotates nobody.
+
+  "Confirmed" means one block deep, not a hundred: the queue has to reflect
+  the last block before the next one is built, and money is not at stake. The
+  cost is that a block reorged out *after* that first confirmation keeps its
+  rotation — the miners it paid stay at the back of the queue and the ones it
+  skipped stay at the front — for a payment that never stood. That is one turn
+  out of order, never a satoshi, and the next block found corrects it.
+
+  **If the pool cannot measure the window, it publishes no job at all.** The
+  window is read back over a bounded walk of the shares table; if that walk
+  cannot prove it covered the configured window — an IO error, a lock held too
+  long — it returns an error rather than a short answer, and the template is
+  held back. Miners keep working the last job until it recovers, which costs
+  hashrate on a new tip but is the only safe direction: in this mode the window
+  is rendered into a coinbase and published, so a wrong one is mined,
+  irreversible, and invisible afterwards. `pplns window walk did not cover …`
+  in the log is that guard firing, not a crash.
+
+  The floor is disclosed in four places: the proxy states it at startup, logs
+  how many miners in the current window fall below it, reports per block what
+  was redistributed and to whom — and publishes the number to `pool_meta`, so
+  the **dashboard states it to miners before they connect**. That last one is
+  the one that matters: the operator's log is the one place the miner it
+  affects cannot look.
+
+[pr76]: https://github.com/LayerTwo-Labs/simplepool/pull/76
 
 In every mode the operator fee stays in BTC, paid to `operator_address`
 out of the same coinbase. On PPLNS it is normally set lower than on PPS:
@@ -601,9 +700,22 @@ The script:
 5. Asserts that `workers` has at least one row, `workers.payout_address`
    is populated, and `rejects` has at least one row.
 
-There is also a full end-to-end regtest (`tests/test_e2e_regtest.sh`) and a
-payout regtest (`tests/test_payout_regtest.sh`); both run in CI. For the
-verification checklist behind each mode, see [`VERIFY.md`](VERIFY.md).
+Note what that integration test is not: it never mines, so it cannot see
+whether a coinbase pays the right person. The end-to-end suites do, one per
+mode, each mining a real chain:
+
+| Suite | Proves |
+| --- | --- |
+| `tests/test_solo_regtest.sh` | two miners, two addresses, a block each — every coinbase pays **its own finder**, rendered per connection |
+| `tests/test_e2e_regtest.sh` | `pps-classic`: the coinbase pays the pool, and shares accrue at the derived rate |
+| `tests/test_pplns_regtest.sh` | both pooled PPLNS rails distribute a matured block exactly once |
+| `tests/test_pplns_btc_payout_regtest.sh` | `pplns-btc` pays miners on L1 through the enforcer wallet |
+| `tests/test_pplns_coinbase_regtest.sh` | `pplns-coinbase`: the block's coinbase pays the window, the pool holds nothing, the payout floor is disclosed, and a mixed 100 : 10 : 1 window really does redistribute the smallest claim across the miners that fit — on chain, with the operator holding only its fee and the payout queue summing to zero |
+| `tests/test_payout_regtest.sh` | the Thunder payout rail settles and confirms |
+
+All of them run in CI. For the verification checklist behind each mode, see
+[`VERIFY.md`](VERIFY.md); for what changed in each release, see
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ## Layout
 

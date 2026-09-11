@@ -4,6 +4,13 @@ This is the design behind `pool_mode = pps-classic`, the pool's
 Thunder-paying PPS mode. It is implemented and running; this doc
 explains the shape and why it looks the way it does.
 
+> Scoped to `pps-classic`. Four other modes exist — see
+> [the five modes](README.md#the-five-modes). The finding below (that the
+> enforcer does not credit coinbase outputs as deposits) is what rules out
+> depositing straight from the coinbase **on a sidechain**; it says nothing
+> about paying miners on L1 from the coinbase, which is exactly what `solo`
+> and `pplns-coinbase` do and which works.
+
 ## Why not deposit straight from the coinbase
 
 The original design (`pool_mode = pps`, since removed) embedded a BIP300

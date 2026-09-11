@@ -6,6 +6,8 @@
 #include <stdatomic.h>
 #include <stdint.h>
 
+#include "coinbase.h"   /* coinbase_payee_t */
+
 typedef struct stratum_job stratum_job_t;
 
 /* The extranonce split, advertised on mining.subscribe and baked into every
@@ -64,6 +66,21 @@ stratum_job_t *stratum_job_new(
     const char *const *tx_hex_list, size_t tx_count,
     const char *coinbasetxn_hex, int coinbase_has_witness);
 
+/* Attach the PPLNS window this job's block would pay, for pool_mode =
+ * pplns-coinbase. The job takes its own copy of both the amounts and the
+ * addresses, so the caller's array can be stack-allocated and reused.
+ *
+ * Called once, before the job is published — the window is a SNAPSHOT taken
+ * when the template was built, not a live view. A miner that connects after
+ * the job went out is not in that job's coinbase and is not paid by a block
+ * found against it; it is picked up by the next template. The refresh cadence
+ * is what bounds how stale that snapshot gets.
+ *
+ * Returns 0 on success, negative on allocation failure. */
+int stratum_job_set_window(stratum_job_t *j,
+                           const coinbase_payee_t *payees,
+                           const int64_t *worker_ids, size_t n_payees);
+
 void stratum_job_free(stratum_job_t *j);
 
 /* Observer hooks filled in by main.c (typically routed to the sqlite store). */
@@ -90,6 +107,15 @@ typedef int (*block_submit_fn)(void *ctx, const char *block_hex,
  * `submit_error` the reason when it was not. A candidate the node refused is
  * still reported here — it is recorded as 'rejected' rather than dropped,
  * because a silent reject is how phantom rewards went unnoticed. */
+/* What a found block's coinbase did to each miner's standing in the queue, as
+ * signed fractions of one block reward that sum to zero. The callback stages
+ * them against the block hash; the confirmation pass decides whether they ever
+ * take effect. pplns-coinbase only. */
+struct store_fraction_delta;
+typedef void (*window_fractions_fn)(void *ctx, const char *block_hash,
+                                    const struct store_fraction_delta *deltas,
+                                    size_t n);
+
 typedef void (*block_found_fn)(void *ctx,
                                const char *worker_name,
                                const char *finder_address,
@@ -127,6 +153,17 @@ typedef struct {
      * for one, which is how the default port and every low-difficulty chain
      * keep their existing behaviour. See clamp_assigned_difficulty. */
     double min_diff;
+    /* This port's coinbase byte ceiling, overriding the server-wide
+     * coinbase_max_bytes. 0 means "use the server-wide one".
+     *
+     * Here for the same reason min_diff is: the ceiling that actually binds is
+     * a MARKETPLACE rule, enforced by whoever is renting you hashrate, and it
+     * only applies to the port they connect to. A byte ceiling costs payouts —
+     * every miner it cuts is one the block cannot pay — so applying a
+     * rental market's limit to your own miners' port buys nothing and costs
+     * them their slots (LayerTwo-Labs/simplepool#76). Set it tight on the
+     * rented port and leave it alone everywhere else. */
+    int    max_coinbase_bytes;
     /* Free-form, for logs and for the dashboard to tell miners which port to
      * point which machine at. Empty for the default listener. */
     char   label[32];
@@ -179,6 +216,18 @@ typedef struct {
      */
     int     coinbase_pays_pool;
     int     username_is_thunder;
+
+    /* pplns-coinbase: the coinbase pays the WINDOW directly, one output per
+     * miner, so the pool never receives the reward at all. Mutually exclusive
+     * with coinbase_pays_pool — the reward goes to the miners or to the pool,
+     * never both — and distinct from solo, which pays only the finder.
+     *
+     * The window itself rides on the job (stratum_job_set_window), because it
+     * is a snapshot taken when the template was built. */
+    int     coinbase_pays_window;
+    size_t  max_coinbase_bytes;   /* 0 = COINBASE_DEFAULT_MAX_BYTES */
+    int64_t payout_floor_sats;    /* below this a claim is not paid this block */
+    window_fractions_fn on_window_fractions;  /* pplns-coinbase only */
 
     /* Does this mode price a share when it arrives? Only pps-classic does.
      * It is what the accrual gate suspends, so the gate must key on this and
@@ -284,6 +333,7 @@ typedef struct stratum_conn stratum_conn_t;
 /* Allocate a connection state attached to a server. Used by tests; the
  * real listener uses an internal allocator. */
 stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s);
+void stratum_conn_set_coinbase_budget_for_test(stratum_conn_t *c, int bytes);
 void            stratum_conn_free_for_test(stratum_conn_t *c);
 
 /* Test accessors — connection internals are otherwise opaque. */

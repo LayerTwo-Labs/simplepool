@@ -211,6 +211,70 @@ pool_mode = solo
 # proxy warns if you set it there.
 # pplns_window_diff_multiple = 2.0
 
+# pplns-coinbase — the byte budget for the WHOLE serialized coinbase, which is
+# what actually limits how many miners one block can pay.
+#
+# Not a consensus limit. Consensus bounds the coinbase by block weight and
+# would allow far more; the real constraint is that rented-hashrate
+# marketplaces verify the coinbase and refuse a job whose coinbase they
+# consider oversized, and a delisting costs more than paying a few small
+# miners a block later.
+#
+# Counted in bytes rather than in outputs because outputs are not the only
+# thing spending them. On a drivechain pool the binding term is the BIP300/301
+# commitment OP_RETURNs the enforcer's template already carries: a
+# coinbase-direct pool in production reports the same 16 payouts costing 817
+# bytes against four of them and 769 against three. A cap counted in outputs
+# cannot see that; this can, because the commitments are simply part of what
+# has already been spent.
+#
+# Whatever does not fit is redistributed across the miners it could pay — see
+# pplns_payout_floor_sats below.
+#
+# Settable PER LISTENER, and usually should be. The ceiling that actually binds
+# is a marketplace rule enforced on the port rented hashrate connects to, and
+# every byte of it costs a payout: at 400 bytes a 100-miner window pays 9, at
+# 3000 it pays 93. There is no reason to make your own miners live under a
+# limit their port is not measured against:
+#
+#   coinbase_max_bytes = 3000
+#   listener = port=3335 label=rental min_diff=500000 initial_diff=500000 max_coinbase_bytes=900
+#
+# A listener that sets none uses the server-wide value below.
+# coinbase_max_bytes = 1000
+
+# pplns-coinbase — the payout floor, in satoshis. A miner whose share of a
+# block is worth less than this gets no output in THAT block.
+#
+# What it was owed is not lost and does not go to you: it is shared out among
+# the miners that block could pay, and the skipped miner goes first in the
+# queue for the next one. You take your fee and nothing else, at every byte
+# budget.
+#
+# That queue is `pplns_fractions` in the database — a signed fraction of one
+# block reward per worker, positive if skipped and negative if paid early out
+# of someone else's skipped share, summing to zero. A quarter of every
+# coinbase's payout slots are reserved for whoever has waited longest, because
+# a miner's share of the window tracks its hashrate: without that, the largest
+# claims take the same slots in every block and the same addresses are never
+# paid at all.
+#
+# It is NOT a balance and you hold nothing against it. Nothing is ever withheld
+# from a coinbase and released later — that would need a block paying less than
+# the reward followed by one paying more, and the second is invalid. Delete the
+# table and nobody is owed a payment; the pool just forgets whose turn it was.
+# Rows are staged when a block is found and applied only once it confirms, so
+# an orphaned block rotates nobody. Confirmed means one block deep, so a block
+# reorged out AFTER that keeps its rotation: one turn out of order, never a
+# satoshi, and corrected by the next block found.
+#
+# So being small here costs a miner FREQUENCY, not money. Say that on your
+# pool page — the proxy states the floor at startup, per template, per block,
+# and on the dashboard, but only you can put it where a miner looks first.
+#
+# Clamped up to 546 (the dust limit) — no smaller output is relayable anyway.
+# pplns_payout_floor_sats = 546
+
 # pps-classic — OPTIONAL rate override, sats credited per unit of share
 # difficulty. Leave it commented out and the proxy derives the rate from each
 # block template as (coinbasevalue / network_difficulty) * (1 - fee_bps/1e4).

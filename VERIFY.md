@@ -1,4 +1,4 @@
-# `pps-thunder` — verification checklist
+# Verification checklist
 
 Step-by-step checks to confirm each landed piece behaves as advertised.
 Tick boxes as you go; each section is independent and you can skip
@@ -7,6 +7,25 @@ investigate.
 
 If a step fails, the section header points at the commit that owns the
 behaviour, so `git show <hash>` is a quick way to inspect.
+
+**Sections 0–12 were written for the original `pps-thunder` work and are
+organised by the commits that landed it.** They still hold, but they predate
+four of the five pool modes. What covers the modes now is one end-to-end
+regtest suite each, all of them in CI, all of them mining a real chain:
+
+| Mode | Suite |
+| --- | --- |
+| `solo` | `tests/test_solo_regtest.sh` |
+| `pps-classic` | `tests/test_e2e_regtest.sh` |
+| `pplns-thunder`, `pplns-btc` | `tests/test_pplns_regtest.sh` |
+| `pplns-btc` payouts | `tests/test_pplns_btc_payout_regtest.sh` |
+| `pplns-coinbase` | `tests/test_pplns_coinbase_regtest.sh` |
+| Thunder payout rail | `tests/test_payout_regtest.sh` |
+
+Running `bash tests/<suite>.sh` is a stronger check than any manual section
+below, because it asserts against the chain rather than against a log. Section
+13 is the manual pass for `pplns-coinbase`, which is the mode with a policy an
+operator has to decide on rather than merely configure.
 
 ---
 
@@ -459,7 +478,101 @@ drove the operator-triggered deposit design in
 
 ---
 
-## 13 · Teardown
+## 13 · Coinbase-direct PPLNS (`pplns-coinbase`)
+
+Owns: the coinbase-direct rail. The automated version of all of this is
+`bash tests/test_pplns_coinbase_regtest.sh`; do that first. This section is
+the manual pass, and it exists because this mode has a **policy** an operator
+has to agree with, not just a config to fill in.
+
+### 13.1 · The config refuses what the mode cannot do
+
+- [ ] `pool_btc_address` set alongside `pool_mode = pplns-coinbase` is
+      refused at startup: *"'pool_btc_address' must not be set when
+      pool_mode=pplns-coinbase"*. There is no pool wallet in this mode.
+- [ ] `pplns_payout_floor_sats = -1` is refused (*"must be >= 0"*).
+- [ ] `coinbase_max_bytes = 150` is refused (*"too small to hold a coinbase
+      and a single payout"*).
+- [ ] No payout worker is installed. `solo` and `pplns-coinbase` need none —
+      see [`payout/README.md`](payout/README.md).
+
+### 13.2 · The floor is disclosed, four ways
+
+A block cannot pay everyone in a large window, so miners have to know both
+halves: what one block may not pay them, and what happens to it. Check this
+rather than assume it.
+
+- [ ] **Startup**, beside the identity line: *"payout floor N sats — a miner
+      whose share of a block is worth less than that is NOT PAID…"*. It prints
+      even when the node is unreachable, because it is a config fact.
+- [ ] **Per template**, when someone in the window is below it: *"N of M
+      miner(s) in the window are below the …-sat payout floor and will earn
+      NOTHING from the next block"*. Only re-logged when the count changes.
+- [ ] **Per block**: either *"paid all N miner(s)"* or *"N claim(s) worth X
+      sats had no room and were REDISTRIBUTED across the miners who did fit"*.
+- [ ] **The dashboard**, before anyone connects. Open `/` and read the
+      "About the numbers" card: it must state the floor in sats and say the
+      amount is *shared out among the miners that block could pay*, and that
+      the miner goes *first in the queue* for the next one. If it does not, the
+      proxy is on a build that predates `pool_meta.pplns_payout_floor_sats` —
+      the card stays silent rather than inventing a default, so check
+      `sqlite3 shares.db "SELECT pplns_payout_floor_sats FROM pool_meta"`.
+- [ ] You have published the floor on your pool page. Nothing in the software
+      can do this one for you.
+
+### 13.3 · The money, read off the chain
+
+Not out of the pool's own database — that is the pool marking its own
+homework. `bitcoin-cli getblock <hash> 2 | jq '.tx[0].vout'`:
+
+- [ ] One output per miner in the window, plus the operator's.
+- [ ] **No output pays an address the pool controls** beyond the operator fee.
+      There is no pool wallet, so a third address means something is wrong.
+- [ ] The outputs sum to the whole block reward. A coinbase paying out less
+      than it may destroys the difference.
+- [ ] The operator output is **exactly `fee_bps` of the block, and no more**,
+      on every block — including ones that could not pay the whole window.
+      This is the check that matters most: until #76 a dropped claim rode on
+      the operator's output, and on a 100-miner window that came to 25% of the
+      block against a 1% advertised fee.
+- [ ] The miners who *were* paid received **more than their own window
+      share**, and the outputs still sum to the whole block. That is the
+      redistribution arriving — if the total is short, value was destroyed
+      rather than shared.
+- [ ] `sqlite3 shares.db "SELECT COUNT(*) FROM pps_credits"` is **0**. This
+      mode credits no balance, ever. Any row means a pooled mode's accrual
+      path ran.
+- [ ] The payout queue balances:
+      `sqlite3 shares.db "SELECT ROUND(COALESCE((SELECT SUM(delta) FROM
+      pplns_pending_fractions),0) + COALESCE((SELECT SUM(owed_fraction) FROM
+      pplns_fractions),0), 9)"` is **0**. It is a record of whose turn it is,
+      not money — a non-zero sum means somebody's turn was invented or
+      destroyed.
+- [ ] After a block is found but before it confirms, its rows are in
+      `pplns_pending_fractions` and **not** in `pplns_fractions`. An orphaned
+      block paid nobody and must rotate nobody; the confirmation pass is what
+      applies them. It applies them at ONE confirmation, so a block reorged
+      out after that has already rotated the queue and is not reversed — a
+      turn out of order, not money, and the next block corrects it.
+
+### 13.4 · The byte budget
+
+- [ ] On a rented port, set `max_coinbase_bytes=` on that **listener** rather
+      than server-wide. The ceiling is a marketplace rule that binds only on
+      the port the rented hashrate connects to, and every byte of it costs a
+      payout — a 100-miner window pays 9 at 400 bytes and 93 at 3000.
+
+- [ ] Measure a real coinbase: `bitcoin-cli getblock <hash> 2 |
+      jq -r '.tx[0].hex' | wc -c` ÷ 2 = bytes. Compare against
+      `coinbase_max_bytes`.
+- [ ] On a drivechain, note the BIP300/301 `OP_RETURN` count. They spend the
+      same budget the payouts do, so the number of miners a block can pay
+      moves with sidechain activity. Reported in production: the same 16
+      payouts cost 817 bytes against four commitments and 769 against three.
+
+---
+
+## 14 · Teardown
 
 ```
 scripts/regtest/stop.sh

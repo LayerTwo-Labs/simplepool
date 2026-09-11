@@ -40,3 +40,10 @@ jobs:
 
       - name: Test
         run: make test
+
+      # The sequence diagrams in docs/simplepool.html are generated, and they
+      # have gone stale once already — the pplns-coinbase forfeit rule was
+      # reversed and the old wording stayed drawn into the SVG. This fails if
+      # the committed HTML no longer matches the specs it came from.
+      - name: Docs diagrams are up to date
+        run: python3 docs/sequence-diagrams.py --check

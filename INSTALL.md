@@ -28,12 +28,21 @@ possibilities are called out clearly:
 - **`pool_mode = pplns-btc`** — the same accounting, paid on Bitcoin L1
   through the enforcer's own wallet. Usernames are Bitcoin addresses.
   No Thunder node anywhere in the stack.
+- **`pool_mode = pplns-coinbase`** — the same accounting with no custody
+  at all: the block's coinbase pays the whole window directly, one output
+  per miner. No pool wallet, no payout worker, no maturity wait.
+  Usernames are Bitcoin addresses. **A miner whose share of a block is
+  worth less than `pplns_payout_floor_sats` (default 546) is not paid,
+  and the amount goes to the operator — it is not carried and not settled
+  later.** That is deliberate; see the mode's section in
+  [README.md](README.md#the-five-modes) and publish the floor to your
+  miners before you run it.
 
 If you cannot fund a PPS reserve, one of the `pplns-*` modes is the
 pooled mode you can actually run: the pool never owes more than it has
 just been paid.
 
-(A fifth mode, `pool_mode = pps`, put the drivechain deposit directly in
+(A sixth mode, `pool_mode = pps`, put the drivechain deposit directly in
 the coinbase. The enforcer never credited it, so it has been removed —
 `CLASSIC_PAYOUTS.md` has the evidence.)
 
@@ -518,6 +527,7 @@ pays, and the rail decides what a stratum username is:
 | --- | --- |
 | `pplns-thunder` | `<their Thunder address>[.<rig_label>]` |
 | `pplns-btc` | `<their Bitcoin address>[.<rig_label>]` |
+| `pplns-coinbase` | `<their Bitcoin address>[.<rig_label>]` |
 
 Nothing is credited when a share arrives. A block that reaches **100
 confirmations** is split across the shares that produced it, pro rata by
@@ -531,6 +541,53 @@ wallet**, and the payout worker started with `PAYOUT_RAIL=btc` (Part F).
 The proxy logs all three at startup, because otherwise the first sign of
 a misconfiguration is a payout failing 100 blocks after the block was
 found.
+
+#### `pplns-coinbase` — the same accounting, no custody
+
+```
+# ... same as solo, plus:
+pool_mode = pplns-coinbase
+pplns_window_diff_multiple = 2.0   # optional; this is the default
+pplns_payout_floor_sats = 546      # optional; this is the default (dust limit)
+coinbase_max_bytes = 1000          # optional; this is the default
+# NO pool_btc_address — the config refuses one in this mode
+```
+
+Everything above about maturity and `pps_credits` stops applying here. The
+block's own coinbase pays the whole window directly, one output per miner, so
+there is no pool wallet, no payout worker, no ledger row and no 100-block
+wait. A reorged block simply never paid, and there is nothing to claw back.
+**Skip Part F entirely.**
+
+Two limits decide how many miners a block can pay, and both cost miners money
+rather than the pool:
+
+- `coinbase_max_bytes` budgets the **whole serialized coinbase**, commitments
+  included — that is what a rented-hashrate marketplace measures when it
+  refuses a job as oversized. On a drivechain the BIP300/301 `OP_RETURN`s
+  spend it before any payout does. Settable per listener
+  (`listener = port=3335 … max_coinbase_bytes=900`), which is usually what you
+  want: the ceiling only applies to the port rented hashrate connects to, and
+  every byte of it costs a payout.
+- `pplns_payout_floor_sats` is the least a claim must be worth to get an
+  output at all.
+
+**A claim that clears neither is paid to the other miners in the window, not
+to the operator.** The block still pays out to the satoshi, the pool still
+holds nothing, and the operator still takes only its fee.
+
+Being small costs your miners **frequency, not money**. A quarter of every
+coinbase's payout slots are reserved for whoever has waited longest, tracked in
+`pplns_fractions` as a signed fraction of one block reward per worker that sums
+to zero. It is not a balance and you hold nothing against it — delete the table
+and nobody is owed a payment, the pool just forgets whose turn it was.
+
+The proxy states the floor at startup, warns per template how many miners fall
+below it, reports per block what was redistributed, and publishes the number so
+the dashboard states it to miners before they connect. **Publish it on your
+pool page as well.** See
+[the five modes](README.md#the-five-modes) and
+[`VERIFY.md` section 13](VERIFY.md).
 
 ### Optional: Redis broadcast
 
@@ -609,7 +666,7 @@ on every request.
 
 ---
 
-## Part F — payout worker (every mode except solo)
+## Part F — payout worker (only the modes that pool the reward)
 
 The payout worker drains `pps_credits.accrued_sats - paid_sats`. One
 worker, two rails, selected by `PAYOUT_RAIL`:
@@ -619,9 +676,15 @@ worker, two rails, selected by `PAYOUT_RAIL`:
 | `pps-classic` | `thunder` (default) | Thunder transactions from the pool reserve |
 | `pplns-thunder` | `thunder` (default) | the same |
 | `pplns-btc` | `btc` | Bitcoin L1, via `WalletService/SendTransaction` on the enforcer |
+| `solo`, `pplns-coinbase` | — | **do not install this worker**: the coinbase is the payment |
 
-The rail must match `pool_mode`: it is the same choice, and getting it
-wrong means the worker cannot pay anyone. Deploy as a systemd service:
+**Skip this whole part on `solo` and `pplns-coinbase`.** Neither writes a
+`pps_credits` row, so there is nothing to drain — the worker would run,
+find an empty ledger and pay nobody. Harmless, but it is a service to
+monitor, alert on and misdiagnose for no reason.
+
+For the other three, the rail must match `pool_mode`: it is the same
+choice, and getting it wrong means the worker cannot pay anyone. Deploy as a systemd service:
 
 ```sh
 # assumes deploy/systemd/simplepool-payout.service was already installed
