@@ -297,6 +297,28 @@ typedef struct {
      * ring tells it everything is fine. */
     int    max_submits_per_sec;
 
+    /* Budget for mining.authorize, in failures. 0 disables both halves.
+     *
+     * A failed authorize -- no worker name, a malformed username, an address
+     * that does not decode -- costs a reject observation and a log line, and
+     * nothing bounded how many of those one client could buy before it had
+     * authenticated at all. It is the cheapest write on the pool and it is
+     * open to anyone who can reach the port.
+     *
+     * Two limits from the one number. Per connection: the auth_max_failures-th
+     * failure is answered, then the connection is closed. Per peer address: an
+     * address that has failed auth_max_failures times within
+     * auth_fail_lockout_sec is refused at the TOP of the handler -- no
+     * decoding, no reject observation, no log line per attempt -- and the
+     * connection is closed, until the window passes. A successful authorize
+     * clears the address's record, so a miner that fixes its username is not
+     * made to wait.
+     *
+     * Ships on. Unlike max_submits_per_sec it refuses nothing a correct miner
+     * does: it only shortens how long a client may keep failing. */
+    int    auth_max_failures;
+    int    auth_fail_lockout_sec;
+
     void  *ctx;
     share_observer_fn  on_share;
     reject_observer_fn on_reject;
@@ -357,6 +379,10 @@ double      stratum_conn_difficulty_for_test(const stratum_conn_t *c);
  * path does when a miner arrives on that port. Exposed so per-port policy can
  * be tested without binding a fixed port, which in CI is a race with whatever
  * else is on the box. */
+/* Set the peer address a test connection reports, so the per-address half of
+ * the authorize budget is reachable without a socket. */
+void        stratum_conn_set_peer_ip_for_test(stratum_conn_t *c, const char *ip);
+
 void        stratum_conn_apply_listener_for_test(stratum_conn_t *c,
                                                  const stratum_listener_t *pol);
 const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);

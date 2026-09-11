@@ -131,6 +131,20 @@ vardiff_idle_step = 2
 # behaviour rather than a symptom.
 max_submits_per_sec = 20000
 
+# Budget for mining.authorize. A failed authorize is the cheapest write on the
+# pool -- a reject observation and a log line -- and until this existed nothing
+# bounded how many of them one client could buy before authenticating at all.
+#
+# The third failure on a connection is answered and the connection is then
+# closed. An address that has failed three times inside the lockout window is
+# refused before its next attempt is even parsed, until the window passes. A
+# successful authorize forgives the address, so a miner that fixes a typo is
+# not made to wait.
+#
+# 0 disables both halves. A correct miner never reaches either.
+auth_max_failures = 3
+auth_fail_lockout_sec = 60
+
 # Idle-connection reaper, in seconds. Two budgets, because the two states are
 # not the same risk:
 #

@@ -26,6 +26,12 @@ typedef struct {
      * See stratum.h for why it sits where it does. */
     int  max_submits_per_sec;
 
+    /* Budget for mining.authorize: failures allowed per connection and per
+     * peer address, and how long an address stays refused once it is spent.
+     * 0 failures disables both. See stratum.h. */
+    int  auth_max_failures;
+    int  auth_fail_lockout_sec;
+
     /* vardiff — auto-adjust each connection's difficulty to keep the
      * share rate near `target_spm` shares/minute. Set vardiff_enabled = 0
      * to pin every connection to initial_diff (the legacy behaviour). */

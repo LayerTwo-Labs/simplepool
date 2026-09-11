@@ -33,6 +33,8 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     /* Far above any correctly configured miner and far below what one
      * mismatched connection can otherwise cost. See proxy.conf.example. */
     cfg->max_submits_per_sec = 20000;
+    cfg->auth_max_failures     = 3;
+    cfg->auth_fail_lockout_sec = 60;
 
     snprintf(cfg->bitcoind_url,  sizeof cfg->bitcoind_url,  "%s", "http://127.0.0.1:18443");
     /* No default credentials: when bitcoind_user/bitcoind_pass are omitted the
@@ -246,6 +248,8 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "listen_port")               == 0) cfg->listen_port = atoi(v);
         else if (strcmp(k, "max_conns")                 == 0) cfg->max_conns = atoi(v);
         else if (strcmp(k, "max_submits_per_sec")       == 0) cfg->max_submits_per_sec = atoi(v);
+        else if (strcmp(k, "auth_max_failures")        == 0) cfg->auth_max_failures = atoi(v);
+        else if (strcmp(k, "auth_fail_lockout_sec")    == 0) cfg->auth_fail_lockout_sec = atoi(v);
         else if (strcmp(k, "initial_diff")              == 0) cfg->initial_diff = atof(v);
         else if (strcmp(k, "listener")                  == 0) {
             /* Repeatable, unlike every other key here: each one adds a port
@@ -467,6 +471,23 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         set_err(errbuf, errlen,
                 "config: 'max_submits_per_sec' cannot be negative "
                 "(0 disables the ceiling)");
+        return -13;
+    }
+    if (cfg->auth_max_failures < 0) {
+        set_err(errbuf, errlen,
+                "config: 'auth_max_failures' cannot be negative "
+                "(0 disables the authorize budget)");
+        return -13;
+    }
+    /* A lockout window of zero with the budget on would expire every entry the
+     * instant it was written, so the per-address half would silently do
+     * nothing while the config claimed it was on. Refuse the combination
+     * rather than ship a limiter that cannot limit. */
+    if (cfg->auth_max_failures > 0 && cfg->auth_fail_lockout_sec <= 0) {
+        set_err(errbuf, errlen,
+                "config: 'auth_fail_lockout_sec' must be > 0 when "
+                "'auth_max_failures' is set (set auth_max_failures = 0 to "
+                "disable the authorize budget)");
         return -13;
     }
     if (cfg->block_interval_sec <= 0) {

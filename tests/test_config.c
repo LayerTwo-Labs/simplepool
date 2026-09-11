@@ -420,6 +420,58 @@ static void test_a_nonsense_log_level_warns_and_keeps_the_default(void) {
     CHECK(cfg.log_level == 1);   /* info, the default */
 }
 
+/* ---- authorize budget ---------------------------------------------------- */
+
+/* Ships on, with the values documented in proxy.conf.example. Pinned because
+ * "on by default" is the whole security claim: a pool that has never heard of
+ * this setting is still protected. */
+static void test_the_authorize_budget_is_on_by_default(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body, "operator_address = %s\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.auth_max_failures == 3);
+    CHECK(cfg.auth_fail_lockout_sec == 60);
+}
+
+/* Zero disables it; the operator has to be able to say so. */
+static void test_a_zero_authorize_budget_loads(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\nauth_max_failures = 0\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.auth_max_failures == 0);
+}
+
+/* A negative budget is not "off", it is a typo. */
+static void test_a_negative_authorize_budget_is_refused(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\nauth_max_failures = -1\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "auth_max_failures") != NULL);
+}
+
+/* A zero window with the budget on would expire every entry as it was
+ * written: the per-address half would do nothing while the config said it was
+ * on. Refused, rather than shipped as a limiter that cannot limit. */
+static void test_a_zero_lockout_window_is_refused(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\nauth_fail_lockout_sec = 0\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "auth_fail_lockout_sec") != NULL);
+    /* ...unless the budget itself is off, when the window means nothing. */
+    proxy_config_t off; char err2[256] = {0};
+    snprintf(body, sizeof body,
+             "operator_address = %s\nauth_max_failures = 0\n"
+             "auth_fail_lockout_sec = 0\n", VALID_ADDR);
+    CHECK(load_text(body, &off, err2, sizeof err2) == 0);
+}
+
 int main(void) {
     printf("running test_config...\n");
     test_hash_inside_value_is_kept();
@@ -446,6 +498,10 @@ int main(void) {
     test_pplns_requires_a_pool_address();
     test_unknown_mode_names_the_real_ones();
     test_pplns_without_a_rail_is_refused();
+    test_the_authorize_budget_is_on_by_default();
+    test_a_zero_authorize_budget_loads();
+    test_a_negative_authorize_budget_is_refused();
+    test_a_zero_lockout_window_is_refused();
     if (failures) { printf("test_config: %d failed\n", failures); return 1; }
     printf("test_config: all tests passed\n");
     return 0;

@@ -104,6 +104,30 @@ _Static_assert((uint64_t)RECENT_JOBS * 30000u >= RECENT_JOB_TTL_MS,
  * stopped reading; a healthy miner drains these in microseconds. */
 #define SEND_TIMEOUT_SEC 10
 
+/* Per-address authorize-failure table: fixed, bounded, and never allocated on
+ * the client's schedule. 1024 slots keyed by peer address, probed linearly up
+ * to AUTH_FAIL_PROBE deep; a miss with no free slot in the run evicts the
+ * entry whose window started earliest. A client spraying addresses can push
+ * others out of the table, which only ever resets THEIR count -- the table is
+ * a limiter, not a ledger, so an evicted entry can never cost anyone a
+ * lockout they had not earned. */
+#define AUTH_FAIL_SLOTS 1024
+#define AUTH_FAIL_PROBE 8
+
+/* mining.authorize calls per connection per window, success or failure. A
+ * successful authorize is not free either -- it validates an address and
+ * seeds the connection's difficulty -- and a client holding one valid address
+ * can repeat it as fast as it likes. Past the ceiling each call is treated as
+ * a failure, and the connection's failure budget closes it.
+ *
+ * Sixty, not ten: the ceiling exists to stop deliberate spam, and spam is
+ * hundreds a second, while a proxy that multiplexes many workers over one
+ * socket and authorizes them in a burst is a legitimate pattern that has to
+ * clear it. Sixty in ten seconds is far above any burst a proxy needs and
+ * still two orders of magnitude under a flood. */
+#define AUTH_CALL_WINDOW_MS       10000
+#define AUTH_MAX_CALLS_PER_WINDOW 60
+
 /* BIP320 reserved version-rolling bits (ASICBoost). Advertised in
  * mining.configure; only these block-header version bits may be rolled by a
  * miner, and a per-connection mask (this ANDed with the client's request) is
@@ -318,6 +342,15 @@ struct stratum_server {
      * yields the same hash on both, and PPS would credit it twice. Keying
      * on the final hash makes the check independent of how the submission
      * was framed (job id, extranonce2, version rolling). */
+    /* Per-address authorize failures. See stratum_cfg_t.auth_max_failures. */
+    pthread_mutex_t auth_fail_lock;
+    struct auth_fail_entry {
+        char     ip[INET6_ADDRSTRLEN];   /* empty = free */
+        uint32_t fails;
+        uint64_t window_start_mono;
+        int      reported;               /* the lockout has been logged once */
+    } auth_fail[AUTH_FAIL_SLOTS];
+
     pthread_mutex_t share_dedupe_lock;
     /* Two structures over one set of keys. The ring is what bounds memory and
      * decides which hash is forgotten next (the oldest, FIFO). The index is
@@ -392,6 +425,18 @@ struct stratum_conn {
     char     pol_label[32];
     int      subscribed;
     int      authorized;
+
+    /* The peer's address, as text, for the per-address authorize budget and
+     * for logs. Empty on a test connection, which is what makes the budget's
+     * per-address half inert there. */
+    char     peer_ip[INET6_ADDRSTRLEN];
+
+    /* Authorize budget state (see auth_gate). Touched only by this
+     * connection's own thread, inside handle_authorize, so no lock. */
+    uint32_t auth_failures;          /* failures on this connection */
+    uint64_t auth_call_window_ms;    /* AUTH_CALL_WINDOW_MS accounting */
+    uint32_t auth_calls_in_window;
+
     uint32_t version_mask;         /* negotiated version-rolling bits; 0 = off */
     char     worker_name[129];     /* full stratum username (sanitized) */
     char     payout_address[128];  /* validated bech32/base58 */
@@ -1616,8 +1661,139 @@ static int handle_suggest_difficulty(stratum_server_t *s, stratum_conn_t *c,
     return 0;
 }
 
+/* ---- authorize budget --------------------------------------------------- */
+
+/* Find the entry for `ip`, or with `create` claim one for it. Caller holds
+ * auth_fail_lock. An entry whose window has passed counts as free: its count
+ * is stale by definition. Returns NULL only when !create and absent. */
+static struct auth_fail_entry *auth_fail_find(stratum_server_t *s, const char *ip,
+                                              uint64_t now_mono, int create) {
+    uint64_t lockout_ms = (uint64_t)s->cfg.auth_fail_lockout_sec * 1000u;
+    size_t home = (size_t)(fnv1a(ip) & (AUTH_FAIL_SLOTS - 1));
+    struct auth_fail_entry *free_slot = NULL, *oldest = NULL;
+    for (size_t k = 0; k < AUTH_FAIL_PROBE; ++k) {
+        struct auth_fail_entry *e = &s->auth_fail[(home + k) & (AUTH_FAIL_SLOTS - 1)];
+        if (e->ip[0] && strcmp(e->ip, ip) == 0) {
+            if (now_mono - e->window_start_mono >= lockout_ms) {
+                /* Expired: forget the old count but keep the slot. */
+                e->fails = 0; e->window_start_mono = now_mono; e->reported = 0;
+            }
+            return e;
+        }
+        int is_free = !e->ip[0] || now_mono - e->window_start_mono >= lockout_ms;
+        if (is_free && !free_slot) free_slot = e;
+        if (!oldest || e->window_start_mono < oldest->window_start_mono) oldest = e;
+    }
+    if (!create) return NULL;
+    struct auth_fail_entry *e = free_slot ? free_slot : oldest;
+    snprintf(e->ip, sizeof e->ip, "%s", ip);
+    e->fails = 0; e->window_start_mono = now_mono; e->reported = 0;
+    return e;
+}
+
+/* Runs at the top of handle_authorize, before the params are even looked at --
+ * which is the point of it. A refusal that decodes an address and writes a
+ * reject row still costs what the limiter exists to stop paying.
+ *
+ * Returns 0 to proceed. Returns -1 having written the refusal into buf: the
+ * caller passes that straight up, and the connection thread closes the socket
+ * after writing it. */
+static int auth_gate(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
+                     char **buf, size_t *len, int *over_call_ceiling) {
+    *over_call_ceiling = 0;
+    int max_fail = s->cfg.auth_max_failures;
+    if (max_fail <= 0) return 0;
+    uint64_t mono = mono_ms();
+
+    if (c->peer_ip[0]) {
+        int locked = 0, first = 0;
+        uint64_t retry_s = 0;
+        pthread_mutex_lock(&s->auth_fail_lock);
+        struct auth_fail_entry *e = auth_fail_find(s, c->peer_ip, mono, 0);
+        if (e && e->fails >= (uint32_t)max_fail) {
+            locked = 1;
+            uint64_t lockout_ms = (uint64_t)s->cfg.auth_fail_lockout_sec * 1000u;
+            uint64_t elapsed = mono - e->window_start_mono;
+            retry_s = (lockout_ms > elapsed ? lockout_ms - elapsed + 999 : 0) / 1000;
+            if (!e->reported) { e->reported = 1; first = 1; }
+        }
+        pthread_mutex_unlock(&s->auth_fail_lock);
+        if (locked) {
+            /* Logged once per lockout, not once per refused attempt -- a
+             * refusal that costs a journal line is still a per-attempt cost. */
+            if (first) {
+                LOG_WARN("stratum: %s has failed mining.authorize %d times in "
+                         "%ds -- refusing further attempts for %llus",
+                         c->peer_ip, max_fail, s->cfg.auth_fail_lockout_sec,
+                         (unsigned long long)retry_s);
+            }
+            char emsg[160];
+            snprintf(emsg, sizeof emsg,
+                     "too many failed authorizations from this address; "
+                     "retry in %llus", (unsigned long long)retry_s);
+            cJSON *err = make_error(24, emsg);
+            emit_response(buf, len, id, NULL, err);
+            return -1;
+        }
+    }
+
+    if (mono - c->auth_call_window_ms >= AUTH_CALL_WINDOW_MS) {
+        c->auth_call_window_ms = mono;
+        c->auth_calls_in_window = 0;
+    }
+    if (++c->auth_calls_in_window > AUTH_MAX_CALLS_PER_WINDOW) *over_call_ceiling = 1;
+    return 0;
+}
+
+/* Every failed authorize ends here with the response already written and `rc`
+ * its return code. Counts the failure against the connection and the peer
+ * address, and turns rc into -1 -- close after writing -- once the connection
+ * has spent its budget. */
+static int auth_failed(stratum_server_t *s, stratum_conn_t *c, int rc) {
+    int max_fail = s->cfg.auth_max_failures;
+    if (max_fail <= 0) return rc;
+    c->auth_failures++;
+    if (c->peer_ip[0]) {
+        pthread_mutex_lock(&s->auth_fail_lock);
+        struct auth_fail_entry *e = auth_fail_find(s, c->peer_ip, mono_ms(), 1);
+        e->fails++;
+        pthread_mutex_unlock(&s->auth_fail_lock);
+    }
+    if (c->auth_failures >= (uint32_t)max_fail) {
+        LOG_INFO("stratum: closing %s after %u failed mining.authorize attempts",
+                 c->peer_ip[0] ? c->peer_ip : "(test conn)", c->auth_failures);
+        return -1;
+    }
+    return rc;
+}
+
+/* A successful authorize forgives the address: the miner has proved it can get
+ * the username right, and a retry budget it could never rebuild would turn two
+ * typos and a fix into a minute of lockout. */
+static void auth_succeeded(stratum_server_t *s, stratum_conn_t *c) {
+    c->auth_failures = 0;
+    if (s->cfg.auth_max_failures <= 0 || !c->peer_ip[0]) return;
+    pthread_mutex_lock(&s->auth_fail_lock);
+    struct auth_fail_entry *e = auth_fail_find(s, c->peer_ip, mono_ms(), 0);
+    if (e) e->ip[0] = '\0';
+    pthread_mutex_unlock(&s->auth_fail_lock);
+}
+
+void stratum_conn_set_peer_ip_for_test(stratum_conn_t *c, const char *ip) {
+    if (!c) return;
+    snprintf(c->peer_ip, sizeof c->peer_ip, "%s", ip ? ip : "");
+}
+
 static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                             cJSON *params, char **buf, size_t *len) {
+    int over_ceiling = 0;
+    if (auth_gate(s, c, id, buf, len, &over_ceiling) < 0) return -1;
+    if (over_ceiling) {
+        /* No reject row for this one: it is the limiter speaking, and a row
+         * per refused call would be the cost the limiter exists to remove. */
+        cJSON *err = make_error(24, "too many mining.authorize calls; slow down");
+        return auth_failed(s, c, emit_response(buf, len, id, NULL, err));
+    }
     const char *worker = NULL;
     double pw_diff = 0.0;
     if (cJSON_IsArray(params) && cJSON_GetArraySize(params) >= 1) {
@@ -1634,7 +1810,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
     if (!worker) {
         cJSON *err = make_error(24, "missing worker name");
-        return emit_response(buf, len, id, NULL, err);
+        return auth_failed(s, c, emit_response(buf, len, id, NULL, err));
     }
 
     /* Username format: <address>[.<rig_label>]. The address part must be
@@ -1649,7 +1825,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         }
         cJSON *err = make_error(24,
             "stratum username must be <bitcoin_address>[.<rig_label>]");
-        return emit_response(buf, len, id, NULL, err);
+        return auth_failed(s, c, emit_response(buf, len, id, NULL, err));
     }
     /* Refuse before taking the address: the miner learns at connect time,
      * which is the only point at which they can still do something about it. */
@@ -1658,6 +1834,10 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             s->cfg.on_reject(s->cfg.ctx, worker, now_ms(),
                              "pps accrual suspended (difficulty below floor)");
         }
+        /* Deliberately NOT counted against the authorize budget: the miner did
+         * nothing wrong and cannot fix this by retrying differently. Charging
+         * it would lock out every honest miner reconnecting while the pool has
+         * accrual suspended -- exactly when they are most likely to retry. */
         cJSON *err = make_error(24, PPS_GATED_MSG);
         return emit_response(buf, len, id, NULL, err);
     }
@@ -1684,7 +1864,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             snprintf(emsg, sizeof emsg,
                      "invalid thunder address in stratum username: %s", derr);
             cJSON *err = make_error(24, emsg);
-            return emit_response(buf, len, id, NULL, err);
+            return auth_failed(s, c, emit_response(buf, len, id, NULL, err));
         }
     } else {
         uint8_t spk[64];
@@ -1701,11 +1881,12 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             snprintf(emsg, sizeof emsg,
                      "invalid payout address in stratum username: %s", derr);
             cJSON *err = make_error(24, emsg);
-            return emit_response(buf, len, id, NULL, err);
+            return auth_failed(s, c, emit_response(buf, len, id, NULL, err));
         }
     }
 
     sanitize_worker(worker, c->worker_name, sizeof(c->worker_name));
+    auth_succeeded(s, c);
     c->authorized = 1;
     if (c->difficulty <= 0) c->difficulty = c->pol_initial_diff;
     /* A request may have arrived either way round: mining.suggest_difficulty
@@ -2773,6 +2954,32 @@ int stratum_conn_idle_budget_for_test(const stratum_server_t *s,
     return conn_idle_budget_sec(s, c);
 }
 
+/* The peer's address as text, with IPv4-mapped IPv6 un-mapped.
+ *
+ * The un-mapping matters rather than being cosmetic: on a dual-stack listener
+ * every IPv4 client arrives as an IPv4-mapped IPv6 address, so without it the
+ * same client reads as "::ffff:198.51.100.7" on one listener and
+ * "198.51.100.7" on another. That splits the per-address budget across two
+ * spellings of one client, and makes a log line hard to match against what
+ * netstat or ss reports. */
+static void peer_ip_from_sockaddr(const struct sockaddr_storage *ss,
+                                  char *out, size_t cap) {
+    if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)(const void *)ss;
+        if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
+            struct in_addr v4;
+            memcpy(&v4, &s6->sin6_addr.s6_addr[12], sizeof v4);
+            if (inet_ntop(AF_INET, &v4, out, (socklen_t)cap)) return;
+        } else if (inet_ntop(AF_INET6, &s6->sin6_addr, out, (socklen_t)cap)) {
+            return;
+        }
+    } else if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in *s4 = (const struct sockaddr_in *)(const void *)ss;
+        if (inet_ntop(AF_INET, &s4->sin_addr, out, (socklen_t)cap)) return;
+    }
+    snprintf(out, cap, "?");
+}
+
 static void *conn_thread(void *arg) {
     stratum_conn_t *c = arg;
     stratum_server_t *s = c->server;
@@ -2910,6 +3117,7 @@ static void *listener_thread(void *arg) {
         stratum_conn_t *c = stratum_conn_new_for_test(s);
         if (!c) { close(fd); continue; }
         c->fd = fd;
+        peer_ip_from_sockaddr(&cli, c->peer_ip, sizeof c->peer_ip);
         /* The port decides the difficulty. Everything after this point reads
          * the policy off the connection and never looks at the listener. */
         conn_apply_listener(c, &ls->pol);
@@ -2961,6 +3169,7 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     pthread_rwlock_init(&s->job_lock, NULL);
     pthread_mutex_init(&s->recent_lock, NULL);
     pthread_mutex_init(&s->conns_lock, NULL);
+    pthread_mutex_init(&s->auth_fail_lock, NULL);
     pthread_mutex_init(&s->share_dedupe_lock, NULL);
     atomic_init(&s->stop, 0);
     atomic_init(&s->conn_count, 0);
@@ -3148,6 +3357,7 @@ void stratum_server_free(stratum_server_t *s) {
     pthread_rwlock_destroy(&s->job_lock);
     pthread_mutex_destroy(&s->recent_lock);
     pthread_mutex_destroy(&s->conns_lock);
+    pthread_mutex_destroy(&s->auth_fail_lock);
     pthread_mutex_destroy(&s->share_dedupe_lock);
     free(s);
 }
