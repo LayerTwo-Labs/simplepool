@@ -59,6 +59,9 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->vardiff_max        = 1e12;
     cfg->max_suggested_diff = 5e7;
     cfg->vardiff_window_sec = 30;
+    cfg->vardiff_min_samples     = 20;
+    cfg->vardiff_max_window_mult = 8;
+    cfg->vardiff_idle_step       = 2.0;
     cfg->idle_timeout_sec   = 600;    /* 10 min silent recv → reap */
     cfg->idle_timeout_authorized_sec = 7200;  /* 2 h once a miner is working */
 
@@ -284,6 +287,9 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "vardiff_max")               == 0) cfg->vardiff_max = atof(v);
         else if (strcmp(k, "max_suggested_diff")     == 0) cfg->max_suggested_diff = atof(v);
         else if (strcmp(k, "vardiff_window_sec")        == 0) cfg->vardiff_window_sec = atoi(v);
+        else if (strcmp(k, "vardiff_min_samples")      == 0) cfg->vardiff_min_samples = atoi(v);
+        else if (strcmp(k, "vardiff_max_window_mult")  == 0) cfg->vardiff_max_window_mult = atoi(v);
+        else if (strcmp(k, "vardiff_idle_step")        == 0) cfg->vardiff_idle_step = atof(v);
         else if (strcmp(k, "idle_timeout_sec")          == 0) cfg->idle_timeout_sec = atoi(v);
         else if (strcmp(k, "idle_timeout_authorized_sec") == 0) cfg->idle_timeout_authorized_sec = atoi(v);
         else if (strcmp(k, "db_path")                   == 0) copy_str(cfg->db_path, sizeof cfg->db_path, v);

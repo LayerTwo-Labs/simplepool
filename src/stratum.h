@@ -255,6 +255,13 @@ typedef struct {
     double vardiff_min;
     double vardiff_max;
     int    vardiff_window_sec;
+    /* See config.h: a window holding fewer than vardiff_min_samples shares is
+     * extended rather than acted on (up to vardiff_max_window_mult windows),
+     * and when it does end under-sampled its step is capped at
+     * vardiff_idle_step instead of the usual 4x. 0 samples disables both. */
+    int    vardiff_min_samples;
+    int    vardiff_max_window_mult;
+    double vardiff_idle_step;
 
     /* Drop a connection whose recv() has been silent for this long. Guards
      * against half-open TCPs from crashed miners and misconfigured clients
