@@ -61,7 +61,7 @@
             <div><label>Workers with a balance</label><strong><%= fmtN(totals.workers) %></strong></div>
         </div>
         <% if (reserve.ok && totals.owed > reserve.available_sats) { %>
-            <p class="muted small" style="margin-top:0.75em;color:#c66">
+            <p class="muted small bad" style="margin-top:0.75em">
                 ⚠ Reserve is short by
                 <%= fmtSats(totals.owed - reserve.available_sats) %>.
                 The payout worker will keep skipping ticks until this is closed.
@@ -85,7 +85,7 @@
             paid — a rejected or orphaned one contributes nothing, and the
             solvency check counts it as nothing.
         </p>
-        <table>
+        <div class="tablewrap"><table>
             <thead><tr>
                 <th>When</th><th>Height</th><th>Block hash</th>
                 <th>Finder</th><th>Reward</th><th>Fee</th><th>Status</th>
@@ -109,7 +109,7 @@
                 </tr>
                 <% }) %>
             </tbody>
-        </table>
+        </table></div>
         <% } %>
     </section>
 </main>

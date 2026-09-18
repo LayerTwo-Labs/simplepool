@@ -1,10 +1,10 @@
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>404 · simplepool</title>
-    <link rel="stylesheet" href="/static/style.css">
+<%# Via the partial, so a saved dark theme applies here too — this page used
+    to hand-roll its own <head> and was the one page that ignored it. No nav,
+    so no toggle: there is nothing on a 404 worth staying to re-theme. %>
+<%- include('partial/head', { title: '404 · simplepool' }) %>
 </head>
 <body>
     <header class="top">

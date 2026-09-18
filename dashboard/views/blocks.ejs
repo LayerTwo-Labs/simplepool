@@ -22,7 +22,7 @@ const shortAddr = (a) => a ? (a.length > 18 ? a.slice(0, 10) + '…' + a.slice(-
             <% if (rows.length === 0) { %>
                 <p class="muted">No blocks recorded yet.</p>
             <% } else { %>
-            <table class="lb">
+            <div class="tablewrap"><table class="lb">
                 <thead>
                     <tr>
                         <th>When</th>
@@ -38,7 +38,7 @@ const shortAddr = (a) => a ? (a.length > 18 ? a.slice(0, 10) + '…' + a.slice(-
                 <tbody>
                 <% rows.forEach(b => { %>
                     <tr>
-                        <td title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
+                        <td class="nowrap" title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
                         <td><%= fmtN(b.height) %></td>
                         <td>
                             <% if (b.finder) { %>
@@ -46,14 +46,14 @@ const shortAddr = (a) => a ? (a.length > 18 ? a.slice(0, 10) + '…' + a.slice(-
                             <% } else { %>—<% } %>
                         </td>
                         <td class="mono small" title="<%= b.finder_address || '' %>"><%= shortAddr(b.finder_address) %></td>
-                        <td><%= b.status === 'confirmed' ? fmtBtc(b.reward_sats) : '—' %></td>
-                        <td><%= b.status === 'confirmed' ? fmtBtc(b.fee_sats) : '—' %></td>
-                        <td><%- blockStatus(b) %></td>
+                        <td class="nowrap"><%= b.status === 'confirmed' ? fmtBtc(b.reward_sats) : '—' %></td>
+                        <td class="nowrap"><%= b.status === 'confirmed' ? fmtBtc(b.fee_sats) : '—' %></td>
+                        <td class="nowrap"><%- blockStatus(b) %></td>
                         <td class="mono small" title="<%= b.hash %>"><%= shortHash(b.hash) %></td>
                     </tr>
                 <% }) %>
                 </tbody>
-            </table>
+            </table></div>
             <p class="muted small">
                 <% if (next_before) { %>
                     <a href="/blocks?before=<%= next_before %>">← older</a>
@@ -71,6 +71,5 @@ const shortAddr = (a) => a ? (a.length > 18 ? a.slice(0, 10) + '…' + a.slice(-
         <span class="sep">·</span>
         <a href="https://github.com/LayerTwo-Labs/simplepool" target="_blank" rel="noopener">source on GitHub</a>
     </footer>
-    <script src="/static/script.js" defer></script>
 </body>
 </html>

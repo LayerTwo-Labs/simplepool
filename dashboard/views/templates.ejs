@@ -109,7 +109,7 @@
                 &nbsp;·&nbsp;mining this tip for <%= Math.floor(age / 60) %> min
             <% } %>
             <% if (pollAge > stallAfter) { %>
-                &nbsp;·&nbsp;<span style="color:#c66">no word from the backend
+                &nbsp;·&nbsp;<span class="bad">no word from the backend
                 for <%= Math.floor(pollAge / 60) %> min — the proxy may not be
                 reaching it</span>
             <% } %>
@@ -141,16 +141,16 @@
                 <%= cur.source === 'enforcer'
                         ? fmtN(cur.cb_spendable) + ' spendable · ' + fmtN(cur.cb_op_returns) + ' OP_RETURN'
                         : 'built by the pool' %></strong></div>
-            <div><label>Carries commitments</label><strong style="color:<%= cur.has_commitments ? '#5b8' : '#c66' %>">
+            <div><label>Carries commitments</label><strong class="<%= cur.has_commitments ? 'ok' : 'bad' %>">
                 <%= cur.has_commitments ? '✓ yes' : '✗ no' %></strong></div>
         </div>
         <% if (cur.has_commitments) { %>
-            <p class="muted small" style="margin-top:0.75em;color:#5b8">
+            <p class="muted small ok" style="margin-top:0.75em">
                 ✓ The backend supplies the coinbase, so blocks from this pool
                 carry the BIP300/301 commitments a sidechain needs.
             </p>
         <% } else { %>
-            <p class="muted small" style="margin-top:0.75em;color:#c66">
+            <p class="muted small bad" style="margin-top:0.75em">
                 ⚠ Blocks from this pool currently carry no sidechain
                 commitments. They are valid blocks and miners are paid
                 normally, but no sidechain can be merge-mined into them — and
@@ -174,7 +174,7 @@
             value is the last one seen for it.
         </p>
         <div style="overflow-x:auto">
-        <table>
+        <div class="tablewrap"><table>
             <thead><tr>
                 <th>When</th><th>Held</th><th>Height</th><th>Difficulty</th>
                 <th>Block value</th><th>Fees</th><th>Txs</th>
@@ -194,7 +194,7 @@
                     <td class="muted small"><%= fmtSats(t.tx_fees_sats) %></td>
                     <td class="muted small"><%= fmtN(t.tx_count) %></td>
                     <td class="mono small"><%= t.source %></td>
-                    <td class="small" style="color:<%= t.has_commitments ? '#5b8' : '#c66' %>">
+                    <td class="small <%= t.has_commitments ? 'ok' : 'bad' %>">
                         <%= t.has_commitments ? '✓' : '✗' %>
                         <% if (t.source === 'enforcer') { %>
                             <span class="muted">(<%= fmtN(t.cb_op_returns) %> OP_RETURN)</span>
@@ -204,7 +204,7 @@
                 </tr>
                 <% }) %>
             </tbody>
-        </table>
+        </table></div>
         </div>
         <% } %>
     </section>

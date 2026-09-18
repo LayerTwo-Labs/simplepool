@@ -6,7 +6,12 @@
     everything passes — a banner that is always visible is a banner nobody
     reads. %>
 <% const _h = typeof health !== 'undefined' ? health : null; %>
+<%# The .banners wrapper gives these the same measure as the cards in
+    <main class="wrap">. Without it they run the full width of the window,
+    because this partial is included from the nav rather than from the page
+    body — which read as a bug once the cards stopped being black on black. %>
 <% if (_h && !_h.ok) { %>
+<div class="banners">
 <section class="card health-alert" role="alert">
     <h2>⚠ <%= _h.failing.length %> health check<%= _h.failing.length === 1 ? '' : 's' %> failing</h2>
     <ul class="health-list">
@@ -19,7 +24,9 @@
         details at <a href="/health">/health</a>
     </p>
 </section>
+</div>
 <% } else if (_h && _h.unavailable && _h.unavailable.length > 0) { %>
+<div class="banners">
 <%# Not a pass. A check that could not run has to say so, or an old DB looks
     identical to a healthy one. %>
 <section class="card health-warn">
@@ -29,4 +36,5 @@
         <a href="/health">/health</a>
     </p>
 </section>
+</div>
 <% } %>

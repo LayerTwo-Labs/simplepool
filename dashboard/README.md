@@ -60,6 +60,7 @@ snapshot cron — SQLite's WAL mode makes that safe too, just less isolated.
 | `/worker/:name`       | Per-worker drilldown                                    |
 | `/api/overview`       | JSON                                                    |
 | `/api/leaderboard`    | JSON                                                    |
+| `/api/node`           | Mainchain tip and the network difficulty behind it      |
 | `/api/worker/:name`   | JSON                                                    |
 | `/api/blocks`         | JSON paginated, `?limit=N&before=<ts>` (default 50)     |
 | `/api/versions`       | Build provenance of every component (see below)         |
@@ -72,6 +73,81 @@ totals and hashrate, mainchain tip, the health checks, and which commit of
 each component is running. It always returns 200 — it is a report, and a
 report that a check is failing was still produced successfully. Watch
 `health.ok` for the condition and `/health` for a status code to alert on.
+
+## Network difficulty
+
+The node-tip card on `/` — and `/api/node` — report the chain's current
+difficulty next to its height. It answers the question every other number on
+the page depends on: what a share is worth under PPS, how often this pool
+should expect a block, and whether a listener's promised `min_diff` is above
+the chain at all.
+
+It does **not** come from `node_status`. That table is the bitcoind tip poll
+and carries no target. It comes from `pool_meta.network_difficulty`, which the
+proxy rewrites from every block template it builds a job from
+(`refresh_pps_rate()` in `src/main.c` derives it from the template's
+target/bits) — the same row the PPS rate and the health checks read, so there
+is one difficulty on this dashboard rather than two that can disagree.
+
+Two consequences worth knowing:
+
+- It carries **its own timestamp**, separate from the tip's. The tip poll and
+  the template feed are different sources and go stale independently, so a
+  difficulty frozen at yesterday's value next to a ticking height has to be
+  visible as such. Hover the figure for the exact value and its "as of".
+- A DB the proxy has never published to shows a **dash**, not `0`. A chain
+  whose difficulty is unknown must not render as a chain at difficulty zero;
+  that reads as a claim, and it is the opposite one.
+
+The displayed form is scaled (`126.98 T`, `111.16 k`) and the exact value is
+in the element's title. Below difficulty 1 it switches to significant figures
+rather than decimals, for the same reason `src/config.c` prints this number
+with `%g`: a forknet runs at 4.66e-10, which `toFixed(2)` renders as `0.00`.
+
+## Theme
+
+Light by default, dark one click away. The toggle is in both navs; it writes
+`data-theme` onto `<html>` and remembers the choice in `localStorage` under
+`sp-theme`.
+
+Three rules hold this together, and each of them broke once while it was
+being written — `test/theme.test.js` now guards all three:
+
+1. **`partial/head.ejs` re-applies the saved theme before the stylesheet
+   paints.** Every page reloads itself on a `<meta refresh>` timer, so a theme
+   applied from the deferred script flashes the other one every 15 seconds.
+2. **`script.js` loads from the head, on every page.** The button is in the
+   shared nav, so a view that does not load the script renders a nav with a
+   permanently hidden button.
+3. **It loads exactly once.** Two copies bind two click handlers, the theme
+   flips twice, and the button looks dead.
+
+`prefers-color-scheme` is deliberately not consulted. The choice here is the
+operator's, and a dashboard that ignores its own toggle because the laptop is
+in dark mode is the worse surprise.
+
+Colours are all `--token`s defined twice, once per palette, in
+`public/style.css`. **Views must not hardcode a colour** — use `.ok`, `.bad`,
+`.warn-text` or `.callout`. A hex in a view is a value that stays
+dark-theme-coloured on a light page; there is a test for that too.
+
+## Density
+
+Two blocks on the public pages are folded shut by default, because both are
+reference material that is right the first time you land and in the way on
+the two-hundredth refresh. Nothing is removed — both are one click open:
+
+- **"About the numbers on this page"** on `/`: four screens of prose on how
+  this mode pays and how to point a rig at it. The summary names the mode, so
+  which of the five stories is inside is still obvious from the closed state.
+- **"Recent shares"** on `/worker/:name`: the 200-row raw share log. The
+  figures that answer "is my rig working" are all in the cards above it. It
+  renders open when a worker has no shares at all, where there is nothing to
+  fold.
+
+`/` also merges what used to be two cards — 24h shares and lifetime totals —
+into one, with lifetime as a quieter second row. Same five figures, one card's
+worth of page for the comparison they exist to support.
 
 ## Pool identity
 

@@ -826,7 +826,40 @@ export function nodeStatus(handle) {
         updated_at: row.updated_at,
         seconds_since_tip:    row.tip_observed_at ? nowSec - row.tip_observed_at : null,
         seconds_since_update: row.updated_at      ? nowSec - row.updated_at      : null,
+        ...networkDifficulty(d),
     };
+}
+
+/* The chain's current difficulty, for the node-tip card and /api/node.
+ *
+ * It is NOT in node_status: that table is the bitcoind tip poll, and nothing
+ * in it carries a target. The number comes from pool_meta, which the proxy
+ * rewrites from every block template it builds a job from (refresh_pps_rate
+ * in main.c derives it from the template's target/bits) — the same row the
+ * PPS rate and the health checks already read, so there is one difficulty on
+ * this dashboard rather than two that can disagree.
+ *
+ * Its own timestamp comes with it, separately from node_status.updated_at:
+ * the tip poll and the template feed are different sources and can go stale
+ * independently, so a difficulty frozen at yesterday's value next to a
+ * ticking tip height has to be visible as such rather than read as current.
+ *
+ * Returns {} — not nulls — on a DB that predates pool_meta, so the caller
+ * spreads nothing and the field is simply absent. */
+function networkDifficulty(d) {
+    try {
+        const r = d.prepare(
+            'SELECT network_difficulty, updated_at FROM pool_meta WHERE id = 1'
+        ).get();
+        const n = Number(r && r.network_difficulty);
+        if (!isFinite(n) || n <= 0) return {};
+        return {
+            network_difficulty: n,
+            network_difficulty_at: Number(r.updated_at || 0) || null,
+        };
+    } catch {
+        return {};   /* pre-pool_meta DB */
+    }
 }
 
 export function recentBlocks(handle, limit = 25) {

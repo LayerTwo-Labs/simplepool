@@ -15,7 +15,7 @@ const failures = rows.filter(r => !r.ok).length;
 <section class="card">
     <h2><%= label %>
         <% if (failures > 0) { %>
-            <span class="tag" style="background:#5a2a2a;color:#f3c6c6"><%= failures %> failed</span>
+            <span class="tag tag-bad"><%= failures %> failed</span>
         <% } %>
     </h2>
 
@@ -32,7 +32,7 @@ const failures = rows.filter(r => !r.ok).length;
         <code>bitcoin-cli decoderawtransaction</code> or
         <code>testmempoolaccept</code> to inspect.
     </p>
-    <table>
+    <div class="tablewrap"><table>
         <thead>
             <tr>
                 <th>When</th>
@@ -50,9 +50,9 @@ const failures = rows.filter(r => !r.ok).length;
                 <td><%= r.kind %><% if (r.worker_name) { %><br><span class="muted small"><%= r.worker_name %></span><% } %></td>
                 <td>
                     <% if (r.ok) { %>
-                        <span style="color:#5b8">✓ broadcast</span>
+                        <span class="ok">✓ broadcast</span>
                     <% } else { %>
-                        <span style="color:#c66">✗ failed</span>
+                        <span class="bad">✗ failed</span>
                         <% if (r.stage) { %><br><span class="muted small">at <%= r.stage %></span><% } %>
                     <% } %>
                 </td>
@@ -84,7 +84,7 @@ const failures = rows.filter(r => !r.ok).length;
 
                     <% if (r.error) { %>
                         <details open>
-                            <summary class="small" style="color:#c66">error</summary>
+                            <summary class="small bad">error</summary>
                             <pre class="small" style="white-space:pre-wrap;word-break:break-word;margin:0.3em 0 0"><%= r.error %></pre>
                         </details>
                     <% } %>
@@ -99,6 +99,6 @@ const failures = rows.filter(r => !r.ok).length;
             </tr>
         <% } %>
         </tbody>
-    </table>
+    </table></div>
     <% } %>
 </section>
