@@ -1,13 +1,74 @@
+/* simplepool dashboard theme.
+ *
+ * Two palettes, one set of names. Every rule below reads a --token; nothing
+ * names a colour directly, so switching themes is switching the tokens and
+ * not hunting through the sheet. Views must not hardcode colours either —
+ * use .ok / .bad / .warn-text / .accent-text rather than an inline hex, or
+ * the element stays dark-theme-coloured on a light page.
+ *
+ * Light is the default, deliberately: this is a page of numbers people read
+ * in daylight next to a rack, and the previous near-black made a dense page
+ * denser. Dark is still here and is one click away — the toggle in the nav
+ * writes data-theme onto <html> and remembers it in localStorage, and
+ * partial/head.ejs re-applies it before first paint so the 15s meta-refresh
+ * doesn't flash white. prefers-color-scheme is deliberately NOT consulted:
+ * the choice on this dashboard is the operator's, and a page that ignores
+ * the toggle because the laptop is in dark mode is the worse surprise.
+ */
+
 :root {
-    --bg: #0e1116;
-    --panel: #161b22;
-    --panel-2: #1c232c;
-    --fg: #d6dde6;
-    --muted: #8a96a3;
-    --accent: #7ad;
-    --warn: #d8a657;
-    --block: #4d8a4d;
-    --border: #242c36;
+    --bg:            #f5f7fa;
+    --panel:         #ffffff;
+    --panel-2:       #f1f4f8;
+    --fg:            #18202b;
+    --fg-soft:       #3d4a5a;
+    --muted:         #5f6c7b;
+    --border:        #dfe4ea;
+    --border-strong: #c6cfdb;
+    --accent:        #1f6feb;
+    --accent-soft:   #eaf1fe;
+    --ok:            #17794a;
+    --warn:          #9a5b00;
+    --warn-soft:     #fdf4e6;
+    --bad:           #c0392b;
+    --bad-soft:      #fdf0ee;
+    --block:         #17794a;
+    --block-row:     rgba(23, 121, 74, 0.09);
+    --row-hover:     rgba(24, 32, 43, 0.035);
+    --code-bg:       #f1f4f8;
+    --admin-bg:      #b45309;
+    --admin-fg:      #fff8ef;
+    --admin-chip:    #7c2d12;
+    --shadow:        0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
+    --shadow-none:   0 0 0 0 rgba(0, 0, 0, 0);
+    color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+    --bg:            #1a1f26;
+    --panel:         #222932;
+    --panel-2:       #2a323d;
+    --fg:            #e8edf3;
+    --fg-soft:       #c3ccd7;
+    --muted:         #98a5b3;
+    --border:        #333c48;
+    --border-strong: #46525f;
+    --accent:        #6ea8fe;
+    --accent-soft:   #1d2b3f;
+    --ok:            #5fd39a;
+    --warn:          #e0a458;
+    --warn-soft:     #2c2519;
+    --bad:           #f08080;
+    --bad-soft:      #2e1f1f;
+    --block:         #5fd39a;
+    --block-row:     rgba(95, 211, 154, 0.12);
+    --row-hover:     rgba(255, 255, 255, 0.04);
+    --code-bg:       #1a1f26;
+    --admin-bg:      #8a3d0b;
+    --admin-fg:      #fdf3e7;
+    --admin-chip:    #5c2408;
+    --shadow:        none;
+    color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -15,58 +76,173 @@
 html, body {
     background: var(--bg);
     color: var(--fg);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    /* Prose and labels are read, not aligned — they get the UI face. Only
+     * the things that have to line up or be compared character by character
+     * (hashes, addresses, stat values, tables) stay monospace, below. */
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
     font-size: 14px;
-    line-height: 1.45;
+    line-height: 1.5;
     margin: 0;
     padding: 0;
+    -webkit-font-smoothing: antialiased;
 }
 
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
+a:focus-visible,
+button:focus-visible,
+summary:focus-visible,
+input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 3px;
+}
+
+code, pre, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+code {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0.05em 0.35em;
+    font-size: 0.92em;
+}
+pre code { background: none; border: 0; padding: 0; }
+
+/* ---------------------------------------------------------------- header */
 
 .top {
+    background: var(--panel);
     border-bottom: 1px solid var(--border);
-    padding: 12px 24px;
+    padding: 10px 24px;
     display: flex;
-    align-items: baseline;
-    gap: 16px;
+    align-items: center;
+    gap: 8px 16px;
     flex-wrap: wrap;
 }
-.top-admin { border-bottom-color: #c66; background: #c6660d; color: #fff; }
-.top-admin .brand { color: #fff; }
-.top-admin a { color: #fff; }
-.top-admin .tag-admin { color: #fff; background: #922; padding: 2px 8px; border-radius: 3px; }
-.brand { font-weight: 700; font-size: 18px; color: var(--fg); text-decoration: none; }
-.tag { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; }
-
-/* "About the numbers" card. The <h3>/<pre> styling used to be inline style=
- * attributes on the one hardcoded copy; it moved here when the card became a
- * partial with three bodies, rather than being repeated three times. */
-.about-h3 { margin-top: 1em; margin-bottom: 0.25em; }
-.about-pre {
-    margin: 0;
-    padding: 0.5em;
-    background: #0002;
-    border-radius: 4px;
-    overflow-x: auto;
-    font-size: 12px;
+.top-admin {
+    background: var(--admin-bg);
+    border-bottom-color: var(--admin-chip);
+    color: var(--admin-fg);
 }
-.about-note { margin-top: 0.5em; }
+.top-admin .brand,
+.top-admin a { color: var(--admin-fg); }
+.top-admin .tag-admin {
+    color: var(--admin-fg);
+    background: var(--admin-chip);
+    border-color: transparent;
+}
+.brand {
+    font-weight: 700;
+    font-size: 17px;
+    letter-spacing: -0.01em;
+    color: var(--fg);
+    text-decoration: none;
+}
+.brand:hover { text-decoration: none; }
+.tag {
+    color: var(--muted);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 9px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    white-space: nowrap;
+}
+.tag-test { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+.tag-bad  { color: var(--bad);  border-color: var(--bad);  background: var(--bad-soft); }
+.top-admin .tag-test { color: var(--admin-fg); background: var(--admin-chip); border-color: transparent; }
 
-/* Pool identity strip — sits between the header and the health banner on
- * every page. Deliberately quiet: it is reference material a miner reads
- * once and then ignores, not an alert. The one exception is a non-mainnet
- * network, which gets a warn-coloured rule, because "why is my payout not
- * arriving" and "this pool is mining signet" are the same question. */
+.topnav {
+    display: flex;
+    gap: 4px;
+    margin-left: 4px;
+    align-items: center;
+}
+.topnav a {
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 13.5px;
+    font-weight: 500;
+    padding: 5px 10px;
+    border-radius: 6px;
+}
+.topnav a:hover { color: var(--fg); background: var(--panel-2); text-decoration: none; }
+.topnav a.active { color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.top-admin .topnav a { color: var(--admin-fg); opacity: 0.8; }
+.top-admin .topnav a:hover { background: var(--admin-chip); opacity: 1; }
+.top-admin .topnav a.active { background: var(--admin-chip); opacity: 1; font-weight: 600; }
+
+.topsearch { margin-left: auto; display: flex; gap: 6px; }
+.topsearch input { min-width: 200px; }
+
+.logout { margin-left: auto; font-size: 13px; opacity: 0.85; }
+.logout:hover { opacity: 1; }
+
+/* Theme switch. Rendered hidden and revealed by script.js — without JS it
+ * would be a button that does nothing, and the page is perfectly usable in
+ * the default theme. */
+.theme-toggle {
+    margin-left: 8px;
+    min-width: 34px;
+    padding: 5px 9px;
+    font-size: 14px;
+    line-height: 1;
+}
+.topsearch + .theme-toggle,
+.logout + .theme-toggle { margin-left: 8px; }
+.top-admin .theme-toggle {
+    background: var(--admin-chip);
+    border-color: transparent;
+    color: var(--admin-fg);
+}
+
+/* ------------------------------------------------------- form controls */
+
+input, select, textarea {
+    background: var(--panel);
+    color: var(--fg);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    padding: 5px 9px;
+    font-size: 13px;
+    font-family: inherit;
+}
+input::placeholder, textarea::placeholder { color: var(--muted); }
+textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+button, input[type="submit"] {
+    background: var(--panel-2);
+    color: var(--fg);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 13px;
+    font-family: inherit;
+    font-weight: 500;
+    cursor: pointer;
+}
+button:hover, input[type="submit"]:hover { border-color: var(--accent); color: var(--accent); }
+
+/* --------------------------------------------------- pool identity strip */
+
+/* Sits between the header and the health banner on every page.
+ * Deliberately quiet: it is reference material a miner reads once and then
+ * ignores, not an alert. The one exception is a non-mainnet network, which
+ * gets a warn-coloured rule, because "why is my payout not arriving" and
+ * "this pool is mining signet" are the same question. */
 .poolid {
     display: flex;
     flex-wrap: wrap;
-    gap: 6px 20px;
+    gap: 6px 22px;
     align-items: baseline;
-    padding: 7px 24px;
+    padding: 8px 24px;
     border-bottom: 1px solid var(--border);
-    background: var(--panel);
+    background: var(--panel-2);
     font-size: 12px;
     color: var(--muted);
 }
@@ -77,9 +253,8 @@ a:hover { text-decoration: underline; }
     letter-spacing: 0.08em;
     font-size: 10px;
     color: var(--muted);
-    opacity: 0.8;
 }
-.poolid-item strong { color: var(--fg); font-weight: 600; }
+.poolid-item strong { color: var(--fg-soft); font-weight: 600; }
 .poolid-note { color: var(--warn); font-style: normal; font-size: 11px; }
 /* Addresses are shown in full — a truncated one cannot be checked against
  * anything — so they have to be allowed to wrap rather than widen the page. */
@@ -95,136 +270,272 @@ a:hover { text-decoration: underline; }
     white-space: nowrap;
 }
 .poolid-ports strong { white-space: nowrap; }
-.tag-test { color: var(--warn); }
-.top-admin .tag-test { color: #ffe9c0; }
 
-.topnav {
-    display: flex;
-    gap: 14px;
-    margin-left: 8px;
-    align-items: baseline;
-}
-.topnav a {
-    color: var(--muted);
-    text-decoration: none;
-    font-size: 14px;
-    padding: 2px 0;
-    border-bottom: 2px solid transparent;
-}
-.topnav a:hover { color: var(--fg); }
-.topnav a.active { color: var(--fg); border-bottom-color: currentColor; font-weight: 600; }
-.top-admin .topnav a { color: #eee; }
-.top-admin .topnav a.active { color: #fff; border-bottom-color: #fff; }
-
-.topsearch { margin-left: auto; display: flex; gap: 4px; }
-.topsearch input { padding: 4px 8px; font-size: 13px; border: 1px solid var(--border); border-radius: 3px; min-width: 240px; }
-.topsearch button { padding: 4px 10px; font-size: 13px; }
-
-.logout { margin-left: auto; font-size: 13px; opacity: 0.85; }
-.logout:hover { opacity: 1; }
-
-.flash { border-left: 4px solid; margin-top: 12px; }
-.flash-ok  { border-left-color: #5b8; }
-.flash-ok h2  { color: #5b8; }
-.flash-err { border-left-color: #c66; }
-.flash-err h2 { color: #c66; }
+/* ------------------------------------------------------------- layout */
 
 .wrap {
-    max-width: 1100px;
+    max-width: 1180px;
     margin: 0 auto;
-    padding: 24px;
+    padding: 22px 24px 4px;
+}
+
+/* Banners are included from the nav partials, so they sit outside
+ * <main class="wrap"> and would otherwise run the full width of the window
+ * while every card under them is inset. Same measure, no vertical padding of
+ * its own — the banner card carries its own margin-top. */
+.banners {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 0 24px;
 }
 
 .card {
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 18px 20px;
-    margin-bottom: 20px;
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 16px;
+    box-shadow: var(--shadow);
 }
-.card.warn { border-color: var(--warn); }
+.card.warn { border-color: var(--warn); background: var(--warn-soft); }
 .card.info { border-left: 3px solid var(--accent); }
 .card h2 {
-    margin: 0 0 14px;
-    font-size: 13px;
+    margin: 0 0 12px;
+    font-size: 11px;
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.09em;
     color: var(--muted);
-    font-weight: 600;
+    font-weight: 700;
 }
+.card h2 a { font-weight: 500; }
+.card > p:last-child { margin-bottom: 0; }
+
+/* A card that folds. Used for reference material the page should offer
+ * without spending a screen on it — "about the numbers" is four screens of
+ * prose that a returning miner has already read. */
+details.card > summary {
+    margin: -16px -18px;
+    padding: 14px 18px;
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: var(--muted);
+    font-weight: 700;
+    border-radius: 9px;
+}
+details.card > summary::-webkit-details-marker { display: none; }
+details.card > summary::before {
+    content: "▸";
+    font-size: 12px;
+    line-height: 1;
+    transition: transform 0.12s ease;
+}
+details.card[open] > summary::before { transform: rotate(90deg); }
+details.card > summary:hover { color: var(--fg); background: var(--panel-2); }
+details.card[open] > summary {
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+    border-radius: 9px 9px 0 0;
+}
+details.card > summary .summary-hint {
+    margin-left: auto;
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 400;
+    font-size: 12px;
+}
+
+/* --------------------------------------------------------- stat tiles */
 
 .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    gap: 14px;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
 }
 .grid > div {
     background: var(--panel-2);
-    border-radius: 6px;
-    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
 }
 .grid label {
     display: block;
-    font-size: 11px;
+    font-size: 10.5px;
     color: var(--muted);
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    margin-bottom: 4px;
+    margin-bottom: 3px;
 }
-.grid strong { font-size: 16px; font-weight: 600; }
+.grid strong {
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    font-variant-numeric: tabular-nums;
+}
 
-table.lb {
+/* A second, quieter row of tiles inside the same card — lifetime totals
+ * under the 24h ones. Same facts, less shouting, one card instead of two. */
+.grid-sub { margin-top: 10px; }
+.grid-sub > div { background: none; border-style: dashed; }
+.grid-sub strong { font-size: 14px; font-weight: 600; color: var(--fg-soft); }
+
+.subhead {
+    margin: 14px 0 6px;
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    font-weight: 700;
+}
+.subhead:first-of-type { margin-top: 0; }
+
+/* ------------------------------------------------------------- tables */
+
+.tablewrap { overflow-x: auto; }
+
+/* Ten of the admin and templates tables carry no class at all and were
+ * rendering with browser defaults — centred bold headers, no rules — next to
+ * the .lb tables on the same page. They are all inside a .card, so cover both
+ * here rather than touching ten views to add a class they should not have
+ * needed in the first place. */
+table.lb, .card table {
     width: 100%;
     border-collapse: collapse;
     font-size: 13px;
+    font-variant-numeric: tabular-nums;
 }
-table.lb th, table.lb td {
+table.lb th, table.lb td,
+.card table th, .card table td {
     text-align: left;
     padding: 7px 10px;
     border-bottom: 1px solid var(--border);
 }
-table.lb th {
+table.lb tbody tr:last-child td,
+.card table tbody tr:last-child td { border-bottom: 0; }
+table.lb th, .card table th {
     color: var(--muted);
     font-weight: 600;
-    font-size: 11px;
+    font-size: 10.5px;
     text-transform: uppercase;
     letter-spacing: 0.06em;
+    border-bottom: 1px solid var(--border-strong);
+    white-space: nowrap;
 }
-table.lb tr.block { background: rgba(77, 138, 77, 0.18); }
-table.lb tr:hover { background: rgba(255, 255, 255, 0.02); }
+table.lb tr.block, .card table tr.block { background: var(--block-row); }
+table.lb tbody tr:hover, .card table tbody tr:hover { background: var(--row-hover); }
+
+/* ------------------------------------------------------------ verdicts */
 
 .muted { color: var(--muted); }
+.small { font-size: 12px; }
 
 /* Block-candidate verdicts. Only "in chain" is a block the pool was paid for;
  * orphaned and rejected are ordinary outcomes rather than errors — amber, not
  * red — but they must never read as successes, and "unverified" stays muted
  * because it is not a claim either way. */
-.blk-ok  { color: var(--block); }
-.blk-bad { color: var(--warn); }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.small { font-size: 12px; }
+.blk-ok  { color: var(--block); font-weight: 600; white-space: nowrap; }
+.blk-bad { color: var(--warn); white-space: nowrap; }
+/* "3.254 BTC" and "in chain · 430 conf" are single values; breaking them
+ * across two lines to save a few pixels makes the column harder to scan,
+ * not narrower. The table scrolls in .tablewrap instead. */
+table.lb td.nowrap, .card table td.nowrap { white-space: nowrap; }
+
+/* The two verdicts every other view needs. These replace the inline
+ * style="color:#5b8" / "color:#c66" that used to be scattered through the
+ * views: those hexes were chosen against a near-black page and go
+ * unreadable on a light one. */
+.ok        { color: var(--ok); }
+.bad       { color: var(--bad); }
+.warn-text { color: var(--warn); }
+.callout {
+    border-left: 3px solid var(--warn);
+    padding-left: 0.75em;
+}
+
+/* ------------------------------------------------------------ about card */
+
+.about-h3 {
+    margin-top: 1.2em;
+    margin-bottom: 0.3em;
+    font-size: 13px;
+    color: var(--fg);
+}
+.about-pre {
+    margin: 0;
+    padding: 0.7em 0.8em;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 12px;
+    color: var(--fg-soft);
+}
+.about-note { margin-top: 0.5em; }
+
+/* ---------------------------------------------------------- flash/health */
+
+.flash { border-left: 4px solid; margin-top: 12px; }
+.flash-ok  { border-left-color: var(--ok); }
+.flash-ok h2  { color: var(--ok); }
+.flash-err { border-left-color: var(--bad); }
+.flash-err h2 { color: var(--bad); }
+
+/* Health banner — hard failures only, so it is loud and it is rare.
+   Sits directly under the nav on every page (partial/health-banner.ejs). */
+.health-alert {
+    border-left: 4px solid var(--bad);
+    background: var(--bad-soft);
+    margin-top: 16px;
+}
+.health-alert h2 { color: var(--bad); margin: 0 0 6px; font-size: 13px; letter-spacing: 0.04em; }
+.health-list { margin: 0 0 6px; padding-left: 1.2em; }
+.health-list li { margin: 2px 0; }
+.health-warn {
+    border-left: 4px solid var(--warn);
+    background: var(--warn-soft);
+    margin-top: 16px;
+}
+
+/* ------------------------------------------------------------ sparkline */
 
 .spark {
     width: 100%;
     height: 120px;
     display: block;
     background: var(--panel-2);
-    border-radius: 6px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    /* The <path> strokes currentColor so the line follows the theme. */
+    color: var(--accent);
 }
+
+/* ---------------------------------------------------------------- footer */
 
 .foot {
     text-align: center;
     color: var(--muted);
-    padding: 24px;
+    padding: 20px 24px 28px;
     font-size: 12px;
 }
 .foot .sep { margin: 0 6px; opacity: 0.5; }
 .foot a { color: var(--accent); }
 
-/* Health banner — hard failures only, so it is loud and it is rare.
-   Sits directly under the nav on every page (partial/health-banner.ejs). */
-.health-alert { border-left: 4px solid #c66; margin-top: 12px; }
-.health-alert h2 { color: #c66; margin: 0 0 6px; font-size: 1rem; }
-.health-list { margin: 0 0 6px; padding-left: 1.2em; }
-.health-list li { margin: 2px 0; }
-.health-warn { border-left: 4px solid #c93; margin-top: 12px; }
+/* ---------------------------------------------------------------- narrow */
+
+@media (max-width: 640px) {
+    .wrap { padding: 16px 14px 4px; }
+    .banners { padding: 0 14px; }
+    .top, .poolid { padding-left: 14px; padding-right: 14px; }
+    .topsearch { margin-left: 0; width: 100%; }
+    .topsearch input { min-width: 0; flex: 1; }
+    .card { padding: 14px; }
+    details.card > summary { margin: -14px; padding: 12px 14px; }
+    /* At this width the hint and the summary fight for the same line and
+     * both lose. The summary alone still says what is inside. */
+    details.card > summary .summary-hint { display: none; }
+}

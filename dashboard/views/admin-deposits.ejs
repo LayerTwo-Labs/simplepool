@@ -31,7 +31,7 @@
                 <% } %>
             </p>
         <% } else { %>
-            <p class="muted small" style="margin-top:0;color:#c66">
+            <p class="muted small bad" style="margin-top:0">
                 Enforcer gRPC unreachable: <em><%= enforcer.error %></em>
             </p>
         <% } %>
@@ -86,7 +86,7 @@
         </form>
 
         <% if (ds && ds.errors && ds.errors.length) { %>
-            <p class="muted small" style="color:#c66;margin-top:0">
+            <p class="muted small bad" style="margin-top:0">
                 ⚠ Status probe incomplete: <%= ds.errors.join('; ') %>.
                 Amounts and txids below are from the pool's own ledger and
                 are unaffected.
@@ -94,7 +94,7 @@
         <% } %>
 
         <% if (stranded) { %>
-            <p class="small" style="color:#c66;margin-top:0">
+            <p class="small bad" style="margin-top:0">
                 ⚠ <strong><%= settled %> deposit(s) are confirmed on the mainchain,
                 but the Thunder reserve is 0.</strong>
                 A deposit only becomes spendable when the sidechain advances a
@@ -108,7 +108,7 @@
         <% if (rows.length === 0) { %>
             <p class="muted">No deposits recorded.</p>
         <% } else { %>
-        <table>
+        <div class="tablewrap"><table>
             <thead><tr>
                 <th>When</th><th>Amount</th><th>Fee</th>
                 <th>Status</th>
@@ -124,7 +124,7 @@
                         <% if (!s) { %>
                             <span class="muted">unknown</span>
                         <% } else { %>
-                            <span style="color:<%= s.ok ? '#5b8' : '#c66' %>">
+                            <span class="<%= s.ok ? 'ok' : 'bad' %>">
                                 <%= s.ok ? '✓' : '○' %> <%= s.label %>
                             </span>
                             <% if (s.height) { %>
@@ -138,7 +138,7 @@
                 </tr>
                 <% }) %>
             </tbody>
-        </table>
+        </table></div>
 
         <p class="muted small" style="margin-top:0.75em">
             A deposit passes through four stages:

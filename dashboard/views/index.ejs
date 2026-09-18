@@ -1,3 +1,9 @@
+<%
+/* Same shortening /blocks uses. The full hash stays in the title attribute —
+ * it is a value you copy, not one you read across, and at 64 characters it
+ * was setting the width of the whole table. */
+const shortHash = (h) => h ? (h.slice(0, 10) + '…' + h.slice(-8)) : '—';
+%>
 <!doctype html>
 <html lang="en">
 <head>
@@ -22,10 +28,22 @@
             <% } else { %>
             <div class="grid">
                 <div><label>Height</label><strong><%= fmtN(node.tip_height) %></strong></div>
+                <%# Difficulty is not part of the tip poll — it is read off the
+                    block template the proxy last built a job from. So it gets
+                    its own "as of", and says so when there isn't one: a chain
+                    whose difficulty is unknown must not render as a chain at
+                    difficulty zero. %>
+                <div><label>Network difficulty</label>
+                    <% if (node.network_difficulty) { %>
+                    <strong title="Exactly <%= node.network_difficulty %>, derived from the block template the proxy is currently mining<%= node.network_difficulty_at ? ' — as of ' + fmtTs(node.network_difficulty_at) : '' %>."><%= fmtDifficulty(node.network_difficulty) %></strong>
+                    <% } else { %>
+                    <strong class="muted" title="The proxy publishes the difficulty with each block template it builds a job from. Nothing has been published yet.">—</strong>
+                    <% } %>
+                </div>
                 <div><label>Time since last block</label><strong title="<%= fmtTs(node.tip_observed_at) %>"><%= ago(node.tip_observed_at) %></strong></div>
                 <div><label>Last poll</label><strong title="<%= fmtTs(node.updated_at) %>"><%= ago(node.updated_at) %></strong></div>
             </div>
-            <p class="mono small muted" style="margin-top:0.5em; word-break:break-all"><%= node.tip_hash %></p>
+            <p class="mono small muted" style="margin-top:0.6em; word-break:break-all"><%= node.tip_hash %></p>
             <% } %>
         </section>
 
@@ -40,20 +58,22 @@
             </div>
         </section>
 
+        <%# 24h and lifetime were two cards of the same five figures, which is
+            two cards' worth of page for one comparison. Same numbers, one
+            card: the 24h row is what you came for, the lifetime row sits
+            under it in the quieter .grid-sub tiles. Nothing is dropped. %>
         <section class="card">
-            <h2>Shares · last 24h</h2>
+            <h2>Shares</h2>
+            <h3 class="subhead">Last 24h</h3>
             <div class="grid">
                 <div><label>Accepted</label><strong><%= fmtN(ov.accepted) %></strong></div>
                 <div><label>Rejected</label><strong><%= fmtN(ov.rejected) %></strong></div>
                 <div><label>Reject rate</label><strong><%= ov.reject_rate_pct.toFixed(2) %>%</strong></div>
                 <div><label>Blocks found</label><strong title="confirmed to be in the chain"><%= fmtN(ov.blocks) %></strong></div>
-                <div><label>Best share (24h)</label><strong><%= fmtN(Math.round(ov.best_share_24h)) %></strong></div>
+                <div><label>Best share</label><strong><%= fmtN(Math.round(ov.best_share_24h)) %></strong></div>
             </div>
-        </section>
-
-        <section class="card">
-            <h2>Lifetime totals</h2>
-            <div class="grid">
+            <h3 class="subhead">Lifetime</h3>
+            <div class="grid grid-sub">
                 <div><label>Shares</label><strong><%= fmtN(ov.shares_lifetime) %></strong></div>
                 <div><label>Rejects</label><strong><%= fmtN(ov.rejects_lifetime) %></strong></div>
                 <div><label>Blocks</label><strong title="confirmed to be in the chain"><%= fmtN(ov.blocks_lifetime) %></strong></div>
@@ -76,7 +96,7 @@
             <% if (!lbAddr || lbAddr.length === 0) { %>
                 <p class="muted">No miners active in the last 24h.</p>
             <% } else { %>
-            <table class="lb">
+            <div class="tablewrap"><table class="lb">
                 <thead>
                     <tr><th>#</th><th>Address</th><th>Rigs</th><th>Shares</th><th>Hashrate</th><th>Pool %</th><th>Last seen</th></tr>
                 </thead>
@@ -91,11 +111,11 @@
                         <td><%= fmtN(m.shares) %></td>
                         <td><%= fmtHashrate(m.hashrate_est) %></td>
                         <td><%= fmtPct(m.share_of_pool_pct) %></td>
-                        <td title="<%= fmtTs(m.last_seen) %>"><%= ago(m.last_seen) %></td>
+                        <td class="nowrap" title="<%= fmtTs(m.last_seen) %>"><%= ago(m.last_seen) %></td>
                     </tr>
                 <% }) %>
                 </tbody>
-            </table>
+            </table></div>
             <% } %>
         </section>
 
@@ -104,7 +124,7 @@
             <% if (lb.length === 0) { %>
                 <p class="muted">No workers active in the last 24h.</p>
             <% } else { %>
-            <table class="lb">
+            <div class="tablewrap"><table class="lb">
                 <thead>
                     <tr><th>#</th><th>Worker</th><th>Shares (24h)</th><th>5m</th><th>1h</th><th>24h avg</th><th>Pool %</th><th>Last seen</th></tr>
                 </thead>
@@ -118,11 +138,11 @@
                         <td><%= fmtHashrate(w.hashrate_1h) %></td>
                         <td><%= fmtHashrate(w.hashrate_est) %></td>
                         <td><%= fmtPct(w.share_of_pool_pct) %></td>
-                        <td title="<%= fmtTs(w.last_seen) %>"><%= ago(w.last_seen) %></td>
+                        <td class="nowrap" title="<%= fmtTs(w.last_seen) %>"><%= ago(w.last_seen) %></td>
                     </tr>
                 <% }) %>
                 </tbody>
-            </table>
+            </table></div>
             <% } %>
         </section>
 
@@ -131,21 +151,21 @@
             <% if (blocks.length === 0) { %>
                 <p class="muted">No blocks found.</p>
             <% } else { %>
-            <table class="lb">
+            <div class="tablewrap"><table class="lb">
                 <thead><tr><th>Height</th><th>Finder</th><th>Reward</th><th>Status</th><th>Hash</th><th>When</th></tr></thead>
                 <tbody>
                 <% blocks.forEach(b => { %>
                     <tr>
                         <td><%= fmtN(b.height) %></td>
                         <td><% if (b.finder) { %><a href="/worker/<%= encodeURIComponent(b.finder) %>"><%= b.finder %></a><% } else { %>—<% } %></td>
-                        <td><%= b.status === 'confirmed' ? fmtBtc(b.reward_sats) : '—' %></td>
-                        <td><%- blockStatus(b) %></td>
-                        <td class="mono small"><%= b.hash %></td>
-                        <td title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
+                        <td class="nowrap"><%= b.status === 'confirmed' ? fmtBtc(b.reward_sats) : '—' %></td>
+                        <td class="nowrap"><%- blockStatus(b) %></td>
+                        <td class="mono small nowrap" title="<%= b.hash %>"><%= shortHash(b.hash) %></td>
+                        <td class="nowrap" title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
                     </tr>
                 <% }) %>
                 </tbody>
-            </table>
+            </table></div>
             <% } %>
         </section>
     </main>
@@ -156,6 +176,5 @@
         <span class="sep">·</span>
         <a href="https://github.com/LayerTwo-Labs/simplepool" target="_blank" rel="noopener">source on GitHub</a>
     </footer>
-    <script src="/static/script.js" defer></script>
 </body>
 </html>

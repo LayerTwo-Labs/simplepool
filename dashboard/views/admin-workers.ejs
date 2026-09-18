@@ -21,7 +21,7 @@
         <% if (workers.length === 0) { %>
             <p class="muted">No workers have a PPS balance yet.</p>
         <% } else { %>
-        <table>
+        <div class="tablewrap"><table>
             <thead>
                 <tr>
                     <th>Worker</th>
@@ -46,7 +46,7 @@
                 </tr>
                 <% }) %>
             </tbody>
-        </table>
+        </table></div>
         <% } %>
     </section>
 </main>

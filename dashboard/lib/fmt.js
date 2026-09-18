@@ -39,6 +39,28 @@ export const fmtPct = (p) => {
     return p.toPrecision(2) + '%';
 };
 
+/* Network difficulty, at whatever scale this chain happens to run at.
+ *
+ * The range is the whole problem: mainnet is ~1.3e14 and a forknet can sit
+ * at 4.66e-10, and one format cannot serve both — toFixed(2) renders the
+ * forknet as "0.00", and a raw 126980000000000 is unreadable at a glance.
+ * So: SI suffix above a thousand, plain decimals down to 1, and significant
+ * figures below it, which is the only form that survives a chain running
+ * ten orders of magnitude under difficulty 1. The exact value always goes
+ * in a title attribute next to it — this is the readable form, not the
+ * authoritative one. */
+export const fmtDifficulty = (d) => {
+    const n = Number(d);
+    if (!isFinite(n) || n <= 0) return '—';
+    const units = [[1e18, 'E'], [1e15, 'P'], [1e12, 'T'],
+                   [1e9, 'G'], [1e6, 'M'], [1e3, 'k']];
+    for (const [scale, suffix] of units) {
+        if (n >= scale) return (n / scale).toFixed(2) + ' ' + suffix;
+    }
+    if (n >= 1) return n.toFixed(2);
+    return n.toPrecision(3);
+};
+
 /* The verdict on a block candidate, as a small piece of HTML.
  *
  * Never render a candidate's status as blank or absent. A row in blocks_found
@@ -75,4 +97,4 @@ export const blockStatus = (b) => {
 };
 
 /* Convenience bundle for res.locals middleware. */
-export const all = { fmtN, fmtF, fmtTs, ago, fmtSats, fmtPct, blockStatus };
+export const all = { fmtN, fmtF, fmtTs, ago, fmtSats, fmtPct, fmtDifficulty, blockStatus };

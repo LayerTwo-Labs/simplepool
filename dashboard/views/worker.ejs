@@ -87,8 +87,8 @@ if (n > 1) {
                 Under PPLNS a balance only appears once the pool has found a
                 block and it has aged 100 deep.</p>
             <% } else { %>
-            <div class="tablewrap">
-            <table>
+            
+            <div class="tablewrap"><table>
                 <thead><tr>
                     <th>Block</th><th>Reward + fees</th><th>After operator fee</th>
                     <th>Your difficulty</th><th>Window</th><th>Your share</th><th>Credited</th>
@@ -106,7 +106,7 @@ if (n > 1) {
                     </tr>
                 <% } %>
                 </tbody>
-            </table>
+            </table></div>
             </div>
             <div class="grid">
                 <div><label>Blocks you were paid from</label><strong><%= fmtN(pplns_audit.block_count) %></strong></div>
@@ -114,14 +114,14 @@ if (n > 1) {
                 <div><label>Stored accrued<br><span class="muted small">from pps_credits</span></label><strong><%= fmtSats(pps_audit.accrued) %></strong></div>
                 <div><label>Match?</label>
                     <% if (pplns_audit.credited_total === pps_audit.accrued) { %>
-                        <strong style="color:#5b8">✓ Yes — the split reproduces your balance</strong>
+                        <strong class="ok">✓ Yes — the split reproduces your balance</strong>
                     <% } else { %>
-                        <strong style="color:#c66">⚠ Off by <%= fmtSats(Math.abs(pps_audit.accrued - pplns_audit.credited_total)) %></strong>
+                        <strong class="bad">⚠ Off by <%= fmtSats(Math.abs(pps_audit.accrued - pplns_audit.credited_total)) %></strong>
                     <% } %>
                 </div>
             </div>
             <% if (pplns_audit.credited_total !== pps_audit.accrued) { %>
-                <p class="muted small" style="color:#c66;margin-top:0.75em">
+                <p class="muted small bad" style="margin-top:0.75em">
                     The most likely cause is not a discrepancy in the ledger.
                     This recomputation uses the pool's <strong>current</strong>
                     operator fee (<%= (pplns_audit.fee_bps / 100).toFixed(2) %>%),
@@ -165,14 +165,14 @@ if (n > 1) {
                 <div><label>Stored accrued<br><span class="muted small">from pps_credits</span></label><strong><%= fmtSats(pps_audit.accrued) %></strong></div>
                 <div><label>Match?</label>
                     <% if (pps_audit.matches) { %>
-                        <strong style="color:#5b8">✓ Yes — every share accounted for</strong>
+                        <strong class="ok">✓ Yes — every share accounted for</strong>
                     <% } else { %>
-                        <strong style="color:#c66">⚠ Off by <%= fmtSats(Math.abs(pps_audit.accrued - pps_audit.accrued_computed)) %></strong>
+                        <strong class="bad">⚠ Off by <%= fmtSats(Math.abs(pps_audit.accrued - pps_audit.accrued_computed)) %></strong>
                     <% } %>
                 </div>
             </div>
             <% if (!pps_audit.matches) { %>
-                <p class="muted small" style="color:#c66;margin-top:0.75em">
+                <p class="muted small bad" style="margin-top:0.75em">
                     A ⚠ here usually means the pool's config
                     (<code>pps_sats_per_diff</code>) changed at some
                     point after this worker started, so recomputing at
@@ -193,18 +193,18 @@ if (n > 1) {
                     log, derived from the block value and difficulty of the
                     template it came from.
                     <% if (v.ok && v.coverage_pct >= 100) { %>
-                        <strong style="color:#5b8">✓ All
+                        <strong class="ok">✓ All
                         <%= fmtN(v.verifiable) %> of your credited shares
                         re-derive exactly</strong>, against
                         <%= fmtN(v.rate_rows) %> logged rate(s).
                     <% } else if (v.ok) { %>
-                        <strong style="color:#5b8">✓ No failures</strong> among
+                        <strong class="ok">✓ No failures</strong> among
                         the <%= fmtN(v.verifiable) %> share(s) carrying a stored
                         rate. The other <%= fmtN(v.unverifiable) %> predate this
                         feature and cannot be recomputed — their credits still
                         stand.
                     <% } else { %>
-                        <strong style="color:#c66">⚠ <%= fmtN(v.mismatched) %>
+                        <strong class="bad">⚠ <%= fmtN(v.mismatched) %>
                         share(s) do not match their own stored rate</strong>
                         <% if (v.orphaned > 0) { %>
                             and <%= fmtN(v.orphaned) %> were credited at an
@@ -237,7 +237,7 @@ if (n > 1) {
                 address. Verify by looking the txid up in your own Thunder
                 wallet — the same tx should show as an incoming credit.
             </p>
-            <table class="lb">
+            <div class="tablewrap"><table class="lb">
                 <thead><tr>
                     <th>When</th>
                     <th>Amount</th>
@@ -247,14 +247,14 @@ if (n > 1) {
                 <tbody>
                 <% payouts.forEach(p => { %>
                     <tr>
-                        <td title="<%= fmtTs(p.paid_at) %>"><%= ago(p.paid_at) %></td>
+                        <td class="nowrap" title="<%= fmtTs(p.paid_at) %>"><%= ago(p.paid_at) %></td>
                         <td><strong><%= fmtSats(p.sats) %></strong></td>
                         <td class="muted small"><%= fmtSats(p.fee_sats) %></td>
                         <td class="mono small" style="word-break:break-all"><%= p.txid %></td>
                     </tr>
                 <% }) %>
                 </tbody>
-            </table>
+            </table></div>
             <p class="muted small" style="margin-top:0.75em">
                 Total paid to date:
                 <strong><%= fmtSats(payouts.reduce((a, p) => a + p.sats, 0)) %></strong>
@@ -274,7 +274,7 @@ if (n > 1) {
                 Thunder to pay you. Look up the coinbase of each block
                 with <code>bitcoin-cli getblock &lt;hash&gt; 2</code>.
             </p>
-            <table class="lb">
+            <div class="tablewrap"><table class="lb">
                 <thead><tr>
                     <th>When</th>
                     <th>Height</th>
@@ -285,7 +285,7 @@ if (n > 1) {
                 <tbody>
                 <% blocks.forEach(b => { %>
                     <tr>
-                        <td title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
+                        <td class="nowrap" title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
                         <td><%= fmtN(b.height) %></td>
                         <td><%= fmtSats(b.reward_sats) %></td>
                         <td class="muted small"><%= fmtSats(b.fee_sats) %></td>
@@ -293,7 +293,7 @@ if (n > 1) {
                     </tr>
                 <% }) %>
                 </tbody>
-            </table>
+            </table></div>
             <p class="muted small" style="margin-top:0.75em">
                 <%= blocks.length %> block<%= blocks.length === 1 ? '' : 's' %> found · pool BTC earned:
                 <strong><%= fmtSats(blocks.reduce((a, b) => a + b.reward_sats + b.fee_sats, 0)) %></strong>
@@ -306,7 +306,7 @@ if (n > 1) {
             <h2>Hashrate · 10-min buckets · last 24h</h2>
             <% if (n > 1) { %>
                 <svg class="spark" viewBox="0 0 <%= W %> <%= H %>" preserveAspectRatio="none">
-                    <path d="<%= pathD %>" fill="none" stroke="#7ad" stroke-width="1.5"/>
+                    <path d="<%= pathD %>" fill="none" stroke="currentColor" stroke-width="1.5"/>
                 </svg>
                 <div class="muted small">peak: <%= fmtHashrate(maxV) %></div>
             <% } else { %>
@@ -314,12 +314,21 @@ if (n > 1) {
             <% } %>
         </section>
 
-        <section class="card">
-            <h2>Recent shares <span class="muted small">(last 200; worker target diff = <%= fmtN(worker.window_shares > 0 && shares.length ? shares[0].difficulty : 1) %>)</span></h2>
+        <%# Two hundred rows of raw share log, folded shut. It is the record a
+            miner checks a specific share against, which is worth having and
+            is not worth six screens of scrolling past on every visit — the
+            figures that answer "is my rig working" are all in the cards
+            above it. Open when there is nothing to hide behind: a worker
+            with no shares yet has a one-line card either way. %>
+        <details class="card"<%= shares.length === 0 ? ' open' : '' %>>
+            <summary>
+                Recent shares
+                <span class="summary-hint muted"><% if (shares.length === 0) { %>none recorded<% } else { %>last <%= fmtN(shares.length) %>; worker target diff = <%= fmtN(worker.window_shares > 0 && shares.length ? shares[0].difficulty : 1) %><% } %></span>
+            </summary>
             <% if (shares.length === 0) { %>
                 <p class="muted">No shares recorded.</p>
             <% } else { %>
-            <table class="lb">
+            <div class="tablewrap"><table class="lb">
                 <thead><tr>
                     <th>When</th>
                     <th title="Worker target difficulty assigned by the proxy">Target</th>
@@ -329,7 +338,7 @@ if (n > 1) {
                 <tbody>
                 <% shares.forEach(s => { %>
                     <tr<% if (s.is_block) { %> class="block"<% } %>>
-                        <td title="<%= fmtTs(s.ts) %>"><%= ago(s.ts) %></td>
+                        <td class="nowrap" title="<%= fmtTs(s.ts) %>"><%= ago(s.ts) %></td>
                         <td><%= fmtN(s.difficulty) %></td>
                         <td><%= s.actual_diff != null ? fmtN(Math.round(s.actual_diff)) : '—' %></td>
                         <td class="mono small">
@@ -338,9 +347,9 @@ if (n > 1) {
                     </tr>
                 <% }) %>
                 </tbody>
-            </table>
+            </table></div>
             <% } %>
-        </section>
+        </details>
 
         <p><a href="/">← back to overview</a></p>
     </main>
@@ -351,6 +360,5 @@ if (n > 1) {
         <span class="sep">·</span>
         <a href="https://github.com/LayerTwo-Labs/simplepool" target="_blank" rel="noopener">source on GitHub</a>
     </footer>
-    <script src="/static/script.js" defer></script>
 </body>
 </html>

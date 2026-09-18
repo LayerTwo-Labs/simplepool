@@ -1,0 +1,13 @@
+<%# Light/dark switch, in both navs.
+
+    Rendered hidden: without JS it is a button that cannot do anything, and
+    the page is entirely usable in the default theme. script.js unhides it,
+    labels it for whichever theme is active, and persists the choice — see
+    partial/head.ejs for the re-apply that keeps the meta-refresh from
+    flashing the other theme. %>
+<button type="button"
+        class="theme-toggle"
+        id="theme-toggle"
+        hidden
+        aria-label="Switch between the light and dark theme"
+        title="Switch between the light and dark theme"></button>

@@ -27,7 +27,7 @@
                 Safe to fire multiple times — the worker holds an
                 in-flight row for anything it touched.
                 <% if (!payoutAdminConfigured) { %>
-                    <br><em style="color:#c66">
+                    <br><em class="bad">
                         Not configured — set <code>PAYOUT_ADMIN_URL</code> on the dashboard service.
                     </em>
                 <% } %>
@@ -49,7 +49,7 @@
             An empty <em>txid</em> is the one that needs you: the broadcast
             may or may not have gone out, and that is never auto-resolved.
         </p>
-        <table>
+        <div class="tablewrap"><table>
             <thead><tr>
                 <th>#</th><th>Worker</th><th>Amount</th>
                 <th>Age</th><th>txid</th><th>State</th>
@@ -66,7 +66,7 @@
                 </tr>
                 <% }) %>
             </tbody>
-        </table>
+        </table></div>
         <% } %>
     </section>
 
@@ -75,7 +75,7 @@
         <% if (payouts.length === 0) { %>
             <p class="muted">No successful payouts yet.</p>
         <% } else { %>
-        <table>
+        <div class="tablewrap"><table>
             <thead><tr>
                 <th>When</th><th>Worker</th><th>Amount</th>
                 <th>Fee</th><th>Thunder txid</th><th>Note</th>
@@ -92,7 +92,7 @@
                 </tr>
                 <% }) %>
             </tbody>
-        </table>
+        </table></div>
         <% } %>
     </section>
     <%- include('partial/tx-attempts', {

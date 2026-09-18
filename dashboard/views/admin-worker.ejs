@@ -124,11 +124,11 @@ const atCurrentRate = meta && meta.rate_sats_per_diff
                 <div><label>pps_credits.accrued (stored)</label><strong><%= fmtSats(audit.ledger.accrued) %></strong></div>
             </div>
             <% if (drift === 0) { %>
-                <p class="muted small" style="margin-top:0.75em;color:#5b8">
+                <p class="muted small ok" style="margin-top:0.75em">
                     ✓ Per-share credits sum exactly to the stored ledger.
                 </p>
             <% } else { %>
-                <p class="muted small" style="margin-top:0.75em;color:#c66">
+                <p class="muted small bad" style="margin-top:0.75em">
                     ⚠ Differs by <%= fmtSats(drift) %>. Shares accepted before
                     this build stored <code>credited_sats = 0</code> and cannot
                     be reconstructed — check
@@ -162,7 +162,7 @@ const atCurrentRate = meta && meta.rate_sats_per_diff
                 it came from.
             </p>
             <% if (!v) { %>
-                <p class="muted small" style="color:#c66">
+                <p class="muted small bad">
                     ⚠ This database predates <code>shares.rate_used</code>, so
                     the ledger cannot be independently verified. The stored
                     credits remain authoritative; there is simply nothing to
@@ -178,18 +178,18 @@ const atCurrentRate = meta && meta.rate_sats_per_diff
                     <div><label>Rates inconsistent with their inputs</label><strong><%= fmtN(v.rates_inconsistent) %></strong></div>
                 </div>
                 <% if (v.ok && v.coverage_pct >= 100) { %>
-                    <p class="muted small" style="margin-top:0.75em;color:#5b8">
+                    <p class="muted small ok" style="margin-top:0.75em">
                         ✓ Every credited share re-derives exactly, and every
                         rate used follows from the template it came from.
                     </p>
                 <% } else if (v.ok) { %>
-                    <p class="muted small" style="margin-top:0.75em;color:#5b8">
+                    <p class="muted small ok" style="margin-top:0.75em">
                         ✓ No failures among the <%= fmtN(v.verifiable) %> share(s)
                         that carry a stored rate. The remainder is not checked
                         — see below.
                     </p>
                 <% } else { %>
-                    <p class="muted small" style="margin-top:0.75em;color:#c66">
+                    <p class="muted small bad" style="margin-top:0.75em">
                         ⚠ Verification failed.
                         <% if (v.mismatched > 0) { %>
                             <%= fmtN(v.mismatched) %> share(s) do not match
@@ -224,7 +224,7 @@ const atCurrentRate = meta && meta.rate_sats_per_diff
             <% if (audit.days.length === 0) { %>
                 <p class="muted">No activity yet.</p>
             <% } else { %>
-            <table>
+            <div class="tablewrap"><table>
                 <thead>
                     <tr>
                         <th>Day (UTC)</th>
@@ -245,7 +245,7 @@ const atCurrentRate = meta && meta.rate_sats_per_diff
                     </tr>
                     <% }) %>
                 </tbody>
-            </table>
+            </table></div>
             <% } %>
         </section>
 
@@ -254,7 +254,7 @@ const atCurrentRate = meta && meta.rate_sats_per_diff
             <% if (!audit.payouts || audit.payouts.length === 0) { %>
                 <p class="muted">No payouts yet. Once the payout worker fires a Thunder tx to this address, each one gets a row here with its txid.</p>
             <% } else { %>
-            <table>
+            <div class="tablewrap"><table>
                 <thead>
                     <tr>
                         <th>When</th>
@@ -275,7 +275,7 @@ const atCurrentRate = meta && meta.rate_sats_per_diff
                     </tr>
                     <% }) %>
                 </tbody>
-            </table>
+            </table></div>
             <% } %>
         </section>
 
@@ -289,7 +289,7 @@ const atCurrentRate = meta && meta.rate_sats_per_diff
                 balance. <em>Running accrued</em> is the sum from the oldest
                 visible share up to and including this one.
             </p>
-            <table>
+            <div class="tablewrap"><table>
                 <thead>
                     <tr>
                         <th>#</th>
@@ -318,7 +318,7 @@ const atCurrentRate = meta && meta.rate_sats_per_diff
                     </tr>
                     <% }) %>
                 </tbody>
-            </table>
+            </table></div>
             <% } %>
         </section>
     </main>

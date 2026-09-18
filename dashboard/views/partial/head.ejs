@@ -2,8 +2,28 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="same-origin">
+<%# Re-apply the saved theme before the stylesheet paints. Every page here
+    reloads itself on a <meta refresh> timer, so a toggle applied from the
+    deferred script would flash the default theme once every 15 seconds.
+    Wrapped in try/catch because localStorage throws outright in a blocked-
+    cookies or private-window context, and losing the theme must not take the
+    rest of the page down with it. %>
+<script>
+(function () {
+    try {
+        var t = localStorage.getItem('sp-theme');
+        if (t === 'dark' || t === 'light') {
+            document.documentElement.setAttribute('data-theme', t);
+        }
+    } catch (e) { /* no storage — the default theme is fine */ }
+})();
+</script>
 <% if (typeof refresh !== 'undefined' && refresh) { %>
 <meta http-equiv="refresh" content="<%= refresh %>">
 <% } %>
 <title><%= (typeof title !== 'undefined' && title) ? title : 'simplepool' %></title>
 <link rel="stylesheet" href="/static/style.css">
+<%# Deferred, and here rather than at the end of each body: the theme
+    toggle it drives is in the shared nav, and eight views had never
+    picked up the body-end copy, so the button stayed hidden on them. %>
+<script src="/static/script.js" defer></script>

@@ -1,17 +1,14 @@
+<%# Generic page shell. Not currently rendered by any route — every view is a
+    full document that includes partial/head and partial/nav-* itself — but
+    kept in step with them so it cannot come back as the one page without a
+    theme. Locals: title, body. %>
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="15">
-    <title><%= title %> · simplepool</title>
-    <link rel="stylesheet" href="/static/style.css">
+<%- include('partial/head', { title: (typeof title !== 'undefined' && title) ? title : 'simplepool', refresh: 15 }) %>
 </head>
 <body>
-    <header class="top">
-        <a href="/" class="brand">simplepool</a>
-        <span class="tag">stratum stats</span>
-    </header>
+<%- include('partial/nav-public', { active: '' }) %>
     <main class="wrap">
         <%- body %>
     </main>
@@ -22,6 +19,5 @@
         <span class="sep">·</span>
         <a href="https://github.com/LayerTwo-Labs/simplepool" target="_blank" rel="noopener">source on GitHub</a>
     </footer>
-    <script src="/static/script.js" defer></script>
 </body>
 </html>

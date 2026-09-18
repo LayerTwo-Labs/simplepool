@@ -17,6 +17,8 @@
     literal — "1 000 sats × share difficulty" — was never true of a rate
     that is derived per template and moves with difficulty.
 
+    Rendered as a collapsed <details> — see the note above the element.
+
     Locals: pool, stratumUrl, sidechainId. %>
 <%
 const _p    = (typeof pool !== 'undefined' && pool) ? pool : null;
@@ -51,8 +53,20 @@ function _examples(net) {
 }
 const _ex = _examples(_net);
 %>
-<section class="card info">
-    <h2>About the numbers on this page</h2>
+<%# Folded shut by default. This is four screens of reference prose about
+    how a mode pays and how to point a rig at it — exactly right the first
+    time a miner lands here, and exactly what is in the way on the two
+    hundredth refresh. <details> keeps every word one click away and costs
+    no JS; the summary names the mode so it is still obvious from the closed
+    state which of the five stories is inside. %>
+<details class="card info">
+    <summary>
+        About the numbers on this page
+        <span class="summary-hint muted">
+            <% if (_mode) { %>how <%= _mode %> pays, and how to connect a miner<% }
+               else { %>how this pool pays, and how to connect a miner<% } %>
+        </span>
+    </summary>
 
 <% if (_mode === 'pps-classic') { %>
     <p class="muted small">
@@ -249,7 +263,7 @@ password:  (ignored — any value)</pre>
         the proxy actually published a floor: an older proxy stores NULL, and
         inventing 546 would state someone else's policy for them. %>
     <% if (_p && _p.pplns_payout_floor_sats != null) { %>
-    <p class="muted small" style="border-left:3px solid #b5651d;padding-left:0.75em">
+    <p class="muted small callout">
         <strong>A single block may not pay everyone.</strong> A coinbase has
         room for only so many outputs, so if your share of a block comes to
         less than <strong><%= _satsInt(_p.pplns_payout_floor_sats) %> sats</strong>,
@@ -321,4 +335,4 @@ password:  (ignored — any value)</pre>
     one thing the five modes agree on. Renders nothing unless the proxy
     published more than one port. %>
 <%- include('connect-ports', { pool: _p, stratumUrl: _url }) %>
-</section>
+</details>
