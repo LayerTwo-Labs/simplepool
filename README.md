@@ -579,7 +579,7 @@ you can commit + push from here), use
 ### Docker
 
 An alternative to the bare-metal script: containerized builds of the
-three services (stratum proxy, dashboard, payout worker) under
+four services (stratum proxy, dashboard, payout worker, slipstream) under
 [`deploy/docker/`](deploy/docker/). One `docker compose up -d --build`
 gets the whole app stack running against a Thunder daemon and Bitcoin
 Core that live on the host (or wherever you point them). Shared bind
@@ -591,6 +591,19 @@ Note: the drivechain infrastructure (`bitcoind`, Thunder, the
 `bip300301_enforcer`, `electrs`) is intentionally NOT containerized —
 those daemons have their own lifecycles and typically run bare-metal on
 the same host.
+
+### Slipstream
+
+[`slipstream/`](slipstream/) is an optional service that takes a raw tx from
+anyone and gets it into the pool's blocks **without relaying it** — for BIP300/
+301 txs (deposits, withdrawal bundles, BMM requests) the network will not relay,
+or any other consensus-valid tx. It hands each one to the enforcer's block
+template server, the same one the proxy mines from, which needs
+`--enable-slipstream` (LayerTwo-Labs/bip300301_enforcer#642). The fee rule is
+Slipstream's: the higher of a 1 sat/vB floor and the current mineable rate.
+Every submission is kept, and each accepted tx is followed from template to
+block. It also serves the pool's `info.json` for pool directories. See
+[`slipstream/README.md`](slipstream/README.md).
 
 ## Config keys
 
@@ -748,6 +761,8 @@ scripts/
 dashboard/           # Node/Express read-only stats UI
 payout/              # payout worker: Thunder rail (pps-classic, pplns-thunder)
                      #   and L1 rail via the enforcer wallet (pplns-btc)
+slipstream/          # slipstream service: takes txs from anyone and mines them
+                     #   without relaying, via the enforcer; serves info.json
 docs/simplepool.html # single-file explainer: every mode, end to end
 ```
 

@@ -1,7 +1,7 @@
 # -----------------------------------------------------------------------------
 # simplepool — docker-compose orchestration
 # -----------------------------------------------------------------------------
-# Runs the three simplepool services against a Thunder daemon that lives on
+# Runs the four simplepool services against a Thunder daemon that lives on
 # the host (or wherever THUNDER_RPC_URL points). Bitcoin Core is likewise
 # expected to be reachable from the simplepool container.
 #
@@ -102,3 +102,42 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     stop_grace_period: 30s
+
+  slipstream:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.slipstream
+    image: simplepool-slipstream:latest
+    container_name: simplepool-slipstream
+    restart: unless-stopped
+    environment:
+      # The enforcer's block template server -- the proxy's bitcoind_url --
+      # running with --enable-slipstream.
+      ENFORCER_GBT_URL: ${ENFORCER_GBT_URL:-http://host.docker.internal:8122}
+      BITCOIND_RPC_URL: ${BITCOIND_RPC_URL:-}
+      BITCOIND_RPC_USER: ${BITCOIND_RPC_USER:-}
+      BITCOIND_RPC_PASS: ${BITCOIND_RPC_PASS:-}
+      SLIPSTREAM_DB_PATH: /data/slipstream.db
+      PROXY_DB_PATH: /data/shares.db
+      SLIPSTREAM_BIND: 0.0.0.0
+      SLIPSTREAM_PORT: "8124"
+      SLIPSTREAM_TRUST_PROXY: ${SLIPSTREAM_TRUST_PROXY:-0}
+      SLIPSTREAM_MIN_FEE_RATE: ${SLIPSTREAM_MIN_FEE_RATE:-1}
+      POOL_NAME: ${POOL_NAME:-}
+      POOL_OPERATOR: ${POOL_OPERATOR:-}
+      POOL_CHAIN: ${POOL_CHAIN:-}
+      POOL_LOGO: ${POOL_LOGO:-}
+      POOL_CONTACT: ${POOL_CONTACT:-}
+      PUBLIC_STRATUM_URL: ${PUBLIC_STRATUM_URL:-}
+      PUBLIC_DASHBOARD_URL: ${PUBLIC_DASHBOARD_URL:-}
+      PUBLIC_SLIPSTREAM_URL: ${PUBLIC_SLIPSTREAM_URL:-}
+    ports:
+      # Loopback on the host: publish through nginx, which is also what
+      # SLIPSTREAM_TRUST_PROXY=1 assumes sets X-Forwarded-For.
+      - "127.0.0.1:${SLIPSTREAM_PORT:-8124}:8124"
+    volumes:
+      # Writes slipstream.db; reads shares.db.
+      - ../../data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    stop_grace_period: 10s

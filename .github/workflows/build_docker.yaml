@@ -1,4 +1,4 @@
-# Build the three simplepool container images and push them to the GitHub
+# Build the four simplepool container images and push them to the GitHub
 # Container Registry (ghcr.io) — the same registry coinshift-rs publishes to.
 #
 # This job runs only in the canonical LayerTwo-Labs repo (see the `if:` guard
@@ -47,6 +47,8 @@ jobs:
             dockerfile: deploy/docker/Dockerfile.dashboard
           - image: simplepool-payout
             dockerfile: deploy/docker/Dockerfile.payout
+          - image: simplepool-slipstream
+            dockerfile: deploy/docker/Dockerfile.slipstream
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -88,6 +90,6 @@ jobs:
                 github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Per-image GitHub Actions cache so the three legs don't collide.
+          # Per-image GitHub Actions cache so the legs don't collide.
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}

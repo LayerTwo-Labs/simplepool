@@ -126,6 +126,14 @@ jobs:
         working-directory: payout
         run: npm test
 
+      - name: Install slipstream dependencies
+        working-directory: slipstream
+        run: npm ci || npm install
+
+      - name: Run slipstream service tests
+        working-directory: slipstream
+        run: npm test
+
   # The payout path the coinbase e2e skips: wallet-enabled enforcer +
   # thunder, a real deposit, and one payout tick broadcasting a Thunder
   # transaction (tests/test_payout_regtest.sh). Separate job purely for
