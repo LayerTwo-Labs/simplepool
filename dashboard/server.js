@@ -19,6 +19,7 @@ import { startHealthMonitor, currentHealth } from './lib/health.js';
 import { versions } from './lib/versions.js';
 import * as fmt from './lib/fmt.js';
 import { createAdminRouter } from './lib/admin-router.js';
+import { fetchSlipstream } from './lib/slipstream.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT     = parseInt(process.env.PORT || '8081', 10);
@@ -55,6 +56,8 @@ app.use((_req, res, next) => {
      * rather than being threaded through one render call. */
     res.locals.stratumUrl  = PUBLIC_STRATUM_URL;
     res.locals.sidechainId = THUNDER_SIDECHAIN_ID;
+    /* The Slipstream nav link appears only on a pool that runs it. */
+    res.locals.slipstreamEnabled = !!SLIPSTREAM_API_URL;
     next();
 });
 
@@ -74,6 +77,14 @@ startHealthMonitor(db, { intervalMs: HEALTH_INTERVAL_MS });
 
 /* --- public-side config ------------------------------------------------- */
 const PUBLIC_STRATUM_URL = process.env.PUBLIC_STRATUM_URL || 'stratum+tcp://<pool-host>:3334';
+
+/* Slipstream (optional). SLIPSTREAM_API_URL is where this process reaches
+ * the service, e.g. http://127.0.0.1:8124; PUBLIC_SLIPSTREAM_URL is where
+ * submitters do. ENFORCER_GBT_URL, the enforcer's block template server, is
+ * what the admin withdraw action talks to: the enforcer holds the txs. */
+const SLIPSTREAM_API_URL    = process.env.SLIPSTREAM_API_URL    || '';
+const PUBLIC_SLIPSTREAM_URL = process.env.PUBLIC_SLIPSTREAM_URL || '';
+const ENFORCER_GBT_URL      = process.env.ENFORCER_GBT_URL      || '';
 
 /* The PPS rate is NOT configured here. It is read from pool_meta, which the
  * proxy writes on every template change, so the dashboard always reports the
@@ -199,6 +210,18 @@ app.get('/templates', (req, res) => {
     });
 });
 
+/* Slipstream: its fees and what has been submitted. 404 on a pool that
+ * does not run it, rather than a page explaining the absence of a feature. */
+app.get('/slipstream', async (_req, res, next) => {
+    if (!SLIPSTREAM_API_URL) return res.status(404).render('404', { what: 'page' });
+    try {
+        res.render('slipstream', {
+            slip: await fetchSlipstream(SLIPSTREAM_API_URL, { limit: 50 }),
+            submitUrl: PUBLIC_SLIPSTREAM_URL || null,
+        });
+    } catch (e) { next(e); }
+});
+
 /* --- JSON API (unchanged) ---------------------------------------------- */
 app.get('/api/overview',              (_req, res) => res.json(stats.overview(db)));
 app.get('/api/node',                  (_req, res) => res.json(stats.nodeStatus(db) || {}));
@@ -290,6 +313,8 @@ app.use('/admin',
         ENFORCER_GRPC_ADDR,
         THUNDER_SIDECHAIN_ID,
         RESERVE_ADDRESS,
+        SLIPSTREAM_API_URL,
+        ENFORCER_GBT_URL,
     }));
 
 /* ================================ 404 =================================== */

@@ -1,4 +1,4 @@
-/* Admin router: the 5 sub-pages + the 4 write-action POSTs + the
+/* Admin router: the 5 sub-pages + the write-action POSTs + the
  * per-worker audit page + /admin/logout.
  *
  * Every route on this router is protected by requireAdminAuth (mounted
@@ -12,6 +12,7 @@ import * as admin   from './admin.js';
 import * as actions from './actions.js';
 import { issueToken, consumeToken } from './csrf.js';
 import { depositStatuses, summarise } from './deposit-status.js';
+import { fetchSlipstream, withdrawSlipstreamTx } from './slipstream.js';
 
 export function createAdminRouter({
     db,                     // read-only handle
@@ -21,6 +22,8 @@ export function createAdminRouter({
     ENFORCER_GRPC_ADDR,
     THUNDER_SIDECHAIN_ID,
     RESERVE_ADDRESS,
+    SLIPSTREAM_API_URL,
+    ENFORCER_GBT_URL,
 } = {}) {
     const router = express.Router();
     const parseAdminForm = express.urlencoded({ extended: false, limit: '4kb' });
@@ -103,6 +106,14 @@ export function createAdminRouter({
                                tipHeight: 0, ctipTxid: null,
                                reserve: { ok: false, error: e.message },
                                errors: [e.message] }));
+        }
+        if (view === 'admin-tools') {
+            /* Only what can still be withdrawn: a mined tx is past taking
+             * back. */
+            extra.slipstream = await fetchSlipstream(SLIPSTREAM_API_URL, {
+                statuses: ['pending', 'in_template'], limit: 200,
+            });
+            extra.slipstreamWithdrawEnabled = !!ENFORCER_GBT_URL;
         }
         res.render(view, {
             ...summary,
@@ -197,6 +208,14 @@ export function createAdminRouter({
             flashRedirect(res, { ok: false, msg: 'deposit status check failed',
                                  detail: e.message }, returnTarget(req));
         }
+    });
+
+    router.post('/action/slipstream-withdraw', parseAdminForm, requireCsrf, async (req, res) => {
+        const r = await withdrawSlipstreamTx({
+            enforcerGbtUrl: ENFORCER_GBT_URL,
+            txid: (req.body?.txid || '').trim(),
+        });
+        flashRedirect(res, r, returnTarget(req));
     });
 
     router.post('/action/deposit', parseAdminForm, requireCsrf, async (req, res) => {
