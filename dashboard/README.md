@@ -87,12 +87,6 @@ The page reads the service's API, never `slipstream.db`, so the service stays
 the only owner of its schema; if it is down, the page says so and the rest of
 the dashboard is unaffected.
 
-Admin → Tools lists the txs still open, each with a **Withdraw** button. That
-calls `removeslipstreamtx` on the enforcer (`ENFORCER_GBT_URL`, its block
-template server), which holds the txs; the service then records the tx as
-dropped (`withdrawn`). Without `ENFORCER_GBT_URL` the list shows, and the
-buttons do not.
-
 ## Network difficulty
 
 The node-tip card on `/` — and `/api/node` — report the chain's current

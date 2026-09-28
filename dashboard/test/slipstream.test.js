@@ -1,4 +1,4 @@
-/* The slipstream page, its nav link, and the admin withdraw action.
+/* The slipstream page and its nav link.
  *
  * The page reads the slipstream service's API, never its database, and has
  * to render when the service is down: a pool whose slipstream service fell
@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import ejs from 'ejs';
 
 import * as fmt from '../lib/fmt.js';
-import { fetchSlipstream, withdrawSlipstreamTx } from '../lib/slipstream.js';
+import { fetchSlipstream } from '../lib/slipstream.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VIEWS = path.resolve(__dirname, '../views');
@@ -64,20 +64,7 @@ test('the nav links to slipstream only on a pool that runs it', async () => {
     assert.doesNotMatch(await nav(false), /href="\/slipstream"/);
 });
 
-test('admin tools lists open txs with a withdraw button', async () => {
-    const html = await render('admin-tools.ejs', {
-        flash: null, csrfToken: 'tok',
-        slipstream: { configured: true, ok: true, fees: FEES,
-                      txs: [{ ...TXS[0], status: 'in_template' }] },
-        slipstreamWithdrawEnabled: true,
-    });
-    assert.match(html, /action="\/admin\/action\/slipstream-withdraw"/);
-    assert.match(html, new RegExp(`name="txid" value="${TXID}"`));
-    const off = await render('admin-tools.ejs', { flash: null, csrfToken: 'tok' });
-    assert.doesNotMatch(off, /Slipstream: open transactions/);
-});
-
-/* A stub HTTP server answering one handler, for the two clients. */
+/* A stub HTTP server answering one handler. */
 async function stub(handler) {
     const calls = [];
     const server = createServer(async (req, res) => {
@@ -112,18 +99,4 @@ test('fetchSlipstream reads fees and txs from the service API', async () => {
     assert.equal((await fetchSlipstream('')).configured, false);
     const down = await fetchSlipstream('http://127.0.0.1:1');
     assert.equal(down.ok, false);
-});
-
-test('withdrawing asks the enforcer to remove the tx', async () => {
-    const s = await stub((_url, body) => ({ json: { jsonrpc: '2.0', id: body.id, result: [body.params[0]] } }));
-    try {
-        const r = await withdrawSlipstreamTx({ enforcerGbtUrl: s.url, txid: TXID.toUpperCase() });
-        assert.equal(r.ok, true);
-        assert.equal(s.calls[0].body.method, 'removeslipstreamtx');
-        assert.deepEqual(s.calls[0].body.params, [TXID]);
-    } finally {
-        await s.close();
-    }
-    assert.equal((await withdrawSlipstreamTx({ enforcerGbtUrl: '', txid: TXID })).ok, false);
-    assert.equal((await withdrawSlipstreamTx({ enforcerGbtUrl: 'http://x', txid: 'nope' })).ok, false);
 });

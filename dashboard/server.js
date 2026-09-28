@@ -80,11 +80,9 @@ const PUBLIC_STRATUM_URL = process.env.PUBLIC_STRATUM_URL || 'stratum+tcp://<poo
 
 /* Slipstream (optional). SLIPSTREAM_API_URL is where this process reaches
  * the service, e.g. http://127.0.0.1:8124; PUBLIC_SLIPSTREAM_URL is where
- * submitters do. ENFORCER_GBT_URL, the enforcer's block template server, is
- * what the admin withdraw action talks to: the enforcer holds the txs. */
+ * submitters do. */
 const SLIPSTREAM_API_URL    = process.env.SLIPSTREAM_API_URL    || '';
 const PUBLIC_SLIPSTREAM_URL = process.env.PUBLIC_SLIPSTREAM_URL || '';
-const ENFORCER_GBT_URL      = process.env.ENFORCER_GBT_URL      || '';
 
 /* The PPS rate is NOT configured here. It is read from pool_meta, which the
  * proxy writes on every template change, so the dashboard always reports the
@@ -313,8 +311,6 @@ app.use('/admin',
         ENFORCER_GRPC_ADDR,
         THUNDER_SIDECHAIN_ID,
         RESERVE_ADDRESS,
-        SLIPSTREAM_API_URL,
-        ENFORCER_GBT_URL,
     }));
 
 /* ================================ 404 =================================== */

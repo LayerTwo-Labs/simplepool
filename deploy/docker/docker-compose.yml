@@ -65,7 +65,6 @@ services:
       # below, over the compose network) to show the Slipstream page.
       SLIPSTREAM_API_URL:    ${SLIPSTREAM_API_URL:-}
       PUBLIC_SLIPSTREAM_URL: ${PUBLIC_SLIPSTREAM_URL:-}
-      ENFORCER_GBT_URL:      ${ENFORCER_GBT_URL:-}
     volumes:
       # Dashboard now writes to the deposits table when the operator
       # submits a deposit via /admin. Mount RW.

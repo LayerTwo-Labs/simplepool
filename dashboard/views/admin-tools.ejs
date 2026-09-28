@@ -52,48 +52,6 @@
             <button type="submit">Remove from mempool</button>
         </form>
     </section>
-
-    <% if (typeof slipstream !== 'undefined' && slipstream.configured) { %>
-    <section class="card">
-        <h2>Slipstream: open transactions</h2>
-        <p class="muted small" style="margin:0 0 0.5em 0">
-            Transactions submitted through slipstream that are not mined
-            yet. Withdrawing takes a tx, and any slipstream txs spending it,
-            out of the enforcer's mempool, so no template carries it again;
-            the slipstream service then records it as dropped
-            (<code>withdrawn</code>). Nothing is broadcast either way.
-        </p>
-        <% if (!slipstream.ok) { %>
-            <p class="bad small">The slipstream service is not answering (<%= slipstream.error %>).</p>
-        <% } else if (slipstream.txs.length === 0) { %>
-            <p class="muted small">Nothing open.</p>
-        <% } else { %>
-        <table>
-            <thead><tr><th>txid</th><th>fee rate</th><th>status</th><th>submitted</th><th></th></tr></thead>
-            <tbody>
-            <% for (const tx of slipstream.txs) { %>
-                <tr>
-                    <td class="mono" title="<%= tx.txid %>"><%= tx.txid.slice(0, 16) %>…</td>
-                    <td><%= fmtF(tx.fee_rate, 2) %> sat/vB</td>
-                    <td><%= tx.status.replace('_', ' ') %></td>
-                    <td title="<%= fmtTs(tx.submitted_at) %>"><%= ago(tx.submitted_at) %></td>
-                    <td>
-                        <% if (slipstreamWithdrawEnabled) { %>
-                        <form method="POST" action="/admin/action/slipstream-withdraw" style="margin:0">
-                            <input type="hidden" name="csrf" value="<%= csrfToken %>">
-                            <input type="hidden" name="return_to" value="/admin/tools">
-                            <input type="hidden" name="txid" value="<%= tx.txid %>">
-                            <button type="submit">Withdraw</button>
-                        </form>
-                        <% } else { %><span class="muted small">set ENFORCER_GBT_URL</span><% } %>
-                    </td>
-                </tr>
-            <% } %>
-            </tbody>
-        </table>
-        <% } %>
-    </section>
-    <% } %>
 </main>
 <footer class="foot">
     <span>admin · tools</span>

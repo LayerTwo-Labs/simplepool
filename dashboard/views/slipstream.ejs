@@ -13,13 +13,13 @@
     <section class="card info">
         <h2>Slipstream</h2>
         <p class="muted small" style="margin-top:0">
-            Submit a transaction straight to this pool, and it is mined
-            without being relayed: it goes into the templates this pool's
-            miners work on, and nowhere else. Anything consensus-valid is
-            taken — BIP300/301 deposits, withdrawal bundles and BMM requests
-            the network will not carry included. Whether a tx relays does
-            not matter; whether it is valid does, and so do the enforcer's
-            BIP300 rules.
+            Submit a transaction straight to this pool and it is taken into
+            the templates this pool's miners work on — including
+            transactions the network will not relay, such as BIP300/301
+            deposits, withdrawal bundles and BMM requests. Anything
+            consensus-valid is taken; the enforcer's BIP300 rules apply too.
+            Once accepted it is broadcast like any other transaction, so
+            another pool may mine it first.
         </p>
     </section>
 
