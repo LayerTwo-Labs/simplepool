@@ -71,6 +71,13 @@ jobs:
       - name: Run coinbase-direct PPLNS end-to-end regtest test
         run: bash tests/test_pplns_coinbase_regtest.sh
 
+      # Slipstream: a tx submitted to the service is checked and broadcast to
+      # the node, reaches the enforcer's template through its mempool mirror,
+      # and is followed to confirmed. No proxy; the template is mined with
+      # generateblock.
+      - name: Run slipstream end-to-end regtest test
+        run: bash tests/test_slipstream_regtest.sh
+
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -81,6 +88,8 @@ jobs:
             .regtest-e2e/logs/
             .regtest-pplns/logs/
             .regtest-cbwin/logs/
+            .regtest/slipstream-e2e/logs/
+            .regtest/slipstream-e2e/slipstream.log
             /tmp/simplepool-e2e.log
             /tmp/simplepool-e2e.conf
             /tmp/simplepool-int.log

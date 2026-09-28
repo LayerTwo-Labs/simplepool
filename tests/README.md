@@ -97,15 +97,14 @@ the version last validated against.
   summed. Own `.regtest-btcpay/` dir.
 
 - `test_slipstream_regtest.sh` — the slipstream service against a real
-  enforcer: a tx the node refuses to relay is accepted, never enters the
-  node's mempool, reaches the template, and is followed through mined to
-  confirmed; a tx under the fee floor is refused and taken back out of the
-  enforcer. Needs `SLIPSTREAM_ENFORCER_BIN`, an enforcer built with
-  `--enable-slipstream`, until a release ships it — so it is not in CI yet.
-  Own `.regtest/slipstream-e2e/` dir.
+  node and the stock enforcer: a non-standard tx is accepted by a node
+  running `-acceptnonstdtxn`, reaches the enforcer's template through its
+  mempool mirror, and is followed through mined to confirmed; a tx under the
+  fee floor is refused before it is broadcast; a tx replaced in the node's
+  mempool is recorded as dropped with the node's reason. Own
+  `.regtest/slipstream-e2e/` dir.
 
-      SLIPSTREAM_ENFORCER_BIN=../bip300301_enforcer/target/debug/bip300301_enforcer \
-          bash tests/test_slipstream_regtest.sh
+      bash tests/test_slipstream_regtest.sh
 
 - `test_pplns_coinbase_regtest.sh` — `pool_mode=pplns-coinbase`, which has no
   ledger step at all: the payment IS the block. Asserts the coinbase pays the

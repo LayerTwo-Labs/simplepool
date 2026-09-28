@@ -22,7 +22,7 @@ import { summary } from './slipstream.js';
 const MAX_BODY_BYTES = 2 * 1_000_000 + 1024;
 
 const TXID_RE = /^[0-9a-f]{64}$/;
-const STATUSES = ['pending', 'in_template', 'mined', 'confirmed', 'dropped', 'expired'];
+const STATUSES = ['pending', 'in_template', 'mined', 'confirmed', 'dropped'];
 
 /* Fixed-window per-address counter. Crude, and enough: a submission costs
  * the enforcer a node round trip, so the point is only to bound that. */

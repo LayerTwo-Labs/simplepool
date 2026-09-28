@@ -1,4 +1,4 @@
-/* A fake enforcer and bitcoind, scripted per test, around a real in-memory
+/* A fake bitcoind and enforcer, scripted per test, around a real in-memory
  * store: the store is what the tests are about, so it is not faked. */
 
 import { openStore } from '../lib/store.js';
@@ -17,7 +17,6 @@ export function baseCfg(overrides = {}) {
     return {
         minFeeRate: 1,
         confirmations: 6,
-        expiryBlocks: 144,
         rateLimitPerMin: 30,
         trustProxy: false,
         presentation: {},
@@ -25,53 +24,60 @@ export function baseCfg(overrides = {}) {
     };
 }
 
-/* An enforcer whose mempool is a Map of txid -> status, and whose
- * template is whatever the test sets. */
+/* A node with a mempool (txid -> entry) and a chain (txid -> block hash,
+ * block hash -> header). */
+export class FakeBitcoind {
+    constructor() {
+        this.mempool = new Map();
+        this.txBlocks = new Map();
+        this.headers = new Map();
+        this.sent = [];
+        this.nextTest = null;
+        this.sendError = null;
+    }
+
+    /* By default any tx checks out as TXID_A, 100 vB paying 200 sat. */
+    async testAccept(_hex) {
+        const next = this.nextTest ?? { txid: TXID_A, allowed: true, vsize: 100, fees: { base: 200e-8 } };
+        this.nextTest = null;
+        if (next instanceof RpcError) throw next;
+        this._lastTest = { wtxid: next.txid, ...next };
+        return this._lastTest;
+    }
+
+    async send(hex) {
+        this.sent.push(hex);
+        if (this.sendError) {
+            const e = this.sendError;
+            this.sendError = null;
+            throw e;
+        }
+        const { txid, vsize = 100, fees = { base: 200e-8 } } = this._lastTest ?? { txid: TXID_A };
+        this.mempool.set(txid, { vsize, weight: vsize * 4, fees });
+        return txid;
+    }
+
+    async mempoolEntry(txid) { return this.mempool.get(txid) ?? null; }
+    async txBlock(txid) { return this.txBlocks.get(txid) ?? null; }
+    async blockConfirmations(hash) { return this.headers.get(hash) ?? null; }
+
+    /* Move a tx from the mempool into `block`, `confirmations` deep. */
+    mine(txid, block, { height = 100, confirmations = 1 } = {}) {
+        this.mempool.delete(txid);
+        this.txBlocks.set(txid, block);
+        this.headers.set(block, { height, confirmations });
+    }
+}
+
 export class FakeEnforcer {
     constructor() {
         this.template = { height: 100, previousblockhash: TIP, transactions: [] };
-        this.statuses = new Map();
-        this.submitted = [];
-        this.removed = [];
-        this.nextSubmit = null;
     }
 
     async getBlockTemplate() {
         if (this.down) throw new Error('connect ECONNREFUSED');
         return this.template;
     }
-
-    /* `nextSubmit` scripts the next answer; by default any tx is accepted as
-     * `txid` at 2 sat/vB. */
-    async submit(hex) {
-        this.submitted.push(hex);
-        const next = this.nextSubmit ?? { txid: TXID_A, accepted: true, fee_sat: 200, vsize: 100 };
-        this.nextSubmit = null;
-        if (next instanceof RpcError) throw next;
-        const resp = { wtxid: next.txid, weight: (next.vsize ?? 100) * 4, ...next };
-        if (resp.accepted) this.statuses.set(resp.txid, { status: 'pending', txid: resp.txid });
-        return resp;
-    }
-
-    async status(txid) {
-        return this.statuses.get(txid) ?? { status: 'unknown', txid };
-    }
-
-    async remove(txid) {
-        this.removed.push(txid);
-        this.statuses.set(txid, { status: 'removed', txid, reason: 'withdrawn' });
-        return [txid];
-    }
-}
-
-export class FakeBitcoind {
-    constructor() {
-        this.headers = new Map();   // block hash -> { confirmations, height }
-        this.txBlocks = new Map();  // txid -> block hash
-    }
-
-    async blockConfirmations(hash) { return this.headers.get(hash) ?? null; }
-    async txBlock(txid) { return this.txBlocks.get(txid) ?? null; }
 }
 
 export function fakePool({ meta = null, ours = [] } = {}) {
@@ -81,17 +87,18 @@ export function fakePool({ meta = null, ours = [] } = {}) {
     };
 }
 
-export function makeSlipstream({ cfg = {}, bitcoind = null, pool = fakePool() } = {}) {
+export function makeSlipstream({ cfg = {}, pool = fakePool() } = {}) {
+    const bitcoind = new FakeBitcoind();
     const enforcer = new FakeEnforcer();
     const slipstream = new Slipstream({
         store: openStore(':memory:'),
-        enforcer,
         bitcoind,
+        enforcer,
         pool,
         cfg: baseCfg(cfg),
         log: quietLog,
     });
-    return { slipstream, enforcer, store: slipstream.store };
+    return { slipstream, bitcoind, enforcer, store: slipstream.store };
 }
 
 /* A template carrying `count` txs of `weight` wu each, paying `feeRate`. */

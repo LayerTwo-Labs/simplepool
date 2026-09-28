@@ -1,50 +1,49 @@
 #!/usr/bin/env bash
 # End-to-end proof of the slipstream service, against a real chain.
 #
-#   bitcoind-patched  <->  bip300301_enforcer --enable-slipstream  <->  slipstream/
+#   bitcoind-patched (-acceptnonstdtxn)  <->  bip300301_enforcer  <->  (proxy)
+#          ^
+#          +-- slipstream/  (testmempoolaccept, sendrawtransaction)
+#
+# The enforcer is the stock release: it mirrors the node's mempool over ZMQ,
+# so whatever the node accepts reaches its templates with no enforcer change.
 #
 # What only a chain can prove, and what this asserts:
 #
-#   1. a tx the node refuses to relay (non-standard: a dust output) is
-#      accepted through slipstream, and never enters the node's mempool.
-#      Nothing is relayed, which is the point of the service.
+#   1. a non-standard tx (a dust output) is accepted through slipstream by a
+#      node running -acceptnonstdtxn, and lands in the node's mempool.
 #   2. it reaches the template the enforcer serves -- the one the proxy
 #      mines -- and the service sees it there (in_template).
 #   3. mining that template confirms it, and the service follows it through
-#      mined to confirmed, with bitcoind supplying the depth.
-#   4. the fee rule holds: a tx under the floor is refused, and taken back
-#      out of the enforcer so it cannot be mined for less than was asked.
-#   5. every submission is kept, refused ones included.
-#   6. info.json names the slipstream URL and the software.
+#      mined to confirmed.
+#   4. the fee rule holds, and holds BEFORE broadcast: a tx under the floor
+#      is refused and never reaches the node's mempool. Nothing can be taken
+#      back out of a mempool, so refusing after sending would be too late.
+#   5. a tx replaced in the node's mempool (RBF) leaves it, is refused when
+#      sent again, and is recorded as dropped with the node's reason.
+#   6. every submission is kept, refused ones included.
+#   7. info.json names the slipstream URL and the software.
 #
-# The proxy is not run: the service talks only to the enforcer and bitcoind,
+# The proxy is not run: the service talks only to the node and the enforcer,
 # and the template is mined directly with generateblock, which accepts a
 # block only if the node finds the whole of it valid.
 #
 # Env:
-#   SLIPSTREAM_ENFORCER_BIN  REQUIRED until an enforcer release ships
-#                            --enable-slipstream (LayerTwo-Labs/
-#                            bip300301_enforcer#642): a bip300301_enforcer
-#                            binary built from that branch.
 #   REGTEST_DIR      data dir, WIPED each run (default: <repo>/.regtest/slipstream-e2e)
-#   REGTEST_BIN_DIR  binary cache for bitcoind (default: <repo>/.regtest/bin)
+#   REGTEST_BIN_DIR  binary cache, kept across runs (default: <repo>/.regtest/bin)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 export REGTEST_DIR="${REGTEST_DIR:-$ROOT/.regtest/slipstream-e2e}"
-CACHE_BIN_DIR="${REGTEST_BIN_DIR:-$ROOT/.regtest/bin}"
+export REGTEST_BIN_DIR="${REGTEST_BIN_DIR:-$ROOT/.regtest/bin}"
 export REGTEST_SKIP_THUNDER=1
 export REGTEST_WALLETLESS=1
-export REGTEST_ENFORCER_EXTRA_ARGS="--enable-slipstream"
-
-: "${SLIPSTREAM_ENFORCER_BIN:?set SLIPSTREAM_ENFORCER_BIN to an enforcer built with --enable-slipstream}"
-[ -x "$SLIPSTREAM_ENFORCER_BIN" ] || { echo "not executable: $SLIPSTREAM_ENFORCER_BIN" >&2; exit 1; }
 
 SVC_LOG="$REGTEST_DIR/slipstream.log"
 SVC_DB="$REGTEST_DIR/slipstream.db"
 SVC_PID=""
-BIN="$REGTEST_DIR/bin"
+BIN="$REGTEST_BIN_DIR"
 
 cli()   { "$BIN/bitcoin-cli" -datadir="$REGTEST_DIR/data/bitcoind" -regtest \
           -rpcuser=user -rpcpassword=password "$@"; }
@@ -65,7 +64,7 @@ dump_logs() {
 
 cleanup() {
     [ -n "$SVC_PID" ] && kill "$SVC_PID" 2>/dev/null || true
-    REGTEST_BIN_DIR="$BIN" "$ROOT/scripts/regtest/stop.sh" || true
+    "$ROOT/scripts/regtest/stop.sh" || true
     rm -rf "$LOCK"
 }
 
@@ -106,20 +105,17 @@ export REGTEST_BITCOIND_RPC_PORT REGTEST_BITCOIND_ZMQ_PORT \
        REGTEST_ENFORCER_RPC_PORT REGTEST_ENFORCER_GRPC_PORT
 
 stage "wipe data dir (fresh chain every run)"
-rm -rf "$REGTEST_DIR/data" "$REGTEST_DIR/logs" "$REGTEST_DIR/run" "$BIN"
+rm -rf "$REGTEST_DIR/data" "$REGTEST_DIR/logs" "$REGTEST_DIR/run"
 rm -f "$SVC_DB" "$SVC_DB-wal" "$SVC_DB-shm" "$SVC_LOG"
 
-stage "binaries: cached bitcoind, slipstream enforcer"
-REGTEST_BIN_DIR="$CACHE_BIN_DIR" "$ROOT/scripts/regtest/setup.sh" >/dev/null
-mkdir -p "$BIN"
-ln -sf "$CACHE_BIN_DIR/bitcoind"    "$BIN/bitcoind"
-ln -sf "$CACHE_BIN_DIR/bitcoin-cli" "$BIN/bitcoin-cli"
-ln -sf "$SLIPSTREAM_ENFORCER_BIN"   "$BIN/bip300301_enforcer"
-"$BIN/bip300301_enforcer" --help | grep -q -- '--enable-slipstream' \
-    || fail "$SLIPSTREAM_ENFORCER_BIN has no --enable-slipstream"
+stage "download prebuilt binaries"
+"$ROOT/scripts/regtest/setup.sh" >/dev/null
 
-stage "start bitcoind-patched + walletless enforcer with slipstream"
-REGTEST_BIN_DIR="$BIN" "$ROOT/scripts/regtest/start.sh" >/dev/null
+stage "start bitcoind-patched (-acceptnonstdtxn) + walletless enforcer"
+# The one node setting slipstream needs, for non-standard txs. Core allows it
+# only off mainnet; on regtest it is simply a config line.
+echo 'acceptnonstdtxn=1' >> "$REGTEST_DIR/data/bitcoind/bitcoin.conf"
+"$ROOT/scripts/regtest/start.sh" >/dev/null
 
 stage "mature coins for the node wallet"
 MINER_ADDR=$(wcli getnewaddress)
@@ -145,9 +141,9 @@ stage "start the slipstream service"
 ( cd "$ROOT/slipstream" && [ -d node_modules ] || npm ci --silent --no-audit --no-fund )
 (
     cd "$ROOT/slipstream"
-    ENFORCER_GBT_URL="http://127.0.0.1:$REGTEST_ENFORCER_RPC_PORT" \
     BITCOIND_RPC_URL="http://127.0.0.1:$REGTEST_BITCOIND_RPC_PORT" \
     BITCOIND_RPC_USER=user BITCOIND_RPC_PASS=password \
+    ENFORCER_GBT_URL="http://127.0.0.1:$REGTEST_ENFORCER_RPC_PORT" \
     SLIPSTREAM_DB_PATH="$SVC_DB" \
     PROXY_DB_PATH="$REGTEST_DIR/no-proxy.db" \
     SLIPSTREAM_PORT="$SVC_PORT" \
@@ -160,8 +156,9 @@ SVC_PID=$!
 for _ in $(seq 1 30); do api /healthz >/dev/null 2>&1 && break; sleep 1; done
 api /healthz >/dev/null || fail "the service never became healthy"
 
-# A spend of one wallet UTXO at `fee_rate` sat/vB paying `extra` as a second
-# output. A 1-sat `extra` is dust, which the node refuses to relay.
+# A spend of one wallet UTXO paying `fee_sats`, with `extra` as a second
+# output, signalling RBF. A 1-sat `extra` is dust: non-standard, so only a
+# node running -acceptnonstdtxn takes it.
 build_tx() {
     local fee_sats="$1" extra_btc="$2"
     local utxo txid vout amount pay dust raw
@@ -173,21 +170,20 @@ build_tx() {
     local send
     send=$(python3 -c "print(f'{$amount - $fee_sats/1e8 - $extra_btc:.8f}')")
     raw=$(wcli createrawtransaction "[{\"txid\":\"$txid\",\"vout\":$vout}]" \
-        "[{\"$pay\":$send},{\"$dust\":$extra_btc}]")
+        "[{\"$pay\":$send},{\"$dust\":$extra_btc}]" 0 true)
     wcli signrawtransactionwithwallet "$raw" | jq -r .hex
 }
 
-stage "1. a non-standard tx is accepted, and the node never sees it"
+stage "1. a non-standard tx is accepted, and broadcast to the node"
 # ~141 vB for a P2WPKH one-in, two-out: 1_000 sat is ~7 sat/vB
 TX_HEX=$(build_tx 1000 0.00000001)
-[ "$(cli testmempoolaccept "[\"$TX_HEX\"]" | jq -r '.[0].allowed')" = "false" ] \
-    || fail "the fixture tx is supposed to be refused by the node's policy"
 RESP=$(post "$TX_HEX")
 echo "  $RESP"
 [ "$(jq -r .accepted <<<"$RESP")" = "true" ] || fail "slipstream refused the tx: $RESP"
 TXID=$(jq -r .txid <<<"$RESP")
-cli getrawmempool | jq -e --arg t "$TXID" 'index($t) == null' >/dev/null \
-    || fail "the slipstream tx reached the node's mempool"
+cli getrawmempool | jq -e --arg t "$TXID" 'index($t) != null' >/dev/null \
+    || fail "the accepted tx is not in the node's mempool"
+cli getmempoolentry "$TXID" >/dev/null
 
 stage "2. it reaches the template"
 for _ in $(seq 1 30); do
@@ -224,7 +220,7 @@ jq -r '.events[].event' <<<"$TX_JSON" | tr '\n' ' '; echo
 [ "$(jq -r '[.events[].event | select(. != "pending")] | join(",")' <<<"$TX_JSON")" \
     = "accepted,in_template,mined,confirmed" ] || fail "unexpected history: $TX_JSON"
 
-stage "4. under the fee floor: refused, and not left in the enforcer"
+stage "4. under the fee floor: refused before broadcast"
 wait_template_on_tip
 # 20 sat for ~141 vB is ~0.14 sat/vB: over the node's relay floor, under ours
 LOW_HEX=$(build_tx 20 0.00001000)
@@ -232,15 +228,29 @@ RESP=$(post "$LOW_HEX")
 echo "  $RESP"
 [ "$(jq -r .reject_reason <<<"$RESP")" = "fee-rate-too-low" ] || fail "low fee not refused: $RESP"
 LOW_TXID=$(jq -r .txid <<<"$RESP")
-gbt | jq -e --arg t "$LOW_TXID" '[.result.transactions[].txid] | index($t) == null' >/dev/null \
-    || fail "the refused tx is still in the enforcer's template"
+cli getrawmempool | jq -e --arg t "$LOW_TXID" 'index($t) == null' >/dev/null \
+    || fail "the refused tx was broadcast anyway"
 
-stage "5. every submission is kept"
+stage "5. replaced in the node's mempool: dropped, with the node's reason"
+RBF_HEX=$(build_tx 2000 0.00001000)
+RESP=$(post "$RBF_HEX")
+[ "$(jq -r .accepted <<<"$RESP")" = "true" ] || fail "slipstream refused the tx: $RESP"
+RBF_TXID=$(jq -r .txid <<<"$RESP")
+wcli bumpfee "$RBF_TXID" >/dev/null
+for _ in $(seq 1 30); do
+    [ "$(api "/api/tx/$RBF_TXID" | jq -r .tx.status)" = "dropped" ] && break
+    sleep 1
+done
+RBF_JSON=$(api "/api/tx/$RBF_TXID")
+echo "  $(jq -c '{status: .tx.status, reason: .tx.status_reason}' <<<"$RBF_JSON")"
+[ "$(jq -r .tx.status <<<"$RBF_JSON")" = "dropped" ] || fail "replacement not noticed: $RBF_JSON"
+
+stage "6. every submission is kept"
 SUBS=$(sqlite3 "$SVC_DB" "SELECT accepted || ':' || COALESCE(reject_reason, '') FROM slipstream_submissions ORDER BY id" | tr '\n' ' ')
 echo "  $SUBS"
-[ "$SUBS" = "1: 0:fee-rate-too-low " ] || fail "unexpected submission log: $SUBS"
+[ "$SUBS" = "1: 0:fee-rate-too-low 1: " ] || fail "unexpected submission log: $SUBS"
 
-stage "6. info.json"
+stage "7. info.json"
 INFO=$(api /info.json)
 [ "$(jq -r .software <<<"$INFO")" = "simplepool" ] || fail "info.json: $INFO"
 [ "$(jq -r .slipstream_url <<<"$INFO")" = "http://127.0.0.1:$SVC_PORT" ] || fail "info.json: $INFO"

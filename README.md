@@ -595,15 +595,16 @@ the same host.
 ### Slipstream
 
 [`slipstream/`](slipstream/) is an optional service that takes a raw tx from
-anyone and gets it into the pool's blocks **without relaying it** — for BIP300/
-301 txs (deposits, withdrawal bundles, BMM requests) the network will not relay,
-or any other consensus-valid tx. It hands each one to the enforcer's block
-template server, the same one the proxy mines from, which needs
-`--enable-slipstream` (LayerTwo-Labs/bip300301_enforcer#642). The fee rule is
-Slipstream's: the higher of a 1 sat/vB floor and the current mineable rate.
-Every submission is kept, and each accepted tx is followed from template to
-block. It also serves the pool's `info.json` for pool directories. See
-[`slipstream/README.md`](slipstream/README.md).
+anyone and gets it into the pool's blocks, including txs the network will not
+relay: BIP300/301 txs, or any other consensus-valid tx. It checks each one
+against the pool's own bitcoind (`testmempoolaccept`) and the fee rule, then
+broadcasts it there; the enforcer's template mempool mirrors that node's, so it
+reaches the templates the proxy mines with no enforcer change. Non-standard txs
+need the node to run `-acceptnonstdtxn` (which Core allows only off mainnet).
+The fee rule is Slipstream's: the higher of a 1 sat/vB floor and the current
+mineable rate. Every submission is kept, and each accepted tx is followed from
+template to block. It also serves the pool's `info.json` for pool directories.
+See [`slipstream/README.md`](slipstream/README.md).
 
 ## Config keys
 
@@ -761,8 +762,8 @@ scripts/
 dashboard/           # Node/Express read-only stats UI
 payout/              # payout worker: Thunder rail (pps-classic, pplns-thunder)
                      #   and L1 rail via the enforcer wallet (pplns-btc)
-slipstream/          # slipstream service: takes txs from anyone and mines them
-                     #   without relaying, via the enforcer; serves info.json
+slipstream/          # slipstream service: takes txs from anyone and gets them
+                     #   into the pool's blocks via its bitcoind; serves info.json
 docs/simplepool.html # single-file explainer: every mode, end to end
 ```
 

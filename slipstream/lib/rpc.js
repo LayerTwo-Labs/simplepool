@@ -1,4 +1,4 @@
-/* JSON-RPC clients for the enforcer's block template server and bitcoind.
+/* JSON-RPC clients for bitcoind and the enforcer's block template server.
  *
  * Both speak the same wire format; they differ only in auth. The template
  * server has none, bitcoind takes basic auth from user/pass or its cookie
@@ -69,7 +69,58 @@ export class RpcClient {
     }
 }
 
-/* The enforcer's block template server, as far as slipstream needs it. */
+/* RPC_INVALID_ADDRESS_OR_KEY: what bitcoind answers for an unknown txid or
+ * block hash. */
+const NOT_FOUND = -5;
+
+const orNull = async (promise) => {
+    try {
+        return await promise;
+    } catch (e) {
+        if (e instanceof RpcError && e.code === NOT_FOUND) return null;
+        throw e;
+    }
+};
+
+/* The pool's own bitcoind: where a slipstream tx is checked, broadcast and
+ * followed. The enforcer's template mempool mirrors this node's mempool, so
+ * a tx accepted here reaches the templates the proxy mines. */
+export class BitcoindClient {
+    constructor(opts) {
+        this.rpc = new RpcClient(opts);
+    }
+
+    /* testmempoolaccept for one tx: { txid, wtxid, allowed, vsize, fees,
+     * 'reject-reason' }. Checks everything sendrawtransaction would, and
+     * broadcasts nothing. */
+    async testAccept(txHex) {
+        const [result] = await this.rpc.call('testmempoolaccept', [[txHex]]);
+        return result;
+    }
+
+    send(txHex) { return this.rpc.call('sendrawtransaction', [txHex]); }
+
+    /* { vsize, weight, fees: { base }, ... }, or null outside the mempool */
+    mempoolEntry(txid) { return orNull(this.rpc.call('getmempoolentry', [txid])); }
+
+    /* The block a tx is confirmed in, if it is confirmed at all. Needs
+     * txindex, which the enforcer already requires of this node. */
+    async txBlock(txid) {
+        const tx = await orNull(this.rpc.call('getrawtransaction', [txid, true]));
+        return tx?.blockhash && tx.confirmations > 0 ? tx.blockhash : null;
+    }
+
+    /* { confirmations, height } of a block, confirmations -1 once it has left
+     * the main chain; null if the node does not know it. */
+    async blockConfirmations(blockHash) {
+        const header = await orNull(this.rpc.call('getblockheader', [blockHash, true]));
+        return header ? { confirmations: header.confirmations, height: header.height } : null;
+    }
+}
+
+/* The enforcer's block template server: read only for the template the
+ * proxy is mining, which is where the mineable rate comes from and how a tx
+ * is seen to be in play. */
 export class EnforcerClient {
     constructor(opts) {
         this.rpc = new RpcClient(opts);
@@ -82,40 +133,5 @@ export class EnforcerClient {
             rules: ['segwit'],
             capabilities: ['coinbasetxn'],
         }]);
-    }
-
-    submit(txHex)   { return this.rpc.call('submitslipstreamtx', [txHex]); }
-    status(txid)    { return this.rpc.call('getslipstreamtx', [txid]); }
-    remove(txid)    { return this.rpc.call('removeslipstreamtx', [txid]); }
-}
-
-/* bitcoind, read-only. */
-export class BitcoindClient {
-    constructor(opts) {
-        this.rpc = new RpcClient(opts);
-    }
-
-    /* Confirmations of `blockHash`, -1 once it has left the main chain, or
-     * null if bitcoind does not know it. */
-    async blockConfirmations(blockHash) {
-        try {
-            const header = await this.rpc.call('getblockheader', [blockHash, true]);
-            return { confirmations: header.confirmations, height: header.height };
-        } catch (e) {
-            if (e instanceof RpcError && e.code === -5) return null;
-            throw e;
-        }
-    }
-
-    /* The block a tx is confirmed in, if it is confirmed at all. Needs
-     * txindex, which the enforcer already requires of this node. */
-    async txBlock(txid) {
-        try {
-            const tx = await this.rpc.call('getrawtransaction', [txid, true]);
-            return tx.blockhash && tx.confirmations > 0 ? tx.blockhash : null;
-        } catch (e) {
-            if (e instanceof RpcError && e.code === -5) return null;
-            throw e;
-        }
     }
 }
