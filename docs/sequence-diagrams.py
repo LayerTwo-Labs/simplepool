@@ -274,6 +274,35 @@ DIAGRAMS['payout'] = build(
 
 
 
+# ---------------------------------------------------------- slipstream -----
+DIAGRAMS['slipstream'] = build(
+    'slipstream: a tx from anyone, into the pool\'s blocks',
+    'A submitter posts a raw tx. The slipstream service checks it against the '
+    'pool\'s bitcoind and the fee rule without broadcasting, then broadcasts it. '
+    'The enforcer mirrors that node\'s mempool, so the tx reaches the template '
+    'the pool mines; the service follows it to a block.',
+    [('sub', 'Submitter', 'any wallet'),
+     ('slip', 'slipstream', ':8124'),
+     ('node', 'bitcoind', '-acceptnonstdtxn'),
+     ('enf', 'enforcer', 'template server'),
+     POOL],
+    [('msg', 'sub', 'slip', 'POST /api/tx  <raw hex>'),
+     ('msg', 'slip', 'node', 'testmempoolaccept'),
+     ('msg', 'node', 'slip', 'allowed? fee, vsize', 'dashed'),
+     ('self', 'slip', 'fee rule: max(floor, mineable)'),
+     ('note', 'Checked BEFORE it is sent: nothing can be taken back out of a mempool, so refusing afterwards would be too late.', 'warn'),
+     ('msg', 'slip', 'node', 'sendrawtransaction'),
+     ('msg', 'node', 'enf', 'mempool mirror (ZMQ)'),
+     ('note', 'From here it is an ordinary mempool tx: relayed to peers, and minable by any pool whose node took it.'),
+     ('msg', 'pool', 'enf', 'getblocktemplate'),
+     ('msg', 'enf', 'pool', 'a template carrying the tx', 'dashed'),
+     ('msg', 'slip', 'enf', 'poll: in the template?'),
+     ('msg', 'slip', 'node', 'poll: mined? how deep?'),
+     ('note', 'Every submission is kept, refusals included. Each accepted tx is followed to confirmed, or to dropped with the node\'s own reason.', 'win'),
+    ], min_width=600)
+
+
+
 # ---- splicing -------------------------------------------------------------
 #
 # Each figure sits between HTML comment markers so a regeneration replaces

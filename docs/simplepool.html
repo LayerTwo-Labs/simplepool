@@ -308,6 +308,8 @@ footer .wrap > p { max-width: 46rem; }
     <li><a href="#audit">Auditing every number</a></li>
     <li><a href="#data">The data model</a></li>
     <li><a href="#connect">Connect a miner</a></li>
+    <li><a href="#dashboard">The dashboard</a></li>
+    <li><a href="#slipstream">Slipstream</a></li>
     <li><a href="#config">Configuration</a></li>
     <li><a href="#operate">Running one</a></li>
     <li><a href="#limits">What it can't do</a></li>
@@ -709,6 +711,20 @@ footer .wrap > p { max-width: 46rem; }
     (<code>pool:shares</code>, <code>pool:rejects</code>, <code>pool:blocks</code>,
     <code>pool:tip</code>, <code>pool:credits</code>). SQLite stays authoritative;
     the publish is fire-and-forget and a Redis outage cannot cost you a share.
+  </p>
+
+  <p>
+    The proxy takes templates from the enforcer's template server, never from
+    bitcoind directly: only the enforcer's carry the BIP300/301 commitments a
+    sidechain needs. It long-polls (BIP22), so a new tip reaches miners as soon
+    as the enforcer has it rather than on the next poll.
+  </p>
+
+  <p>
+    Optionally, the <a href="#slipstream">slipstream service</a> sits beside the
+    proxy and takes transactions from anyone. It hands them to the pool's
+    bitcoind; the enforcer's template mempool mirrors that node's, so they reach
+    the pool's templates without any change to the enforcer.
   </p>
 </section>
 
@@ -2067,6 +2083,27 @@ SELECT (SELECT COALESCE(SUM(reward_sats),0) + COALESCE(SUM(fee_sats),0)
       it is stated here rather than enforced by a trigger that would hide it.
     </p>
   </div>
+
+  <h3>The slipstream service keeps its own</h3>
+  <p>
+    <code>data/slipstream.db</code>, written only by the
+    <a href="#slipstream">slipstream service</a>, which opens
+    <code>shares.db</code> read-only for <code>pool_meta</code> and
+    <code>blocks_found</code> and never writes to it.
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Table</th><th>What it holds</th></tr></thead>
+      <tbody>
+        <tr><td><code>slipstream_submissions</code></td>
+            <td>every POST exactly as it arrived, accepted or refused, with the reason — the record of what was asked of the pool</td></tr>
+        <tr><td><code>slipstream_txs</code></td>
+            <td>one row per accepted tx: fee and the rate it was held to, where it stands now, when it was first and last in a template, the block that mined it and whether that block was the pool's, and the raw tx, so it can be sent again</td></tr>
+        <tr><td><code>slipstream_events</code></td>
+            <td>every status change, append-only, so a tx's history can be read back rather than inferred</td></tr>
+      </tbody>
+    </table>
+  </div>
 </section>
 
 <!-- ========================================================== 13. connect == -->
@@ -2190,7 +2227,181 @@ Password  (anything — it is discarded)</code></pre>
   </div>
 </section>
 
-<!-- =========================================================== 14. config == -->
+<!-- ======================================================== 14. dashboard == -->
+<section id="dashboard">
+  <h2>The dashboard</h2>
+  <p class="section-sub">
+    Everything the proxy writes down, readable by anyone. The dashboard reads
+    <code>shares.db</code> and never keeps a second copy of the pool's config:
+    the mode, the fee, the rate and the ports it shows are the ones the proxy
+    wrote into <code>pool_meta</code>, so the page cannot disagree with the
+    process that did the work.
+  </p>
+
+  <h3>Public pages</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Path</th><th>What it shows</th></tr></thead>
+      <tbody>
+        <tr><td><code>/</code></td><td>hashrate, the leaderboard (per worker and per address), recent blocks, how to connect with each port's difficulty policy, and a card explaining every number on the page for this pool's mode</td></tr>
+        <tr><td><code>/worker/:name</code></td><td>one worker: shares, hashrate, credits and payouts</td></tr>
+        <tr><td><code>/blocks</code></td><td>every block the pool found, paginated, with its status and what it paid</td></tr>
+        <tr><td><code>/templates</code></td><td>the work being handed out: height, block value, fees, the sidechain commitments it carries, and the template history</td></tr>
+        <tr><td><code>/slipstream</code></td><td>only when <a href="#slipstream">slipstream</a> runs: its fees, how to submit, and each recent submission with where it stands</td></tr>
+        <tr><td><code>/health</code></td><td>the hard-failure checks — ledger arithmetic, rate, duplicates — with a 503 while any is failing, so an uptime monitor can watch it</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>JSON, for monitors and other tools</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Path</th><th>What it returns</th></tr></thead>
+      <tbody>
+        <tr><td><code>/api/status</code></td><td>everything at once: the pool's identity and totals, the node, the health checks, and which commit of each component is running. Always 200 — read <code>health.ok</code></td></tr>
+        <tr><td><code>/api/overview</code>, <code>/api/leaderboard</code>, <code>/api/worker/:name</code>, <code>/api/blocks</code>, <code>/api/templates</code>, <code>/api/node</code></td><td>the data behind each page</td></tr>
+        <tr><td><code>/api/versions</code></td><td>build provenance of simplepool, the enforcer, Thunder and bitcoind</td></tr>
+        <tr><td><code>/healthz</code></td><td>liveness only</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Admin</h3>
+  <p>
+    <code>/admin</code>, behind basic auth, is where the operator acts: balances
+    and what is owed, per-worker audits, deposits into the Thunder reserve,
+    payouts and a "pay now" trigger, and a tools page for the stuck cases. Every
+    write action is CSRF-gated, and every broadcast attempt is logged in
+    <code>tx_attempts</code>, successful or not.
+  </p>
+</section>
+
+<!-- ======================================================= 15. slipstream == -->
+<section id="slipstream">
+  <h2>Slipstream</h2>
+  <p class="section-sub">
+    An optional service that takes a raw transaction from anyone and gets it
+    into the pool's blocks — including the ones the network will not relay:
+    BIP300/301 deposits, withdrawal bundles and BMM requests, or anything else
+    that is consensus-valid. It borrows the fee rule of Marathon's Slipstream.
+  </p>
+
+  <h3>How a transaction gets in</h3>
+  <p>
+    The service checks the transaction against the pool's own bitcoind with
+    <code>testmempoolaccept</code>, which reports the fee and size and
+    broadcasts nothing, applies the fee rule, and only then sends it with
+    <code>sendrawtransaction</code>. The enforcer's template mempool mirrors
+    that node's mempool, so the transaction reaches the template the proxy is
+    mining with no enforcer change — and with the enforcer's own BIP300 rules
+    still applied on the way in.
+  </p>
+
+  <!-- seq:slipstream -->
+<figure>
+  <div class="svgbox">
+    <svg viewBox="0 0 784 578" role="img"
+         aria-labelledby="sq7448fct sq7448fcd" style="max-width: 784px; margin: 0 auto;">
+      <title id="sq7448fct">slipstream: a tx from anyone, into the pool's blocks</title>
+      <desc id="sq7448fcd">A submitter posts a raw tx. The slipstream service checks it against the pool's bitcoind and the fee rule without broadcasting, then broadcasts it. The enforcer mirrors that node's mempool, so the tx reaches the template the pool mines; the service follows it to a block.</desc>
+      <style>
+        .abx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; }
+        .abx.accent { fill: var(--pplns-bg); stroke: var(--pplns); }
+        .at   { fill: var(--fg); font: 600 12px ui-sans-serif, system-ui, sans-serif; }
+        .as   { fill: var(--fg-faint); font: 400 10px ui-monospace, monospace; }
+        .life { stroke: var(--rule); stroke-width: 1.25; stroke-dasharray: 3 4; }
+        .ln   { stroke: var(--rule-firm); stroke-width: 1.5; fill: none; }
+        .ln.dash { stroke-dasharray: 5 4; }
+        .lbl  { fill: var(--fg-muted); font: 400 10.5px ui-monospace, monospace; }
+        .note { fill: var(--bg-sunk); stroke: var(--rule); stroke-width: 1; }
+        .note.win  { fill: var(--ok-bg, var(--pplns-bg)); stroke: var(--ok); }
+        .note.warn { fill: var(--warn-bg); stroke: var(--warn); }
+        .notet { fill: var(--fg-muted); font: 400 10.5px ui-sans-serif, system-ui, sans-serif; }
+      </style>
+      <defs>
+        <marker id="sqar" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--rule-firm)"/>
+        </marker>
+      </defs>
+      <rect class="abx" x="10.0" y="34" width="132" height="46" rx="7"/><text class="at" x="76" y="54" text-anchor="middle">Submitter</text><text class="as" x="76" y="70" text-anchor="middle">any wallet</text><rect class="abx" x="168.0" y="34" width="132" height="46" rx="7"/><text class="at" x="234" y="54" text-anchor="middle">slipstream</text><text class="as" x="234" y="70" text-anchor="middle">:8124</text><rect class="abx" x="326.0" y="34" width="132" height="46" rx="7"/><text class="at" x="392" y="54" text-anchor="middle">bitcoind</text><text class="as" x="392" y="70" text-anchor="middle">-acceptnonstdtxn</text><rect class="abx" x="484.0" y="34" width="132" height="46" rx="7"/><text class="at" x="550" y="54" text-anchor="middle">enforcer</text><text class="as" x="550" y="70" text-anchor="middle">template server</text><rect class="abx accent" x="642.0" y="34" width="132" height="46" rx="7"/><text class="at" x="708" y="54" text-anchor="middle">simplepool</text><text class="as" x="708" y="70" text-anchor="middle">:3334</text>
+      <line class="life" x1="76" y1="80" x2="76" y2="564"/><line class="life" x1="234" y1="80" x2="234" y2="564"/><line class="life" x1="392" y1="80" x2="392" y2="564"/><line class="life" x1="550" y1="80" x2="550" y2="564"/><line class="life" x1="708" y1="80" x2="708" y2="564"/>
+      <line class="ln" x1="80" y1="118" x2="229" y2="118" marker-end="url(#sqar)"/><text class="lbl" x="154" y="112" text-anchor="middle">POST /api/tx  &lt;raw hex&gt;</text><line class="ln" x1="238" y1="152" x2="387" y2="152" marker-end="url(#sqar)"/><text class="lbl" x="312" y="146" text-anchor="middle">testmempoolaccept</text><line class="ln dash" x1="388" y1="186" x2="239" y2="186" marker-end="url(#sqar)"/><text class="lbl" x="314" y="180" text-anchor="middle">allowed? fee, vsize</text><path class="ln" d="M238,220 h26 v16 h-26" marker-end="url(#sqar)"/><text class="lbl" x="270" y="224" text-anchor="start">fee rule: max(floor, mineable)</text><rect class="note warn" x="14" y="244" width="756" height="26" rx="5"/><text class="notet" x="392" y="261" text-anchor="middle">Checked BEFORE it is sent: nothing can be taken back out of a mempool, so refusing afterwards would be too late.</text><line class="ln" x1="238" y1="296" x2="387" y2="296" marker-end="url(#sqar)"/><text class="lbl" x="312" y="290" text-anchor="middle">sendrawtransaction</text><line class="ln" x1="396" y1="330" x2="545" y2="330" marker-end="url(#sqar)"/><text class="lbl" x="470" y="324" text-anchor="middle">mempool mirror (ZMQ)</text><rect class="note plain" x="14" y="350" width="756" height="26" rx="5"/><text class="notet" x="392" y="367" text-anchor="middle">From here it is an ordinary mempool tx: relayed to peers, and minable by any pool whose node took it.</text><line class="ln" x1="704" y1="402" x2="555" y2="402" marker-end="url(#sqar)"/><text class="lbl" x="630" y="396" text-anchor="middle">getblocktemplate</text><line class="ln dash" x1="554" y1="436" x2="703" y2="436" marker-end="url(#sqar)"/><text class="lbl" x="628" y="430" text-anchor="middle">a template carrying the tx</text><line class="ln" x1="238" y1="470" x2="545" y2="470" marker-end="url(#sqar)"/><text class="lbl" x="392" y="464" text-anchor="middle">poll: in the template?</text><line class="ln" x1="238" y1="504" x2="387" y2="504" marker-end="url(#sqar)"/><text class="lbl" x="312" y="498" text-anchor="middle">poll: mined? how deep?</text><rect class="note win" x="14" y="524" width="756" height="26" rx="5"/><text class="notet" x="392" y="541" text-anchor="middle">Every submission is kept, refusals included. Each accepted tx is followed to confirmed, or to dropped with the node's own reason.</text>
+    </svg>
+  </div>
+</figure>
+<!-- /seq:slipstream -->
+
+  <h3>The fee rule</h3>
+  <p>
+    A transaction must pay <strong>the higher of the minimum submission rate
+    and the current mineable rate</strong>. The minimum is
+    <code>SLIPSTREAM_MIN_FEE_RATE</code>, 1 sat/vB by default. The mineable
+    rate is read off the template being mined: while it has room, anything over
+    the minimum gets in, so the two are equal; once it is full, it is the rate
+    of the cheapest transaction it carries. The rule is checked once, at
+    submission; after that a transaction competes by fee rate like any other.
+  </p>
+  <div class="note">
+    <span class="label">Why the order matters</span>
+    <p>
+      Nothing can be taken back out of a node's mempool. A transaction that
+      paid too little and was refused <em>after</em> it was sent would be
+      relayed and mined anyway, for less than was asked. So the rule runs
+      between the check and the broadcast, never after.
+    </p>
+  </div>
+
+  <h3>Following it to a block</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Status</th><th>Means</th></tr></thead>
+      <tbody>
+        <tr><td><code>pending</code></td><td>in the node's mempool, not in the latest template</td></tr>
+        <tr><td><code>in_template</code></td><td>in the latest template: the pool's miners are working on it now</td></tr>
+        <tr><td><code>mined</code></td><td>in a block, recorded as the pool's or another pool's from <code>blocks_found</code></td></tr>
+        <tr><td><code>confirmed</code></td><td><code>SLIPSTREAM_CONFIRMATIONS</code> deep, 6 by default</td></tr>
+        <tr><td><code>dropped</code></td><td>left the mempool unmined, and the node refused it when it was sent again; the reason is the node's own, e.g. a replacement or a spent input</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    A transaction whose block is orphaned goes back to <code>pending</code> when
+    the node restores it to its mempool, which it does by itself. Every
+    submission is kept, refusals included, and every status change is logged.
+  </p>
+
+  <h3>info.json</h3>
+  <p>
+    The service also answers <code>GET /info.json</code>, the listing a pool
+    directory reads. Its facts — <code>mode</code> (the exact
+    <code>pool_mode</code>), <code>fee_bps</code>, <code>coinbase_tag</code>,
+    <code>operator_address</code>, <code>pool_btc_address</code> — come from
+    <code>pool_meta</code>, never from the service's config. Name, chain, logo,
+    contact and the public URLs, <code>slipstream_url</code> among them, come
+    from its environment.
+  </p>
+
+  <h3>What it needs</h3>
+  <ul>
+    <li>
+      <strong>A node that takes non-standard transactions:</strong>
+      <code>acceptnonstdtxn=1</code>. Core refuses that setting on a chain that
+      reports itself as mainnet — drivechain-patched builds included — so a
+      mainnet-fork chain needs a Core patch that lifts the check before it can
+      take them. BIP300 deposits are standard on a drivechain-patched node
+      already and need no setting at all.
+    </li>
+    <li>
+      <strong>Acceptance of relay.</strong> An accepted transaction is broadcast
+      like any other, so another pool may mine it first. That is the price of
+      needing nothing from the enforcer, and the status table records whose
+      block it was.
+    </li>
+  </ul>
+</section>
+
+<!-- =========================================================== 16. config == -->
 <section id="config">
   <h2>Configuration</h2>
   <p class="section-sub">
@@ -2244,7 +2455,7 @@ Password  (anything — it is discarded)</code></pre>
         <tr><td><code>bitcoind_user</code> / <code>bitcoind_pass</code></td><td>—</td>
             <td>Optional — omit <em>both</em> for an unauthenticated backend and the call goes out with no auth header. Cookie auth is not supported.</td></tr>
         <tr><td><code>bitcoind_poll_interval_ms</code></td><td><code>30000</code></td>
-            <td>Template refresh. On a drivechain pool this is also the worst-case delay before a sidechain's BMM request can reach a job — lower it to 5000–10000 if sidechains need to merge-mine reliably.</td></tr>
+            <td>Template refresh when the backend does not long-poll. The enforcer does (BIP22), and then the proxy wakes on each new tip instead and this only paces retries. Against a backend that does not, it is also the worst-case delay before a sidechain's BMM request can reach a job — lower it to 5000–10000 if sidechains need to merge-mine reliably.</td></tr>
         <tr><td><code>coinbase_tag</code></td><td><code>/simplepool/</code></td>
             <td>Short string baked into the coinbase scriptSig.</td></tr>
         <tr><td><code>db_path</code></td><td><code>./data/shares.db</code></td>
@@ -2266,11 +2477,16 @@ Password  (anything — it is discarded)</code></pre>
     <code>PAYOUT_SETTLE_INTERVAL_MS</code>, <code>PAYOUT_MIN_SATS</code>,
     <code>THUNDER_FROM_ADDRESS</code> and friends. The Thunder reserve address is
     deliberately <em>not</em> a proxy key: the coinbase never touches Thunder, so
-    only the dashboard and the payout worker have any business knowing it.
+    only the dashboard and the payout worker have any business knowing it. The
+    <a href="#slipstream">slipstream service</a> is configured the same way —
+    <code>BITCOIND_RPC_URL</code>, <code>ENFORCER_GBT_URL</code>,
+    <code>SLIPSTREAM_MIN_FEE_RATE</code> and the <code>POOL_*</code> /
+    <code>PUBLIC_*</code> presentation fields; <code>slipstream/lib/config.js</code>
+    has the full list.
   </p>
 </section>
 
-<!-- ========================================================== 15. operate == -->
+<!-- ========================================================== 17. operate == -->
 <section id="operate">
   <h2>Running one</h2>
   <p class="section-sub">
@@ -2303,12 +2519,21 @@ sudo simplepoolctl uninstall    # --purge also deletes the ledger</code></pre>
     <table>
       <thead><tr><th>Unit</th><th>Mode</th><th>Job</th></tr></thead>
       <tbody>
-        <tr><td><code>simplepool.service</code></td><td>both</td><td>the stratum proxy — the only thing that is strictly required</td></tr>
-        <tr><td><code>simplepool-dashboard.service</code></td><td>both</td><td>read-only public stats on :8081, plus <code>/admin</code> behind basic auth</td></tr>
-        <tr><td><code>simplepool-payout.service</code></td><td>pps-classic</td><td>the daily Thunder payout batch</td></tr>
+        <tr><td><code>simplepool.service</code></td><td>all</td><td>the stratum proxy — the only thing that is strictly required</td></tr>
+        <tr><td><code>simplepool-dashboard.service</code></td><td>all</td><td>read-only public stats on :8081, plus <code>/admin</code> behind basic auth</td></tr>
+        <tr><td><code>simplepool-payout.service</code></td><td>pps-classic, pplns-thunder, pplns-btc</td><td>the daily payout batch, over Thunder or on L1 through the enforcer's wallet</td></tr>
+        <tr><td><code>simplepool-slipstream.service</code></td><td>any, optional</td><td>the <a href="#slipstream">slipstream</a> service on :8124, published through nginx</td></tr>
       </tbody>
     </table>
   </div>
+
+  <p>
+    Slipstream is not set up by the installer yet. Its unit and nginx vhost are
+    templates in the repository — <code>deploy/systemd/simplepool-slipstream.service</code>
+    and <code>deploy/nginx/slipstream.conf</code> — and
+    <code>slipstream/README.md</code> walks through installing them. The
+    docker-compose stack runs it as a fourth container.
+  </p>
 
   <h3>Which commit is running</h3>
   <p>
@@ -2322,7 +2547,7 @@ sudo simplepoolctl uninstall    # --purge also deletes the ledger</code></pre>
   </p>
 </section>
 
-<!-- =========================================================== 16. limits == -->
+<!-- =========================================================== 18. limits == -->
 <section id="limits">
   <h2>What it can't do</h2>
   <p class="section-sub">
@@ -2377,6 +2602,14 @@ sudo simplepoolctl uninstall    # --purge also deletes the ledger</code></pre>
       when an order is cancelled.
     </li>
     <li>
+      <strong>Slipstream does not keep transactions private.</strong> It
+      broadcasts through the pool's bitcoind, so another pool can mine a
+      submitted transaction first, and it cannot withdraw one once sent. On a
+      chain that reports itself as mainnet the node cannot run
+      <code>acceptnonstdtxn</code> without a Core patch, so there it takes only
+      standard transactions — which includes BIP300 deposits.
+    </li>
+    <li>
       <strong>The submit ceiling bounds a flood, it does not end one.</strong> A
       mismatched connection is refused cheaply instead of validated, but it is
       still connected and still sending. What ends it is vardiff climbing to a
@@ -2392,8 +2625,8 @@ sudo simplepoolctl uninstall    # --purge also deletes the ledger</code></pre>
 <footer>
   <div class="wrap">
     <p>
-      <strong>simplepool</strong> — a solo and PPS Bitcoin mining pool in C11, by
-      Roberto Santacroce. MIT licensed.
+      <strong>simplepool</strong> — a Bitcoin and drivechain mining pool in C11,
+      with five payout modes, by Roberto Santacroce. MIT licensed.
     </p>
     <p>
       This page is a single self-contained HTML file with no scripts and no
@@ -2404,8 +2637,10 @@ sudo simplepoolctl uninstall    # --purge also deletes the ledger</code></pre>
       <code>NONCE_AND_SHARES.md</code> (share and payout math),
       <code>CLASSIC_PAYOUTS.md</code> (the pps-classic design and the
       coinbase-deposit finding),
-      <code>OPERATOR_GUIDE.md</code> (day-to-day operations) and
-      <code>VERIFY.md</code> (the verification checklist).
+      <code>OPERATOR_GUIDE.md</code> (day-to-day operations),
+      <code>VERIFY.md</code> (the verification checklist),
+      <code>dashboard/README.md</code> (every page and endpoint) and
+      <code>slipstream/README.md</code> (the slipstream service).
       Where this page and those disagree, they are right.
     </p>
   </div>

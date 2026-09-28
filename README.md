@@ -604,7 +604,10 @@ need the node to run `-acceptnonstdtxn` (which Core allows only off mainnet).
 The fee rule is Slipstream's: the higher of a 1 sat/vB floor and the current
 mineable rate. Every submission is kept, and each accepted tx is followed from
 template to block. It also serves the pool's `info.json` for pool directories.
-See [`slipstream/README.md`](slipstream/README.md).
+It is not set up by `install.sh` yet: the systemd unit and nginx vhost are
+templates in [`deploy/`](deploy/), and [`slipstream/README.md`](slipstream/README.md)
+walks through installing them. [`docs/simplepool.html`](docs/simplepool.html)
+explains it end to end.
 
 ## Config keys
 

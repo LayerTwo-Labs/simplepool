@@ -105,7 +105,51 @@ environment variables:
 
 `status_url` is the dashboard's `/api/status`.
 
-## Run
+## Install (systemd + nginx)
+
+The installer does not set this up yet. The unit and the vhost are
+templates in the repository; from the pool checkout (`ROOT`), as root:
+
+```
+cd ROOT/slipstream && sudo -u <pool user> npm ci --omit=dev
+
+sed -e "s|@USER@|<pool user>|g" -e "s|@ROOT@|ROOT|g" \
+    ROOT/deploy/systemd/simplepool-slipstream.service \
+    > /etc/systemd/system/simplepool-slipstream.service
+$EDITOR /etc/systemd/system/simplepool-slipstream.service   # RPC credentials, POOL_*, PUBLIC_*
+systemctl daemon-reload && systemctl enable --now simplepool-slipstream
+
+sed "s/slipstream\.example/<your host>/g" ROOT/deploy/nginx/slipstream.conf \
+    > /etc/nginx/sites-available/<your host>
+ln -s /etc/nginx/sites-available/<your host> /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
+certbot --nginx -d <your host>
+```
+
+The vhost overwrites `X-Forwarded-For` with the connecting address, and the
+service (with `SLIPSTREAM_TRUST_PROXY=1`) keys its rate limit on the last hop
+of that header, so a client cannot pick its own key. It reuses the
+dashboard's `pool_dash` rate-limit zone from `deploy/nginx/pool-ratelimit.conf`,
+which the installer already puts in `conf.d/`.
+
+To show the Slipstream page on the dashboard, add to
+`simplepool-dashboard.service` (or its `local.conf` drop-in) and restart it:
+
+```
+Environment=SLIPSTREAM_API_URL=http://127.0.0.1:8124
+Environment=PUBLIC_SLIPSTREAM_URL=https://<your host>
+```
+
+Check it:
+
+```
+curl -s https://<your host>/healthz
+curl -s https://<your host>/api/fees
+curl -s https://<your host>/info.json
+journalctl -u simplepool-slipstream -f
+```
+
+## Run by hand
 
 ```
 cd slipstream && npm ci
@@ -117,8 +161,7 @@ node index.js
 ```
 
 The full list of variables is in [`lib/config.js`](lib/config.js). The service
-listens on `127.0.0.1:8124`, and is published through nginx with
-`SLIPSTREAM_TRUST_PROXY=1`, so the rate limit applies per client.
+listens on `127.0.0.1:8124`.
 
 ## Tests
 

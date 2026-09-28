@@ -43,10 +43,17 @@ export function rateLimiter(perMinute) {
     };
 }
 
-function clientAddress(req, trustProxy) {
+/* Behind a proxy, the LAST X-Forwarded-For entry: the one the proxy itself
+ * added. Anything before it came from the client, which can write whatever
+ * it likes there -- taking the first entry would let a client pick its own
+ * rate-limit key. */
+export function clientAddress(req, trustProxy) {
     if (trustProxy) {
         const fwd = req.headers['x-forwarded-for'];
-        if (typeof fwd === 'string' && fwd.length > 0) return fwd.split(',')[0].trim();
+        if (typeof fwd === 'string' && fwd.length > 0) {
+            const hops = fwd.split(',').map(h => h.trim()).filter(Boolean);
+            if (hops.length > 0) return hops[hops.length - 1];
+        }
     }
     return req.socket.remoteAddress ?? 'unknown';
 }
