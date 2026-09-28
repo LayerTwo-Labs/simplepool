@@ -1,5 +1,5 @@
 <%# Top nav for the public (read-only) dashboard.
-    Locals: active ('overview'|'blocks'|'templates'|'worker'). %>
+    Locals: active ('overview'|'blocks'|'templates'|'slipstream'|'worker'). %>
 <% const _pactive = (typeof active === 'string') ? active : ''; %>
 <%# The chip used to read "stratum stats", which every page already looks
     like. It now carries the two facts that change what the numbers below
@@ -16,6 +16,9 @@
         <a href="/"       class="<%= _pactive === 'overview' ? 'active' : '' %>">Overview</a>
         <a href="/blocks" class="<%= _pactive === 'blocks'   ? 'active' : '' %>">Blocks</a>
         <a href="/templates" class="<%= _pactive === 'templates' ? 'active' : '' %>">Templates</a>
+        <% if (typeof slipstreamEnabled !== 'undefined' && slipstreamEnabled) { %>
+        <a href="/slipstream" class="<%= _pactive === 'slipstream' ? 'active' : '' %>">Slipstream</a>
+        <% } %>
     </nav>
     <form action="/worker-lookup" method="GET" class="topsearch" role="search">
         <input type="text"

@@ -60,6 +60,11 @@ services:
       PAYOUT_ADMIN_URL:   ${PAYOUT_ADMIN_URL:-http://host.docker.internal:9080}
       ENFORCER_GRPC_ADDR: ${ENFORCER_GRPC_ADDR:-host.docker.internal:50051}
       THUNDER_SIDECHAIN_ID: ${THUNDER_SIDECHAIN_ID:-9}
+      # --- Slipstream (optional) ---
+      # Set SLIPSTREAM_API_URL=http://slipstream:8124 (the compose service
+      # below, over the compose network) to show the Slipstream page.
+      SLIPSTREAM_API_URL:    ${SLIPSTREAM_API_URL:-}
+      PUBLIC_SLIPSTREAM_URL: ${PUBLIC_SLIPSTREAM_URL:-}
     volumes:
       # Dashboard now writes to the deposits table when the operator
       # submits a deposit via /admin. Mount RW.
