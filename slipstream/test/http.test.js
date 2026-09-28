@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 
-import { createHandler } from '../lib/http.js';
+import { clientAddress, createHandler } from '../lib/http.js';
 import { TXID_A, fakePool, makeSlipstream, quietLog } from './helpers.js';
 
 const HEX = '0200000001' + '00'.repeat(60);
@@ -76,4 +76,12 @@ test('fees are reported, and submissions are rate limited per address', async ()
     } finally {
         await close();
     }
+});
+
+test('behind a proxy, the client address is the hop the proxy added, not one the client wrote', () => {
+    const req = (fwd) => ({ headers: { 'x-forwarded-for': fwd }, socket: { remoteAddress: '127.0.0.1' } });
+    assert.equal(clientAddress(req('1.2.3.4, 203.0.113.9'), true), '203.0.113.9');
+    assert.equal(clientAddress(req('203.0.113.9'), true), '203.0.113.9');
+    assert.equal(clientAddress(req('1.2.3.4'), false), '127.0.0.1');
+    assert.equal(clientAddress({ headers: {}, socket: { remoteAddress: '::1' } }, true), '::1');
 });
