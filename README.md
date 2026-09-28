@@ -579,7 +579,7 @@ you can commit + push from here), use
 ### Docker
 
 An alternative to the bare-metal script: containerized builds of the
-three services (stratum proxy, dashboard, payout worker) under
+four services (stratum proxy, dashboard, payout worker, slipstream) under
 [`deploy/docker/`](deploy/docker/). One `docker compose up -d --build`
 gets the whole app stack running against a Thunder daemon and Bitcoin
 Core that live on the host (or wherever you point them). Shared bind
@@ -591,6 +591,23 @@ Note: the drivechain infrastructure (`bitcoind`, Thunder, the
 `bip300301_enforcer`, `electrs`) is intentionally NOT containerized —
 those daemons have their own lifecycles and typically run bare-metal on
 the same host.
+
+### Slipstream
+
+[`slipstream/`](slipstream/) is an optional service that takes a raw tx from
+anyone and gets it into the pool's blocks, including txs the network will not
+relay: BIP300/301 txs, or any other consensus-valid tx. It checks each one
+against the pool's own bitcoind (`testmempoolaccept`) and the fee rule, then
+broadcasts it there; the enforcer's template mempool mirrors that node's, so it
+reaches the templates the proxy mines with no enforcer change. Non-standard txs
+need the node to run `-acceptnonstdtxn` (which Core allows only off mainnet).
+The fee rule is Slipstream's: the higher of a 1 sat/vB floor and the current
+mineable rate. Every submission is kept, and each accepted tx is followed from
+template to block. It also serves the pool's `info.json` for pool directories.
+It is not set up by `install.sh` yet: the systemd unit and nginx vhost are
+templates in [`deploy/`](deploy/), and [`slipstream/README.md`](slipstream/README.md)
+walks through installing them. [`docs/simplepool.html`](docs/simplepool.html)
+explains it end to end.
 
 ## Config keys
 
@@ -748,6 +765,8 @@ scripts/
 dashboard/           # Node/Express read-only stats UI
 payout/              # payout worker: Thunder rail (pps-classic, pplns-thunder)
                      #   and L1 rail via the enforcer wallet (pplns-btc)
+slipstream/          # slipstream service: takes txs from anyone and gets them
+                     #   into the pool's blocks via its bitcoind; serves info.json
 docs/simplepool.html # single-file explainer: every mode, end to end
 ```
 

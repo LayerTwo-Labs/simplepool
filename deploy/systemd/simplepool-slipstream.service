@@ -1,0 +1,55 @@
+[Unit]
+Description=simplepool slipstream (tx submission)
+Documentation=https://github.com/LayerTwo-Labs/simplepool/blob/main/slipstream/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=@ROOT@/slipstream
+# The pool's bitcoind: the node the enforcer mirrors its mempool from. Txs
+# are checked (testmempoolaccept) and broadcast (sendrawtransaction) here.
+# For non-standard txs it must run -acceptnonstdtxn, which Core allows only
+# off mainnet. Credentials: user/pass, or BITCOIND_RPC_COOKIE_FILE instead.
+Environment=BITCOIND_RPC_URL=http://127.0.0.1:8332
+# Environment=BITCOIND_RPC_USER=<rpcuser>
+# Environment=BITCOIND_RPC_PASS=<rpcpass>
+# Environment=BITCOIND_RPC_COOKIE_FILE=/var/lib/bitcoind/.cookie
+# The enforcer's block template server -- the same URL as bitcoind_url in
+# proxy.conf. Read only: the template it serves is where the mineable rate
+# comes from and how a tx is seen to be in play.
+Environment=ENFORCER_GBT_URL=http://127.0.0.1:8122
+Environment=SLIPSTREAM_DB_PATH=@ROOT@/data/slipstream.db
+Environment=PROXY_DB_PATH=@ROOT@/data/shares.db
+# Loopback only; nginx publishes it (deploy/nginx/slipstream.conf), and
+# sets the X-Forwarded-For hop the rate limit is keyed on.
+Environment=SLIPSTREAM_BIND=127.0.0.1
+Environment=SLIPSTREAM_PORT=8124
+Environment=SLIPSTREAM_TRUST_PROXY=1
+Environment=SLIPSTREAM_MIN_FEE_RATE=1
+# info.json presentation. Facts about the pool (mode, fee, coinbase tag,
+# addresses) are read from pool_meta and are NOT set here.
+# Environment=PUBLIC_SLIPSTREAM_URL=https://slipstream.example
+# Environment=PUBLIC_STRATUM_URL=stratum+tcp://stratum.example:3334
+# Environment=PUBLIC_DASHBOARD_URL=https://pool.example
+# Environment=POOL_NAME=<name>
+# Environment=POOL_OPERATOR=<operator>
+# Environment=POOL_CHAIN=<e.g. betanet>
+# Environment=POOL_LOGO=<path or URL>
+# Environment=POOL_CONTACT=<contact>
+ExecStart=/usr/bin/node @ROOT@/slipstream/index.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@ROOT@/data
+
+[Install]
+WantedBy=multi-user.target

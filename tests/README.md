@@ -96,6 +96,16 @@ the version last validated against.
   batched transaction through the enforcer's wallet, with a shared address
   summed. Own `.regtest-btcpay/` dir.
 
+- `test_slipstream_regtest.sh` — the slipstream service against a real
+  node and the stock enforcer: a non-standard tx is accepted by a node
+  running `-acceptnonstdtxn`, reaches the enforcer's template through its
+  mempool mirror, and is followed through mined to confirmed; a tx under the
+  fee floor is refused before it is broadcast; a tx replaced in the node's
+  mempool is recorded as dropped with the node's reason. Own
+  `.regtest/slipstream-e2e/` dir.
+
+      bash tests/test_slipstream_regtest.sh
+
 - `test_pplns_coinbase_regtest.sh` — `pool_mode=pplns-coinbase`, which has no
   ledger step at all: the payment IS the block. Asserts the coinbase pays the
   window on chain, that no output pays anything the pool controls beyond its
