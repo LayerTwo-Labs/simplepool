@@ -117,12 +117,15 @@ services:
     container_name: simplepool-slipstream
     restart: unless-stopped
     environment:
-      # The enforcer's block template server -- the proxy's bitcoind_url --
-      # running with --enable-slipstream.
-      ENFORCER_GBT_URL: ${ENFORCER_GBT_URL:-http://host.docker.internal:8122}
-      BITCOIND_RPC_URL: ${BITCOIND_RPC_URL:-}
+      # The pool's bitcoind -- the node the enforcer mirrors its mempool
+      # from. Txs are checked and broadcast here. Run it with
+      # -acceptnonstdtxn to take non-standard txs (not allowed on mainnet).
+      BITCOIND_RPC_URL: ${BITCOIND_RPC_URL:-http://host.docker.internal:8332}
       BITCOIND_RPC_USER: ${BITCOIND_RPC_USER:-}
       BITCOIND_RPC_PASS: ${BITCOIND_RPC_PASS:-}
+      # The enforcer's block template server -- the proxy's bitcoind_url.
+      # Read only: the template is where the mineable rate comes from.
+      ENFORCER_GBT_URL: ${ENFORCER_GBT_URL:-http://host.docker.internal:8122}
       SLIPSTREAM_DB_PATH: /data/slipstream.db
       PROXY_DB_PATH: /data/shares.db
       SLIPSTREAM_BIND: 0.0.0.0

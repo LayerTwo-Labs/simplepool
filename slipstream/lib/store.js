@@ -6,21 +6,21 @@
  *                           arrived. The record of what was asked of the
  *                           pool, kept even when the tx was refused.
  *   slipstream_txs          one row per accepted tx, holding where it stands
- *                           now: pending, in_template, mined, confirmed,
- *                           dropped or expired.
+ *                           now: pending, in_template, mined, confirmed or
+ *                           dropped.
  *   slipstream_events       every status change, append-only, so a row's
  *                           history can be read back rather than inferred.
  *
  * Status meanings:
- *   pending      in the enforcer's mempool, not in the latest template
+ *   pending      in the node's mempool, not in the latest template
  *   in_template  in the latest template, i.e. being mined on now
  *   mined        in a block, fewer than the configured confirmations deep
  *   confirmed    that deep
- *   dropped      will not be mined: status_reason says why
- *   expired      waited past the expiry and was withdrawn
+ *   dropped      left the mempool unmined, and the node refused it when it
+ *                was sent again: status_reason is the node's reason
  *
- * Nothing is ever relayed, so "propagated" here means only this: did the tx
- * reach a template, and did a block carry it.
+ * A tx is relayed once the node accepts it, so another pool may mine it:
+ * mined_by_pool says whose block it was.
  */
 
 import Database from 'better-sqlite3';
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS slipstream_txs (
   mined_by_pool        INTEGER,             -- 1 ours, 0 not, NULL unknown
   confirmations        INTEGER,
   confirmed_at         INTEGER,
-  resubmissions        INTEGER NOT NULL DEFAULT 0
+  resubmissions        INTEGER NOT NULL DEFAULT 0  -- rebroadcasts after leaving the mempool
 );
 CREATE INDEX IF NOT EXISTS slipstream_txs_status_idx ON slipstream_txs(status);
 CREATE INDEX IF NOT EXISTS slipstream_txs_submitted_idx ON slipstream_txs(submitted_at);

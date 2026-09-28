@@ -1,15 +1,18 @@
 /* Submission and tracking.
  *
- * The enforcer's block template server holds the txs; this keeps the record
- * of them. A submission is handed straight to the enforcer, which has the
- * node check it for consensus validity and then keeps it in the template
- * mempool, never relaying it. After that, every poll asks the enforcer where
- * each open tx stands and reads the template the proxy is mining, and moves
- * the row accordingly.
+ * A submission goes to the pool's own bitcoind. The enforcer's template
+ * mempool mirrors that node's mempool, so a tx the node accepts reaches the
+ * templates the proxy mines with no further step. The node needs
+ * `-acceptnonstdtxn` for it to take non-standard txs; BIP300 deposits are
+ * standard on a drivechain-patched node already.
  *
- * The enforcer forgets a tx when it leaves its mempool, and forgets all of
- * them when it restarts or a block is disconnected. This side remembers, so
- * that is where resubmission lives.
+ * Nothing can be taken back out of a node's mempool, so the fee rule is
+ * applied BEFORE anything is broadcast: `testmempoolaccept` reports the fee
+ * and size without broadcasting, and only a tx that passes both the node and
+ * the rule is sent. Once sent it is relayed like any other.
+ *
+ * After that, every poll reads the template the proxy is mining and asks the
+ * node where each open tx stands, and moves the row accordingly.
  */
 
 import { RpcError } from './rpc.js';
@@ -17,15 +20,20 @@ import { OPEN_STATUSES } from './store.js';
 import { feeRate, feeSnapshot } from './fees.js';
 
 const now = () => Math.floor(Date.now() / 1000);
+const btcToSats = (btc) => Math.round(btc * 1e8);
 
-/* A serialized tx is at most the 1M wu the enforcer accepts, i.e. 1MB. */
+/* A serialized tx is at most a block, 4M wu, i.e. 4MB; nothing near that is
+ * useful, and a POST body has to be bounded somewhere. 1MB of tx. */
 export const MAX_TX_HEX_LEN = 2 * 1_000_000;
 
+/* testmempoolaccept's reasons for a tx the node already has */
+const ALREADY_KNOWN = ['txn-already-in-mempool', 'txn-already-known'];
+
 export class Slipstream {
-    constructor({ store, enforcer, bitcoind = null, pool, cfg, log }) {
+    constructor({ store, bitcoind, enforcer, pool, cfg, log }) {
         this.store = store;
-        this.enforcer = enforcer;
         this.bitcoind = bitcoind;
+        this.enforcer = enforcer;
         this.pool = pool;
         this.cfg = cfg;
         this.log = log;
@@ -53,7 +61,7 @@ export class Slipstream {
         return this.template;
     }
 
-    /* Hand one tx to the enforcer and record the outcome. Returns
+    /* Check one tx, and broadcast it if it passes. Returns
      * `{ httpStatus, body }`. Every call is logged as a submission, whatever
      * becomes of it. */
     async submit(rawHex, submitter) {
@@ -69,63 +77,79 @@ export class Slipstream {
         }
         if (hex.length > MAX_TX_HEX_LEN) return refuse(400, 'tx-size');
 
-        let resp;
+        let check;
         try {
-            resp = await this.enforcer.submit(hex);
+            check = await this.bitcoind.testAccept(hex);
         } catch (e) {
-            if (e instanceof RpcError) {
-                if (e.code === -22) return refuse(400, 'tx-decode-failed');
-                if (e.code === -32601) return refuse(503, 'slipstream-disabled');
-                if (e.code === -10) return refuse(503, 'enforcer-syncing');
-            }
-            this.log.error(`submitslipstreamtx failed: ${e.message}`);
-            return refuse(502, 'enforcer-unavailable');
+            if (e instanceof RpcError && e.code === -22) return refuse(400, 'tx-decode-failed');
+            this.log.error(`testmempoolaccept failed: ${e.message}`);
+            return refuse(502, 'node-unavailable');
         }
-        const { txid } = resp;
-        if (!resp.accepted) {
-            return refuse(200, resp.reject_reason ?? 'rejected', { txid });
-        }
+        const { txid } = check;
 
         const existing = this.store.get(txid);
-        if (existing && !['dropped', 'expired'].includes(existing.status)) {
+        if (existing && !['dropped'].includes(existing.status)) {
             record({ txid, accepted: true });
             return { httpStatus: 200, body: { accepted: true, already_tracked: true, ...summary(existing) } };
+        }
+
+        // Fee and size: from the check, or from the mempool for a tx the node
+        // already has, which is then taken on and followed like any other.
+        let feeSats;
+        let vsize;
+        let alreadyInMempool = false;
+        if (check.allowed) {
+            feeSats = btcToSats(check.fees.base);
+            vsize = check.vsize;
+        } else if (ALREADY_KNOWN.includes(check['reject-reason'])) {
+            const entry = await this.bitcoind.mempoolEntry(txid);
+            if (!entry) return refuse(200, 'already-confirmed', { txid });
+            feeSats = btcToSats(entry.fees.base);
+            vsize = entry.vsize;
+            alreadyInMempool = true;
+        } else {
+            return refuse(200, check['reject-reason'] ?? 'rejected', { txid });
         }
 
         if (!this.template) {
             try { await this.refreshTemplate(); } catch { /* the floor still applies */ }
         }
         const fees = this.fees();
-        const rate = feeRate(resp.fee_sat, resp.vsize);
+        const rate = feeRate(feeSats, vsize);
         if (rate < fees.required_rate) {
-            // Already in the enforcer's mempool by now: take it back out, or
-            // it is mined for less than was asked.
-            try {
-                await this.enforcer.remove(txid);
-            } catch (e) {
-                this.log.error(`removeslipstreamtx ${txid} after a low fee failed: ${e.message}`);
-            }
             return refuse(200, 'fee-rate-too-low', {
                 txid, fee_rate: rate, required_fee_rate: fees.required_rate,
             });
         }
 
+        if (!alreadyInMempool) {
+            try {
+                await this.bitcoind.send(hex);
+            } catch (e) {
+                // Lost a race with something the check did not see, e.g. a
+                // conflicting tx arriving in between.
+                if (e instanceof RpcError) return refuse(200, e.rpcMessage, { txid });
+                this.log.error(`sendrawtransaction ${txid} failed: ${e.message}`);
+                return refuse(502, 'node-unavailable', { txid });
+            }
+        }
+        const entry = await this.bitcoind.mempoolEntry(txid);
         const row = {
             txid,
-            wtxid: resp.wtxid,
+            wtxid: check.wtxid,
             raw_hex: hex,
-            vsize: resp.vsize,
-            weight: resp.weight,
-            fee_sats: resp.fee_sat,
+            vsize,
+            weight: entry?.weight ?? vsize * 4,
+            fee_sats: feeSats,
             fee_rate: rate,
             required_fee_rate: fees.required_rate,
             submitted_height: this.template?.height ?? null,
             submitter: submitter ?? null,
         };
         if (existing) {
-            // Dropped or expired before, and valid again now
+            // Dropped before, and valid again now
             this.store.touch(txid, {
-                raw_hex: hex, fee_sats: row.fee_sats, fee_rate: rate,
+                raw_hex: hex, fee_sats: feeSats, fee_rate: rate,
                 required_fee_rate: row.required_fee_rate, submitted_at: now(),
                 submitted_height: row.submitted_height,
             });
@@ -134,36 +158,26 @@ export class Slipstream {
             this.store.insertAccepted(row);
         }
         record({ txid, accepted: true });
-        this.log.info(`accepted ${txid} at ${rate} sat/vB (required ${fees.required_rate})`);
+        this.log.info(`accepted ${txid} at ${rate} sat/vB (required ${fees.required_rate})`
+                      + (alreadyInMempool ? ', already in the mempool' : ''));
         return { httpStatus: 200, body: { accepted: true, ...summary(this.store.get(txid)) } };
     }
 
-    /* One pass over every tx still in play. Errors reaching the enforcer end
-     * the pass early; the next one picks up where it stood. */
+    /* One pass over every tx still in play. An unreachable enforcer ends the
+     * pass before anything moves; the next one picks up where it stood. */
     async tick() {
         const template = await this.refreshTemplate();
         const inTemplate = new Set((template.transactions ?? []).map(tx => tx.txid));
         for (const row of this.store.byStatus(OPEN_STATUSES)) {
-            await this._followOpen(row, template, inTemplate);
+            await this._followOpen(row, inTemplate);
         }
         for (const row of this.store.byStatus(['mined'])) {
-            await this._followMined(row, template);
+            await this._followMined(row);
         }
     }
 
-    async _followOpen(row, template, inTemplate) {
-        const status = await this.enforcer.status(row.txid);
-        switch (status.status) {
-        case 'pending': {
-            if (row.submitted_height !== null
-                && template.height - row.submitted_height >= this.cfg.expiryBlocks) {
-                await this.enforcer.remove(row.txid);
-                this.store.setStatus(row.txid, 'expired', {
-                    detail: { submitted_height: row.submitted_height, height: template.height },
-                });
-                this.log.info(`expired ${row.txid} after ${this.cfg.expiryBlocks} blocks`);
-                return;
-            }
+    async _followOpen(row, inTemplate) {
+        if (await this.bitcoind.mempoolEntry(row.txid)) {
             const ts = now();
             if (inTemplate.has(row.txid)) {
                 this.store.setStatus(row.txid, 'in_template', {
@@ -175,110 +189,81 @@ export class Slipstream {
             }
             return;
         }
-        case 'removed':
-            switch (status.reason) {
-            case 'mined':
-                return this._markMined(row, status.block_hash, template);
-            case 'reorged':
-                return this._resubmit(row, 'reorged');
-            default:
-                // conflict_mined, parent_removed, rejected_by_enforcer, or a
-                // withdrawal that was not ours
-                this.store.setStatus(row.txid, 'dropped', {
-                    reason: status.reason,
-                    detail: { block_hash: status.block_hash, spent_by: status.spent_by, parent: status.parent },
-                });
-                this.log.info(`dropped ${row.txid}: ${status.reason}`);
-                return;
-            }
-        case 'unknown': {
-            // The enforcer restarted and lost it. It may have been mined
-            // while it was down.
-            const block = this.bitcoind ? await this.bitcoind.txBlock(row.txid) : null;
-            if (block) return this._markMined(row, block, template);
-            return this._resubmit(row, 'enforcer-forgot');
-        }
-        default:
-            this.log.warn(`getslipstreamtx ${row.txid}: unexpected status ${JSON.stringify(status)}`);
-        }
+        const block = await this.bitcoind.txBlock(row.txid);
+        if (block) return this._markMined(row, block);
+        // Out of the mempool and not mined: evicted, expired, replaced, or its
+        // input spent by a block. Sending it again tells which.
+        return this._rebroadcast(row, 'left-mempool');
     }
 
-    async _markMined(row, blockHash, template) {
-        let height = null;
-        let confirmations = null;
-        if (this.bitcoind) {
-            const header = await this.bitcoind.blockConfirmations(blockHash);
-            if (header) ({ height, confirmations } = header);
-        } else if (blockHash === template.previousblockhash) {
-            height = template.height - 1;
-            confirmations = 1;
-        }
+    async _markMined(row, blockHash) {
+        const header = await this.bitcoind.blockConfirmations(blockHash);
         this.store.setStatus(row.txid, 'mined', {
             fields: {
                 mined_block_hash: blockHash,
-                mined_height: height,
+                mined_height: header?.height ?? null,
                 mined_at: now(),
                 mined_by_pool: boolOrNull(this.pool.foundBlock(blockHash)),
-                confirmations,
+                confirmations: header?.confirmations ?? null,
             },
-            detail: { block_hash: blockHash, height },
+            detail: { block_hash: blockHash, height: header?.height ?? null },
         });
         this.log.info(`mined ${row.txid} in ${blockHash}`);
     }
 
-    async _followMined(row, template) {
-        let confirmations;
-        if (this.bitcoind) {
-            const header = await this.bitcoind.blockConfirmations(row.mined_block_hash);
-            if (!header || header.confirmations < 0) {
-                // Its block left the main chain. Mined again elsewhere, or
-                // waiting to be.
-                const block = await this.bitcoind.txBlock(row.txid);
-                if (block && block !== row.mined_block_hash) {
-                    return this._markMined(row, block, template);
-                }
-                return this._resubmit(row, 'orphaned');
+    async _followMined(row) {
+        const header = await this.bitcoind.blockConfirmations(row.mined_block_hash);
+        if (!header || header.confirmations < 0) {
+            // Its block left the main chain. The node puts a disconnected
+            // block's txs back in its mempool when it can, so it may already
+            // be waiting again, or mined in the block that replaced it.
+            const block = await this.bitcoind.txBlock(row.txid);
+            if (block && block !== row.mined_block_hash) return this._markMined(row, block);
+            if (await this.bitcoind.mempoolEntry(row.txid)) {
+                return this._backToPending(row, 'orphaned');
             }
-            confirmations = header.confirmations;
-        } else if (row.mined_height !== null) {
-            // Without the node an orphan cannot be seen, only depth
-            confirmations = template.height - row.mined_height;
-        } else {
-            return;
+            return this._rebroadcast(row, 'orphaned');
         }
-        if (confirmations >= this.cfg.confirmations) {
+        if (header.confirmations >= this.cfg.confirmations) {
             this.store.setStatus(row.txid, 'confirmed', {
-                fields: { confirmations, confirmed_at: now() },
+                fields: { confirmations: header.confirmations, confirmed_at: now() },
             });
-            this.log.info(`confirmed ${row.txid} (${confirmations} deep)`);
+            this.log.info(`confirmed ${row.txid} (${header.confirmations} deep)`);
         } else {
-            this.store.touch(row.txid, { confirmations });
+            this.store.touch(row.txid, { confirmations: header.confirmations });
         }
     }
 
-    async _resubmit(row, why) {
-        let resp;
+    _backToPending(row, why) {
+        this.store.setStatus(row.txid, 'pending', {
+            fields: { mined_block_hash: null, mined_height: null, mined_at: null,
+                      mined_by_pool: null, confirmations: null },
+            detail: { after: why },
+        });
+        this.log.info(`${row.txid} back in the mempool after ${why}`);
+    }
+
+    async _rebroadcast(row, why) {
         try {
-            resp = await this.enforcer.submit(row.raw_hex);
+            await this.bitcoind.send(row.raw_hex);
         } catch (e) {
-            this.log.warn(`resubmitting ${row.txid} (${why}) failed: ${e.message}`);
+            if (!(e instanceof RpcError)) {
+                this.log.warn(`rebroadcasting ${row.txid} (${why}) failed: ${e.message}`);
+                return;
+            }
+            // -27: "Transaction already in block chain" -- mined, and the
+            // lookup above raced the block. The next poll finds its block.
+            if (e.code === -27) return;
+            this.store.setStatus(row.txid, 'dropped', {
+                reason: e.rpcMessage,
+                detail: { after: why },
+            });
+            this.log.info(`dropped ${row.txid}: the node refused it again after ${why} (${e.rpcMessage})`);
             return;
         }
-        if (resp.accepted) {
-            this.store.touch(row.txid, { resubmissions: row.resubmissions + 1 });
-            this.store.setStatus(row.txid, 'pending', {
-                fields: { mined_block_hash: null, mined_height: null, mined_at: null,
-                          mined_by_pool: null, confirmations: null },
-                detail: { resubmitted_after: why },
-            });
-            this.log.info(`resubmitted ${row.txid} after ${why}`);
-        } else {
-            this.store.setStatus(row.txid, 'dropped', {
-                reason: resp.reject_reason ?? 'rejected',
-                detail: { resubmitted_after: why },
-            });
-            this.log.info(`dropped ${row.txid}: resubmission after ${why} refused (${resp.reject_reason})`);
-        }
+        this.store.touch(row.txid, { resubmissions: row.resubmissions + 1 });
+        this.store.event(row.txid, 'rebroadcast', { after: why });
+        this._backToPending(row, why);
     }
 }
 

@@ -15,9 +15,6 @@
 #                         CreateDepositTransaction) are unavailable.
 #                         Mine with MiningService/GenerateToAddress
 #                         (enforcer PR #477).
-#   REGTEST_ENFORCER_EXTRA_ARGS
-#                         further enforcer flags, space-separated, e.g.
-#                         --enable-slipstream (tests/test_slipstream_regtest.sh)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -122,8 +119,7 @@ start_if_dead bip300301_enforcer \
     --node-zmq-addr-sequence=tcp://127.0.0.1:$BITCOIND_ZMQ_PORT \
     --enable-block-template-server \
     --serve-rpc-addr=127.0.0.1:$ENFORCER_RPC_PORT \
-    --serve-grpc-addr=127.0.0.1:$ENFORCER_GRPC_PORT \
-    ${REGTEST_ENFORCER_EXTRA_ARGS:-}
+    --serve-grpc-addr=127.0.0.1:$ENFORCER_GRPC_PORT
 
 wait_for bip300301_enforcer "nc -z 127.0.0.1 $ENFORCER_RPC_PORT" 30
 # Thunder connects to the enforcer's gRPC — make sure that's actually

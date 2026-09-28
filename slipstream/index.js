@@ -1,15 +1,16 @@
-/* simplepool-slipstream — take txs from anyone, mine them without relaying.
+/* simplepool-slipstream — take txs from anyone, mine them in the pool's blocks.
  *
- * Submissions go straight to the enforcer's block template server, the one
- * the proxy mines from, which keeps them in its template mempool and never
- * hands them to the node's. This service records every submission, holds
- * each one to the fee rule, and follows it from template to block.
+ * Submissions are checked against the pool's own bitcoind and the fee rule,
+ * then broadcast to it. The enforcer's template mempool mirrors that node's,
+ * so an accepted tx reaches the templates the proxy mines. This service
+ * records every submission and follows each accepted tx from template to
+ * block.
  *
  * Config is environment-only — see lib/config.js for the full list.
  *
  * Run:
- *   ENFORCER_GBT_URL=http://127.0.0.1:8122 \
  *   BITCOIND_RPC_URL=http://127.0.0.1:8332 BITCOIND_RPC_COOKIE_FILE=... \
+ *   ENFORCER_GBT_URL=http://127.0.0.1:8122 \
  *   PROXY_DB_PATH=../data/shares.db \
  *   node index.js
  */
@@ -33,18 +34,15 @@ const log = {
     error: (m) => console.error(`[error] ${m}`),
 };
 
-log.info(`simplepool-slipstream ${version} starting (enforcer=${cfg.enforcerUrl} db=${cfg.dbPath})`);
+log.info(`simplepool-slipstream ${version} starting ` +
+         `(node=${cfg.bitcoind.url} enforcer=${cfg.enforcerUrl} db=${cfg.dbPath})`);
 log.info(`  fee floor ${cfg.minFeeRate} sat/vB, confirmed at ${cfg.confirmations}, ` +
-         `expiry ${cfg.expiryBlocks} blocks, poll ${cfg.pollMs}ms`);
-if (!cfg.bitcoind) {
-    log.warn('BITCOIND_RPC_URL unset: mined txs are never checked for orphaning, ' +
-             'and their depth is only estimated from the template height');
-}
+         `poll ${cfg.pollMs}ms`);
 
 const slipstream = new Slipstream({
     store:    openStore(cfg.dbPath),
+    bitcoind: new BitcoindClient(cfg.bitcoind),
     enforcer: new EnforcerClient({ url: cfg.enforcerUrl }),
-    bitcoind: cfg.bitcoind ? new BitcoindClient(cfg.bitcoind) : null,
     pool:     openPoolDb(cfg.proxyDbPath),
     cfg,
     log,
