@@ -96,6 +96,14 @@ CREATE TABLE IF NOT EXISTS blocks_found (
 CREATE INDEX IF NOT EXISTS blocks_found_ts_idx ON blocks_found(ts);
 CREATE INDEX IF NOT EXISTS blocks_found_status_idx ON blocks_found(status);
 CREATE INDEX IF NOT EXISTS blocks_found_pplns_idx ON blocks_found(pplns_distributed, status);
+/* blocks_found also carries a UNIQUE index on hash, blocks_found_hash_idx,
+ * which is deliberately NOT created here. Databases written before it existed
+ * can hold the same hash twice, and a CREATE UNIQUE INDEX over them fails --
+ * which, since install.sh applies this file under `set -e` on every upgrade,
+ * would abort the upgrade half-done. The proxy creates it at startup instead
+ * (store_finalize_block_hash_index), after collapsing any duplicates onto the
+ * earliest row and carrying their verdict with it. Deleting rows is not
+ * something this file may do: it is also run against a live shares.db. */
 
 /* Single-row mirror of the upstream bitcoind tip the proxy is currently
  * mining on. Written by the proxy's tip watcher on every successful
@@ -161,7 +169,7 @@ CREATE TABLE IF NOT EXISTS pool_meta (
   /* Mirror of the proxy's in-memory events_lost counter: accepted shares that
    * never reached the DB after every commit retry failed. Must be 0 — it is
    * work a miner was told was accepted and that no query can otherwise see. */
-  events_lost         INTEGER NOT NULL DEFAULT 0,  /* unix seconds */
+  events_lost         INTEGER NOT NULL DEFAULT 0,  /* count of events */
   /* The stratum ports this pool listens on and the difficulty policy of
    * each, as a JSON array of {port, label, min_diff, initial_diff}. Written
    * at startup with the rest of the identity. A miner cannot tell from the
