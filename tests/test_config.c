@@ -390,6 +390,27 @@ static void test_a_listener_without_a_port_is_refused(void) {
     CHECK(load_text(body, &cfg, err, sizeof err) != 0);
 }
 
+/* listen_port holds one of the server's STRATUM_MAX_LISTENERS slots, so only
+ * STRATUM_MAX_EXTRA_LISTENERS `listener` lines can actually be bound. One more
+ * used to load cleanly and then be silently dropped by the server. */
+static void test_listeners_beyond_the_bindable_count_are_refused(void) {
+    char body[2048];
+    size_t n = (size_t)snprintf(body, sizeof body, "operator_address = %s\n", VALID_ADDR);
+    for (int i = 0; i < STRATUM_MAX_EXTRA_LISTENERS; ++i)
+        n += (size_t)snprintf(body + n, sizeof body - n,
+                              "listener = port=%d label=p%d\n", 3335 + i, i);
+
+    proxy_config_t ok; char err[256] = {0};
+    CHECK(load_text(body, &ok, err, sizeof err) == 0);
+    CHECK(ok.listener_count == STRATUM_MAX_EXTRA_LISTENERS);
+
+    snprintf(body + n, sizeof body - n, "listener = port=%d label=over\n",
+             3335 + STRATUM_MAX_EXTRA_LISTENERS);
+    proxy_config_t over; char err2[256] = {0};
+    CHECK(load_text(body, &over, err2, sizeof err2) != 0);
+    CHECK(strstr(err2, "at most") != NULL);
+}
+
 /* ---- log level ----------------------------------------------------------- */
 
 static void test_log_level_accepts_names_and_numbers(void) {
@@ -488,6 +509,7 @@ int main(void) {
     test_a_nonsense_log_level_warns_and_keeps_the_default();
     test_log_level_accepts_names_and_numbers();
     test_a_listener_without_a_port_is_refused();
+    test_listeners_beyond_the_bindable_count_are_refused();
     test_a_listener_field_that_is_not_key_value_is_refused();
     test_several_listeners_keep_their_own_policies();
     test_a_listener_line_becomes_a_port_policy();

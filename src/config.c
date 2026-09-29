@@ -254,9 +254,11 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "listener")                  == 0) {
             /* Repeatable, unlike every other key here: each one adds a port
              * rather than replacing the last. */
-            if (cfg->listener_count >= STRATUM_MAX_LISTENERS) {
-                set_err(errbuf, errlen, "config: line %d: at most %d listeners",
-                        lineno, STRATUM_MAX_LISTENERS);
+            if (cfg->listener_count >= STRATUM_MAX_EXTRA_LISTENERS) {
+                set_err(errbuf, errlen,
+                        "config: line %d: at most %d listener lines "
+                        "(listen_port takes the remaining slot)",
+                        lineno, STRATUM_MAX_EXTRA_LISTENERS);
                 fclose(f);
                 return -1;
             }

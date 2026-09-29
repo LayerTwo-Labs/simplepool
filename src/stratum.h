@@ -170,6 +170,12 @@ typedef struct {
 } stratum_listener_t;
 
 #define STRATUM_MAX_LISTENERS 8
+/* How many `listener` lines a config may add. The server binds listen_port in
+ * slot 0 and the extra ports after it, all out of STRATUM_MAX_LISTENERS slots,
+ * so one fewer than that fits. The config used to accept all 8 and the server
+ * then dropped the last one without a word: a port the operator configured,
+ * advertised and firewalled, that nothing was listening on. */
+#define STRATUM_MAX_EXTRA_LISTENERS (STRATUM_MAX_LISTENERS - 1)
 
 typedef struct {
     char   bind_addr[64];
