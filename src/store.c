@@ -10,6 +10,7 @@
 
 #include "store.h"
 #include "log.h"
+#include "coinbase.h"  /* COINBASE_DUST_SATS */
 
 #include <stdint.h>   /* INT64_MAX */
 
@@ -1432,10 +1433,17 @@ int store_pplns_distribute(store_t *s, int maturity_confs, int fee_bps,
 
         /* Net of the operator fee, the same basis points solo and PPS use.
          * On PPLNS the fee is normally set lower: there is no variance being
-         * absorbed, so there is no risk premium to charge for. */
+         * absorbed, so there is no risk premium to charge for.
+         *
+         * The dust rule is the coinbase's, and has to be: a fee below
+         * COINBASE_DUST_SATS was never paid out -- the builder drops that
+         * output and the pool wallet receives the whole block. Deducting it
+         * here anyway credited miners less than the wallet actually holds for
+         * them, and the difference sat there owed to nobody. */
         int64_t payable = gross;
         if (fee_bps > 0 && fee_bps <= 10000) {
-            payable = gross - (gross * (int64_t)fee_bps) / 10000;
+            int64_t fee = (gross * (int64_t)fee_bps) / 10000;
+            if (fee >= COINBASE_DUST_SATS) payable = gross - fee;
         }
         if (payable <= 0) {
             /* Nothing to share out, but the block is still settled: leaving

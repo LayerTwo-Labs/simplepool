@@ -2520,7 +2520,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         int64_t fee_sats = 0;
         if (s->cfg.fee_bps > 0 && s->cfg.operator_address[0]) {
             fee_sats = (job->value_sats * (int64_t)s->cfg.fee_bps) / 10000;
-            if (fee_sats < 546) fee_sats = 0; /* matches coinbase dust rule */
+            if (fee_sats < COINBASE_DUST_SATS) fee_sats = 0; /* the coinbase dust rule */
         }
         int64_t reward_sats = job->value_sats - fee_sats;
         s->cfg.on_block_found(s->cfg.ctx, c->worker_name,

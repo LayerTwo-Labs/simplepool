@@ -1226,6 +1226,86 @@ static void test_pplns_distributes_the_window(void) {
     printf("  ok test_pplns_distributes_the_window\n");
 }
 
+/* A fee below the dust limit is not deducted from what miners are credited.
+ *
+ * The coinbase drops an operator output worth less than COINBASE_DUST_SATS, so
+ * on a small block the pool wallet receives the whole reward. The distributor
+ * has to share out that whole reward: taking fee_bps off it anyway leaves sats
+ * in the pool wallet that no miner is credited for. 50000 sats at 1% is a
+ * 500-sat fee, under 546, so nothing comes off. */
+static void test_pplns_does_not_deduct_a_dust_fee(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "alice", "addr_a",
+                                       2000ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+        assert(store_record_share_addr(s, "bob", "addr_b",
+                                       2100ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_record_share_addr(s, "alice", "addr_a", 3000, 0.0,
+                                   1, "blk_dustfee", 0, 0.0) == 0);
+    /* Recorded as the coinbase paid it: the whole 50000 to the pool, no fee. */
+    assert(store_record_block(s, 3000, 800200, "blk_dustfee", "alice", "addr_a",
+                              50000, 0, STORE_BLOCK_PENDING, NULL, 100.0) == 0);
+    assert(store_flush(s) == 0);
+    assert(store_set_block_status(s, "blk_dustfee", STORE_BLOCK_CONFIRMED,
+                                  100, "node") == 0);
+
+    int blocks = 0, workers = 0;
+    assert(store_pplns_distribute(s, 100, 100, &blocks, &workers, NULL, 0) == 1);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT SUM(accrued_sats) FROM pps_credits") == 50000);
+    assert(scalar_i64(db, "SELECT accrued_sats FROM pps_credits WHERE worker_id ="
+                          " (SELECT id FROM workers WHERE name='alice')") == 25000);
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pplns_does_not_deduct_a_dust_fee\n");
+}
+
+/* A fee at or above the dust limit still comes off the top. 1,000,000 sats at
+ * 1% is 10000 sats of fee, leaving 990000 to share. */
+static void test_pplns_deducts_a_real_fee(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    for (int i = 0; i < 10; ++i)
+        assert(store_record_share_addr(s, "alice", "addr_a",
+                                       2000ULL + (uint64_t)i, 10.0,
+                                       0, NULL, 0, 0.0) == 0);
+    assert(store_record_share_addr(s, "alice", "addr_a", 3000, 0.0,
+                                   1, "blk_realfee", 0, 0.0) == 0);
+    assert(store_record_block(s, 3000, 800201, "blk_realfee", "alice", "addr_a",
+                              990000, 10000, STORE_BLOCK_PENDING, NULL, 100.0) == 0);
+    assert(store_flush(s) == 0);
+    assert(store_set_block_status(s, "blk_realfee", STORE_BLOCK_CONFIRMED,
+                                  100, "node") == 0);
+
+    int blocks = 0, workers = 0;
+    assert(store_pplns_distribute(s, 100, 100, &blocks, &workers, NULL, 0) == 1);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT SUM(accrued_sats) FROM pps_credits") == 990000);
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pplns_deducts_a_real_fee\n");
+}
+
 /* Two matured blocks settled by a single pass.
  *
  * Every other pplns test distributes exactly one block per call, which never
@@ -1980,6 +2060,8 @@ int main(void) {
     test_block_hash_index_after_dedupe();
     test_open_upgrades_a_pre_status_database();
     test_pplns_distributes_the_window();
+    test_pplns_does_not_deduct_a_dust_fee();
+    test_pplns_deducts_a_real_fee();
     test_pplns_takes_the_operator_fee();
     test_the_payout_floor_is_published_for_the_dashboard();
     test_the_window_reads_past_the_first_batch();

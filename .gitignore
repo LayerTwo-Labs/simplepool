@@ -22,3 +22,6 @@
 # and a `git add -A` sweeps them into a public repo.
 .DS_Store
 **/.DS_Store
+# graphify knowledge-graph output (graph.json, graph.html, report, cache).
+# Built locally per machine; not part of the project.
+/graphify-out/

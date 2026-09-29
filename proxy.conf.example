@@ -66,6 +66,7 @@ vardiff_idle_step = 2
 # unlike every other key here, a second `listener` line adds a port rather
 # than replacing the first. listen_port above is always served too, on the
 # settings above.
+# At most 7 listener lines: listen_port takes the eighth port slot.
 #
 #   port           the port to bind (required)
 #   min_diff       vardiff floor for this port, and its starting difficulty

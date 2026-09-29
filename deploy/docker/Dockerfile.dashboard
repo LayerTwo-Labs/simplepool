@@ -23,5 +23,7 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY dashboard/ ./
 USER node
+# Inside a container loopback is unreachable from the published port.
+ENV DASHBOARD_BIND=0.0.0.0
 EXPOSE 8081
 ENTRYPOINT ["/usr/bin/tini", "--", "node", "server.js"]

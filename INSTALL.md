@@ -656,8 +656,11 @@ scripted one-liner in [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md#rotating-the-admin-p
 
 ### Reverse proxy (recommended)
 
-The dashboard binds `0.0.0.0:8081` — reachable directly. In
-production you probably want nginx / caddy in front of it. Solo
+The dashboard binds `127.0.0.1:8081` by default (`DASHBOARD_BIND`), so it
+is reachable only through a reverse proxy on the same host. To serve it
+directly, set `Environment=DASHBOARD_BIND=0.0.0.0` in its drop-in — and then
+put TLS in front of `/admin` some other way. In production you want nginx /
+caddy in front of it. Solo
 `deploy/nginx/simplepool.conf` has a working template.
 
 Do NOT expose `/admin` on plain HTTP over the internet without at
