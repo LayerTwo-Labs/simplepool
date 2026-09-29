@@ -8,6 +8,43 @@ Anything that changes what a miner is paid, or what an operator has to tell
 their miners, is called out explicitly — those are the changes that cost
 somebody money if they go unread.
 
+## Unreleased
+
+### Operators: the dashboard now listens on loopback by default
+
+`dashboard/server.js` binds `DASHBOARD_BIND`, default `127.0.0.1`, where it
+used to bind every interface. Behind nginx nothing changes. **If you reach the
+dashboard directly on `:8081`, add `Environment=DASHBOARD_BIND=0.0.0.0` to its
+systemd drop-in before upgrading**, or it stops answering there. `install.sh`
+sets it for you: loopback with nginx, all interfaces with `--no-nginx`. The
+Docker image sets `0.0.0.0` inside the container.
+
+### Miners on pplns-thunder / pplns-btc: small blocks are no longer short-changed
+
+When a block's operator fee came to less than the 546-sat dust limit, the
+coinbase (correctly) paid no fee output and the pool wallet received the whole
+reward — but the distributor still took `fee_bps` off before crediting miners,
+so the difference sat in the pool wallet credited to nobody. The distributor
+now applies the coinbase's dust rule. Only blocks worth less than roughly
+`546 × 10000 / fee_bps` sats are affected (54,600 sats at 1%).
+
+### Config: an eighth `listener` line is refused
+
+The server has room for `listen_port` plus seven extra ports. An eighth
+`listener` used to load cleanly and then silently not be bound; it is now a
+config error naming the limit.
+
+### Smaller fixes
+
+- `install.sh --help` no longer claims `--pps-sats-per-diff` defaults to 1000
+  — it defaults to unset (derived per template) — and the installer warns if
+  you pass it.
+- `schema.sql` documents the unique index on `blocks_found(hash)` that the
+  proxy creates at startup, and why it is not created there.
+- `docs/simplepool.html` is now a full reference: every config key and
+  environment variable, the stratum protocol, the coinbase layout, every API,
+  the schema and the hard limits.
+
 ## 0.4.0 — three PPLNS modes, and coinbase-direct payouts
 
 The headline is that a pool no longer has to hold miners' money to run PPLNS.

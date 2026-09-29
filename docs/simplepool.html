@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>simplepool — how it works</title>
-<meta name="description" content="simplepool: a single-binary C11 stratum server for Bitcoin. How solo, pps-classic and the two pplns modes work, end to end — shares, difficulty, the coinbase, share credit, Thunder and L1 payouts, and how to audit every number.">
+<meta name="description" content="simplepool: a single-binary C11 stratum server for Bitcoin. How all five modes work end to end, and the full reference: every configuration key, the stratum protocol, the coinbase layout, APIs, database schema and limits.">
 <style>
 /* ---------------------------------------------------------------------------
    One file, no build step, no network. Everything below is deliberately
@@ -73,7 +73,7 @@ code, pre, .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
 /* ------------------------------------------------------------ page frame -- */
 .wrap { max-width: 1180px; margin: 0 auto; padding: 0 1.25rem; }
 .layout { display: grid; grid-template-columns: 15rem minmax(0,1fr); gap: 3rem; align-items: start; }
-@media (max-width: 900px) { .layout { grid-template-columns: 1fr; gap: 0; } }
+@media (max-width: 900px) { .layout { grid-template-columns: minmax(0,1fr); gap: 0; } }
 
 /* ------------------------------------------------------------------ nav --- */
 nav.toc {
@@ -121,6 +121,7 @@ header.masthead .lede {
   border: 1px solid var(--rule-firm); color: var(--fg-muted);
   background: var(--bg-card); white-space: nowrap;
 }
+@media (max-width: 480px) { .badge { white-space: normal; } }
 
 /* -------------------------------------------------------------- content --- */
 main { padding-bottom: 6rem; }
@@ -242,6 +243,16 @@ figcaption { font-size: .8125rem; color: var(--fg-faint); margin-top: .6rem; max
 .legend { font-size: .8125rem; color: var(--fg-faint); display: flex; gap: 1.25rem; flex-wrap: wrap; }
 .legend i { display: inline-block; width: .7rem; height: .7rem; border-radius: 3px; margin-right: .35rem; }
 
+/* -------------------------------------------------------------- details -- */
+details { margin: 0 0 1.5rem; }
+details > summary {
+  cursor: pointer; font-weight: 620; color: var(--fg-muted); padding: .5rem 0;
+  font-size: .9375rem;
+}
+details > summary:hover { color: var(--fg); }
+details[open] > summary { margin-bottom: .5rem; }
+@media print { details > summary { display: none; } details { display: block; } }
+
 /* ---------------------------------------------------------------- footer -- */
 footer { border-top: 1px solid var(--rule); padding: 2.5rem 0 4rem; color: var(--fg-muted); font-size: .875rem; }
 footer .wrap > p { max-width: 46rem; }
@@ -281,7 +292,8 @@ footer .wrap > p { max-width: 46rem; }
     </p>
     <div class="badges">
       <span class="badge">C11 · no runtime dependencies beyond libc, sqlite3, libcurl, hiredis</span>
-      <span class="badge">stratum v1 on :3334</span>
+      <span class="badge">stratum v1 on :3334 (+ up to 7 ports)</span>
+      <span class="badge">5 payout modes</span>
       <span class="badge">SQLite (WAL) ledger</span>
       <span class="badge">MIT</span>
     </div>
@@ -310,7 +322,13 @@ footer .wrap > p { max-width: 46rem; }
     <li><a href="#connect">Connect a miner</a></li>
     <li><a href="#dashboard">The dashboard</a></li>
     <li><a href="#slipstream">Slipstream</a></li>
-    <li><a href="#config">Configuration</a></li>
+    <li><a href="#config">Configuration reference</a></li>
+    <li><a href="#stratum">Stratum protocol</a></li>
+    <li><a href="#coinbase">Coinbase layout</a></li>
+    <li><a href="#interfaces">Ports, APIs &amp; events</a></li>
+    <li><a href="#schema">Database schema</a></li>
+    <li><a href="#constants">Constants &amp; limits</a></li>
+    <li><a href="#build">Build, release &amp; tests</a></li>
     <li><a href="#operate">Running one</a></li>
     <li><a href="#limits">What it can't do</a></li>
   </ol>
@@ -336,14 +354,15 @@ footer .wrap > p { max-width: 46rem; }
   </p>
   <p>
     There is no account system. There is no password — the stratum password
-    field is read and discarded. Your identity on the pool <em>is</em> the
+    field carries no secret; the only thing read from it is an optional
+    <code>d=&lt;n&gt;</code> difficulty hint. Your identity on the pool <em>is</em> the
     payout address you authorize with, which means there is nothing to register,
     nothing to log into, and nothing the operator can quietly change about who
     you are.
   </p>
 
   <div class="grid-3">
-    <div class="card stat"><span class="n">2</span><span class="k">payout modes</span></div>
+    <div class="card stat"><span class="n">5</span><span class="k">payout modes</span></div>
     <div class="card stat"><span class="n">1</span><span class="k">binary, no daemon zoo</span></div>
     <div class="card stat"><span class="n">1</span><span class="k">writer to the ledger</span></div>
     <div class="card stat"><span class="n">0</span><span class="k">accounts to create</span></div>
@@ -742,10 +761,16 @@ footer .wrap > p { max-width: 46rem; }
       <h4><code>mining.subscribe</code></h4>
       <p>
         The pool allocates this connection a 4-byte <strong>extranonce1</strong> and
-        replies with it. The value comes from an atomic counter XORed with the
-        current millisecond, so two rigs subscribing in the same nanosecond
-        cannot collide, and a rig reconnecting days later after the counter has
-        wrapped still gets something fresh.
+        replies with it. The value is the next tick of a server-wide atomic
+        counter, seeded from the clock when the process starts — so it is unique
+        across every live connection until the counter wraps at 2<sup>32</sup>
+        subscribes, and unpredictable across restarts. It is deliberately
+        <em>not</em> mixed with the clock again per subscribe: an earlier
+        version XORed it with the current millisecond, and that collides
+        whenever the two advance in step — which is exactly what a rig opening
+        several connections at once does. Identical extranonce1 means identical
+        coinbases, identical headers and the same share found twice. A
+        server-wide dedupe on the header hash now backs this up regardless.
       </p>
     </li>
     <li>
@@ -757,7 +782,8 @@ footer .wrap > p { max-width: 46rem; }
         base58 Thunder where it is Thunder (pps-classic, pplns-thunder).
         An invalid address is rejected with a clear error and written to the
         <code>rejects</code> table rather than silently accepted. The password is
-        discarded.
+        ignored except for one optional hint, <code>d=&lt;n&gt;</code>, which asks
+        for a difficulty floor (see <a href="#stratum">the protocol reference</a>).
       </p>
     </li>
     <li>
@@ -2119,13 +2145,13 @@ SELECT (SELECT COALESCE(SUM(reward_sats),0) + COALESCE(SUM(fee_sats),0)
       <h3 style="margin-top:.25rem">Solo</h3>
       <pre style="margin-bottom:0"><code>URL       stratum+tcp://pool.example.com:3334
 Worker    bc1qw508d6…kv8f3t4.rig-01
-Password  (anything — it is discarded)</code></pre>
+Password  x   (or d=65536 to ask for a difficulty floor)</code></pre>
     </div>
     <div class="card mode-card pps">
       <h3 style="margin-top:.25rem">pps-classic</h3>
       <pre style="margin-bottom:0"><code>URL       stratum+tcp://pool.example.com:3334
 Worker    JPbJrEKEaA69dAADY2qfW7dfyYQ.rig-01
-Password  (anything — it is discarded)</code></pre>
+Password  x   (or d=65536 to ask for a difficulty floor)</code></pre>
     </div>
   </div>
 
@@ -2403,87 +2429,976 @@ Password  (anything — it is discarded)</code></pre>
 
 <!-- =========================================================== 16. config == -->
 <section id="config">
-  <h2>Configuration</h2>
+  <h2>Configuration reference</h2>
   <p class="section-sub">
-    One <code>key = value</code> file, <code>proxy.conf</code>. The keys that
-    change behaviour rather than tuning it:
+    Four processes, two ways of configuring them. The stratum proxy reads one
+    <code>key = value</code> file, <code>proxy.conf</code>; the three Node
+    services — payout, dashboard, slipstream — read only environment
+    variables. Every key each one understands is below, with its default and
+    what happens when it is wrong.
   </p>
 
+  <h3 id="config-syntax">proxy.conf syntax</h3>
+  <ul>
+    <li>One <code>key = value</code> per line. The value is split at the
+        <em>first</em> <code>=</code>, so values may contain <code>=</code>.
+        Whitespace around the line, the key and the value is trimmed.</li>
+    <li><code>#</code> starts a comment at the beginning of a line or after a
+        space or tab, and never inside double quotes — so
+        <code>bitcoind_pass = p#ss</code> keeps its <code>#</code>, and
+        <code>fee_bps = 100 # 1%</code> is 100. One pair of surrounding double
+        quotes is stripped; there are no escape sequences.</li>
+    <li>Keys are case-sensitive. A repeated key: the last one wins — except
+        <code>listener</code>, where every line adds a port.</li>
+    <li>An unknown key, or a line with no <code>=</code>, logs a warning and
+        loading continues. A typo is therefore <em>not</em> fatal: read the
+        startup log.</li>
+    <li>Numbers are parsed leniently (<code>atoi</code>/<code>atof</code>), so
+        <code>fee_bps = one</code> reads as 0. Strings longer than their buffer
+        are truncated silently.</li>
+    <li>The file is read once. There is no reload on <code>SIGHUP</code>;
+        restart the proxy to apply a change.</li>
+  </ul>
+
+  <h3 id="config-cli">Command line &amp; exit codes</h3>
+  <pre><code>simplepool [config_path]      # default ./proxy.conf
+simplepool --version | -V     # version, commit, branch, and "tree: dirty" if built dirty
+simplepool --help | -h</code></pre>
   <div class="tablewrap">
     <table>
-      <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
+      <thead><tr><th>Exit</th><th>Meaning</th></tr></thead>
       <tbody>
-        <tr><td><code>pool_mode</code></td><td><code>solo</code></td>
-            <td><code>solo</code>, <code>pps-classic</code>, <code>pplns-thunder</code>, <code>pplns-btc</code> or <code>pplns-coinbase</code>.
-                Decides the coinbase shape, what a username must be, and when a balance moves.
-                Bare <code>pplns</code> is refused: it does not say which rail pays.</td></tr>
-        <tr><td><code>pplns_window_diff_multiple</code></td><td><code>2.0</code></td>
-            <td>PPLNS only. Window size as a multiple of the CURRENT network difficulty, so it
-                self-scales across retargets. Must be &gt; 0; below 1.0 a block pays out across
-                less work than it took to find, which rewards pool hopping, and the proxy warns.</td></tr>
-        <tr><td><code>coinbase_max_bytes</code></td><td><code>1000</code></td>
-            <td><code>pplns-coinbase</code> only. Byte budget for the WHOLE serialized coinbase,
-                commitments included — a rented-hashrate marketplace measures bytes, and drivechain
-                <code>OP_RETURN</code>s spend them before any payout does. Minimum 200. Settable
-                per listener (<code>max_coinbase_bytes=</code> on a <code>listener</code> line),
-                which is usually right: the ceiling binds only on the port rented hashrate
-                connects to, and every byte of it costs a payout.</td></tr>
-        <tr><td><code>pplns_payout_floor_sats</code></td><td><code>546</code></td>
-            <td><code>pplns-coinbase</code> only. A claim worth less than this is <strong>not paid,
-                in that block</strong>; what it was owed is shared among the miners the block
-                could pay, and it goes first in the queue for the next one. Clamped up to 546,
-                the dust limit. Disclose it to your miners.</td></tr>
-        <tr><td><code>operator_address</code></td><td>—</td>
-            <td><strong>Required.</strong> Receives the <code>fee_bps</code> cut. The proxy refuses to start without it.</td></tr>
-        <tr><td><code>fee_bps</code></td><td><code>100</code></td>
-            <td>Fee in basis points; 100 = 1%, hard cap 1000 = 10%. <code>0</code> drops the fee output entirely.</td></tr>
-        <tr><td><code>pool_btc_address</code></td><td>—</td>
-            <td>Required by <code>pps-classic</code>, <code>pplns-thunder</code> and
-                <code>pplns-btc</code>: the coinbase pays here. Unused in <code>solo</code>,
-                and <strong>refused</strong> in <code>pplns-coinbase</code>, which has no
-                pool wallet at all — setting it there is a config error, not a no-op.</td></tr>
-        <tr><td><code>pps_sats_per_diff</code></td><td><em>unset</em></td>
-            <td>Leave it unset. See the warning in <a href="#pps">section 8</a>.</td></tr>
-        <tr><td><code>listen_addr</code> / <code>listen_port</code></td><td><code>0.0.0.0</code> / <code>3334</code></td>
-            <td>Where stratum listens.</td></tr>
-        <tr><td><code>listener</code></td><td><em>none</em></td>
-            <td>An extra port with its own difficulty policy — <code>port=</code>, <code>min_diff=</code>, <code>initial_diff=</code>, <code>max_diff=</code>, <code>label=</code>. Repeatable, unlike every other key here: each line adds a port. See <a href="#difficulty">section 6</a>. Remember to open it in the firewall.</td></tr>
-        <tr><td><code>max_submits_per_sec</code></td><td><code>20000</code></td>
-            <td>Per-connection ceiling on <code>mining.submit</code>; <code>0</code> disables it. Bounds what one badly matched connection can cost. Raise it only if you pin a low difficulty for a very large miner.</td></tr>
-        <tr><td><code>bitcoind_url</code></td><td>—</td>
-            <td>JSON-RPC endpoint for <code>getblocktemplate</code> / <code>submitblock</code>.</td></tr>
-        <tr><td><code>bitcoind_user</code> / <code>bitcoind_pass</code></td><td>—</td>
-            <td>Optional — omit <em>both</em> for an unauthenticated backend and the call goes out with no auth header. Cookie auth is not supported.</td></tr>
-        <tr><td><code>bitcoind_poll_interval_ms</code></td><td><code>30000</code></td>
-            <td>Template refresh when the backend does not long-poll. The enforcer does (BIP22), and then the proxy wakes on each new tip instead and this only paces retries. Against a backend that does not, it is also the worst-case delay before a sidechain's BMM request can reach a job — lower it to 5000–10000 if sidechains need to merge-mine reliably.</td></tr>
-        <tr><td><code>coinbase_tag</code></td><td><code>/simplepool/</code></td>
-            <td>Short string baked into the coinbase scriptSig.</td></tr>
-        <tr><td><code>db_path</code></td><td><code>./data/shares.db</code></td>
-            <td>The ledger.</td></tr>
-        <tr><td><code>commit_window_ms</code> / <code>commit_max_shares</code></td><td><code>100</code> / <code>100</code></td>
-            <td>Write batching — commit on whichever comes first.</td></tr>
-        <tr><td><code>templates_retention_days</code></td><td><code>30</code></td>
-            <td>How much template history the dashboard keeps. <code>0</code> keeps everything.</td></tr>
-        <tr><td><code>redis_url</code></td><td><em>empty</em></td>
-            <td>Set to mirror events onto Redis pub/sub. Empty disables it.</td></tr>
-        <tr><td><code>log_level</code></td><td><code>info</code></td>
-            <td><code>debug</code> logs every RPC request and raw response.</td></tr>
+        <tr><td><code>0</code></td><td>clean shutdown (<code>SIGINT</code> / <code>SIGTERM</code>: stop stratum, flush the store, log final stats)</td></tr>
+        <tr><td><code>2</code></td><td>config error, or an <code>operator_address</code> / <code>pool_btc_address</code> that does not decode — printed as <code>config error: …</code></td></tr>
+        <tr><td><code>3</code></td><td>the template backend could not be reached (client init or the startup <code>getblockchaininfo</code> ping)</td></tr>
+        <tr><td><code>4</code></td><td>the SQLite ledger could not be opened</td></tr>
+        <tr><td><code>5</code></td><td>the first <code>getblocktemplate</code> failed</td></tr>
+        <tr><td><code>6</code></td><td>the first job could not be built from that template</td></tr>
+        <tr><td><code>7</code></td><td>a stratum port could not be bound — if any one fails, none are kept</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="config-proxy">proxy.conf — every key</h3>
+
+  <h4>Stratum listeners &amp; connections</h4>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Rules</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>listen_addr</code></td><td><code>0.0.0.0</code></td><td><code>::</code> = dual-stack; any IPv6 literal binds v6-only</td><td>Address every stratum port binds to.</td></tr>
+        <tr><td><code>listen_port</code></td><td><code>3334</code></td><td>no <code>listener</code> may reuse it</td><td>The default port, served on the server-wide vardiff settings. Always bound.</td></tr>
+        <tr><td><code>listener</code></td><td><em>none</em></td><td>repeatable; see <a href="#config-listener">sub-keys</a></td><td>An extra port with its own difficulty policy and coinbase budget.</td></tr>
+        <tr><td><code>max_conns</code></td><td><code>500</code></td><td>≤0 → 500</td><td>Concurrent connections across all ports. Past it, accept closes the socket immediately, silently. One thread and one fd each.</td></tr>
+        <tr><td><code>idle_timeout_sec</code></td><td><code>600</code></td><td>0 → default · negative disables</td><td>Reap a socket that has sent nothing and has <em>not</em> authorized.</td></tr>
+        <tr><td><code>idle_timeout_authorized_sec</code></td><td><code>7200</code></td><td>0 → default · negative disables</td><td>Reap an authorized miner that has sent nothing. Long on purpose — silence between shares is normal.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Template backend</h4>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Rules</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>bitcoind_url</code></td><td><code>http://127.0.0.1:18443</code></td><td>—</td><td>JSON-RPC endpoint for <code>getblocktemplate</code> and <code>submitblock</code>. On a drivechain pool this is the <strong>enforcer's</strong> GBT server (<code>:8122</code>), not bitcoind: only the enforcer's template carries the BIP300/301 commitments.</td></tr>
+        <tr><td><code>bitcoind_user</code> / <code>bitcoind_pass</code></td><td><em>empty</em></td><td>both empty → no auth header and no startup ping</td><td>Basic auth. Cookie auth is not supported.</td></tr>
+        <tr><td><code>bitcoind_poll_interval_ms</code></td><td><code>30000</code></td><td>not validated — keep it positive</td><td>Template refresh when the backend offers no long-poll. With long-poll (the enforcer does BIP22) the proxy wakes on each tip instead. After an error the retry backs off from 1 s doubling to 32 s.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Coinbase &amp; fee</h4>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Rules</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>operator_address</code></td><td>—</td><td><strong>required</strong>; must decode, else exit 2</td><td>Receives the <code>fee_bps</code> output. A network mismatch with the node (mainnet vs test) only warns.</td></tr>
+        <tr><td><code>fee_bps</code></td><td><code>100</code></td><td>0–1000, else refuse to start</td><td>Fee in basis points; 100 = 1%. 0 removes the fee output. A fee below 546 sats is dropped rather than made dust.</td></tr>
+        <tr><td><code>coinbase_tag</code></td><td><code>/simplepool/</code></td><td>≤63 chars; scriptSig must stay ≤100 bytes</td><td>Text in the coinbase scriptSig after the BIP34 height.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Pool mode</h4>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Rules</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>pool_mode</code></td><td><code>solo</code></td><td><code>solo</code> · <code>pps-classic</code> · <code>pplns-thunder</code> · <code>pplns-btc</code> · <code>pplns-coinbase</code>; anything else refuses to start</td><td>Coinbase shape, what a username must be, when a balance moves. See the matrix below.</td></tr>
+        <tr><td><code>pool_btc_address</code></td><td>—</td><td>required by pps-classic, pplns-thunder, pplns-btc; <strong>refused</strong> by pplns-coinbase; ignored by solo</td><td>The pool wallet the coinbase pays. For pplns-btc it must belong to the enforcer's wallet.</td></tr>
+        <tr><td><code>block_interval_sec</code></td><td><code>600</code></td><td>must be &gt; 0 (all modes)</td><td>Target seconds per block. Feeds the PPS floor and the issuance ceiling.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>PPLNS (pplns-thunder, pplns-btc, pplns-coinbase)</h4>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Rules</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>pplns_window_diff_multiple</code></td><td><code>2.0</code></td><td>&gt; 0 required; &lt; 1.0 warns</td><td>Window size as a multiple of the current network difficulty.</td></tr>
+        <tr><td><code>coinbase_max_bytes</code></td><td><code>1000</code></td><td>pplns-coinbase: ≥ 200; 0 → 1000</td><td>Byte budget for the whole serialized coinbase, commitments included. Overridable per listener.</td></tr>
+        <tr><td><code>pplns_payout_floor_sats</code></td><td><code>546</code></td><td>pplns-coinbase: ≥ 0; raised to 546</td><td>A claim below this gets no output in that block; its value is redistributed and the miner is queued first for the next.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>pps-classic</h4>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Rules</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>pps_sats_per_diff</code></td><td><code>0</code> (derive)</td><td>≥ 0</td><td><strong>Leave unset.</strong> 0 derives the rate per template as <code>coinbasevalue / network_difficulty × (1 − fee_bps/10⁴)</code>. A value is used verbatim, already net of fee; the proxy warns when it implies a fee more than 25 bps from <code>fee_bps</code>.</td></tr>
+        <tr><td><code>pps_min_network_difficulty</code></td><td><code>0</code> (off)</td><td>≥ 0</td><td>Below this network difficulty nothing accrues. Set it to <code>hashrate × block_interval_sec / 2³²</code> on any young chain.</td></tr>
+        <tr><td><code>pps_refuse_shares_below_min</code></td><td><code>1</code></td><td>—</td><td>While the floor holds accrual off, refuse authorize and reject submits (error 24) instead of taking uncredited work. A refusal here does not count against the authorize budget.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Difficulty &amp; vardiff (for <code>listen_port</code>; listeners override)</h4>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Rules</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>initial_diff</code></td><td><code>1</code></td><td>≤0 → 1</td><td>Starting difficulty on <code>listen_port</code>.</td></tr>
+        <tr><td><code>vardiff_enabled</code></td><td><code>1</code></td><td>0 = off</td><td>Off pins each connection to its starting difficulty.</td></tr>
+        <tr><td><code>vardiff_target_spm</code></td><td><code>12</code></td><td>—</td><td>Target shares per minute per connection.</td></tr>
+        <tr><td><code>vardiff_window_sec</code></td><td><code>30</code></td><td>—</td><td>Retarget interval.</td></tr>
+        <tr><td><code>vardiff_min</code> / <code>vardiff_max</code></td><td><code>1</code> / <code>1e12</code></td><td><code>vardiff_max = 0</code> = no cap</td><td>Clamps. Both still yield to the network-difficulty ceiling.</td></tr>
+        <tr><td><code>vardiff_min_samples</code></td><td><code>20</code></td><td>0 = previous behaviour</td><td>Shares a window must hold before its rate is trusted; below it the window is extended.</td></tr>
+        <tr><td><code>vardiff_max_window_mult</code></td><td><code>8</code></td><td>≤0 → 8</td><td>How far a window may be extended waiting for samples.</td></tr>
+        <tr><td><code>vardiff_idle_step</code></td><td><code>2</code></td><td>≤1 → 2</td><td>Max step for an under-sampled window (a full one may move 4×).</td></tr>
+        <tr><td><code>max_suggested_diff</code></td><td><code>5e7</code></td><td>≤0 <strong>disables</strong> requests</td><td>Ceiling on a miner-requested floor (<code>d=</code> or <code>mining.suggest_difficulty</code>). Size it against <code>idle_timeout_authorized_sec</code>: at 50M a 25 TH/s rig expects one share per ~8600 s.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Abuse limits</h4>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Rules</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>max_submits_per_sec</code></td><td><code>20000</code></td><td>≥ 0; 0 disables</td><td>Per-connection ceiling, fixed 1 s window. Excess submits are refused before parsing; logged to <code>rejects</code> at most every 10 s.</td></tr>
+        <tr><td><code>auth_max_failures</code></td><td><code>3</code></td><td>≥ 0; 0 disables the budget</td><td>Failed authorizes allowed per connection (then it is closed) and per peer IP within the lockout window.</td></tr>
+        <tr><td><code>auth_fail_lockout_sec</code></td><td><code>60</code></td><td>&gt; 0 when failures &gt; 0</td><td>How long an IP that spent its budget is refused. A success clears it.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Storage, broadcast, logging</h4>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Rules</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>db_path</code></td><td><code>./data/shares.db</code></td><td>must open, else exit 4</td><td>The SQLite ledger (WAL).</td></tr>
+        <tr><td><code>commit_window_ms</code> / <code>commit_max_shares</code></td><td><code>100</code> / <code>100</code></td><td>≤0 → 100</td><td>Batch commit on whichever comes first.</td></tr>
+        <tr><td><code>templates_retention_days</code></td><td><code>30</code></td><td>≤0 keeps forever</td><td>History kept in <code>templates</code> (dashboard only).</td></tr>
+        <tr><td><code>redis_url</code></td><td><em>empty</em></td><td><code>redis://[user[:pass]@]host[:port][/db]</code> or <code>host:port</code></td><td>Mirror events onto Redis pub/sub. A failed connect at startup warns and continues without it.</td></tr>
+        <tr><td><code>redis_publish_timeout_ms</code></td><td><code>200</code></td><td>≤0 → 200</td><td>Per-publish bound.</td></tr>
+        <tr><td><code>redis_reconnect_backoff_ms</code></td><td><code>2000</code></td><td>≤0 → 2000</td><td>Wait between reconnects. The queue holds 4096 events.</td></tr>
+        <tr><td><code>log_level</code></td><td><code>info</code></td><td><code>debug</code> · <code>info</code> · <code>warn</code> · <code>error</code> or 0–3; case-insensitive</td><td><code>debug</code> logs every RPC request and raw response. An unknown value warns and is ignored.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="config-listener"><code>listener</code> sub-keys</h3>
+  <pre><code>listener = port=3335 min_diff=65536 label=braiins
+listener = port=3336 min_diff=500000 initial_diff=500000 max_coinbase_bytes=900 label=nicehash</code></pre>
+  <p>
+    Fields are separated by spaces, tabs or commas, in any order. Any error here
+    refuses to start: a field without <code>=</code>, an unknown field, a bad
+    port or label, or <code>initial_diff</code> above <code>max_diff</code>.
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Field</th><th>Rules</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>port</code></td><td>required, 1–65535, unique, ≠ <code>listen_port</code></td><td>Port to bind.</td></tr>
+        <tr><td><code>min_diff</code></td><td>&lt; 1024 warns</td><td>Vardiff floor <em>and</em> the promised floor — kept even above the network difficulty (which costs blocks).</td></tr>
+        <tr><td><code>initial_diff</code></td><td>defaults to <code>min_diff</code></td><td>Starting difficulty.</td></tr>
+        <tr><td><code>max_diff</code></td><td>—</td><td>Vardiff ceiling for this port.</td></tr>
+        <tr><td><code>max_coinbase_bytes</code></td><td>0 = server-wide; else ≥ 200</td><td>pplns-coinbase byte budget on this port.</td></tr>
+        <tr><td><code>label</code></td><td><code>[A-Za-z0-9_-]</code>, ≤ 31 chars</td><td>Shown in the log and on the dashboard.</td></tr>
       </tbody>
     </table>
   </div>
   <p>
-    The payout worker is configured entirely by environment variables, not by
-    this file — <code>PAYOUT_INTERVAL_MS</code>,
-    <code>PAYOUT_SETTLE_INTERVAL_MS</code>, <code>PAYOUT_MIN_SATS</code>,
-    <code>THUNDER_FROM_ADDRESS</code> and friends. The Thunder reserve address is
-    deliberately <em>not</em> a proxy key: the coinbase never touches Thunder, so
-    only the dashboard and the payout worker have any business knowing it. The
-    <a href="#slipstream">slipstream service</a> is configured the same way —
-    <code>BITCOIND_RPC_URL</code>, <code>ENFORCER_GBT_URL</code>,
-    <code>SLIPSTREAM_MIN_FEE_RATE</code> and the <code>POOL_*</code> /
-    <code>PUBLIC_*</code> presentation fields; <code>slipstream/lib/config.js</code>
-    has the full list.
+    At most <strong>7</strong> <code>listener</code> lines: the server has eight
+    port slots and <code>listen_port</code> takes one. An eighth is refused at
+    startup.
   </p>
+
+  <h3 id="config-modes">What each mode requires</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>pool_mode</th><th>Coinbase pays</th><th>Username</th><th><code>pool_btc_address</code></th><th>Also needs</th></tr></thead>
+      <tbody>
+        <tr><td><code>solo</code></td><td>the finder, minus fee</td><td>Bitcoin</td><td>ignored</td><td>—</td></tr>
+        <tr><td><code>pps-classic</code></td><td>the pool, minus fee</td><td>Thunder</td><td>required</td><td>payout worker (<code>PAYOUT_RAIL=thunder</code>), Thunder reserve, <code>pps_min_network_difficulty</code> on young chains</td></tr>
+        <tr><td><code>pplns-thunder</code></td><td>the pool, minus fee</td><td>Thunder</td><td>required</td><td>payout worker (<code>PAYOUT_RAIL=thunder</code>)</td></tr>
+        <tr><td><code>pplns-btc</code></td><td>the pool, minus fee</td><td>Bitcoin</td><td>required (enforcer wallet)</td><td>enforcer <code>--enable-wallet</code>; payout worker <code>PAYOUT_RAIL=btc</code> + <code>ENFORCER_RPC_ADDR</code></td></tr>
+        <tr><td><code>pplns-coinbase</code></td><td>the window, directly (solo-shaped while it is empty)</td><td>Bitcoin</td><td><strong>refused</strong></td><td>nothing — no pool wallet, no payout worker</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="config-removed">Removed and renamed keys</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>You wrote</th><th>What happens</th></tr></thead>
+      <tbody>
+        <tr><td><code>payout_address</code></td><td>refuses to start: rename it to <code>operator_address</code></td></tr>
+        <tr><td><code>pool_mode = pps</code></td><td>refuses to start: use <code>pps-classic</code></td></tr>
+        <tr><td><code>pool_mode = pplns</code></td><td>refuses to start: name the rail — <code>pplns-thunder</code>, <code>pplns-btc</code> or <code>pplns-coinbase</code></td></tr>
+        <tr><td><code>pool_thunder_reserve_address</code>, <code>thunder_sidechain_number</code>, <code>thunder_op_return_hex</code></td><td>warns "obsolete and ignored" and starts. The reserve address belongs to the dashboard and payout worker.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="config-examples">Minimal configs</h3>
+  <div class="grid-2">
+    <div class="card mode-card solo">
+      <h3 style="margin-top:.25rem"><code>solo</code></h3>
+      <pre style="margin-bottom:0"><code>pool_mode        = solo
+bitcoind_url     = http://127.0.0.1:8122
+operator_address = bc1q…
+fee_bps          = 100
+db_path          = ./data/shares.db</code></pre>
+    </div>
+    <div class="card mode-card pps">
+      <h3 style="margin-top:.25rem"><code>pps-classic</code></h3>
+      <pre style="margin-bottom:0"><code>pool_mode        = pps-classic
+bitcoind_url     = http://127.0.0.1:8122
+operator_address = bc1q…
+pool_btc_address = bc1q…   # same as operator_address keeps the fee margin
+fee_bps          = 100
+pps_min_network_difficulty = 5600000  # 40 TH/s</code></pre>
+    </div>
+    <div class="card mode-card pplns">
+      <h3 style="margin-top:.25rem"><code>pplns-btc</code></h3>
+      <pre style="margin-bottom:0"><code>pool_mode        = pplns-btc
+bitcoind_url     = http://127.0.0.1:8122
+operator_address = bc1q…
+pool_btc_address = bc1q…   # from the enforcer wallet
+fee_bps          = 50
+pplns_window_diff_multiple = 2.0</code></pre>
+    </div>
+    <div class="card mode-card pplns">
+      <h3 style="margin-top:.25rem"><code>pplns-coinbase</code></h3>
+      <pre style="margin-bottom:0"><code>pool_mode        = pplns-coinbase
+bitcoind_url     = http://127.0.0.1:8122
+operator_address = bc1q…
+fee_bps          = 50
+coinbase_max_bytes      = 3000
+pplns_payout_floor_sats = 546
+listener = port=3335 min_diff=500000 max_coinbase_bytes=900 label=rental</code></pre>
+    </div>
+  </div>
+
+  <h3 id="config-payout">Payout worker — environment</h3>
+  <p>
+    <code>payout/index.js</code>. Runs for pps-classic and both custodial PPLNS
+    rails. A missing required variable exits with code 2. Numeric values are
+    parsed with <code>parseInt</code> and not otherwise checked.
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>PAYOUT_DB_PATH</code></td><td><strong>required</strong></td><td>Path to <code>shares.db</code> (opened read-write).</td></tr>
+        <tr><td><code>PAYOUT_RAIL</code></td><td><code>thunder</code></td><td><code>thunder</code> or <code>btc</code> (L1 through the enforcer wallet, for pplns-btc).</td></tr>
+        <tr><td><code>THUNDER_RPC_URL</code></td><td>required for thunder</td><td>Thunder JSON-RPC.</td></tr>
+        <tr><td><code>THUNDER_RPC_USER</code> / <code>THUNDER_RPC_PASS</code></td><td>—</td><td>Basic auth for Thunder.</td></tr>
+        <tr><td><code>THUNDER_FROM_ADDRESS</code></td><td>required for thunder</td><td>The reserve address paid from. Must equal the dashboard's <code>POOL_THUNDER_RESERVE_ADDRESS</code>.</td></tr>
+        <tr><td><code>ENFORCER_RPC_ADDR</code></td><td>required for btc</td><td>Enforcer ConnectRPC <code>host:port</code>; the enforcer must run with <code>--enable-wallet</code>.</td></tr>
+        <tr><td><code>ENFORCER_WALLET_PASSPHRASE</code></td><td>—</td><td>Unlocks an encrypted enforcer wallet.</td></tr>
+        <tr><td><code>PAYOUT_FEE_RATE_SAT_VB</code></td><td><code>5</code></td><td>L1 fee rate passed to the enforcer.</td></tr>
+        <tr><td><code>PAYOUT_INTERVAL_MS</code></td><td><code>86400000</code></td><td>Batch cadence (24 h).</td></tr>
+        <tr><td><code>PAYOUT_SETTLE_INTERVAL_MS</code></td><td><code>30000</code></td><td>Re-check cadence while a broadcast batch is unconfirmed.</td></tr>
+        <tr><td><code>PAYOUT_RETRY_INTERVAL_MS</code></td><td><code>300000</code></td><td>Wait after a failed, reserve-short or mempool-blocked tick.</td></tr>
+        <tr><td><code>PAYOUT_MIN_SATS</code></td><td><code>10000</code></td><td>Smallest owed balance paid.</td></tr>
+        <tr><td><code>PAYOUT_MAX_PER_TICK</code></td><td><code>50</code></td><td>Most workers paid in one batch.</td></tr>
+        <tr><td><code>PAYOUT_DRY_RUN</code></td><td>off</td><td><code>1</code>: log only — no RPC writes, no DB writes.</td></tr>
+        <tr><td><code>PAYOUT_NUDGE_MINE</code></td><td>on</td><td><code>0</code>: never call Thunder <code>mine</code>.</td></tr>
+        <tr><td><code>PAYOUT_NUDGE_INTERVAL_MS</code></td><td><code>120000</code></td><td>Minimum gap between stall nudges.</td></tr>
+        <tr><td><code>PAYOUT_NUDGE_STALL_SEC</code></td><td><code>300</code></td><td>How long a batch sits before it is nudged again.</td></tr>
+        <tr><td><code>PAYOUT_ADMIN_BIND</code> / <code>PAYOUT_ADMIN_PORT</code></td><td><code>127.0.0.1</code> / <code>9080</code></td><td>The unauthenticated <code>/tick</code> endpoint. Port 0 disables it. Keep it on loopback.</td></tr>
+        <tr><td><code>PAYOUT_DEBUG</code></td><td>off</td><td><code>1</code>: debug logging.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="config-dashboard">Dashboard — environment</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>PORT</code></td><td><code>8081</code></td><td>HTTP port.</td></tr>
+        <tr><td><code>DASHBOARD_BIND</code></td><td><code>127.0.0.1</code></td><td>Listen address. Loopback is for nginx in front; <code>0.0.0.0</code> serves it directly (the installer sets that with <code>--no-nginx</code>, and the Docker image inside its container). <code>/admin</code> is Basic auth, so never directly without TLS.</td></tr>
+        <tr><td><code>PROXY_DB_PATH</code></td><td><code>../data/shares.db</code></td><td>The ledger, relative to <code>dashboard/</code>.</td></tr>
+        <tr><td><code>PUBLIC_STRATUM_URL</code></td><td><code>stratum+tcp://&lt;host&gt;:3334</code></td><td>Shown on the connect card and in <code>/api/status</code>.</td></tr>
+        <tr><td><code>HEALTH_INTERVAL_MS</code></td><td><code>300000</code></td><td>Health-monitor period.</td></tr>
+        <tr><td><code>ADMIN_CREDENTIALS_FILE</code></td><td>—</td><td>A <code>user:pass</code> file; wins over the two below. Unreadable or malformed is fatal at boot.</td></tr>
+        <tr><td><code>ADMIN_USER</code> / <code>ADMIN_PASSWORD</code></td><td>—</td><td>If either is empty, <code>/admin</code> answers 503. A <code>:</code> in either is fatal.</td></tr>
+        <tr><td><code>POOL_THUNDER_RESERVE_ADDRESS</code></td><td>—</td><td>Reserve address shown and deposited to from admin.</td></tr>
+        <tr><td><code>THUNDER_RPC_URL</code></td><td><code>http://127.0.0.1:6009</code></td><td>Thunder RPC (balance, mine, remove_from_mempool).</td></tr>
+        <tr><td><code>ENFORCER_GRPC_ADDR</code></td><td><code>127.0.0.1:50051</code></td><td>Enforcer ConnectRPC (wallet balance, deposits, Ctip).</td></tr>
+        <tr><td><code>THUNDER_SIDECHAIN_ID</code></td><td><code>9</code></td><td>Sidechain slot deposits go to.</td></tr>
+        <tr><td><code>PAYOUT_ADMIN_URL</code></td><td>—</td><td>Payout worker base URL; empty hides "trigger payout".</td></tr>
+        <tr><td><code>VERSIONS_TTL_MS</code> / <code>VERSIONS_EXEC_TIMEOUT_MS</code></td><td><code>300000</code> / <code>5000</code></td><td><code>/api/versions</code> cache and probe timeout.</td></tr>
+        <tr><td><code>VERSIONS_USE_CHECKOUT</code></td><td>on</td><td><code>0</code>: don't read git checkouts for versions.</td></tr>
+        <tr><td><code>{SIMPLEPOOL,ENFORCER,THUNDER,BITCOIN}_REPO_DIR</code>, <code>SIMPLEPOOL_BIN</code>, <code>ENFORCER_BIN</code>, <code>THUNDER_BIN</code>, <code>BITCOIND_BIN</code>, <code>*_BUILD_MANIFEST</code></td><td>sibling checkouts</td><td>Where <code>/api/versions</code> looks for each component.</td></tr>
+        <tr><td><code>POOL_PPS_SATS_PER_DIFF</code></td><td>—</td><td>Ignored; only warns. The rate comes from <code>pool_meta</code>.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="config-slipstream">Slipstream — environment</h3>
+  <p>
+    Numeric values must be finite and at least their minimum, or the service
+    refuses to start. An empty value counts as unset.
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>BITCOIND_RPC_URL</code></td><td><strong>required</strong></td><td>The pool's bitcoind: <code>testmempoolaccept</code>, <code>sendrawtransaction</code>, tracking. Needs <code>txindex</code>.</td></tr>
+        <tr><td><code>BITCOIND_RPC_USER</code> / <code>BITCOIND_RPC_PASS</code></td><td>—</td><td>Basic auth.</td></tr>
+        <tr><td><code>BITCOIND_RPC_COOKIE_FILE</code></td><td>—</td><td>Wins over user/pass; re-read on every call.</td></tr>
+        <tr><td><code>ENFORCER_GBT_URL</code></td><td><strong>required</strong></td><td>The enforcer's GBT server (<code>:8122</code>) — the template being mined.</td></tr>
+        <tr><td><code>SLIPSTREAM_DB_PATH</code></td><td><code>../data/slipstream.db</code></td><td>Its own database (created if missing).</td></tr>
+        <tr><td><code>PROXY_DB_PATH</code></td><td><code>../data/shares.db</code></td><td>The ledger, opened read-only.</td></tr>
+        <tr><td><code>SLIPSTREAM_BIND</code> / <code>SLIPSTREAM_PORT</code></td><td><code>127.0.0.1</code> / <code>8124</code></td><td>HTTP listener.</td></tr>
+        <tr><td><code>SLIPSTREAM_TRUST_PROXY</code></td><td>off</td><td><code>1</code>: rate-limit on the last <code>X-Forwarded-For</code> hop. Only behind a proxy that overwrites it.</td></tr>
+        <tr><td><code>SLIPSTREAM_MIN_FEE_RATE</code></td><td><code>1</code></td><td>Minimum submission rate, sat/vB (≥ 0).</td></tr>
+        <tr><td><code>SLIPSTREAM_CONFIRMATIONS</code></td><td><code>6</code></td><td>Depth at which a tx becomes <code>confirmed</code> (≥ 1).</td></tr>
+        <tr><td><code>SLIPSTREAM_POLL_MS</code></td><td><code>5000</code></td><td>Follow-loop period (≥ 100).</td></tr>
+        <tr><td><code>SLIPSTREAM_RATE_LIMIT_PER_MIN</code></td><td><code>30</code></td><td>Submissions per client per minute (≥ 1).</td></tr>
+        <tr><td><code>POOL_NAME</code>, <code>POOL_OPERATOR</code>, <code>POOL_LOGO</code>, <code>POOL_CONTACT</code>, <code>POOL_CHAIN</code>, <code>POOL_PAYOUT_TEXT</code>, <code>PUBLIC_STRATUM_URL</code>, <code>PUBLIC_DASHBOARD_URL</code>, <code>PUBLIC_SLIPSTREAM_URL</code></td><td>—</td><td>Presentation fields for <code>info.json</code> only.</td></tr>
+        <tr><td><code>SLIPSTREAM_DEBUG</code></td><td>off</td><td><code>1</code>: debug logging.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ========================================================= 17. stratum == -->
+<section id="stratum">
+  <h2>Stratum protocol reference</h2>
+  <p class="section-sub">
+    Stratum v1 as simplepool speaks it: newline-delimited JSON-RPC over plain
+    TCP, one thread per connection. What a firmware author or a marketplace
+    integrator needs to know, taken from <code>src/stratum.c</code>.
+  </p>
+
+  <h3>Framing</h3>
+  <ul>
+    <li>One JSON object per line. Replies are
+        <code>{"id":…,"result":…,"error":…}</code> with no
+        <code>jsonrpc</code> field; notifications carry <code>"id":null</code>.
+        An error is <code>[code, "message", null]</code>.</li>
+    <li>A line may be at most 16&nbsp;KB. Longer, or a full buffer with no newline,
+        closes the connection with the reason logged.</li>
+    <li>Blank lines are ignored — the only keepalive a miner has. A JSON
+        <em>response</em> object (no <code>method</code>) is swallowed silently.</li>
+    <li>Malformed JSON or a missing method is answered with error 20 and the
+        connection stays open; eight such lines in a row close it.</li>
+  </ul>
+
+  <h3>Methods the pool accepts</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Method</th><th>Params</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td><code>mining.configure</code></td>
+            <td><code>[["version-rolling"], {"version-rolling.mask":"…"}]</code></td>
+            <td><code>{"version-rolling":true,"version-rolling.mask":"%08x"}</code> — your mask ANDed with <code>0x1fffe000</code> (BIP320). Other extensions are ignored; without version-rolling the result is <code>{}</code>.</td></tr>
+        <tr><td><code>mining.subscribe</code></td>
+            <td>ignored (no session resume)</td>
+            <td><code>[[["mining.set_difficulty","sd"],["mining.notify","sn"]], "&lt;extranonce1, 8 hex&gt;", 8]</code></td></tr>
+        <tr><td><code>mining.authorize</code></td>
+            <td><code>[username, password]</code></td>
+            <td><code>true</code>, then <code>mining.set_difficulty</code>, then <code>mining.notify</code> with <code>clean_jobs = true</code>. Subscribe before authorizing — see below.</td></tr>
+        <tr><td><code>mining.suggest_difficulty</code></td>
+            <td><code>[number &gt; 0]</code></td>
+            <td><code>true</code>. Applied as a floor, like <code>d=</code>; re-announced if already authorized.</td></tr>
+        <tr><td><code>mining.submit</code></td>
+            <td><code>[worker, job_id, extranonce2, ntime, nonce, (version)]</code></td>
+            <td><code>true</code>, or an error below. The worker field is ignored — the connection's authorized identity is used.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Anything else — <code>mining.extranonce.subscribe</code>,
+    <code>mining.get_transactions</code>, <code>mining.multi_version</code>,
+    <code>client.*</code> — is answered with error 20 <em>unknown method</em>,
+    and the connection stays up.
+  </p>
+
+  <h3>What the pool sends</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Notification</th><th>Params</th></tr></thead>
+      <tbody>
+        <tr><td><code>mining.set_difficulty</code></td><td><code>[difficulty]</code> — takes effect on the <em>next</em> notify.</td></tr>
+        <tr><td><code>mining.notify</code></td>
+            <td><code>[job_id, prevhash, coinb1, coinb2, [merkle_branch…], version, nbits, ntime, clean_jobs]</code>.
+                <code>job_id</code> is the build time in ms, lowercase hex. <code>prevhash</code> is word-swapped
+                (each 4-byte word byte-reversed). <code>version</code>/<code>nbits</code>/<code>ntime</code> are
+                <code>%08x</code>. <code>coinb1</code>/<code>coinb2</code> are rendered <em>per connection</em>.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    <code>clean_jobs</code> is <code>true</code> on a new tip (height or previous
+    hash changed) and on the first job after startup; <code>false</code> on the
+    periodic refresh, which rebuilds the job every 30 s so new transactions are
+    picked up. The pool never sends <code>client.reconnect</code>,
+    <code>mining.set_extranonce</code> or <code>mining.set_version_mask</code>.
+  </p>
+
+  <h3>Usernames and passwords</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Rail</th><th>Modes</th><th>Accepted address</th></tr></thead>
+      <tbody>
+        <tr><td>Bitcoin</td><td>solo, pplns-btc, pplns-coinbase</td>
+            <td>bech32 <code>bc1</code>/<code>tb1</code>/<code>bcrt1</code> v0 (P2WPKH, P2WSH), bech32m v1 (P2TR);
+                base58 P2PKH (0x00 / 0x6f) and P2SH (0x05 / 0xc4). Witness v2–v16 is refused — anyone-can-spend today.</td></tr>
+        <tr><td>Thunder</td><td>pps-classic, pplns-thunder</td>
+            <td>bare base58 of a 20-byte hash. The <code>s&lt;n&gt;_&lt;b58&gt;_&lt;hex6&gt;</code> deposit wrapper is refused.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    The username is <code>&lt;address&gt;[.&lt;rig_label&gt;]</code>, split at the
+    first dot; the address part is 1–127 characters. The stored worker name is the
+    full username with anything outside <code>[A-Za-z0-9._-]</code> replaced by
+    <code>_</code>, up to 128 characters.
+  </p>
+  <p>
+    The password carries no secret. The one thing read from it is
+    <code>d=&lt;n&gt;</code> — at the start or after <code>,</code>,
+    <code>;</code> or a space — which asks for a <strong>difficulty floor</strong>,
+    not a pinned value. It is clamped in this order: capped at
+    <code>max_suggested_diff</code>, then at the network difficulty, then the
+    port's promised <code>min_diff</code> wins over that cap, then the port's
+    <code>max_diff</code>. At authorize, a password <code>d=</code> overrides an
+    earlier <code>mining.suggest_difficulty</code>.
+  </p>
+
+  <h3>Authorize limits</h3>
+  <ul>
+    <li>At most 60 <code>mining.authorize</code> calls per 10 s per connection; past that each counts as a failure.</li>
+    <li>After <code>auth_max_failures</code> failures the error is sent and the connection closed.</li>
+    <li>A peer IP that has failed <code>auth_max_failures</code> times within <code>auth_fail_lockout_sec</code> is refused before its request is parsed. A success clears it. IPv4-mapped IPv6 addresses count as their IPv4 form.</li>
+  </ul>
+
+  <h3>The work split</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Field</th><th>Size</th><th>Rule</th></tr></thead>
+      <tbody>
+        <tr><td>extranonce1</td><td>4 B</td><td>Next value of a clock-seeded server counter per subscribe. Unique until 2<sup>32</sup> subscribes.</td></tr>
+        <tr><td>extranonce2</td><td>8 B</td><td>Exactly 8 bytes or <em>wrong extranonce2 size</em>. Enough for a marketplace router to slice per machine (it needs ≥ 7).</td></tr>
+        <tr><td>version</td><td>mask <code>0x1fffe000</code></td><td>Submitted version is <code>(job &amp; ~mask) | (rolled &amp; mask)</code> using the negotiated mask, or the default if none.</td></tr>
+        <tr><td>ntime</td><td>−600 s … +7200 s</td><td>Measured from the job's own ntime.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note">
+    <span class="label">Subscribe first</span>
+    <p>
+      A connection that authorizes without ever subscribing gets its first job
+      but keeps extranonce1 <code>00000000</code> — shared by every such
+      connection, so they mine identical work — and it is left out of later job
+      broadcasts. The server-wide hash dedupe stops that turning into
+      double credit; the wasted hashrate is the client's.
+    </p>
+  </div>
+
+  <h3>How a submit is checked</h3>
+  <ol>
+    <li>authorized? → 24 <em>unauthorized</em></li>
+    <li>under <code>max_submits_per_sec</code>? → 20 <em>submitting too fast</em></li>
+    <li>at least five params? → 20 <em>bad params</em></li>
+    <li>pps-classic gate open? → 24 (the "not crediting right now" message)</li>
+    <li>job known and retained? → 21 <em>stale or unknown job</em></li>
+    <li>version hex valid</li>
+    <li>not seen on this connection? → 22 <em>duplicate share</em></li>
+    <li>ntime and nonce hex, ntime in window → 20 <em>ntime out of range</em></li>
+    <li>extranonce2 hex, exactly 8 bytes → 20 <em>wrong extranonce2 size</em></li>
+    <li>render the coinbase → 25 on failure</li>
+    <li>hash the header; not seen server-wide? → 22 <em>duplicate share</em></li>
+    <li>hash ≤ network target → submit the block, whatever the share target says</li>
+    <li>hash ≤ share target → accept; else 23 <em>low difficulty</em></li>
+  </ol>
+  <p>
+    Step 7 records the share key before the later checks run, so resubmitting a
+    share that failed validation answers <em>duplicate share</em>. The
+    per-connection ring keys on <code>job_id|extranonce2|ntime|nonce|version</code>
+    (1024 entries); the server-wide ring keys on the header hash itself (16384
+    entries), so it holds across connections and reconnects.
+  </p>
+  <p>
+    A share is judged at the difficulty <em>its job</em> was notified under (34
+    remembered per connection). One that misses that but meets the connection's
+    current, lower difficulty is credited at the current one. Jobs are kept for
+    the current plus 16 retired, up to 5 minutes, pruned when a new job is pushed.
+  </p>
+
+  <h3>Error codes</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Code</th><th>Messages</th></tr></thead>
+      <tbody>
+        <tr><td><code>20</code></td><td>bad params · unknown method · malformed JSON · missing method · bad version hex · bad ntime/nonce hex · ntime out of range · bad extranonce2 hex · wrong extranonce2 size · submitting too fast</td></tr>
+        <tr><td><code>21</code></td><td>stale or unknown job</td></tr>
+        <tr><td><code>22</code></td><td>duplicate share</td></tr>
+        <tr><td><code>23</code></td><td>low difficulty</td></tr>
+        <tr><td><code>24</code></td><td>unauthorized · missing worker name · bad username / invalid address · too many authorize calls · too many failed authorizations from this address · PPS accrual suspended</td></tr>
+        <tr><td><code>25</code></td><td>coinbase render failed</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Rejected submits and failed authorizes are written to <code>rejects</code>
+    with their reason. Malformed hex and bad params are not; a flood past the
+    submit ceiling is summarised at most once every 10 s.
+  </p>
+
+  <h3>Vardiff, precisely</h3>
+  <ul>
+    <li>Runs only when a share is accepted — a silent connection is never retargeted. The window is armed at authorize.</li>
+    <li>After <code>vardiff_window_sec</code>: if fewer than <code>vardiff_min_samples</code> shares arrived, the window stretches up to <code>vardiff_max_window_mult</code>× before acting.</li>
+    <li><code>ratio = observed_spm / target_spm</code>. Inside <code>[0.5, 2.0]</code> nothing changes; outside, <code>new = old × ratio</code>, capped at 4× per step — or <code>vardiff_idle_step</code> for an under-sampled window.</li>
+    <li>Miner-floor detection: with ≥ 5 shares whose <em>lowest</em> achieved difficulty is over 4× what was assigned, the miner is enforcing its own floor; difficulty jumps to 95% of that minimum with no step cap.</li>
+    <li>Clamp order: requested floor → port <code>vardiff_min</code> → port <code>vardiff_max</code> → network difficulty → port <code>min_diff</code> (wins) → never below 1.</li>
+    <li>A change sends one <code>mining.set_difficulty</code> (no re-notify) and logs it.</li>
+  </ul>
+
+  <h3>Sockets</h3>
+  <p>
+    <code>TCP_NODELAY</code>; keepalive after 120 s idle, 3 probes 30 s apart
+    (Linux); a 10 s send timeout drops a peer that stops reading; listen
+    backlog 64.
+  </p>
+</section>
+
+<!-- ======================================================== 18. coinbase == -->
+<section id="coinbase">
+  <h2>Coinbase layout</h2>
+  <p class="section-sub">
+    Byte by byte, what the pool puts in the one transaction it writes.
+  </p>
+
+  <h3>Input</h3>
+  <div class="bytes">
+    <div class="f"><b>prevout</b><span>32 × 00 · ffffffff</span></div>
+    <div class="f"><b>BIP34 height</b><span>minimal push</span></div>
+    <div class="f"><b>tag</b><span><code>coinbase_tag</code>, ≤ 75 B</span></div>
+    <div class="f pool"><b>extranonce1</b><span>4 B</span></div>
+    <div class="f miner"><b>extranonce2</b><span>8 B</span></div>
+    <div class="f"><b>sequence</b><span>ffffffff</span></div>
+  </div>
+  <p>
+    <code>coinb1</code> ends just before extranonce1; <code>coinb2</code> starts
+    at the sequence. The whole scriptSig must be 2–100 bytes. When the template
+    supplies its own coinbase (<code>coinbasetxn</code>, as the enforcer does),
+    its scriptSig, version and locktime are kept and the tag and extranonces are
+    appended to it.
+  </p>
+
+  <h3>Outputs, by mode</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Mode</th><th>From the enforcer's <code>coinbasetxn</code></th><th>Built from scratch</th></tr></thead>
+      <tbody>
+        <tr><td><code>solo</code></td>
+            <td>template outputs in order; its single spendable output becomes <em>miner</em> + <em>[fee]</em>. Every OP_RETURN — BIP300/301 commitments, witness commitment — kept byte for byte.</td>
+            <td>miner · [fee] · [witness commitment]</td></tr>
+        <tr><td><code>pps-classic</code>, <code>pplns-thunder</code>, <code>pplns-btc</code></td>
+            <td>as solo, with <code>pool_btc_address</code> in the miner slot</td>
+            <td>pool · [fee] · [witness commitment]</td></tr>
+        <tr><td><code>pplns-coinbase</code></td>
+            <td>the reward output becomes one output per paid miner + [fee]; solo-shaped while the window is empty</td>
+            <td>payees… · [fee] · [witness commitment]</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    A template must have exactly one spendable (non-<code>OP_RETURN</code>)
+    output to be used. The fee is <code>floor(value × fee_bps / 10000)</code>;
+    below 546 sats, or with no operator address, it is 0 and the output is
+    omitted.
+  </p>
+
+  <h3>pplns-coinbase: who fits</h3>
+  <ol>
+    <li>Split: <code>sats_i = floor(payable × diff_i / Σdiff)</code>, remainder to the first. <code>value</code> is the template's actual spendable output.</li>
+    <li>Order: a quarter of the expected slots go first to the largest positive <code>owed_fraction</code>; then everyone else by difficulty, largest first.</li>
+    <li>Fit: walk that order; skip claims under the floor; charge each output its real size (31 B for P2WPKH, 43 B for P2TR); skip one that would exceed the budget and keep going, since a smaller script later may still fit.</li>
+    <li>Redistribute: what skipped miners were owed goes to the paid ones pro rata; the rounding remainder to the largest output. The operator gets its fee and nothing else.</li>
+    <li>Queue: each miner's <code>entitled − received</code> share of the block is staged against the block hash, applied at one confirmation, discarded if orphaned.</li>
+  </ol>
+  <p>
+    The byte budget is <code>max_coinbase_bytes</code> minus the fixed envelope
+    — version, input, scriptSig, locktime, the witness commitment, every
+    template <code>OP_RETURN</code>, and a reserved operator output. On a
+    drivechain those commitments are the largest fixed cost.
+  </p>
+
+  <h3>Submitting a block</h3>
+  <p>
+    Header, transaction count, coinbase, then the template's transactions. When
+    the template's coinbase was segwit-serialized, the coinbase is re-serialized
+    with the marker, flag and a 32-byte zero witness reserved value, matching the
+    commitment the backend computed. <code>submitblock</code> returning
+    <code>null</code> is accepted (row <code>pending</code>); a reason string is
+    recorded as <code>rejected</code> in <code>submit_error</code>.
+    From a plain bitcoind template the coinbase goes out in legacy form, and
+    Core's <code>submitblock</code> adds the witness reserved value itself
+    before validating; it is not part of the block hash.
+  </p>
+</section>
+
+<!-- ====================================================== 19. interfaces == -->
+<section id="interfaces">
+  <h2>Ports, APIs &amp; events</h2>
+  <p class="section-sub">
+    Everything that listens, and everything it says.
+  </p>
+
+  <h3>Ports</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Port</th><th>Process</th><th>Bind</th><th>Expose?</th></tr></thead>
+      <tbody>
+        <tr><td><code>3334</code> + listeners</td><td>simplepool (stratum)</td><td><code>listen_addr</code></td><td>yes — raw TCP, open in the firewall</td></tr>
+        <tr><td><code>8081</code></td><td>dashboard</td><td><code>DASHBOARD_BIND</code>, <code>127.0.0.1</code></td><td>through nginx</td></tr>
+        <tr><td><code>9080</code></td><td>payout admin</td><td><code>127.0.0.1</code></td><td><strong>never</strong> — unauthenticated</td></tr>
+        <tr><td><code>8124</code></td><td>slipstream</td><td><code>127.0.0.1</code></td><td>through nginx</td></tr>
+        <tr><td><code>8122</code></td><td>enforcer GBT (upstream)</td><td>—</td><td>no</td></tr>
+        <tr><td><code>50051</code></td><td>enforcer ConnectRPC (upstream)</td><td>—</td><td>no</td></tr>
+        <tr><td><code>6009</code></td><td>Thunder RPC (upstream)</td><td>—</td><td>no</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Dashboard HTTP</h3>
+  <p>
+    Every response carries <code>X-Content-Type-Options: nosniff</code>,
+    <code>X-Frame-Options: DENY</code> and <code>Referrer-Policy: same-origin</code>.
+    Rate limiting is nginx's job (30 r/s, burst 20, in the shipped config).
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Method · path</th><th>Returns</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /</code>, <code>/worker/:name</code>, <code>/blocks?before=</code>, <code>/templates?limit=</code>, <code>/slipstream</code></td><td>HTML pages</td></tr>
+        <tr><td><code>GET /worker-lookup?name=</code></td><td>302 to the worker page</td></tr>
+        <tr><td><code>GET /api/overview</code></td><td>pool totals</td></tr>
+        <tr><td><code>GET /api/node</code></td><td>backend tip, or <code>{}</code></td></tr>
+        <tr><td><code>GET /api/leaderboard</code>, <code>/api/leaderboard/by-address</code></td><td>per worker / per address</td></tr>
+        <tr><td><code>GET /api/worker/:name</code></td><td>one worker; 404 <code>{"error":"unknown worker"}</code></td></tr>
+        <tr><td><code>GET /api/blocks?before=&amp;limit=</code></td><td><code>{rows, next_before}</code></td></tr>
+        <tr><td><code>GET /api/templates?limit=</code></td><td><code>{current, history, total}</code></td></tr>
+        <tr><td><code>GET /api/versions[?force=1]</code></td><td>build provenance of every component</td></tr>
+        <tr><td><code>GET /api/status[?force=1]</code></td><td><code>{generated_at, pool, node, health, versions}</code> — always 200</td></tr>
+        <tr><td><code>GET /health</code></td><td><code>{ok, checks, failing, unavailable, checked_at, took_ms}</code>; 503 while failing or before the first pass</td></tr>
+        <tr><td><code>GET /healthz</code></td><td><code>{ok:true, db_ready}</code> — liveness, always 200</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    The health monitor runs every <code>HEALTH_INTERVAL_MS</code> and checks:
+    events lost, duplicate shares, ledger arithmetic, margin, PPS difficulty,
+    listener difficulty, block value, orphan rate, ambiguous payouts, stalled
+    payouts and template commitments.
+  </p>
+  <h4>Admin (<code>/admin</code>, HTTP Basic, realm "simplepool admin")</h4>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Method · path</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /admin</code>, <code>/admin/workers</code>, <code>/admin/worker/:id</code>, <code>/admin/deposits</code>, <code>/admin/payouts</code>, <code>/admin/tools</code></td><td>HTML pages</td></tr>
+        <tr><td><code>GET /admin/api/summary</code>, <code>/admin/api/worker/:id</code></td><td>JSON: reserve, enforcer balance, totals, workers, in-flight, payouts, deposits, blocks, tx attempts</td></tr>
+        <tr><td><code>POST /admin/action/deposit</code></td><td>enforcer <code>CreateDepositTransaction</code> (<code>address</code>, <code>value_sats</code>, <code>fee_sats</code>, <code>sidechain_id</code>) and a <code>deposits</code> row</td></tr>
+        <tr><td><code>POST /admin/action/check-deposits</code></td><td>probe deposit status</td></tr>
+        <tr><td><code>POST /admin/action/trigger-payout</code></td><td><code>POST PAYOUT_ADMIN_URL/tick</code></td></tr>
+        <tr><td><code>POST /admin/action/nudge-mine</code></td><td>Thunder <code>mine</code></td></tr>
+        <tr><td><code>POST /admin/action/remove-from-mempool</code></td><td>Thunder <code>remove_from_mempool</code> (<code>txid</code>)</td></tr>
+        <tr><td><code>GET /admin/logout</code></td><td>401, clearing the browser's credentials</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Every <code>POST</code> needs a single-use CSRF token (1 h) and replies 302
+    back to the page with a flash message. Missing credentials make
+    <code>/admin</code> answer 503 rather than run open.
+  </p>
+
+  <h3>Payout worker HTTP</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Method · path</th><th>Returns</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /tick</code></td><td>runs one payout pass now: <code>{ok, result:{attempted, paid, failed, settled, txid?, waiting_on?, reserve_short?, mempool_blocked?, reason?}}</code>; 500 on error</td></tr>
+        <tr><td><code>GET /healthz</code></td><td><code>{ok:true}</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    No authentication — the loopback bind is the boundary. Its loop picks the
+    next wait from the last result: <em>settle</em> (30 s) while a batch is
+    broadcast and unconfirmed, <em>retry</em> (5 min) after a failure, a short
+    reserve or a blocked mempool, otherwise the <em>interval</em> (24 h).
+  </p>
+
+  <h3>Slipstream HTTP</h3>
+  <p>CORS <code>*</code> on every response; no auth; trailing slashes ignored.</p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Method · path</th><th>Returns</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /api/tx</code> (or <code>/tx</code>)</td>
+            <td>Body: raw hex as <code>text/plain</code>, or JSON <code>"hex"</code>, <code>{"hex":…}</code>, <code>{"tx":…}</code>; ≤ 2,000,000 hex chars.
+                200 <code>{accepted:true, …}</code> or <code>{accepted:false, reject_reason, fee_rate?, required_fee_rate?}</code>;
+                400 invalid body/hex/decode; 413 too large; 429 rate-limited; 502 node unavailable.</td></tr>
+        <tr><td><code>GET /api/tx/:txid</code></td><td><code>{tx, events}</code>; 400 bad txid; 404 unknown</td></tr>
+        <tr><td><code>GET /api/txs?status=&amp;limit=</code></td><td><code>{txs}</code>; status one of pending, in_template, mined, confirmed, dropped; limit 1–500 (50)</td></tr>
+        <tr><td><code>GET /api/fees</code></td><td><code>{min_submission_rate, mineable_rate, required_rate, template_height, template_weight, updated_at}</code></td></tr>
+        <tr><td><code>GET /info.json</code> (or <code>/api/info</code>)</td><td>pool listing: <code>name, operator, chain, mode, fee_bps, coinbase_tag, stratum_url, dashboard_url, status_url, slipstream_url, operator_address, pool_btc_address, payout, software, version, logo, contact</code>; cached 60 s</td></tr>
+        <tr><td><code>GET /healthz</code></td><td><code>{ok, template_age_s, enforcer_error}</code>; 503 without a template</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Redis channels</h3>
+  <p>
+    Only with <code>redis_url</code> set. Fire-and-forget: SQLite is the record,
+    and a dropped message is counted, not retried.
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Channel</th><th>JSON fields</th></tr></thead>
+      <tbody>
+        <tr><td><code>pool:shares</code></td><td><code>worker, payout_address, ts_ms, difficulty, is_block, share_hash</code></td></tr>
+        <tr><td><code>pool:rejects</code></td><td><code>worker, ts_ms, reason</code></td></tr>
+        <tr><td><code>pool:blocks</code></td><td><code>worker, finder_address, ts_ms, height, hash, reward_sats, fee_sats</code> — only blocks the node accepted</td></tr>
+        <tr><td><code>pool:tip</code></td><td><code>height, hash, observed_at_s</code></td></tr>
+        <tr><td><code>pool:credits</code></td><td><code>worker, ts_ms, delta_sats, accrued_total_sats</code> (the total is always 0 — read the ledger)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Upstream calls</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Caller</th><th>Calls</th></tr></thead>
+      <tbody>
+        <tr><td>simplepool</td><td><code>getblocktemplate</code> (<code>rules:["segwit"]</code>, <code>capabilities:["coinbasetxn","longpoll"]</code>), <code>submitblock</code>, <code>getblockhash</code>, <code>getblockchaininfo</code></td></tr>
+        <tr><td>payout (thunder)</td><td>Thunder <code>balance, create_transfer, sign_transaction, submit_transaction, get_transaction, get_wallet_addresses, get_wallet_utxos, get_block_template, mine</code></td></tr>
+        <tr><td>payout (btc)</td><td>enforcer <code>WalletService/{UnlockWallet, GetBalance, SendTransaction, ListTransactions, ListUnspentOutputs}</code></td></tr>
+        <tr><td>dashboard</td><td>Thunder <code>balance, mine, remove_from_mempool</code>; enforcer <code>WalletService/{GetBalance, CreateDepositTransaction, ListSidechainDepositTransactions}</code>, <code>ValidatorService/{GetChainTip, GetCtip}</code></td></tr>
+        <tr><td>slipstream</td><td>bitcoind <code>testmempoolaccept, sendrawtransaction, getmempoolentry, getrawtransaction, getblockheader</code>; enforcer <code>getblocktemplate</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ========================================================== 20. schema == -->
+<section id="schema">
+  <h2>Database schema</h2>
+  <p class="section-sub">
+    Every column of <code>shares.db</code>. The proxy applies
+    <code>schema.sql</code> at startup and adds newer columns with
+    <code>ALTER TABLE</code>, so an old database upgrades in place.
+  </p>
+
+  <h3>Connection settings</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Process</th><th>Mode</th><th>Pragmas</th></tr></thead>
+      <tbody>
+        <tr><td>simplepool</td><td>read-write, sole writer of the share ledger</td><td>WAL, <code>synchronous=NORMAL</code>, <code>foreign_keys=ON</code>, <code>busy_timeout=5000</code></td></tr>
+        <tr><td>payout</td><td>read-write: <code>payouts*</code>, <code>pps_credits.paid_sats</code>, <code>tx_attempts</code></td><td>WAL, NORMAL, 5000</td></tr>
+        <tr><td>dashboard</td><td>read-only; a separate handle writes <code>deposits</code> and <code>tx_attempts</code> for admin actions</td><td>WAL, 2000</td></tr>
+        <tr><td>slipstream</td><td>read-only on <code>shares.db</code>; owns <code>slipstream.db</code></td><td>WAL, NORMAL, 5000</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    The proxy's writes go through one 65,536-event ring and one writer thread,
+    committed as a <code>BEGIN IMMEDIATE</code> batch every
+    <code>commit_window_ms</code> or <code>commit_max_shares</code>. A batch that
+    fails three times is counted in <code>pool_meta.events_lost</code> — which
+    the dashboard health check watches. Timestamps are unix seconds.
+  </p>
+
+  <details>
+    <summary>All tables and columns</summary>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Table</th><th>Columns</th></tr></thead>
+        <tbody>
+          <tr><td><code>workers</code></td><td><code>id</code> PK · <code>name</code> UNIQUE · <code>first_seen</code> · <code>last_seen</code> · <code>payout_address</code> (set once, never changed)</td></tr>
+          <tr><td><code>shares</code></td><td><code>id</code> PK · <code>worker_id</code> → workers · <code>ts</code> · <code>difficulty</code> REAL · <code>is_block</code> · <code>block_hash</code> (the share's own hash, on every row) · <code>credited_sats</code> · <code>rate_used</code> REAL</td></tr>
+          <tr><td><code>rejects</code></td><td><code>id</code> · <code>worker_name</code> · <code>ts</code> · <code>reason</code></td></tr>
+          <tr><td><code>blocks_found</code></td><td><code>id</code> · <code>ts</code> · <code>height</code> · <code>hash</code> (UNIQUE, index added at startup) · <code>finder_id</code> · <code>finder_address</code> · <code>reward_sats</code> · <code>fee_sats</code> · <code>status</code> (pending · confirmed · orphaned · rejected) · <code>confirmations</code> · <code>pplns_window_diff</code> · <code>pplns_distributed</code> · <code>submit_error</code> · <code>checked_via</code> (node · tips)</td></tr>
+          <tr><td><code>node_status</code></td><td>single row: <code>tip_height</code> · <code>tip_hash</code> · <code>tip_observed_at</code> · <code>updated_at</code></td></tr>
+          <tr><td><code>pool_meta</code></td><td>single row: <code>network</code> · <code>network_source</code> (node · inferred) · <code>pool_mode</code> · <code>coinbase_tag</code> · <code>operator_address</code> · <code>pool_btc_address</code> · <code>fee_bps</code> · <code>pplns_payout_floor_sats</code> · <code>listeners</code> (JSON <code>[{port,label,min_diff,initial_diff}]</code>) · <code>rate_source</code> (derived · override) · <code>rate_sats_per_diff</code> · <code>gross_sats_per_diff</code> · <code>effective_fee_bps</code> · <code>network_difficulty</code> · <code>block_value_sats</code> · <code>credited_from</code> · <code>events_lost</code> · <code>updated_at</code></td></tr>
+          <tr><td><code>rate_history</code></td><td><code>ts</code> · <code>rate_sats_per_diff</code> · <code>gross_sats_per_diff</code> · <code>fee_bps</code> · <code>network_difficulty</code> · <code>block_value_sats</code> · <code>rate_source</code> — appended when any of them changes, pps-classic only</td></tr>
+          <tr><td><code>templates</code></td><td><code>ts</code> · <code>height</code> · <code>prev_hash</code> · <code>bits</code> · <code>network_difficulty</code> · <code>coinbase_value_sats</code> · <code>tx_count</code> · <code>tx_fees_sats</code> · <code>source</code> (enforcer · bitcoind) · <code>cb_spendable</code> · <code>cb_op_returns</code> · <code>longpoll</code> · <code>rate_sats_per_diff</code> · <code>last_seen</code> · <code>polls</code>. Repeat polls fold into one row on (height, prev_hash, bits, source, cb_spendable, cb_op_returns, longpoll).</td></tr>
+          <tr><td><code>pps_credits</code></td><td><code>worker_id</code> PK · <code>accrued_sats</code> (proxy) · <code>paid_sats</code> (payout) · <code>last_updated</code></td></tr>
+          <tr><td><code>deposits</code></td><td><code>ts</code> · <code>btc_txid</code> · <code>sats_deposited</code> · <code>fee_sats</code> · <code>thunder_recipient</code> · <code>ctip_seq_before</code> · <code>ctip_seq_after</code> · <code>notes</code></td></tr>
+          <tr><td><code>payouts</code></td><td><code>worker_id</code> · <code>sats</code> · <code>fee_sats</code> · <code>txid</code> · <code>paid_at</code> · <code>note</code></td></tr>
+          <tr><td><code>payouts_in_flight</code></td><td><code>worker_id</code> · <code>sats</code> · <code>txid</code> ('' until broadcast) · <code>started_at</code></td></tr>
+          <tr><td><code>tx_attempts</code></td><td><code>ts</code> · <code>kind</code> (deposit · payout) · <code>status</code> (broadcast · failed) · <code>stage</code> · <code>txid</code> · <code>raw_tx</code> · <code>amount_sats</code> · <code>fee_sats</code> · <code>destination</code> · <code>worker_id</code> · <code>error</code> · <code>detail</code> (JSON)</td></tr>
+          <tr><td><code>pplns_fractions</code></td><td><code>worker_id</code> PK · <code>owed_fraction</code> REAL · <code>updated_at</code></td></tr>
+          <tr><td><code>pplns_pending_fractions</code></td><td>(<code>block_hash</code>, <code>worker_id</code>) PK · <code>delta</code> REAL</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+
+  <h3>How a block's status moves</h3>
+  <p>
+    The confirmation pass runs on every tip change, up to 16 rows at a time.
+    With <code>getblockhash</code> available it asks the node directly
+    (<code>checked_via = node</code>); against a backend that serves only
+    templates it compares each row's hash with the <code>prev_hash</code> of
+    the newest template one height above (<code>checked_via = tips</code>).
+  </p>
+  <pre><code>pending   → confirmed | orphaned
+confirmed → orphaned            (reorg)
+orphaned  → confirmed           (tips path only)
+rejected                        (terminal: submitblock refused it)</code></pre>
+  <p>
+    pplns-thunder and pplns-btc distribute a block once it is confirmed at
+    ≥ 100 confirmations, in one transaction that also sets
+    <code>pplns_distributed = 1</code>. The window is shares up to the one
+    that found the block, newest first, until the running difficulty reaches
+    <code>pplns_window_diff</code> (the crossing share counts whole);
+    <code>payable = gross − floor(gross × fee_bps / 10⁴)</code> — with the
+    coinbase's dust rule, so a fee under 546 sats that was never paid out is not
+    deducted either — split by difficulty and truncated.
+  </p>
+</section>
+
+<!-- ========================================================== 21. limits == -->
+<section id="constants">
+  <h2>Constants &amp; hard limits</h2>
+  <p class="section-sub">Compiled in; not configurable.</p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>What</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td>Extra stratum ports</td><td>7 (8 slots including <code>listen_port</code>)</td></tr>
+        <tr><td>Stratum line length</td><td>16 KB</td></tr>
+        <tr><td>Consecutive unusable lines before close</td><td>8</td></tr>
+        <tr><td>Retained jobs · job lifetime</td><td>current + 16 · 5 min</td></tr>
+        <tr><td>Per-connection job-difficulty memory</td><td>34 jobs</td></tr>
+        <tr><td>Duplicate rings</td><td>1024 per connection · 16384 server-wide</td></tr>
+        <tr><td>Authorize call budget</td><td>60 per 10 s per connection; 1024-slot per-IP table</td></tr>
+        <tr><td>Periodic job refresh</td><td>30 s</td></tr>
+        <tr><td>Template backend timeouts</td><td>10 s per RPC, 90 s long-poll; retry 1 s → 32 s</td></tr>
+        <tr><td>RPC response cap</td><td>32 MiB</td></tr>
+        <tr><td>Hashrate window (issuance ceiling)</td><td>60 s</td></tr>
+        <tr><td>Dust limit</td><td>546 sats</td></tr>
+        <tr><td>Coinbase budget</td><td>default 1000 B, minimum 200 B; ≤ 200 payout outputs</td></tr>
+        <tr><td>pplns-coinbase reserved slots</td><td>¼ of the expected slots</td></tr>
+        <tr><td>Maturity for pplns-thunder / pplns-btc</td><td>100 confirmations</td></tr>
+        <tr><td>Blocks checked per confirmation pass</td><td>16</td></tr>
+        <tr><td>Store ring · commit retries</td><td>65,536 events · 3</td></tr>
+        <tr><td>Redis queue · payload</td><td>4096 messages · 1024 B</td></tr>
+        <tr><td>PPS override drift warning</td><td>25 bps</td></tr>
+        <tr><td>Withholding audit threshold</td><td>expected ≥ 5 blocks and z ≥ 3</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- =========================================================== 22. build == -->
+<section id="build">
+  <h2>Build, release &amp; tests</h2>
+
+  <h3>Requirements</h3>
+  <ul>
+    <li><strong>simplepool:</strong> a C11 compiler, <code>libsqlite3</code>, <code>libcurl</code>, <code>libhiredis</code>, pthreads. cJSON is vendored.</li>
+    <li><strong>Node services:</strong> Node.js ≥ 20. The dashboard needs <code>express</code>, <code>ejs</code> and <code>better-sqlite3</code>; payout and slipstream only <code>better-sqlite3</code>.</li>
+    <li><strong>Upstream:</strong> a template backend — on a drivechain, the <code>bip300301_enforcer</code> (GBT on :8122) in front of a drivechain-patched bitcoind; Thunder for the Thunder rails.</li>
+    <li><strong>Platforms:</strong> release binaries for Linux amd64 and arm64, built on Ubuntu 22.04 (glibc 2.35), so they run on 22.04, 24.04 and Debian 12. macOS builds for development.</li>
+  </ul>
+
+  <h3>Make targets</h3>
+  <pre><code>make              # build/simplepool
+make test         # all 11 C unit suites
+make asan         # the core suites under ASan + UBSan
+make coverage     # llvm-cov over the unit suites
+make format       # clang-format
+make install      # PREFIX=/usr/local</code></pre>
+  <p>
+    Flags: <code>-std=c11 -O2 -Wall -Wextra -Werror -Wpedantic -Wshadow
+    -fstack-protector-strong -D_FORTIFY_SOURCE=2</code>, and never
+    <code>-ffast-math</code> — the audit's exact-equality check depends on
+    IEEE-754 arithmetic. The commit, branch and dirty flag are compiled in.
+  </p>
+
+  <h3>Releases</h3>
+  <p>
+    A tag must equal the Makefile <code>VERSION</code> (currently 0.4.0). CI
+    builds <code>simplepool-&lt;version&gt;-linux-&lt;arch&gt;.tar.gz</code> — the
+    source tree, the binary, its <code>.build.json</code> manifest and a
+    <code>RELEASE</code> file — smoke-tests it, publishes
+    <code>SHA256SUMS</code>, and takes the notes from <code>CHANGELOG.md</code>.
+    Four Docker images go to <code>ghcr.io/layertwo-labs/</code>:
+    <code>simplepool</code>, <code>simplepool-dashboard</code>,
+    <code>simplepool-payout</code>, <code>simplepool-slipstream</code>.
+  </p>
+
+  <h3>Tests</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Suite</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr><td><code>test_share</code></td><td>targets, difficulty, PPS rate formulas, merkle, header</td></tr>
+        <tr><td><code>test_stratum</code></td><td>subscribe / authorize / submit, vardiff, window render</td></tr>
+        <tr><td><code>test_store</code>, <code>test_store_walk</code></td><td>SQLite store, migrations, reconcile SQL, PPLNS distribution and window walk (with fault injection)</td></tr>
+        <tr><td><code>test_coinbase</code></td><td>builders, address decoding, template replacement, witness</td></tr>
+        <tr><td><code>test_bitcoind</code></td><td>JSON-RPC client against a stub server</td></tr>
+        <tr><td><code>test_config</code>, <code>test_reconcile</code>, <code>test_pplns</code>, <code>test_broadcast</code>, <code>test_thunder</code></td><td>config parsing; confirmation pass; split and ordering; Redis without Redis; Thunder addresses</td></tr>
+        <tr><td><code>tests/test_*_regtest.sh</code></td><td>end to end on regtest, per mode — solo, pps-classic, pplns, pplns-coinbase, slipstream, Thunder payout, L1 payout</td></tr>
+        <tr><td><code>npm test</code> in each service</td><td><code>node --test</code> suites for the dashboard, payout and slipstream</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    CI also runs <code>python3 docs/sequence-diagrams.py --check</code>: the
+    diagrams on this page are generated, and the build fails if they drift.
+  </p>
+
+  <h3>Source layout</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Path</th><th>Responsibility</th></tr></thead>
+      <tbody>
+        <tr><td><code>src/main.c</code></td><td>startup, tip watcher, job building, PPS rate, share and block callbacks</td></tr>
+        <tr><td><code>src/stratum.c</code></td><td>the stratum server: sessions, extranonce, vardiff, per-mode coinbase render, submit validation, block assembly</td></tr>
+        <tr><td><code>src/store.c</code></td><td>SQLite writer thread, schema and migrations, block status, PPLNS distribution and window, fraction ledger</td></tr>
+        <tr><td><code>src/coinbase.c</code></td><td>address → script, BIP34, coinbase builders, byte budget</td></tr>
+        <tr><td><code>src/bitcoind.c</code></td><td>libcurl JSON-RPC: GBT with long-poll, submitblock, getblockhash</td></tr>
+        <tr><td><code>src/config.c</code></td><td><code>proxy.conf</code> parsing and validation</td></tr>
+        <tr><td><code>src/pplns.c</code>, <code>src/reconcile.c</code></td><td>window split and ordering; confirmation pass</td></tr>
+        <tr><td><code>src/share.c</code>, <code>src/sha256.c</code></td><td>share math and PPS formulas; SHA-256</td></tr>
+        <tr><td><code>src/broadcast.c</code>, <code>src/thunder.c</code>, <code>src/log.c</code>, <code>src/version.c</code></td><td>Redis, Thunder addresses, logging, build provenance</td></tr>
+        <tr><td><code>dashboard/</code>, <code>payout/</code>, <code>slipstream/</code></td><td>the three Node services</td></tr>
+        <tr><td><code>deploy/</code></td><td>systemd units, nginx vhosts, docker-compose</td></tr>
+        <tr><td><code>scripts/</code></td><td><code>install.sh</code>, <code>simplepoolctl</code>, release and regtest tooling</td></tr>
+        <tr><td><code>schema.sql</code>, <code>proxy.conf.example</code></td><td>the ledger schema; the annotated config</td></tr>
+      </tbody>
+    </table>
+  </div>
 </section>
 
 <!-- ========================================================== 17. operate == -->
@@ -2520,7 +3435,7 @@ sudo simplepoolctl uninstall    # --purge also deletes the ledger</code></pre>
       <thead><tr><th>Unit</th><th>Mode</th><th>Job</th></tr></thead>
       <tbody>
         <tr><td><code>simplepool.service</code></td><td>all</td><td>the stratum proxy — the only thing that is strictly required</td></tr>
-        <tr><td><code>simplepool-dashboard.service</code></td><td>all</td><td>read-only public stats on :8081, plus <code>/admin</code> behind basic auth</td></tr>
+        <tr><td><code>simplepool-dashboard.service</code></td><td>all</td><td>read-only public stats on 127.0.0.1:8081 (published by nginx), plus <code>/admin</code> behind basic auth</td></tr>
         <tr><td><code>simplepool-payout.service</code></td><td>pps-classic, pplns-thunder, pplns-btc</td><td>the daily payout batch, over Thunder or on L1 through the enforcer's wallet</td></tr>
         <tr><td><code>simplepool-slipstream.service</code></td><td>any, optional</td><td>the <a href="#slipstream">slipstream</a> service on :8124, published through nginx</td></tr>
       </tbody>
@@ -2533,6 +3448,84 @@ sudo simplepoolctl uninstall    # --purge also deletes the ledger</code></pre>
     and <code>deploy/nginx/slipstream.conf</code> — and
     <code>slipstream/README.md</code> walks through installing them. The
     docker-compose stack runs it as a fourth container.
+  </p>
+
+  <h3>Installer options</h3>
+  <p>
+    Everything the installer asks can be passed up front, which is how
+    <code>simplepoolctl upgrade</code> re-runs it unattended.
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Flags</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>--from-release [tag]</code> · <code>--from-source [--repo URL] [--branch B]</code></td><td>install a published build (default: latest), or clone and compile</td></tr>
+        <tr><td><code>--root DIR</code> · <code>--user NAME</code></td><td>install location (<code>/home/simplepool</code>) and service user (<code>simplepool</code>)</td></tr>
+        <tr><td><code>--mode</code> · <code>--stratum-port</code> · <code>--bitcoind-url</code> / <code>-user</code> / <code>-pass</code></td><td>the core of <code>proxy.conf</code></td></tr>
+        <tr><td><code>--operator-address</code> · <code>--fee-bps</code> · <code>--coinbase-tag</code> · <code>--pool-btc-address</code></td><td>coinbase and fee</td></tr>
+        <tr><td><code>--thunder-address</code> · <code>--thunder-rpc-url</code> · <code>--payout-interval-hours</code></td><td>the Thunder reserve and payout cadence</td></tr>
+        <tr><td><code>--hostname FQDN</code> · <code>--dashboard-port</code> · <code>--admin-user</code> · <code>--admin-password</code> · <code>--tls --email ADDR</code></td><td>the dashboard, nginx and a certbot certificate</td></tr>
+        <tr><td><code>--no-dashboard</code> · <code>--no-payout</code> · <code>--no-nginx</code> · <code>--no-firewall</code> · <code>--enable-firewall</code> · <code>--no-deps</code> · <code>--run-tests</code></td><td>what to skip or add</td></tr>
+        <tr><td><code>--non-interactive</code> · <code>--yes</code></td><td>accept defaults, ask nothing</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    The installer offers <code>solo</code> and <code>pps-classic</code>; for the
+    PPLNS modes, set <code>pool_mode</code> in <code>proxy.conf</code> afterwards.
+    Don't pass <code>--pps-sats-per-diff</code>: leave the rate derived.
+  </p>
+
+  <h3>Where things live</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Path</th><th>What</th></tr></thead>
+      <tbody>
+        <tr><td><code>&lt;root&gt;/proxy.conf</code></td><td>the proxy config</td></tr>
+        <tr><td><code>&lt;root&gt;/build/simplepool</code></td><td>the binary</td></tr>
+        <tr><td><code>&lt;root&gt;/data/shares.db</code></td><td>the ledger (mode 0640) — the only directory the units may write</td></tr>
+        <tr><td><code>&lt;root&gt;/data/slipstream.db</code></td><td>slipstream's own database</td></tr>
+        <tr><td><code>/etc/simplepool/install.env</code></td><td>the installer's saved answers (0600)</td></tr>
+        <tr><td><code>/etc/simplepool/admin.cred</code></td><td>dashboard admin <code>user:pass</code></td></tr>
+        <tr><td><code>/etc/systemd/system/simplepool*.service</code> + <code>.d/local.conf</code></td><td>units; the drop-ins carry the environment variables</td></tr>
+        <tr><td><code>/etc/nginx/sites-available/&lt;fqdn&gt;</code>, <code>/etc/nginx/conf.d/pool-ratelimit.conf</code></td><td>the dashboard vhost and its rate limit</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Every unit runs as the service user with <code>NoNewPrivileges</code>,
+    <code>PrivateTmp</code>, <code>ProtectSystem=full</code> and
+    <code>ProtectHome=read-only</code>, and restarts on failure.
+  </p>
+
+  <h3><code>simplepoolctl</code></h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Command</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>status</code></td><td>units, ports, versions, ledger totals (the default)</td></tr>
+        <tr><td><code>doctor</code></td><td>binary, config, addresses, payout source, DB and schema, disk, bitcoind reachable, units up, ports open, firewall</td></tr>
+        <tr><td><code>logs [svc] [-f] [-n N]</code></td><td>journal for <code>proxy</code>, <code>dashboard</code>, <code>payout</code> or all</td></tr>
+        <tr><td><code>start</code> · <code>stop</code> · <code>restart [svc]</code></td><td>systemd lifecycle</td></tr>
+        <tr><td><code>config</code></td><td>where every config file is, and what it says</td></tr>
+        <tr><td><code>version</code></td><td>installed release and the latest one</td></tr>
+        <tr><td><code>upgrade [tag]</code></td><td>re-run the installer non-interactively onto a release</td></tr>
+        <tr><td><code>uninstall [--purge]</code></td><td>remove units and the CLI; <code>--purge</code> also deletes the root and <code>/etc/simplepool</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Neither the installer nor <code>simplepoolctl</code> manages slipstream yet.
+  </p>
+
+  <h3>Docker</h3>
+  <p>
+    <code>deploy/docker/docker-compose.yml</code> runs the four images against
+    an existing node stack on the host. The proxy uses host networking; the
+    dashboard publishes <code>8081</code>; payout and slipstream publish on
+    <code>127.0.0.1</code> only. All four share <code>data/</code> as
+    <code>/data</code> and reach host services through
+    <code>host.docker.internal</code>.
   </p>
 
   <h3>Which commit is running</h3>
@@ -2610,6 +3603,12 @@ sudo simplepoolctl uninstall    # --purge also deletes the ledger</code></pre>
       standard transactions — which includes BIP300 deposits.
     </li>
     <li>
+      <strong>On a drivechain, the template must come from the enforcer.</strong>
+      Pointed at a plain bitcoind, the pool mines valid blocks, but they carry
+      no BIP300/301 commitments, so the sidechains starve. Only the enforcer's
+      template (<code>coinbasetxn</code>) includes them.
+    </li>
+    <li>
       <strong>The submit ceiling bounds a flood, it does not end one.</strong> A
       mismatched connection is refused cheaply instead of validated, but it is
       still connected and still sending. What ends it is vardiff climbing to a
@@ -2639,6 +3638,8 @@ sudo simplepoolctl uninstall    # --purge also deletes the ledger</code></pre>
       coinbase-deposit finding),
       <code>OPERATOR_GUIDE.md</code> (day-to-day operations),
       <code>VERIFY.md</code> (the verification checklist),
+      <code>proxy.conf.example</code> (every key, annotated),
+      <code>schema.sql</code> (the ledger),
       <code>dashboard/README.md</code> (every page and endpoint) and
       <code>slipstream/README.md</code> (the slipstream service).
       Where this page and those disagree, they are right.
