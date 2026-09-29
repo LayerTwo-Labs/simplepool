@@ -50,6 +50,7 @@ services:
       - "${DASHBOARD_PORT:-8081}:8081"
     environment:
       PORT: "8081"
+      DASHBOARD_BIND: 0.0.0.0
       PROXY_DB_PATH: /data/shares.db
       PUBLIC_STRATUM_URL: ${PUBLIC_STRATUM_URL:-stratum+tcp://<pool-host>:3334}
       THUNDER_RPC_URL: ${THUNDER_RPC_URL:-http://host.docker.internal:6009}

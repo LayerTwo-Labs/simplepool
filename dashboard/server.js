@@ -22,6 +22,11 @@ import { createAdminRouter } from './lib/admin-router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT     = parseInt(process.env.PORT || '8081', 10);
+// Loopback by default, like the payout and slipstream services: the
+// dashboard is meant to be published through nginx, and /admin speaks HTTP
+// Basic auth, which must not be reachable in the clear on a public
+// interface. Set DASHBOARD_BIND=0.0.0.0 (or ::) to serve it directly.
+const BIND     = process.env.DASHBOARD_BIND || '127.0.0.1';
 const DB_PATH  = process.env.PROXY_DB_PATH || '../data/shares.db';
 
 const app = express();
@@ -296,6 +301,6 @@ app.use('/admin',
 
 app.use((_req, res) => res.status(404).render('404', { what: 'page' }));
 
-app.listen(PORT, () => {
-    console.log(`simplepool dashboard on :${PORT} (db: ${db.path})`);
+app.listen(PORT, BIND, () => {
+    console.log(`simplepool dashboard on ${BIND}:${PORT} (db: ${db.path})`);
 });

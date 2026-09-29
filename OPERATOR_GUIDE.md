@@ -45,6 +45,12 @@ tracked by git.
 | SSH | `root@<pool-host>` | `<ssh-key>` |
 | Everything from the shell | `simplepoolctl status` / `doctor` / `logs -f` | root for `restart`, `upgrade`, `uninstall` |
 
+The `:8081` URLs assume the dashboard listens publicly. Since it defaults to
+loopback (`DASHBOARD_BIND=127.0.0.1`), that needs
+`Environment=DASHBOARD_BIND=0.0.0.0` in
+`/etc/systemd/system/simplepool-dashboard.service.d/local.conf`; behind nginx,
+use `https://<your-domain>/` instead and leave it on loopback.
+
 The admin password is stashed at `/root/simplepool-admin-cred.txt` on the
 box (root-only). To rotate, edit
 `/etc/systemd/system/simplepool-dashboard.service.d/pps-thunder.conf`
