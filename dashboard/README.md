@@ -67,12 +67,25 @@ snapshot cron — SQLite's WAL mode makes that safe too, just less isolated.
 | `/api/status`         | Everything at once: pool, node, health, versions        |
 | `/healthz`            | `{ ok: true, db_ready: bool }`                          |
 | `/health`             | Full hard-failure detail; 503 when a check is failing   |
+| `/slipstream`         | Slipstream fees and recent txs (only with `SLIPSTREAM_API_URL`) |
 
 `/api/status` is the one URL to poll if you want a single document: pool
 totals and hashrate, mainchain tip, the health checks, and which commit of
 each component is running. It always returns 200 — it is a report, and a
 report that a check is failing was still produced successfully. Watch
 `health.ok` for the condition and `/health` for a status code to alert on.
+
+## Slipstream
+
+Set `SLIPSTREAM_API_URL` (where this process reaches the [slipstream
+service](../slipstream/README.md), e.g. `http://127.0.0.1:8124`) and the
+public nav gains a **Slipstream** page: the minimum submission rate, the
+current mineable rate, how to submit, and each recent tx with where it
+stands. `PUBLIC_SLIPSTREAM_URL` is the address shown to submitters.
+
+The page reads the service's API, never `slipstream.db`, so the service stays
+the only owner of its schema; if it is down, the page says so and the rest of
+the dashboard is unaffected.
 
 ## Network difficulty
 

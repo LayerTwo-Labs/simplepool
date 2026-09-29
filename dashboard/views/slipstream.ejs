@@ -1,0 +1,95 @@
+<%# Public view of the slipstream service. Locals: slip (from
+    lib/slipstream.js fetchSlipstream), submitUrl (PUBLIC_SLIPSTREAM_URL or
+    null). %>
+<!doctype html>
+<html lang="en">
+<head>
+<%- include('partial/head', { title: 'slipstream · simplepool', refresh: 20 }) %>
+</head>
+<body>
+<%- include('partial/nav-public', { active: 'slipstream' }) %>
+<main class="wrap">
+
+    <section class="card info">
+        <h2>Slipstream</h2>
+        <p class="muted small" style="margin-top:0">
+            Submit a transaction straight to this pool and it is taken into
+            the templates this pool's miners work on — including
+            transactions the network will not relay, such as BIP300/301
+            deposits, withdrawal bundles and BMM requests. Anything
+            consensus-valid is taken; the enforcer's BIP300 rules apply too.
+            Once accepted it is broadcast like any other transaction, so
+            another pool may mine it first.
+        </p>
+    </section>
+
+    <% if (!slip.ok) { %>
+        <section class="card">
+            <p class="bad">The slipstream service is not answering right now<%= slip.error ? ' (' + slip.error + ')' : '' %>.</p>
+        </section>
+    <% } else { const f = slip.fees; %>
+    <section class="card">
+        <h2>Fees</h2>
+        <div class="grid">
+            <div><label>Minimum submission rate</label><strong><%= fmtF(f.min_submission_rate, 2) %> sat/vB</strong></div>
+            <div><label>Current mineable rate</label><strong><%= fmtF(f.mineable_rate, 2) %> sat/vB</strong></div>
+            <div><label>Required now</label><strong><%= fmtF(f.required_rate, 2) %> sat/vB</strong></div>
+            <% if (f.updated_at) { %>
+            <div><label>Read from the template</label><strong title="<%= fmtTs(f.updated_at) %>"><%= ago(f.updated_at) %></strong></div>
+            <% } %>
+        </div>
+        <p class="muted small" style="margin-top:0.75em">
+            A transaction must pay the higher of the minimum submission rate
+            and the current mineable rate: the rate of the cheapest
+            transaction in the block being mined once it is full, the minimum
+            until then. It is checked once, when it is submitted.
+        </p>
+    </section>
+
+    <section class="card">
+        <h2>Submit</h2>
+        <% if (submitUrl) { %>
+        <pre class="mono small">curl -X POST --data-binary "$RAW_TX_HEX" <%= submitUrl.replace(/\/+$/, '') %>/api/tx</pre>
+        <p class="muted small">
+            Then follow it at <span class="mono"><%= submitUrl.replace(/\/+$/, '') %>/api/tx/&lt;txid&gt;</span>.
+            The pool's listing for directories is at
+            <a href="<%= submitUrl.replace(/\/+$/, '') %>/info.json">info.json</a>.
+        </p>
+        <% } else { %>
+        <p class="muted small">This pool has not published its slipstream address.</p>
+        <% } %>
+    </section>
+
+    <section class="card">
+        <h2>Recent transactions</h2>
+        <% if (slip.txs.length === 0) { %>
+            <p class="muted small">Nothing has been submitted yet.</p>
+        <% } else { %>
+        <table>
+            <thead><tr>
+                <th>txid</th><th>fee rate</th><th>status</th><th>block</th><th>submitted</th>
+            </tr></thead>
+            <tbody>
+            <% for (const tx of slip.txs) { %>
+                <tr>
+                    <td class="mono" title="<%= tx.txid %>"><%= tx.txid.slice(0, 16) %>…</td>
+                    <td><%= fmtF(tx.fee_rate, 2) %> sat/vB</td>
+                    <td><span class="<%= ['dropped', 'expired'].includes(tx.status) ? 'bad' : (tx.status === 'confirmed' ? 'ok' : '') %>"><%= tx.status.replace('_', ' ') %></span><% if (tx.status_reason) { %>
+                        <span class="muted small">(<%= tx.status_reason %>)</span><% } %></td>
+                    <td><% if (tx.mined_block_hash) { %>
+                        <span class="mono" title="<%= tx.mined_block_hash %>"><%= tx.mined_height !== null ? fmtN(tx.mined_height) : tx.mined_block_hash.slice(0, 12) + '…' %></span><% if (tx.mined_by_pool === 1) { %> <span class="muted small">(ours)</span><% } else if (tx.mined_by_pool === 0) { %> <span class="muted small">(another pool)</span><% } %>
+                    <% } else { %><span class="muted">—</span><% } %></td>
+                    <td title="<%= fmtTs(tx.submitted_at) %>"><%= ago(tx.submitted_at) %></td>
+                </tr>
+            <% } %>
+            </tbody>
+        </table>
+        <% } %>
+    </section>
+    <% } %>
+</main>
+<footer class="foot">
+    <span>slipstream</span>
+</footer>
+</body>
+</html>
