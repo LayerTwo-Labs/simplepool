@@ -1,0 +1,38 @@
+[Unit]
+Description=simplepool broadcaster (Telegram channel posts)
+Documentation=https://github.com/LayerTwo-Labs/simplepool/blob/main/broadcaster/README.md
+After=network-online.target simplepool-dashboard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=@ROOT@/broadcaster
+# Reads the dashboard's public JSON API only, never shares.db.
+Environment=DASHBOARD_URL=http://127.0.0.1:8081
+Environment=BROADCASTER_STATE_PATH=@ROOT@/data/broadcaster.json
+Environment=DIGEST_UTC_HOUR=12
+# Environment=BROADCASTER_LIVE=1
+# Environment=PUBLIC_DASHBOARD_URL=https://pool.example
+# Environment=POOL_NAME=<name>
+# The bot token and channel go in a 0600 drop-in, not here: this file is
+# world-readable, and so is `systemctl show`'s view of Environment=.
+#   /etc/systemd/system/simplepool-broadcaster.service.d/local.conf
+#     [Service]
+#     Environment=TELEGRAM_BOT_TOKEN=<from @BotFather>
+#     Environment=TELEGRAM_CHAT_ID=@yourchannel
+ExecStart=/usr/bin/node @ROOT@/broadcaster/index.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@ROOT@/data
+
+[Install]
+WantedBy=multi-user.target

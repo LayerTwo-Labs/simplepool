@@ -1,0 +1,15 @@
+# -----------------------------------------------------------------------------
+# simplepool broadcaster — posts pool stats to a Telegram channel (Node.js)
+# -----------------------------------------------------------------------------
+# No dependencies: it needs only Node's built-in fetch, so there is no
+# build stage.
+# -----------------------------------------------------------------------------
+
+FROM node:20-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tini ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY broadcaster/ ./
+USER node
+ENTRYPOINT ["/usr/bin/tini", "--", "node", "index.js"]

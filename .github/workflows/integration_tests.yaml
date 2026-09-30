@@ -143,6 +143,10 @@ jobs:
         working-directory: slipstream
         run: npm test
 
+      - name: Run broadcaster tests
+        working-directory: broadcaster
+        run: npm test
+
   # The payout path the coinbase e2e skips: wallet-enabled enforcer +
   # thunder, a real deposit, and one payout tick broadcasting a Thunder
   # transaction (tests/test_payout_regtest.sh). Separate job purely for

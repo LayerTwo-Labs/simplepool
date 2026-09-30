@@ -609,6 +609,16 @@ templates in [`deploy/`](deploy/), and [`slipstream/README.md`](slipstream/READM
 walks through installing them. [`docs/simplepool.html`](docs/simplepool.html)
 explains it end to end.
 
+### Telegram broadcaster
+
+[`broadcaster/`](broadcaster/) is an optional service that posts the pool's
+stats to a Telegram channel: a daily digest, blocks found (and orphaned),
+the pool going quiet and coming back, ledger health changes, and optionally a
+pinned message kept current. It reads only the dashboard's public JSON API,
+so what it posts matches the dashboard. The bot is a posting credential for
+the channel, not something subscribers talk to. Like slipstream it is not set
+up by `install.sh`; see [`broadcaster/README.md`](broadcaster/README.md).
+
 ## Config keys
 
 ```
@@ -767,6 +777,7 @@ payout/              # payout worker: Thunder rail (pps-classic, pplns-thunder)
                      #   and L1 rail via the enforcer wallet (pplns-btc)
 slipstream/          # slipstream service: takes txs from anyone and gets them
                      #   into the pool's blocks via its bitcoind; serves info.json
+broadcaster/         # posts pool stats to a Telegram channel from the dashboard API
 docs/simplepool.html # single-file explainer: every mode, end to end
 ```
 

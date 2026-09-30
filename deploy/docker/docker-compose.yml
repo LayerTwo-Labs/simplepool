@@ -144,3 +144,32 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     stop_grace_period: 10s
+
+  # Optional: posts pool stats to a Telegram channel. Reads the dashboard's
+  # public JSON API only. Start it with `docker compose --profile broadcaster up -d`
+  # once TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set in .env.
+  broadcaster:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.broadcaster
+    image: simplepool-broadcaster:latest
+    container_name: simplepool-broadcaster
+    restart: unless-stopped
+    profiles: ["broadcaster"]
+    depends_on:
+      - dashboard
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # Container-to-container on the compose network.
+      DASHBOARD_URL: http://dashboard:8081
+      PUBLIC_DASHBOARD_URL: ${PUBLIC_DASHBOARD_URL:-}
+      POOL_NAME: ${POOL_NAME:-}
+      BROADCASTER_STATE_PATH: /data/broadcaster.json
+      DIGEST_UTC_HOUR: ${DIGEST_UTC_HOUR:-12}
+      BROADCASTER_LIVE: ${BROADCASTER_LIVE:-0}
+      BROADCASTER_DRY_RUN: ${BROADCASTER_DRY_RUN:-0}
+    volumes:
+      # Writes only broadcaster.json.
+      - ../../data:/data
+    stop_grace_period: 10s
