@@ -49,6 +49,11 @@ curl -fsSL https://raw.githubusercontent.com/LayerTwo-Labs/simplepool/main/scrip
 > published at **<https://layertwo-labs.github.io/simplepool/>**. Open it from
 > disk or serve it next to the dashboard.
 
+> Integrating with Slipstream? The API guide — submitting a transaction,
+> reject reasons, status tracking, fees and `info.json` — lives at
+> [`docs/slipstream-api-guide.html`](docs/slipstream-api-guide.html),
+> published at **<https://layertwo-labs.github.io/simplepool/slipstream-api-guide.html>**.
+
 ### The five modes
 
 This repository ships **all five**, selected by `pool_mode` in
@@ -780,6 +785,7 @@ slipstream/          # slipstream service: takes txs from anyone and gets them
                      #   into the pool's blocks via its bitcoind; serves info.json
 broadcaster/         # posts pool stats to a Telegram channel from the dashboard API
 docs/simplepool.html # single-file explainer: every mode, end to end
+docs/slipstream-api-guide.html # Slipstream API integration guide
 ```
 
 ## Roadmap

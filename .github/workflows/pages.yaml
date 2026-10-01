@@ -1,7 +1,9 @@
-# Publish docs/simplepool.html to GitHub Pages on every push to main that
-# touches docs/. The page is one self-contained file (inline CSS and SVG, no
-# scripts, no relative links), so there is no build: it is copied in as
-# index.html, and also kept at simplepool.html so links to that name work.
+# Publish docs/simplepool.html and docs/slipstream-api-guide.html to GitHub
+# Pages on every push to main that touches docs/. Each page is one
+# self-contained file (inline CSS and SVG, no scripts, no relative links), so
+# there is no build: simplepool.html is copied in as index.html, and also kept
+# at simplepool.html so links to that name work; the Slipstream guide is
+# copied under its own name.
 name: Pages
 
 on:
@@ -42,6 +44,7 @@ jobs:
           mkdir -p _site
           cp docs/simplepool.html _site/index.html
           cp docs/simplepool.html _site/simplepool.html
+          cp docs/slipstream-api-guide.html _site/slipstream-api-guide.html
 
       - uses: actions/configure-pages@v5
 
