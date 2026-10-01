@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slipstream API Guide</title>
+<meta name="description" content="How to submit and track transactions through avonpool's Slipstream service on betanet.">
+<style>
+:root {
+  --bg: #ffffff; --fg: #1d1f23; --muted: #5d6470; --border: #dfe2e7;
+  --code-bg: #f4f5f7; --head-bg: #f7f8fa; --accent: #1f6feb;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171b; --fg: #e4e6ea; --muted: #9aa1ad; --border: #2c3038;
+    --code-bg: #1d2026; --head-bg: #1b1e23; --accent: #6ea8fe;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15171b; --fg: #e4e6ea; --muted: #9aa1ad; --border: #2c3038;
+  --code-bg: #1d2026; --head-bg: #1b1e23; --accent: #6ea8fe;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+main { max-width: 860px; margin: 0 auto; padding: 40px 16px 64px; }
+h1 { font-size: 1.9rem; line-height: 1.25; margin: 0 0 4px; }
+h2 { font-size: 1.3rem; margin: 40px 0 12px; padding-top: 8px; border-top: 1px solid var(--border); }
+.byline { color: var(--muted); font-size: .9rem; margin-bottom: 20px; }
+a { color: var(--accent); }
+nav { font-size: .9rem; margin: 16px 0 8px; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .86em; }
+:not(pre) > code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
+      padding: 12px 14px; overflow-x: auto; line-height: 1.45; }
+.table-wrap { overflow-x: auto; margin: 12px 0; }
+table { border-collapse: collapse; width: 100%; font-size: .92rem; }
+th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+th { background: var(--head-bg); font-weight: 600; }
+ul { padding-left: 22px; }
+li { margin: 6px 0; }
+.lead { font-size: 1.05rem; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Slipstream API integration guide</h1>
+<div class="byline">avonpool betanet · 1 October 2026</div>
+
+<p class="lead">Slipstream takes a signed raw transaction over HTTPS, checks it against the avonpool betanet node and a fee rule, and broadcasts it so the pool mines it. Base URL: <code>https://slipstream.beta.avonpool.xyz</code>. No API key, JSON responses, CORS open to any origin.</p>
+
+<nav>
+  <a href="#endpoints">Endpoints</a>
+  <a href="#submit">Submitting</a>
+  <a href="#responses">Responses</a>
+  <a href="#tracking">Tracking</a>
+  <a href="#fees">Fees</a>
+  <a href="#info">info.json</a>
+  <a href="#limits">Limits</a>
+</nav>
+
+<h2 id="endpoints">Endpoints</h2>
+<p>All paths are relative to <code>https://slipstream.beta.avonpool.xyz</code>. Plain HTTP redirects to HTTPS with a 301.</p>
+<div class="table-wrap"><table>
+<tr><th>Method</th><th>Path</th><th>Returns</th></tr>
+<tr><td>POST</td><td><code>/api/tx</code> (alias <code>/tx</code>)</td><td>Submits one raw transaction. <code>{accepted, txid, status, ...}</code> or <code>{accepted: false, reject_reason}</code></td></tr>
+<tr><td>GET</td><td><code>/api/tx/{txid}</code></td><td><code>{tx, events}</code>: current state plus every status change. 404 for an unknown txid</td></tr>
+<tr><td>GET</td><td><code>/api/txs?status=&amp;limit=</code></td><td><code>{txs: [...]}</code>, newest first. <code>limit</code> 1–500, default 50</td></tr>
+<tr><td>GET</td><td><code>/api/fees</code></td><td><code>{min_submission_rate, mineable_rate, required_rate, template_height, template_weight, updated_at}</code></td></tr>
+<tr><td>GET</td><td><code>/info.json</code> (alias <code>/api/info</code>)</td><td>The pool description. Also served at <code>https://pool.beta.avonpool.xyz/info.json</code></td></tr>
+<tr><td>GET</td><td><code>/healthz</code></td><td><code>{ok, template_age_s, enforcer_error}</code>. 200 when healthy, 503 when the node's template source is down</td></tr>
+<tr><td>GET</td><td><code>/</code></td><td>The list of endpoints</td></tr>
+</table></div>
+
+<h2 id="submit">Submitting a transaction</h2>
+<p>Send the fully signed transaction as hex in one POST. The service runs <code>testmempoolaccept</code> first, so nothing is broadcast unless the node and the fee rule both accept it. Two body formats are accepted:</p>
+<ul>
+  <li><code>Content-Type: text/plain</code> (or none): the body is the hex string itself.</li>
+  <li><code>Content-Type: application/json</code>: <code>{"hex": "0200..."}</code>. A bare JSON string or <code>{"tx": "..."}</code> also works.</li>
+</ul>
+<pre><code>curl -s -X POST --data-binary "$RAW_TX_HEX" \
+  https://slipstream.beta.avonpool.xyz/api/tx</code></pre>
+<pre><code>const BASE = 'https://slipstream.beta.avonpool.xyz';
+
+async function submitTx(hex) {
+  const res = await fetch(`${BASE}/api/tx`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ hex }),
+  });
+  const body = await res.json();
+  if (res.status === 429) throw new Error('rate-limited: retry next minute');
+  if (res.status &gt;= 500) throw new Error(`slipstream unavailable: ${body.reject_reason ?? res.status}`);
+  return body; // check body.accepted, then body.reject_reason
+}</code></pre>
+<p>An accepted response carries the stored record, abridged here (the full field list is under <a href="#tracking">Tracking a transaction</a>):</p>
+<pre><code>{
+  "accepted": true,
+  "txid": "3f1c...",
+  "wtxid": "9a2e...",
+  "status": "pending",
+  "vsize": 141,
+  "weight": 561,
+  "fee_sats": 282,
+  "fee_rate": 2,
+  "required_fee_rate": 1,
+  "submitted_height": 970802
+}</code></pre>
+<p>Submitting the same transaction again is safe. It returns <code>accepted: true</code> with <code>already_tracked: true</code> and the current record, instead of an error.</p>
+
+<h2 id="responses">Responses and reject reasons</h2>
+<p>Always read <code>accepted</code> from the body: a rejection by the node or the fee rule comes back as HTTP 200 with <code>accepted: false</code>. Only malformed input, rate limiting and outages use other status codes.</p>
+<div class="table-wrap"><table>
+<tr><th>HTTP</th><th><code>reject_reason</code></th><th>Meaning</th><th>Caller should</th></tr>
+<tr><td>200</td><td>(none, <code>accepted: true</code>)</td><td>Broadcast and tracked</td><td>Store the <code>txid</code>, start polling</td></tr>
+<tr><td>200</td><td><code>fee-rate-too-low</code></td><td>Below the required rate. Body adds <code>fee_rate</code> and <code>required_fee_rate</code></td><td>Rebuild at or above <code>required_fee_rate</code></td></tr>
+<tr><td>200</td><td><code>already-confirmed</code></td><td>Already in a block</td><td>Treat as done</td></tr>
+<tr><td>200</td><td>node reason, e.g. <code>missing-inputs</code>, <code>bad-txns-inputs-missingorspent</code>, <code>insufficient fee</code>, <code>scriptpubkey</code>, <code>mandatory-script-verify-flag-failed (...)</code></td><td>The node refused it as it stands</td><td>Fix the transaction; do not retry unchanged</td></tr>
+<tr><td>400</td><td><code>invalid-hex</code></td><td>Empty, odd length or non-hex body</td><td>Fix the encoding</td></tr>
+<tr><td>400</td><td><code>tx-decode-failed</code></td><td>Hex that is not a transaction</td><td>Fix the serialization</td></tr>
+<tr><td>400 / 413</td><td><code>tx-size</code></td><td>Over 1 MB of transaction (2 MB of hex)</td><td>Split or shrink it</td></tr>
+<tr><td>400</td><td><code>invalid-body</code></td><td>JSON that does not parse</td><td>Fix the request</td></tr>
+<tr><td>429</td><td><code>rate-limited</code></td><td>Over 30 submissions per minute from this IP</td><td>Back off until the next minute</td></tr>
+<tr><td>502</td><td><code>node-unavailable</code></td><td>The pool's node did not answer</td><td>Retry later with backoff</td></tr>
+</table></div>
+
+<h2 id="tracking">Tracking a transaction</h2>
+<p>Poll <code>GET /api/tx/{txid}</code> until <code>tx.status</code> is <code>confirmed</code> or <code>dropped</code>. The service rechecks every transaction on each new block template, so polling every 30–60 seconds is enough.</p>
+<div class="table-wrap"><table>
+<tr><th><code>status</code></th><th>Meaning</th><th>Final?</th></tr>
+<tr><td><code>pending</code></td><td>In the node's mempool, not in the pool's current template</td><td>No</td></tr>
+<tr><td><code>in_template</code></td><td>In the template the pool's miners are working on now</td><td>No</td></tr>
+<tr><td><code>mined</code></td><td>In a block, fewer than 6 confirmations. <code>mined_by_pool</code> is 1 if avonpool mined it, 0 if another pool did</td><td>No</td></tr>
+<tr><td><code>confirmed</code></td><td>6 or more confirmations</td><td>Yes</td></tr>
+<tr><td><code>dropped</code></td><td>Left the mempool unmined and the node refused it on resend. <code>status_reason</code> gives the node's reason</td><td>Yes, unless resubmitted</td></tr>
+</table></div>
+<p>The usual path is <code>pending</code> → <code>in_template</code> → <code>mined</code> → <code>confirmed</code>. Two moves go backwards: a block that is orphaned returns its transaction to <code>pending</code>, and a transaction that leaves the mempool is resent automatically, ending in <code>pending</code> or <code>dropped</code>. A <code>dropped</code> transaction can be submitted again once it is valid.</p>
+<pre><code>curl -s https://slipstream.beta.avonpool.xyz/api/tx/$TXID</code></pre>
+<p>The <code>tx</code> object has these fields: <code>txid</code>, <code>wtxid</code>, <code>vsize</code>, <code>weight</code>, <code>fee_sats</code>, <code>fee_rate</code>, <code>required_fee_rate</code>, <code>submitted_at</code>, <code>submitted_height</code>, <code>submitter</code>, <code>status</code>, <code>status_reason</code>, <code>status_at</code>, <code>first_in_template_at</code>, <code>last_in_template_at</code>, <code>mined_block_hash</code>, <code>mined_height</code>, <code>mined_at</code>, <code>mined_by_pool</code>, <code>confirmations</code>, <code>confirmed_at</code>, <code>resubmissions</code>. Times are Unix seconds; rates are sat/vB. <code>events</code> is the history as <code>[{ts, event, detail}]</code>, oldest first.</p>
+<p><code>GET /api/txs?status=in_template&amp;limit=100</code> lists recent transactions across all submitters, without <code>submitter</code>.</p>
+
+<h2 id="fees">Fees</h2>
+<p>Build the transaction at or above <code>required_rate</code> from <code>GET /api/fees</code>, or it is refused with <code>fee-rate-too-low</code>. The required rate is the higher of the pool's floor (1 sat/vB) and the current mineable rate. The mineable rate equals the floor while the block template has room, and becomes the cheapest included transaction's rate once the template is full.</p>
+<pre><code>curl -s https://slipstream.beta.avonpool.xyz/api/fees</code></pre>
+<pre><code>{"min_submission_rate":1,"mineable_rate":1,"required_rate":1,"template_height":970802,"template_weight":3766,"updated_at":1790866502}</code></pre>
+<p>The fee rate is checked as fee in sats divided by virtual size, so read it just before signing and add a margin if blocks are filling up.</p>
+
+<h2 id="info">info.json</h2>
+<p><code>GET /info.json</code> describes the pool for pool directories and is cached for 60 seconds. Mode, fee, coinbase tag and addresses are read from the running pool, so they always match what the coinbase pays. The same document is served at <code>https://pool.beta.avonpool.xyz/info.json</code>.</p>
+<pre><code>{
+  "name": "avonpool_beta",
+  "operator": "avonpool",
+  "chain": "betanet",
+  "mode": "solo",
+  "fee_bps": 100,
+  "coinbase_tag": "/avonpool/",
+  "stratum_url": "stratum+tcp://pool.beta.avonpool.xyz:3334",
+  "dashboard_url": "https://pool.beta.avonpool.xyz",
+  "status_url": "https://pool.beta.avonpool.xyz/api/status",
+  "slipstream_url": "https://slipstream.beta.avonpool.xyz",
+  "operator_address": "bc1qljvzxk0tp6qtrunt590z5rtdhs8jhkkn4ny4rm",
+  "pool_btc_address": null,
+  "payout": "The stratum username is your BTC address; each block's coinbase pays the miner who found it.",
+  "software": "simplepool",
+  "version": "0.1.0",
+  "logo": null,
+  "contact": "pool@ecash.com"
+}</code></pre>
+<p><code>fee_bps</code> is in basis points (100 = 1%). <code>status_url</code> returns live pool statistics (hashrate, workers, blocks).</p>
+
+<h2 id="limits">Limits and caveats</h2>
+<ul>
+  <li><strong>Standard transactions only.</strong> The betanet node reports its chain as <code>main</code>, where Bitcoin Core does not allow non-standard transactions. A non-standard output is refused with <code>scriptpubkey</code>. BIP300 deposits are standard and are accepted.</li>
+  <li><strong>Not exclusive to avonpool.</strong> An accepted transaction is relayed like any other, so another pool may mine it first. <code>mined_by_pool</code> says which.</li>
+  <li><strong>Rate limit:</strong> 30 submissions per minute per client IP, counted in fixed one-minute windows. Reads are limited by nginx with a burst of 20.</li>
+  <li><strong>Size:</strong> at most 1 MB of transaction per request.</li>
+  <li><strong>Your IP is stored.</strong> Each submission records the client IP as <code>submitter</code>, and <code>GET /api/tx/{txid}</code> returns it to anyone who knows the txid.</li>
+  <li><strong>Health check:</strong> before a batch of submissions, <code>GET /healthz</code> returns 503 if the pool cannot build templates, and submissions may then fail with <code>node-unavailable</code>.</li>
+</ul>
+
+</main>
+</body>
+</html>
