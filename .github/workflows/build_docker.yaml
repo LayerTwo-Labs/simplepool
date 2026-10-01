@@ -49,6 +49,8 @@ jobs:
             dockerfile: deploy/docker/Dockerfile.payout
           - image: simplepool-slipstream
             dockerfile: deploy/docker/Dockerfile.slipstream
+          - image: simplepool-broadcaster
+            dockerfile: deploy/docker/Dockerfile.broadcaster
     steps:
       - name: Checkout
         uses: actions/checkout@v4
