@@ -45,8 +45,9 @@ curl -fsSL https://raw.githubusercontent.com/LayerTwo-Labs/simplepool/main/scrip
 
 > A single-file, no-JavaScript explainer covering every mode end to end —
 > shares, difficulty, the coinbase, PPS credit, Thunder payouts and how to
-> audit every number — lives at [`docs/simplepool.html`](docs/simplepool.html).
-> Open it from disk or serve it next to the dashboard.
+> audit every number — lives at [`docs/simplepool.html`](docs/simplepool.html),
+> published at **<https://layertwo-labs.github.io/simplepool/>**. Open it from
+> disk or serve it next to the dashboard.
 
 ### The five modes
 
