@@ -1,0 +1,53 @@
+# Publish docs/simplepool.html to GitHub Pages on every push to main that
+# touches docs/. The page is one self-contained file (inline CSS and SVG, no
+# scripts, no relative links), so there is no build: it is copied in as
+# index.html, and also kept at simplepool.html so links to that name work.
+name: Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
+      - '.github/workflows/pages.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; a newer push supersedes a queued one, but a deploy
+# already running is allowed to finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Match the other workflows: Pages is published from the org repo only.
+    if: github.repository_owner == 'LayerTwo-Labs'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp docs/simplepool.html _site/index.html
+          cp docs/simplepool.html _site/simplepool.html
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
