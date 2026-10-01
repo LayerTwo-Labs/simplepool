@@ -493,6 +493,47 @@ static void test_a_zero_lockout_window_is_refused(void) {
     CHECK(load_text(body, &off, err2, sizeof err2) == 0);
 }
 
+/* The backlog defaults to 0, which stratum.c reads as "use
+ * STRATUM_DEFAULT_BACKLOG". 0 is the sentinel on purpose: config.c must not
+ * depend on the stratum header just to name a default. */
+static void test_listen_backlog_defaults_to_sentinel(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(cfg.listen_backlog == 0);
+}
+
+/* An explicit backlog lets a marketplace burst be absorbed without a rebuild. */
+static void test_listen_backlog_parses(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n"
+             "listen_backlog = 2048\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(cfg.listen_backlog == 2048);
+    /* Nothing else moved. */
+    CHECK(cfg.max_conns == 500);
+    CHECK(cfg.listen_port == 3334);
+}
+
+/* A negative backlog is a typo, not a request for the default: refused, like
+ * every other negative count. */
+static void test_a_negative_listen_backlog_is_refused(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\nlisten_backlog = -1\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "listen_backlog") != NULL);
+}
+
 int main(void) {
     printf("running test_config...\n");
     test_hash_inside_value_is_kept();
@@ -524,6 +565,9 @@ int main(void) {
     test_a_zero_authorize_budget_loads();
     test_a_negative_authorize_budget_is_refused();
     test_a_zero_lockout_window_is_refused();
+    test_listen_backlog_defaults_to_sentinel();
+    test_listen_backlog_parses();
+    test_a_negative_listen_backlog_is_refused();
     if (failures) { printf("test_config: %d failed\n", failures); return 1; }
     printf("test_config: all tests passed\n");
     return 0;
