@@ -25,6 +25,22 @@ test('send posts HTML to the chat and returns the message id', async () => {
     assert.equal(f.calls[0].body.parse_mode, 'HTML');
 });
 
+test('send names the topic only when one is set; edit and pin never do', async () => {
+    const ok = (id) => [200, { ok: true, result: { message_id: id } }];
+    const f = fakeFetch([ok(1), ok(2), [200, { ok: true, result: true }], [200, { ok: true, result: true }]]);
+    const t = new TelegramClient({ token: 'x', chatId: -1001518607784, threadId: 23563, fetchImpl: f, sleep: noSleep, minGapMs: 0 });
+    await t.send('a');
+    await t.edit(1, 'b');
+    await t.pin(1);
+    assert.equal(f.calls[0].body.message_thread_id, 23563);
+    assert.equal(f.calls[1].body.message_thread_id, undefined);
+    assert.equal(f.calls[2].body.message_thread_id, undefined);
+
+    const g = fakeFetch([ok(3)]);
+    await new TelegramClient({ token: 'x', chatId: 'c', fetchImpl: g, sleep: noSleep, minGapMs: 0 }).send('c');
+    assert.equal('message_thread_id' in g.calls[0].body, false);
+});
+
 test('429 waits retry_after and tries again', async () => {
     const slept = [];
     const f = fakeFetch([

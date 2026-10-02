@@ -52,6 +52,11 @@ appear under the channel's name and avatar.
 3. `TELEGRAM_CHAT_ID` is `@channelname` for a public channel. For a private
    one, it is the numeric id starting `-100`. Forward any channel post to
    `@userinfobot`, or read `chat.id` from `getUpdates`, to get it.
+4. For a group with topics, set `TELEGRAM_THREAD_ID` to post into one topic.
+   A message link `https://t.me/c/1518607784/23563` gives both: the chat is
+   `-100` + the first number (`-1001518607784`), the topic is the second
+   (`23563`). In a group, the bot posts as itself and needs no admin rights
+   when members may send (and, for the live message, pin) messages.
 
 Try it without a token first:
 
@@ -69,6 +74,7 @@ Environment only. The full list with defaults is in
 | | |
 |---|---|
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | required unless `BROADCASTER_DRY_RUN=1` |
+| `TELEGRAM_THREAD_ID` | a forum group's topic to post in (default: its General topic) |
 | `DASHBOARD_URL` | default `http://127.0.0.1:8081` |
 | `PUBLIC_DASHBOARD_URL` | link included in posts |
 | `POOL_NAME` | heading of every post (default `simplepool`) |

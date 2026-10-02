@@ -10,6 +10,10 @@
  *                           numeric '-100...' id for a private one.
  *
  * Optional:
+ *   TELEGRAM_THREAD_ID      post into one topic of a forum group instead of
+ *                           its General topic. A topic link
+ *                           https://t.me/c/1518607784/23563 is chat
+ *                           -1001518607784, topic 23563. Unset = General.
  *   DASHBOARD_URL           where to read stats from (default
  *                           http://127.0.0.1:8081). Only the dashboard's
  *                           public JSON API is used, never shares.db, so
@@ -57,6 +61,15 @@ function str(name) {
     return v === undefined || v === '' ? null : v;
 }
 
+/* Topic ids are message ids: a positive integer. */
+function topicId() {
+    const v = num('TELEGRAM_THREAD_ID', null, { min: 1 });
+    if (v != null && !Number.isInteger(v)) {
+        throw new Error(`TELEGRAM_THREAD_ID=${v}: expected a whole number (the topic id)`);
+    }
+    return v;
+}
+
 export function loadConfig() {
     const dryRun = process.env.BROADCASTER_DRY_RUN === '1';
     if (!dryRun) {
@@ -69,6 +82,7 @@ export function loadConfig() {
     return {
         token:        str('TELEGRAM_BOT_TOKEN'),
         chatId:       str('TELEGRAM_CHAT_ID'),
+        threadId:     topicId(),
         dashboardUrl: (str('DASHBOARD_URL') || 'http://127.0.0.1:8081').replace(/\/+$/, ''),
         publicUrl:    str('PUBLIC_DASHBOARD_URL')?.replace(/\/+$/, '') ?? null,
         poolName:     str('POOL_NAME') || 'simplepool',

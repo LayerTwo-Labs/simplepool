@@ -167,6 +167,7 @@ services:
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
       # Container-to-container on the compose network.
       DASHBOARD_URL: http://dashboard:8081
       PUBLIC_DASHBOARD_URL: ${PUBLIC_DASHBOARD_URL:-}

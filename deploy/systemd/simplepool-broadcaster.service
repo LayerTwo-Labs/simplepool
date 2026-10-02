@@ -23,6 +23,7 @@ Environment=DIGEST_UTC_HOUR=12
 #     [Service]
 #     Environment=TELEGRAM_BOT_TOKEN=<from @BotFather>
 #     Environment=TELEGRAM_CHAT_ID=@yourchannel
+#     Environment=TELEGRAM_THREAD_ID=<topic id, forum groups only>
 ExecStart=/usr/bin/node @ROOT@/broadcaster/index.js
 Restart=on-failure
 RestartSec=5
