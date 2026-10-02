@@ -17,7 +17,7 @@ if Telegram or the service goes down, the pool is unaffected.
 
 | | when |
 |---|---|
-| **Daily digest** | once per UTC day at `DIGEST_UTC_HOUR` (default 12): hashrate 1h/24h, active workers, shares and reject rate, best share, blocks in the last 24h and all time, mode and fee |
+| **Daily digest** | once per UTC day at `DIGEST_UTC_HOUR` (default 12): hashrate now (5m), 1h and 24h, active workers, accepted and rejected shares, best share, blocks in the last 24h and all time, mode and fee |
 | **Block found** | the first time a block appears in `/api/blocks` as `pending` or `confirmed` |
 | **Block lost** | a block it announced turns `orphaned` or `rejected` |
 | **Pool quiet / back** | no share accepted for `STALE_SHARES_SEC` (default 15m), and when shares resume |

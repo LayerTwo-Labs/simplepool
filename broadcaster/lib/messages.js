@@ -63,12 +63,15 @@ function lines(...xs) {
     return xs.filter((x) => x != null && x !== false).join('\n');
 }
 
-/* The core stat block shared by the digest and the pinned live message. */
+/* The core stat block shared by the digest, the live message, the periodic
+ * update and /pool_status. "Current" is the dashboard's 5-minute rate. */
 function statLines(p) {
     return [
-        `Hashrate: <b>${fmtHashrate(p.hashrate_1h)}</b> (1h) · ${fmtHashrate(p.hashrate)} (24h)`,
+        `Hashrate now: <b>${fmtHashrate(p.hashrate_5m)}</b> (5m)`,
+        `Hashrate: ${fmtHashrate(p.hashrate_1h)} (1h) · ${fmtHashrate(p.hashrate)} (24h)`,
         `Active workers (24h): <b>${fmtN(p.workers_active)}</b>`,
-        `Shares (24h): ${fmtN(p.accepted)} accepted · ${(p.reject_rate_pct ?? 0).toFixed(2)}% rejected`,
+        `Shares (24h): ${fmtN(p.accepted)} accepted · ${fmtN(p.rejected)} rejected ` +
+            `(${(p.reject_rate_pct ?? 0).toFixed(2)}%)`,
         `Best share (24h): ${fmtDiff(p.best_share_24h)}`,
     ];
 }
