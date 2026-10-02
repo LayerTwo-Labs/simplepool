@@ -287,9 +287,20 @@ test('live message and summary show the last counted block', async () => {
         block('lost', 101, 'orphaned', T0 / 1000 - 600),
     ];
     await b.tick(T0);
-    assert.match(telegram.posts[0], /Last block: <b>#100<\/b> · 2h 0m ago/);
+    assert.match(telegram.posts[0], /Last mined block: <b>#100<\/b> · 2h 0m ago/);
     dashboard.s = status({ lastShareTs: (T0 + 60 * MIN) / 1000 });
     await b.tick(T0 + 60 * MIN);
     assert.match(telegram.posts[1], /— update/);
-    assert.match(telegram.posts[1], /Last block: <b>#100<\/b>/);
+    assert.match(telegram.posts[1], /Last mined block: <b>#100<\/b>/);
+});
+
+test('chain tip line appears with node status and is left out without it', async () => {
+    const { b, dashboard, telegram } = setup({ live: true, digestHour: null });
+    dashboard.s.node = { tip_height: 105, tip_observed_at: T0 / 1000 - 90 };
+    await b.tick(T0);
+    assert.match(telegram.posts[0], /Chain tip: #105 · 1m ago/);
+
+    const other = setup({ live: true, digestHour: null });
+    await other.b.tick(T0);
+    assert.doesNotMatch(other.telegram.posts[0], /Chain tip/);
 });

@@ -101,18 +101,28 @@ export function digest({ status, blocks, poolName, publicUrl, nowSec }) {
     );
 }
 
-/* The newest block that still counts: pending or confirmed. An orphaned or
- * rejected one is not the pool's last block. `blocks` is newest first. */
+/* The newest block THIS POOL mined that still counts: pending or confirmed.
+ * An orphaned or rejected one is not the pool's last block. `blocks` is
+ * newest first. Labelled "mined" so it is never read as the chain's height,
+ * which chainTipLine gives. */
 export function lastBlockLine(blocks, nowSec) {
     const b = (blocks ?? []).find((x) => x.status === 'pending' || x.status === 'confirmed');
-    if (!b) return 'Last block: none yet';
+    if (!b) return 'Last mined block: none yet';
     const ago = b.ts != null ? ` · ${fmtAgo(nowSec - b.ts)} ago` : '';
-    return `Last block: <b>#${fmtN(b.height)}</b>${ago}`;
+    return `Last mined block: <b>#${fmtN(b.height)}</b>${ago}`;
+}
+
+/* The network's latest block, as the pool's node sees it, by anyone. Null
+ * when the dashboard has no node status yet. */
+export function chainTipLine(node, nowSec) {
+    if (node?.tip_height == null) return null;
+    const ago = node.tip_observed_at != null ? ` · ${fmtAgo(nowSec - node.tip_observed_at)} ago` : '';
+    return `Chain tip: #${fmtN(node.tip_height)}${ago}`;
 }
 
 /* The pinned message, the periodic summary and the /pool_status reply show
  * the same numbers; only the heading and the time line differ. The last
- * block line appears whenever the blocks list was read. */
+ * mined block line appears whenever the blocks list was read. */
 function snapshot({ status, blocks, poolName, publicUrl, nowSec, flowing, title, timeLabel }) {
     const p = status.pool;
     const lastShare = p.last_share_ts ? fmtAgo(nowSec - p.last_share_ts) + ' ago' : 'never';
@@ -121,6 +131,7 @@ function snapshot({ status, blocks, poolName, publicUrl, nowSec, flowing, title,
         '',
         ...statLines(p),
         `Last share: ${lastShare}`,
+        chainTipLine(status.node, nowSec),
         blocks !== undefined ? lastBlockLine(blocks, nowSec) : null,
         `Blocks (all time): ${fmtN(p.blocks_lifetime)}`,
         '',
