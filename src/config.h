@@ -10,6 +10,9 @@ typedef struct {
     char listen_addr[64];
     int  listen_port;
     int  max_conns;
+    /* listen() backlog for every stratum listener. 0 -> STRATUM_DEFAULT_BACKLOG.
+     * The kernel clamps it to net.core.somaxconn. */
+    int  listen_backlog;
     /* Still 1: the difficulty policy lives on the listener now, so a config
      * naming no listeners behaves exactly as it always did. A rental port
      * sets its own via `listener = port=3335 min_diff=65536`. */

@@ -169,6 +169,12 @@ typedef struct {
     char   label[32];
 } stratum_listener_t;
 
+/* Default listen() backlog. A marketplace order arrives as one burst of
+ * hundreds of connections; the queue only has to absorb the burst until the
+ * listener thread drains it. Over-asking is harmless (the kernel clamps to
+ * net.core.somaxconn); under-asking silently drops connections. */
+#define STRATUM_DEFAULT_BACKLOG 1024
+
 #define STRATUM_MAX_LISTENERS 8
 /* How many `listener` lines a config may add. The server binds listen_port in
  * slot 0 and the extra ports after it, all out of STRATUM_MAX_LISTENERS slots,
@@ -181,6 +187,15 @@ typedef struct {
     char   bind_addr[64];
     int    bind_port;
     int    max_conns;            /* default 500 */
+    /* listen() backlog: how many completed handshakes the kernel may hold
+     * before accept() takes them. <= 0 uses STRATUM_DEFAULT_BACKLOG.
+     *
+     * Hardcoded at 64 before, which is far too small for a hashrate
+     * marketplace: those open hundreds of connections in one burst, and a full
+     * accept queue makes the kernel drop the connection. The pool sees nothing
+     * -- there is no accept() error to log, because there was no accept. The
+     * only evidence is TcpExt:ListenOverflows in /proc/net/netstat. */
+    int    listen_backlog;
 
     /* Ceiling on a miner-requested difficulty; <= 0 disables requests. */
     double max_suggested_diff;

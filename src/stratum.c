@@ -3265,7 +3265,9 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
                       strerror(errno));
             goto bind_failed;
         }
-        if (listen(ls->fd, 64) < 0) goto bind_failed;
+        int backlog = cfg->listen_backlog > 0 ? cfg->listen_backlog
+                                              : STRATUM_DEFAULT_BACKLOG;
+        if (listen(ls->fd, backlog) < 0) goto bind_failed;
         if (pthread_create(&ls->thr, NULL, listener_thread, ls) != 0) {
             goto bind_failed;
         }
