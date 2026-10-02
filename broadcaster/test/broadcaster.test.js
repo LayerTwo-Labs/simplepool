@@ -269,3 +269,24 @@ test('summary is off by default and leaves the live message alone', async () => 
     assert.equal(telegram.posts.length, 1);    // the live message, posted once
     assert.equal(telegram.edits.length, 1);
 });
+
+test('BROADCASTER_LIVE_PIN=0 posts the live message without pinning it', async () => {
+    const { b, telegram } = setup({ live: true, livePin: false, digestHour: null });
+    await b.tick(T0);
+    assert.equal(telegram.posts.length, 1);
+    assert.deepEqual(telegram.pins, []);
+});
+
+test('live message and summary show the last counted block', async () => {
+    const { b, dashboard, telegram } = setup({ live: true, summaryHours: 1, digestHour: null });
+    dashboard.b = [
+        block('old', 100, 'confirmed', T0 / 1000 - 7200),
+        block('lost', 101, 'orphaned', T0 / 1000 - 600),
+    ];
+    await b.tick(T0);
+    assert.match(telegram.posts[0], /Last block: <b>#100<\/b> · 2h 0m ago/);
+    dashboard.s = status({ lastShareTs: (T0 + 60 * MIN) / 1000 });
+    await b.tick(T0 + 60 * MIN);
+    assert.match(telegram.posts[1], /— update/);
+    assert.match(telegram.posts[1], /Last block: <b>#100<\/b>/);
+});

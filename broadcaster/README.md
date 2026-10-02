@@ -22,7 +22,8 @@ if Telegram or the service goes down, the pool is unaffected.
 | **Block lost** | a block it announced turns `orphaned` or `rejected` |
 | **Pool quiet / back** | no share accepted for `STALE_SHARES_SEC` (default 15m), and when shares resume |
 | **Health failing / recovered** | `/health` changes state, with the failing checks listed |
-| **Pinned live message** (`BROADCASTER_LIVE=1`) | one message, pinned, edited every `BROADCASTER_LIVE_MS` (default 5m) with current stats |
+| **Pinned live message** (`BROADCASTER_LIVE=1`) | one message, pinned unless `BROADCASTER_LIVE_PIN=0`, edited every `BROADCASTER_LIVE_MS` (default 5m) with current stats and the last block |
+| **`/pool_status`** (`BROADCASTER_COMMANDS=1`) | when someone sends it in the chat: the current stats, as a reply in the same topic, at most once per `BROADCASTER_COMMAND_COOLDOWN_SEC` (default 30) |
 | **Periodic update** (`BROADCASTER_SUMMARY_HOURS=N`) | the same stats as a new message every N hours, on UTC boundaries (6 → 00, 06, 12, 18 UTC) |
 
 - **Edited is not posted.** Telegram does not notify anyone of an edit or
@@ -58,6 +59,23 @@ appear under the channel's name and avatar.
    (`23563`). In a group, the bot posts as itself and needs no admin rights
    when members may send (and, for the live message, pin) messages.
 
+### `/pool_status`
+
+With `BROADCASTER_COMMANDS=1` the service also reads the chat, with
+`getUpdates`, and answers `/pool_status` with the live message's numbers
+plus the last block. It answers only in `TELEGRAM_CHAT_ID`, so adding the
+bot to another group does not make it answer there.
+
+- It registers the command in the bot's `/` menu. A bot in privacy mode
+  (BotFather's default) always sees `/pool_status@yourbot`, which is what a
+  tap in that menu sends, but not always a bare `/pool_status`. Turn privacy
+  off (`/setprivacy` → Disable) if people type it by hand.
+- Telegram allows one `getUpdates` reader per bot and none while a webhook
+  is set. Run one broadcaster per bot, and don't poll the bot from anywhere
+  else while it runs.
+- The first start skips commands sent before it, and the read position is
+  kept in `broadcaster.json`, so a restart answers nothing twice.
+
 Try it without a token first:
 
 ```bash
@@ -82,7 +100,9 @@ Environment only. The full list with defaults is in
 | `BROADCASTER_POLL_MS` | default 60000 |
 | `DIGEST_UTC_HOUR` | 0–23, or `off` (default 12) |
 | `BROADCASTER_LIVE`, `BROADCASTER_LIVE_MS` | pinned live message (default off, 300000) |
+| `BROADCASTER_LIVE_PIN` | `0` = post the live message without pinning it (default 1) |
 | `BROADCASTER_SUMMARY_HOURS` | 1–168, or `off` (default off) |
+| `BROADCASTER_COMMANDS`, `BROADCASTER_COMMAND_COOLDOWN_SEC` | answer `/pool_status` (default off, 30) |
 | `STALE_SHARES_SEC` | default 900 |
 | `HEALTH_DEBOUNCE` | default 3 |
 

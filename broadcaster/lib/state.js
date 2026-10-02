@@ -9,7 +9,9 @@
  *   lastDigestDate    'YYYY-MM-DD' (UTC) of the last daily digest
  *   lastSummarySlot   index of the last BROADCASTER_SUMMARY_HOURS period a
  *                     summary was posted for (ms since epoch / period)
- *   liveMessageId     the pinned message edited in place
+ *   liveMessageId     the live message edited in place
+ *   updateOffset      next Telegram update id to read (BROADCASTER_COMMANDS=1);
+ *                     null until the first start skips the backlog
  *   liveUpdatedAt     ms of its last refresh
  *   sharesFlowing     last announced liveness (true/false/null)
  *   healthOk          last announced ledger-health state (true/false/null)
@@ -32,6 +34,7 @@ export function emptyState() {
         lastDigestDate: null,
         lastSummarySlot: null,
         liveMessageId: null,
+        updateOffset: null,
         liveUpdatedAt: 0,
         sharesFlowing: null,
         healthOk: null,

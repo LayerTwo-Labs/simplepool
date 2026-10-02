@@ -31,6 +31,14 @@
  *                           with current stats (default off)
  *   BROADCASTER_LIVE_MS     how often the pinned message is refreshed
  *                           (default 300000)
+ *   BROADCASTER_LIVE_PIN    '0' = post the live message without pinning it,
+ *                           for a chat where the bot may not pin (default 1)
+ *   BROADCASTER_COMMANDS    '1' = answer /pool_status in TELEGRAM_CHAT_ID with
+ *                           the current stats (default off). Reads messages
+ *                           with getUpdates, so nothing else may poll this
+ *                           bot and it must have no webhook.
+ *   BROADCASTER_COMMAND_COOLDOWN_SEC  at most one reply per chat this often
+ *                           (default 30), so the command cannot flood a chat
  *   BROADCASTER_SUMMARY_HOURS  also post the current stats as a NEW message
  *                           every N hours (1-168), on UTC boundaries: 6 means
  *                           00, 06, 12 and 18 UTC (exact for any N that
@@ -90,6 +98,9 @@ export function loadConfig() {
         pollMs:       num('BROADCASTER_POLL_MS', 60000, { min: 1000 }),
         digestHour:   digestRaw === 'off' ? null : num('DIGEST_UTC_HOUR', 12, { min: 0, max: 23 }),
         live:         process.env.BROADCASTER_LIVE === '1',
+        livePin:      process.env.BROADCASTER_LIVE_PIN !== '0',
+        commands:     process.env.BROADCASTER_COMMANDS === '1',
+        commandCooldownSec: num('BROADCASTER_COMMAND_COOLDOWN_SEC', 30, { min: 0 }),
         liveMs:       num('BROADCASTER_LIVE_MS', 300000, { min: 60000 }),
         summaryHours: summaryRaw == null || summaryRaw === 'off' || summaryRaw === '0'
             ? null : num('BROADCASTER_SUMMARY_HOURS', null, { min: 1, max: 168 }),

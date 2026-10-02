@@ -98,9 +98,19 @@ export function digest({ status, blocks, poolName, publicUrl, nowSec }) {
     );
 }
 
-/* The pinned message and the periodic summary show the same numbers; only
- * the heading and the time line differ. */
-function snapshot({ status, poolName, publicUrl, nowSec, flowing, title, timeLabel }) {
+/* The newest block that still counts: pending or confirmed. An orphaned or
+ * rejected one is not the pool's last block. `blocks` is newest first. */
+export function lastBlockLine(blocks, nowSec) {
+    const b = (blocks ?? []).find((x) => x.status === 'pending' || x.status === 'confirmed');
+    if (!b) return 'Last block: none yet';
+    const ago = b.ts != null ? ` · ${fmtAgo(nowSec - b.ts)} ago` : '';
+    return `Last block: <b>#${fmtN(b.height)}</b>${ago}`;
+}
+
+/* The pinned message, the periodic summary and the /pool_status reply show
+ * the same numbers; only the heading and the time line differ. The last
+ * block line appears whenever the blocks list was read. */
+function snapshot({ status, blocks, poolName, publicUrl, nowSec, flowing, title, timeLabel }) {
     const p = status.pool;
     const lastShare = p.last_share_ts ? fmtAgo(nowSec - p.last_share_ts) + ' ago' : 'never';
     return lines(
@@ -108,6 +118,7 @@ function snapshot({ status, poolName, publicUrl, nowSec, flowing, title, timeLab
         '',
         ...statLines(p),
         `Last share: ${lastShare}`,
+        blocks !== undefined ? lastBlockLine(blocks, nowSec) : null,
         `Blocks (all time): ${fmtN(p.blocks_lifetime)}`,
         '',
         `<i>${timeLabel} ${new Date(nowSec * 1000).toISOString().slice(11, 16)} UTC</i>`,
@@ -121,6 +132,14 @@ export function live({ flowing = true, ...rest }) {
 
 export function summary({ flowing = true, ...rest }) {
     return snapshot({ ...rest, flowing, title: 'update', timeLabel: 'As of' });
+}
+
+export function poolStatus({ flowing = true, ...rest }) {
+    return snapshot({ ...rest, flowing, title: 'status', timeLabel: 'As of' });
+}
+
+export function statusUnavailable({ poolName }) {
+    return `⚠️ <b>${esc(poolName)}</b>: the pool's status can't be read right now. Try again in a minute.`;
 }
 
 export function blockFound({ block, poolName, publicUrl }) {
