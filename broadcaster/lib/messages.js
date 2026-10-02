@@ -98,19 +98,29 @@ export function digest({ status, blocks, poolName, publicUrl, nowSec }) {
     );
 }
 
-export function live({ status, poolName, publicUrl, nowSec, flowing = true }) {
+/* The pinned message and the periodic summary show the same numbers; only
+ * the heading and the time line differ. */
+function snapshot({ status, poolName, publicUrl, nowSec, flowing, title, timeLabel }) {
     const p = status.pool;
     const lastShare = p.last_share_ts ? fmtAgo(nowSec - p.last_share_ts) + ' ago' : 'never';
     return lines(
-        `${flowing ? '🟢' : '🔴'} <b>${esc(poolName)} — live</b>`,
+        `${flowing ? '🟢' : '🔴'} <b>${esc(poolName)} — ${title}</b>`,
         '',
         ...statLines(p),
         `Last share: ${lastShare}`,
         `Blocks (all time): ${fmtN(p.blocks_lifetime)}`,
         '',
-        `<i>Updated ${new Date(nowSec * 1000).toISOString().slice(11, 16)} UTC</i>`,
+        `<i>${timeLabel} ${new Date(nowSec * 1000).toISOString().slice(11, 16)} UTC</i>`,
         link(publicUrl, '/', 'Open the dashboard'),
     );
+}
+
+export function live({ flowing = true, ...rest }) {
+    return snapshot({ ...rest, flowing, title: 'live', timeLabel: 'Updated' });
+}
+
+export function summary({ flowing = true, ...rest }) {
+    return snapshot({ ...rest, flowing, title: 'update', timeLabel: 'As of' });
 }
 
 export function blockFound({ block, poolName, publicUrl }) {

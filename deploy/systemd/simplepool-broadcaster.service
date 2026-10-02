@@ -14,6 +14,7 @@ Environment=DASHBOARD_URL=http://127.0.0.1:8081
 Environment=BROADCASTER_STATE_PATH=@ROOT@/data/broadcaster.json
 Environment=DIGEST_UTC_HOUR=12
 # Environment=BROADCASTER_LIVE=1
+# Environment=BROADCASTER_SUMMARY_HOURS=6
 # Environment=PUBLIC_DASHBOARD_URL=https://pool.example
 # Environment=POOL_NAME=<name>
 # The bot token and channel go in a 0600 drop-in, not here: this file is

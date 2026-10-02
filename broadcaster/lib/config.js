@@ -27,6 +27,13 @@
  *                           with current stats (default off)
  *   BROADCASTER_LIVE_MS     how often the pinned message is refreshed
  *                           (default 300000)
+ *   BROADCASTER_SUMMARY_HOURS  also post the current stats as a NEW message
+ *                           every N hours (1-168), on UTC boundaries: 6 means
+ *                           00, 06, 12 and 18 UTC (exact for any N that
+ *                           divides 24). The pinned live message
+ *                           is edited in place, and Telegram neither notifies
+ *                           nor moves it for an edit; this is the post that
+ *                           shows up in the feed. Default off.
  *   STALE_SHARES_SEC        no accepted share for this long is announced as
  *                           the pool being down (default 900)
  *   HEALTH_DEBOUNCE         consecutive polls a new health / liveness state
@@ -58,6 +65,7 @@ export function loadConfig() {
         }
     }
     const digestRaw = str('DIGEST_UTC_HOUR');
+    const summaryRaw = str('BROADCASTER_SUMMARY_HOURS');
     return {
         token:        str('TELEGRAM_BOT_TOKEN'),
         chatId:       str('TELEGRAM_CHAT_ID'),
@@ -69,6 +77,8 @@ export function loadConfig() {
         digestHour:   digestRaw === 'off' ? null : num('DIGEST_UTC_HOUR', 12, { min: 0, max: 23 }),
         live:         process.env.BROADCASTER_LIVE === '1',
         liveMs:       num('BROADCASTER_LIVE_MS', 300000, { min: 60000 }),
+        summaryHours: summaryRaw == null || summaryRaw === 'off' || summaryRaw === '0'
+            ? null : num('BROADCASTER_SUMMARY_HOURS', null, { min: 1, max: 168 }),
         staleSharesSec: num('STALE_SHARES_SEC', 900, { min: 60 }),
         debounce:     num('HEALTH_DEBOUNCE', 3, { min: 1 }),
         dryRun,
