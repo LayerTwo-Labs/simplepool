@@ -32,7 +32,8 @@ const log = {
 };
 
 log.info(`simplepool-broadcaster ${version} starting ` +
-         `(dashboard=${cfg.dashboardUrl} chat=${cfg.chatId ?? '-'} state=${cfg.statePath}` +
+         `(dashboard=${cfg.dashboardUrl} chat=${cfg.chatId ?? '-'}` +
+         `${cfg.threadId != null ? ` topic=${cfg.threadId}` : ''} state=${cfg.statePath}` +
          `${cfg.dryRun ? ' DRY RUN' : ''})`);
 log.info(`  poll ${cfg.pollMs}ms, digest ${cfg.digestHour == null ? 'off' : `${cfg.digestHour}:00 UTC`}, ` +
          `live ${cfg.live ? `every ${cfg.liveMs}ms` : 'off'}, ` +
@@ -41,7 +42,7 @@ log.info(`  poll ${cfg.pollMs}ms, digest ${cfg.digestHour == null ? 'off' : `${c
 
 const broadcaster = new Broadcaster({
     dashboard: new DashboardClient({ url: cfg.dashboardUrl }),
-    telegram:  cfg.dryRun ? new DryRunClient() : new TelegramClient({ token: cfg.token, chatId: cfg.chatId }),
+    telegram:  cfg.dryRun ? new DryRunClient() : new TelegramClient({ token: cfg.token, chatId: cfg.chatId, threadId: cfg.threadId }),
     state:     loadState(cfg.statePath),
     cfg,
     log,

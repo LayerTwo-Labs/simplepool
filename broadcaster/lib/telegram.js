@@ -21,9 +21,10 @@ export class TelegramError extends Error {
 }
 
 export class TelegramClient {
-    constructor({ token, chatId, fetchImpl = fetch, sleep = defaultSleep, minGapMs = MIN_GAP_MS }) {
+    constructor({ token, chatId, threadId = null, fetchImpl = fetch, sleep = defaultSleep, minGapMs = MIN_GAP_MS }) {
         this.base = `https://api.telegram.org/bot${token}`;
         this.chatId = chatId;
+        this.threadId = threadId;
         this.fetch = fetchImpl;
         this.sleep = sleep;
         this.minGapMs = minGapMs;
@@ -31,10 +32,12 @@ export class TelegramClient {
         this.lastSent = 0;
     }
 
-    /* Returns the new message's id. */
+    /* Returns the new message's id. Only a send names the topic: edits and
+     * pins address a message id, which already belongs to one. */
     async send(html) {
         const r = await this.call('sendMessage', {
             chat_id: this.chatId,
+            ...(this.threadId != null && { message_thread_id: this.threadId }),
             text: html,
             parse_mode: 'HTML',
             link_preview_options: { is_disabled: true },
