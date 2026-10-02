@@ -7,6 +7,8 @@
  *                     pool's whole history.
  *   blocks            hash -> last status announced
  *   lastDigestDate    'YYYY-MM-DD' (UTC) of the last daily digest
+ *   lastSummarySlot   index of the last BROADCASTER_SUMMARY_HOURS period a
+ *                     summary was posted for (ms since epoch / period)
  *   liveMessageId     the pinned message edited in place
  *   liveUpdatedAt     ms of its last refresh
  *   sharesFlowing     last announced liveness (true/false/null)
@@ -28,6 +30,7 @@ export function emptyState() {
         initialized: false,
         blocks: {},
         lastDigestDate: null,
+        lastSummarySlot: null,
         liveMessageId: null,
         liveUpdatedAt: 0,
         sharesFlowing: null,

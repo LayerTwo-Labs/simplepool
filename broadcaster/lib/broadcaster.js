@@ -6,6 +6,7 @@
  *   - announces shares stopping / resuming, and ledger health failing /
  *     recovering, once the new state has held for `debounce` polls
  *   - posts the daily digest once per UTC day, at or after DIGEST_UTC_HOUR
+ *   - posts a stats summary once per BROADCASTER_SUMMARY_HOURS period
  *   - refreshes the pinned live message (BROADCASTER_LIVE=1)
  *
  * State is saved after every post, so a failure halfway through a tick
@@ -44,6 +45,7 @@ export class Broadcaster {
             await this.#liveness(status, nowSec);
             await this.#health(status);
             await this.#digest(status, blocks, nowMs);
+            await this.#summary(status, nowMs);
         }
         await this.#live(status, nowMs);
     }
@@ -57,6 +59,7 @@ export class Broadcaster {
         if (this.cfg.digestHour != null && now.getUTCHours() >= this.cfg.digestHour) {
             this.state.lastDigestDate = utcDate(now);
         }
+        if (this.cfg.summaryHours != null) this.state.lastSummarySlot = this.#summarySlot(nowMs);
         this.state.initialized = true;
         this.persist();
         this.log.info(`seeded: ${blocks.length} existing block(s) will not be announced`);
@@ -107,6 +110,29 @@ export class Broadcaster {
         await this.#post(msg.digest({ status, blocks, nowSec: Math.floor(nowMs / 1000), ...this.#ctx() }));
         this.state.lastDigestDate = today;
         this.persist();
+    }
+
+    /* A new message per period, unlike the live one, which is edited. The
+     * first period seen (first run, or the option just turned on) is
+     * recorded without a post, so enabling it does not post on the spot. */
+    async #summary(status, nowMs) {
+        if (this.cfg.summaryHours == null) return;
+        const slot = this.#summarySlot(nowMs);
+        if (this.state.lastSummarySlot === slot) return;
+        if (this.state.lastSummarySlot != null) {
+            await this.#post(msg.summary({
+                status,
+                nowSec: Math.floor(nowMs / 1000),
+                flowing: this.state.sharesFlowing !== false,
+                ...this.#ctx(),
+            }));
+        }
+        this.state.lastSummarySlot = slot;
+        this.persist();
+    }
+
+    #summarySlot(nowMs) {
+        return Math.floor(nowMs / (this.cfg.summaryHours * 3_600_000));
     }
 
     async #live(status, nowMs) {

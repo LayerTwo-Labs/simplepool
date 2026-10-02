@@ -35,7 +35,9 @@ log.info(`simplepool-broadcaster ${version} starting ` +
          `(dashboard=${cfg.dashboardUrl} chat=${cfg.chatId ?? '-'} state=${cfg.statePath}` +
          `${cfg.dryRun ? ' DRY RUN' : ''})`);
 log.info(`  poll ${cfg.pollMs}ms, digest ${cfg.digestHour == null ? 'off' : `${cfg.digestHour}:00 UTC`}, ` +
-         `live ${cfg.live ? `every ${cfg.liveMs}ms` : 'off'}, stale after ${cfg.staleSharesSec}s`);
+         `live ${cfg.live ? `every ${cfg.liveMs}ms` : 'off'}, ` +
+         `summary ${cfg.summaryHours == null ? 'off' : `every ${cfg.summaryHours}h`}, ` +
+         `stale after ${cfg.staleSharesSec}s`);
 
 const broadcaster = new Broadcaster({
     dashboard: new DashboardClient({ url: cfg.dashboardUrl }),

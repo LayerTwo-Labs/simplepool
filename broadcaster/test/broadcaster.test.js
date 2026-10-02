@@ -230,3 +230,42 @@ test('a failed post is retried next tick, not skipped', async () => {
     assert.equal(telegram.posts.length, 1);
     assert.match(telegram.posts[0], /107/);
 });
+
+test('summary posts a new message once per period, on UTC boundaries', async () => {
+    const H = 60 * MIN;
+    const { b, dashboard, telegram, state } = setup({ summaryHours: 6, digestHour: null });
+    // Shares keep flowing, so the only posts are summaries.
+    const tick = (ms) => { dashboard.s = status({ lastShareTs: ms / 1000 }); return b.tick(ms); };
+    await tick(T0);                         // 10:00, seeds: no post
+    assert.equal(telegram.posts.length, 0);
+    await tick(T0 + H);                     // 11:00, same 06-12 period
+    assert.equal(telegram.posts.length, 0);
+    await tick(T0 + 2 * H);                 // 12:00, new period
+    assert.equal(telegram.posts.length, 1);
+    assert.match(telegram.posts[0], /testpool — update/);
+    assert.match(telegram.posts[0], /As of 12:00 UTC/);
+    assert.match(telegram.posts[0], /Hashrate: <b>2\.00 TH\/s<\/b>/);
+    await tick(T0 + 5 * H);                 // 15:00, still 12-18
+    assert.equal(telegram.posts.length, 1);
+    await tick(T0 + 8 * H);                 // 18:00
+    assert.equal(telegram.posts.length, 2);
+    assert.equal(state.lastSummarySlot, Math.floor((T0 + 8 * H) / (6 * H)));
+});
+
+test('summary turned on for an existing state does not post on the spot', async () => {
+    const state = { ...emptyState(), initialized: true, sharesFlowing: true, healthOk: true };
+    const { b, dashboard, telegram } = setup({ summaryHours: 1, digestHour: null }, state);
+    await b.tick(T0);
+    assert.equal(telegram.posts.length, 0);
+    dashboard.s = status({ lastShareTs: (T0 + 60 * MIN) / 1000 });
+    await b.tick(T0 + 60 * MIN);
+    assert.equal(telegram.posts.length, 1);
+});
+
+test('summary is off by default and leaves the live message alone', async () => {
+    const { b, telegram } = setup({ live: true, digestHour: null });
+    await b.tick(T0);
+    await b.tick(T0 + 24 * 60 * MIN);
+    assert.equal(telegram.posts.length, 1);    // the live message, posted once
+    assert.equal(telegram.edits.length, 1);
+});

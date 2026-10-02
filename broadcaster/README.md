@@ -23,7 +23,12 @@ if Telegram or the service goes down, the pool is unaffected.
 | **Pool quiet / back** | no share accepted for `STALE_SHARES_SEC` (default 15m), and when shares resume |
 | **Health failing / recovered** | `/health` changes state, with the failing checks listed |
 | **Pinned live message** (`BROADCASTER_LIVE=1`) | one message, pinned, edited every `BROADCASTER_LIVE_MS` (default 5m) with current stats |
+| **Periodic update** (`BROADCASTER_SUMMARY_HOURS=N`) | the same stats as a new message every N hours, on UTC boundaries (6 → 00, 06, 12, 18 UTC) |
 
+- **Edited is not posted.** Telegram does not notify anyone of an edit or
+  move the message down the chat, so the pinned live message stays where it
+  was first posted. Followers who want stats in the feed need the periodic
+  update.
 - **No repeats, no backlog.** `broadcaster.json` records what was already
   posted. On its very first run the service records every existing block
   and today's digest (if the hour has passed) without posting them, so it
@@ -71,6 +76,7 @@ Environment only. The full list with defaults is in
 | `BROADCASTER_POLL_MS` | default 60000 |
 | `DIGEST_UTC_HOUR` | 0–23, or `off` (default 12) |
 | `BROADCASTER_LIVE`, `BROADCASTER_LIVE_MS` | pinned live message (default off, 300000) |
+| `BROADCASTER_SUMMARY_HOURS` | 1–168, or `off` (default off) |
 | `STALE_SHARES_SEC` | default 900 |
 | `HEALTH_DEBOUNCE` | default 3 |
 
