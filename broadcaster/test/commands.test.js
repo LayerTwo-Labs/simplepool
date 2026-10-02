@@ -14,6 +14,7 @@ function status() {
             db_ready: true, hashrate: 1e12, hashrate_1h: 2e12, hashrate_5m: 3e12, workers_active: 4,
             accepted: 1000, rejected: 5, reject_rate_pct: 0.5, best_share_24h: 123456, blocks_lifetime: 7, last_share_ts: T0 / 1000 - 5,
         },
+        node: { tip_height: 970861, tip_observed_at: T0 / 1000 - 1200 },
     };
 }
 
@@ -69,7 +70,7 @@ test('/pool_status is answered in its topic, as a reply, with the last block', a
     assert.match(html, /avonpool_beta — status/);
     assert.match(html, /Hashrate now: <b>3\.00 TH\/s<\/b> \(5m\)/);
     assert.match(html, /1,000 accepted · 5 rejected \(0\.50%\)/);
-    assert.match(html, /Last block: <b>#970,802<\/b> · 1h 0m ago/);
+    assert.match(html, /Chain tip: #970,861 · 20m ago\nLast mined block: <b>#970,802<\/b> · 1h 0m ago/);
     assert.match(html, /^🟢/);
 });
 
