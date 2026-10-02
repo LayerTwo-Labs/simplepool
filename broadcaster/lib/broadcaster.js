@@ -7,7 +7,8 @@
  *     recovering, once the new state has held for `debounce` polls
  *   - posts the daily digest once per UTC day, at or after DIGEST_UTC_HOUR
  *   - posts a stats summary once per BROADCASTER_SUMMARY_HOURS period
- *   - refreshes the pinned live message (BROADCASTER_LIVE=1)
+ *   - refreshes the live message (BROADCASTER_LIVE=1), pinned unless
+ *     BROADCASTER_LIVE_PIN=0
  *
  * State is saved after every post, so a failure halfway through a tick
  * retries only what was not sent.
@@ -45,9 +46,9 @@ export class Broadcaster {
             await this.#liveness(status, nowSec);
             await this.#health(status);
             await this.#digest(status, blocks, nowMs);
-            await this.#summary(status, nowMs);
+            await this.#summary(status, blocks, nowMs);
         }
-        await this.#live(status, nowMs);
+        await this.#live(status, blocks, nowMs);
     }
 
     /* First run: remember everything as already said. */
@@ -115,13 +116,14 @@ export class Broadcaster {
     /* A new message per period, unlike the live one, which is edited. The
      * first period seen (first run, or the option just turned on) is
      * recorded without a post, so enabling it does not post on the spot. */
-    async #summary(status, nowMs) {
+    async #summary(status, blocks, nowMs) {
         if (this.cfg.summaryHours == null) return;
         const slot = this.#summarySlot(nowMs);
         if (this.state.lastSummarySlot === slot) return;
         if (this.state.lastSummarySlot != null) {
             await this.#post(msg.summary({
                 status,
+                blocks,
                 nowSec: Math.floor(nowMs / 1000),
                 flowing: this.state.sharesFlowing !== false,
                 ...this.#ctx(),
@@ -135,10 +137,11 @@ export class Broadcaster {
         return Math.floor(nowMs / (this.cfg.summaryHours * 3_600_000));
     }
 
-    async #live(status, nowMs) {
+    async #live(status, blocks, nowMs) {
         if (!this.cfg.live || nowMs - this.state.liveUpdatedAt < this.cfg.liveMs) return;
         const html = msg.live({
             status,
+            blocks,
             nowSec: Math.floor(nowMs / 1000),
             flowing: this.state.sharesFlowing !== false,
             ...this.#ctx(),
@@ -156,10 +159,15 @@ export class Broadcaster {
         if (this.state.liveMessageId == null) {
             this.state.liveMessageId = await this.telegram.send(html);
             this.persist();
-            try {
-                await this.telegram.pin(this.state.liveMessageId);
-            } catch (e) {
-                this.log.warn(`could not pin the live message (does the bot have "Pin messages"?): ${e.message}`);
+            // BROADCASTER_LIVE_PIN=0: a chat where the bot may post but not
+            // pin keeps the message, without a warning on every new one.
+            if (this.cfg.livePin !== false) {
+                try {
+                    await this.telegram.pin(this.state.liveMessageId);
+                } catch (e) {
+                    this.log.warn(`could not pin the live message (does the bot have "Pin messages"? ` +
+                                  `BROADCASTER_LIVE_PIN=0 stops trying): ${e.message}`);
+                }
             }
         }
         this.state.liveUpdatedAt = nowMs;

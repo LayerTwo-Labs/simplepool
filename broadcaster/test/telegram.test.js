@@ -86,3 +86,34 @@ test('calls are spaced minGapMs apart', async () => {
     assert.equal(slept.length, 1);
     assert.ok(slept[0] > 2900 && slept[0] <= 3000);
 });
+
+test('a command reply overrides chat and topic and quotes the command', async () => {
+    const f = fakeFetch([[200, { ok: true, result: { message_id: 9 } }]]);
+    const t = new TelegramClient({ token: 'x', chatId: 'c', threadId: 1, fetchImpl: f, sleep: noSleep, minGapMs: 0 });
+    await t.send('a', { chatId: -100, threadId: null, replyTo: 77 });
+    const body = f.calls[0].body;
+    assert.equal(body.chat_id, -100);
+    assert.equal('message_thread_id' in body, false);
+    assert.deepEqual(body.reply_parameters, { message_id: 77, allow_sending_without_reply: true });
+});
+
+test('getUpdates is not queued behind posts and asks only for messages', async () => {
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const calls = [];
+    let updatesBody;
+    const fetchImpl = async (url, init) => {
+        calls.push(url.split('/').pop());
+        if (url.endsWith('getUpdates')) updatesBody = JSON.parse(init.body);
+        if (url.endsWith('sendMessage')) await gate;
+        return { status: 200, json: async () => ({ ok: true, result: url.endsWith('getUpdates') ? [] : { message_id: 1 } }) };
+    };
+    const t = new TelegramClient({ token: 'x', chatId: 'c', fetchImpl, sleep: noSleep, minGapMs: 0 });
+    const posting = t.send('a');
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(await t.getUpdates({ offset: 3, timeoutSec: 0 }), []);
+    assert.deepEqual(calls, ['sendMessage', 'getUpdates']);
+    assert.deepEqual(updatesBody.allowed_updates, ['message']);
+    release();
+    await posting;
+});

@@ -29,7 +29,7 @@ function status({ lastShareTs, healthOk = true, healthStatus } = {}) {
         pool: {
             db_ready: true,
             hashrate: 1e12, hashrate_1h: 2e12, hashrate_5m: 3e12,
-            workers_active: 4, accepted: 1000, reject_rate_pct: 0.5,
+            workers_active: 4, accepted: 1000, rejected: 5, reject_rate_pct: 0.5,
             best_share_24h: 123456, blocks_lifetime: 7,
             last_share_ts: lastShareTs, mode: 'pps-classic', fee_bps: 100,
         },
@@ -179,7 +179,8 @@ test('digest posts once per UTC day at or after the configured hour', async () =
     const digests = telegram.posts.filter((p) => p.includes('daily report'));
     assert.equal(digests.length, 1);
     assert.match(digests[0], /2026-09-30/);
-    assert.match(digests[0], /2\.00 TH\/s<\/b> \(1h\)/);
+    assert.match(digests[0], /Hashrate now: <b>3\.00 TH\/s<\/b> \(5m\)/);
+    assert.match(digests[0], /2\.00 TH\/s \(1h\)/);
     assert.match(digests[0], /pps-classic · fee 1\.00%/);
     assert.match(digests[0], /href="https:\/\/pool\.example\/"/);
 
@@ -244,7 +245,9 @@ test('summary posts a new message once per period, on UTC boundaries', async () 
     assert.equal(telegram.posts.length, 1);
     assert.match(telegram.posts[0], /testpool — update/);
     assert.match(telegram.posts[0], /As of 12:00 UTC/);
-    assert.match(telegram.posts[0], /Hashrate: <b>2\.00 TH\/s<\/b>/);
+    assert.match(telegram.posts[0], /Hashrate now: <b>3\.00 TH\/s<\/b> \(5m\)/);
+    assert.match(telegram.posts[0], /Hashrate: 2\.00 TH\/s \(1h\) · 1\.00 TH\/s \(24h\)/);
+    assert.match(telegram.posts[0], /Shares \(24h\): 1,000 accepted · 5 rejected \(0\.50%\)/);
     await tick(T0 + 5 * H);                 // 15:00, still 12-18
     assert.equal(telegram.posts.length, 1);
     await tick(T0 + 8 * H);                 // 18:00
@@ -268,4 +271,25 @@ test('summary is off by default and leaves the live message alone', async () => 
     await b.tick(T0 + 24 * 60 * MIN);
     assert.equal(telegram.posts.length, 1);    // the live message, posted once
     assert.equal(telegram.edits.length, 1);
+});
+
+test('BROADCASTER_LIVE_PIN=0 posts the live message without pinning it', async () => {
+    const { b, telegram } = setup({ live: true, livePin: false, digestHour: null });
+    await b.tick(T0);
+    assert.equal(telegram.posts.length, 1);
+    assert.deepEqual(telegram.pins, []);
+});
+
+test('live message and summary show the last counted block', async () => {
+    const { b, dashboard, telegram } = setup({ live: true, summaryHours: 1, digestHour: null });
+    dashboard.b = [
+        block('old', 100, 'confirmed', T0 / 1000 - 7200),
+        block('lost', 101, 'orphaned', T0 / 1000 - 600),
+    ];
+    await b.tick(T0);
+    assert.match(telegram.posts[0], /Last block: <b>#100<\/b> · 2h 0m ago/);
+    dashboard.s = status({ lastShareTs: (T0 + 60 * MIN) / 1000 });
+    await b.tick(T0 + 60 * MIN);
+    assert.match(telegram.posts[1], /— update/);
+    assert.match(telegram.posts[1], /Last block: <b>#100<\/b>/);
 });

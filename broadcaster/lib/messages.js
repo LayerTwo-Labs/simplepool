@@ -63,12 +63,15 @@ function lines(...xs) {
     return xs.filter((x) => x != null && x !== false).join('\n');
 }
 
-/* The core stat block shared by the digest and the pinned live message. */
+/* The core stat block shared by the digest, the live message, the periodic
+ * update and /pool_status. "Current" is the dashboard's 5-minute rate. */
 function statLines(p) {
     return [
-        `Hashrate: <b>${fmtHashrate(p.hashrate_1h)}</b> (1h) · ${fmtHashrate(p.hashrate)} (24h)`,
+        `Hashrate now: <b>${fmtHashrate(p.hashrate_5m)}</b> (5m)`,
+        `Hashrate: ${fmtHashrate(p.hashrate_1h)} (1h) · ${fmtHashrate(p.hashrate)} (24h)`,
         `Active workers (24h): <b>${fmtN(p.workers_active)}</b>`,
-        `Shares (24h): ${fmtN(p.accepted)} accepted · ${(p.reject_rate_pct ?? 0).toFixed(2)}% rejected`,
+        `Shares (24h): ${fmtN(p.accepted)} accepted · ${fmtN(p.rejected)} rejected ` +
+            `(${(p.reject_rate_pct ?? 0).toFixed(2)}%)`,
         `Best share (24h): ${fmtDiff(p.best_share_24h)}`,
     ];
 }
@@ -98,9 +101,19 @@ export function digest({ status, blocks, poolName, publicUrl, nowSec }) {
     );
 }
 
-/* The pinned message and the periodic summary show the same numbers; only
- * the heading and the time line differ. */
-function snapshot({ status, poolName, publicUrl, nowSec, flowing, title, timeLabel }) {
+/* The newest block that still counts: pending or confirmed. An orphaned or
+ * rejected one is not the pool's last block. `blocks` is newest first. */
+export function lastBlockLine(blocks, nowSec) {
+    const b = (blocks ?? []).find((x) => x.status === 'pending' || x.status === 'confirmed');
+    if (!b) return 'Last block: none yet';
+    const ago = b.ts != null ? ` · ${fmtAgo(nowSec - b.ts)} ago` : '';
+    return `Last block: <b>#${fmtN(b.height)}</b>${ago}`;
+}
+
+/* The pinned message, the periodic summary and the /pool_status reply show
+ * the same numbers; only the heading and the time line differ. The last
+ * block line appears whenever the blocks list was read. */
+function snapshot({ status, blocks, poolName, publicUrl, nowSec, flowing, title, timeLabel }) {
     const p = status.pool;
     const lastShare = p.last_share_ts ? fmtAgo(nowSec - p.last_share_ts) + ' ago' : 'never';
     return lines(
@@ -108,6 +121,7 @@ function snapshot({ status, poolName, publicUrl, nowSec, flowing, title, timeLab
         '',
         ...statLines(p),
         `Last share: ${lastShare}`,
+        blocks !== undefined ? lastBlockLine(blocks, nowSec) : null,
         `Blocks (all time): ${fmtN(p.blocks_lifetime)}`,
         '',
         `<i>${timeLabel} ${new Date(nowSec * 1000).toISOString().slice(11, 16)} UTC</i>`,
@@ -121,6 +135,14 @@ export function live({ flowing = true, ...rest }) {
 
 export function summary({ flowing = true, ...rest }) {
     return snapshot({ ...rest, flowing, title: 'update', timeLabel: 'As of' });
+}
+
+export function poolStatus({ flowing = true, ...rest }) {
+    return snapshot({ ...rest, flowing, title: 'status', timeLabel: 'As of' });
+}
+
+export function statusUnavailable({ poolName }) {
+    return `⚠️ <b>${esc(poolName)}</b>: the pool's status can't be read right now. Try again in a minute.`;
 }
 
 export function blockFound({ block, poolName, publicUrl }) {
