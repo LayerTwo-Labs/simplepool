@@ -159,6 +159,11 @@ struct stratum_job {
     uint32_t ntime;
     uint8_t  network_target_be[32];
     uint32_t height;
+    /* Per-job coinbase salt (see cb_tag_push in coinbase.c): derived from
+     * job_id at construction, never 0, so two jobs from one template
+     * practically never share a coinbase (32 bits: a collision is possible,
+     * just negligible over a template's lifetime). */
+    uint32_t cb_salt;
 
     char   **tx_hex_list;   /* owned */
     size_t   tx_count;
@@ -190,6 +195,9 @@ struct stratum_job {
      * look like a solved block. */
     _Atomic int refs;
 };
+
+/* Defined with the dedupe helpers below; the job constructor needs it first. */
+static uint64_t fnv1a(const char *s);
 
 stratum_job_t *stratum_job_new(
     const char *job_id,
@@ -235,6 +243,12 @@ stratum_job_t *stratum_job_new(
     j->ntime = ntime;
     if (network_target_be) memcpy(j->network_target_be, network_target_be, 32);
     j->height = height;
+    /* job_id is unique per job (main.c derives it from the build time), so
+     * hashing it makes the salt unique too. Truncate to 32 bits and force
+     * non-zero: 0 means "no salt push" to the builders and would silently
+     * bring back identical work. */
+    j->cb_salt = (uint32_t)fnv1a(j->job_id);
+    if (j->cb_salt == 0) j->cb_salt = 1;
     if (tx_count && tx_hex_list) {
         j->tx_hex_list = calloc(tx_count, sizeof(char *));
         if (!j->tx_hex_list) goto fail;
@@ -872,7 +886,7 @@ static int render_finder_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                             c->payout_address,
                                             s->cfg.operator_address,
                                             s->cfg.fee_bps,
-                                            s->cfg.coinbase_tag,
+                                            s->cfg.coinbase_tag, job->cb_salt,
                                             job->en1_size, job->en2_size,
                                             parts, NULL, NULL, NULL,
                                             err, errlen);
@@ -880,7 +894,7 @@ static int render_finder_coinbase(stratum_server_t *s, stratum_conn_t *c,
     return coinbase_build_split(job->height, job->value_sats,
                                 c->payout_address,
                                 s->cfg.operator_address, s->cfg.fee_bps,
-                                job->wc_hex, s->cfg.coinbase_tag,
+                                job->wc_hex, s->cfg.coinbase_tag, job->cb_salt,
                                 job->en1_size, job->en2_size,
                                 parts, NULL, NULL, err, errlen);
 }
@@ -911,7 +925,7 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
             rc = coinbase_build_window_from_template(
                     job->coinbasetxn_hex, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps,
-                    s->cfg.coinbase_tag, job->en1_size, job->en2_size,
+                    s->cfg.coinbase_tag, job->cb_salt, job->en1_size, job->en2_size,
                     conn_coinbase_budget(s, c), s->cfg.payout_floor_sats,
                     &parts, NULL, NULL,
                     err, sizeof err);
@@ -919,7 +933,7 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
             rc = coinbase_build_window(
                     job->height, job->value_sats, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps, job->wc_hex,
-                    s->cfg.coinbase_tag, job->en1_size, job->en2_size,
+                    s->cfg.coinbase_tag, job->cb_salt, job->en1_size, job->en2_size,
                     conn_coinbase_budget(s, c), s->cfg.payout_floor_sats,
                     &parts, NULL, err, sizeof err);
         }
@@ -933,14 +947,14 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
             rc = coinbase_build_from_template(job->coinbasetxn_hex,
                                               s->cfg.pool_btc_address,
                                               s->cfg.operator_address, s->cfg.fee_bps,
-                                              s->cfg.coinbase_tag,
+                                              s->cfg.coinbase_tag, job->cb_salt,
                                               job->en1_size, job->en2_size,
                                               &parts, NULL, NULL, NULL, err, sizeof err);
         } else {
             rc = coinbase_build_split(job->height, job->value_sats,
                                       s->cfg.pool_btc_address,
                                       s->cfg.operator_address, s->cfg.fee_bps,
-                                      job->wc_hex, s->cfg.coinbase_tag,
+                                      job->wc_hex, s->cfg.coinbase_tag, job->cb_salt,
                                       job->en1_size, job->en2_size,
                                       &parts, NULL, NULL, err, sizeof err);
         }
@@ -2418,14 +2432,14 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             wrc = coinbase_build_window_from_template(
                     job->coinbasetxn_hex, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps,
-                    s->cfg.coinbase_tag, job->en1_size, job->en2_size,
+                    s->cfg.coinbase_tag, job->cb_salt, job->en1_size, job->en2_size,
                     conn_coinbase_budget(s, c), s->cfg.payout_floor_sats,
                     &throwaway, NULL, &res, werr, sizeof werr);
         } else {
             wrc = coinbase_build_window(
                     job->height, job->value_sats, job->payees, job->n_payees,
                     s->cfg.operator_address, s->cfg.fee_bps, job->wc_hex,
-                    s->cfg.coinbase_tag, job->en1_size, job->en2_size,
+                    s->cfg.coinbase_tag, job->cb_salt, job->en1_size, job->en2_size,
                     conn_coinbase_budget(s, c), s->cfg.payout_floor_sats,
                     &throwaway, &res, werr, sizeof werr);
         }
@@ -2700,6 +2714,9 @@ void stratum_conn_apply_listener_for_test(stratum_conn_t *c,
 void stratum_conn_set_coinbase_budget_for_test(stratum_conn_t *c, int bytes) {
     if (c) c->pol_max_coinbase_bytes = bytes;
 }
+
+void stratum_job_set_cb_salt_for_test(stratum_job_t *j, uint32_t salt) { j->cb_salt = salt; }
+uint32_t stratum_job_cb_salt_for_test(const stratum_job_t *j) { return j->cb_salt; }
 
 stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     stratum_conn_t *c = calloc(1, sizeof(*c));
