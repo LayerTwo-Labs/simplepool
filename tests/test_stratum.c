@@ -1803,7 +1803,7 @@ static void test_jobs_from_one_template_have_distinct_coinbases(void) {
     uint8_t net[32]; memset(net, 0xff, 32);
 
     stratum_job_t *a = make_test_job("18f3a0c1d2e", net);
-    stratum_job_t *b = make_test_job("18f3a0c1d4f", net);   /* 30 s later */
+    stratum_job_t *b = make_test_job("18f3a0c1d4f", net);   /* 33 ms later */
     stratum_job_t *z = make_test_job("18f3a0c1d50", net);
     stratum_job_set_cb_salt_for_test(z, 0);
     CHECK(stratum_job_cb_salt_for_test(a) != 0);
@@ -3314,6 +3314,65 @@ static void test_the_queue_credits_the_miners_the_block_actually_skipped(void) {
     printf("ok: the payout queue credits the miner the block actually skipped\n");
 }
 
+/* One found block on a two-miner window under a coinbase byte budget `budget`,
+ * with the job salt either left as stratum_job_new set it or forced to 0.
+ * Returns how many rotations the block staged, or -1 if no block was found
+ * (the coinbase could not be rendered at that budget at all). */
+static int salted_edge_rotations(size_t budget, int force_unsalted) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2, .initial_diff = 1e12,
+                          .coinbase_pays_window = 1,
+                          .max_coinbase_bytes = budget,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block,
+                          .on_window_fractions = on_window_fractions };
+    snprintf(cfg.bind_addr, sizeof cfg.bind_addr, "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    if (!s) return -2;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_job_t *job = make_test_job("JQS", net);
+    if (force_unsalted) stratum_job_set_cb_salt_for_test(job, 0);
+    const coinbase_payee_t win[] = {
+        { TEST_ADDR,  3000000000LL }, { TEST_ADDR2, 2000000000LL },
+    };
+    const int64_t ids[] = { 301, 302 };
+    CHECK(stratum_job_set_window(job, win, ids, 2) == 0);
+    stratum_server_set_job(s, job, 1);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":9,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"JQS\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    free(out);
+    int r = obs.blocks == 1 ? (int)obs.frac_calls : -1;
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    return r;
+}
+
+/* The after-block recount must render with the job's salt.
+ *
+ * submit_with_job() rebuilds the window coinbase after a block to learn who
+ * the block actually paid, and stages the rotation from that. It must pass
+ * the same salt the miner hashed: at the exact edge of the byte budget the
+ * salted coinbase cuts a payee that an unsalted one would still pay, and a
+ * recount without the salt would then record "everyone paid" for a block
+ * that skipped somebody. So find a budget where the salted job cuts and the
+ * unsalted one does not, and require the salted block to stage the rotation. */
+static void test_the_after_block_recount_uses_the_job_salt(void) {
+    size_t edge = 0;
+    for (size_t b = 100; b <= 600 && !edge; ++b)
+        if (salted_edge_rotations(b, 1) == 0 && salted_edge_rotations(b, 0) == 1)
+            edge = b;
+    CHECK(edge > 0);
+    /* and the two sides of it really are the edge */
+    CHECK(salted_edge_rotations(edge + COINBASE_JOB_SALT_PUSH_BYTES, 0) == 0);
+    printf("ok: the after-block recount renders with the job salt (edge %zu)\n", edge);
+}
+
 /* A window nothing was dropped from stages nothing.
  *
  * The deltas are "who did this block treat differently from their claim", so a
@@ -3713,6 +3772,7 @@ int main(void) {
     test_pplns_coinbase_pays_every_miner_in_the_window();
     test_the_queue_credits_the_miners_the_block_actually_skipped();
     test_a_block_that_pays_everyone_stages_no_rotation();
+    test_the_after_block_recount_uses_the_job_salt();
     test_a_rejected_candidate_stages_no_rotation();
     test_pplns_btc_takes_a_bitcoin_username();
     test_pplns_thunder_takes_a_thunder_username();

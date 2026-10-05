@@ -44,7 +44,7 @@ simplepool uses the standard stratum-v1 split:
 ```
 coinbase scriptSig layout (assembled at share-check time):
 
-   [ height_push ] [ tag ] [ extranonce1 (4 B) ][ extranonce2 (8 B) ]
+   [ height_push ] [ tag ] [ job salt (5 B) ] [ extranonce1 (4 B) ][ extranonce2 (8 B) ]
                             └── pool assigns ──┘└──  miner picks   ──┘
 ```
 

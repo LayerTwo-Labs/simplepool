@@ -1495,8 +1495,7 @@ size_t coinbase_expected_payout_slots(size_t max_coinbase_bytes,
     size_t budget = max_coinbase_bytes ? max_coinbase_bytes
                                        : (size_t)COINBASE_DEFAULT_MAX_BYTES;
     /* The envelope the builder always pays: version, input, scriptSig with a
-     * generous extranonce, tag and job salt push (160 covers a scriptSig at
-     * its 100-byte cap), output count, locktime, and a reserved
+     * generous extranonce and tag, output count, locktime, and a reserved
      * operator output. Deliberately on the pessimistic side -- reserving one
      * slot too few costs a rotation, reserving one too many costs a payout. */
     size_t fixed = 160;

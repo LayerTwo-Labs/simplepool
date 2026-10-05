@@ -160,7 +160,9 @@ struct stratum_job {
     uint8_t  network_target_be[32];
     uint32_t height;
     /* Per-job coinbase salt (see cb_tag_push in coinbase.c): derived from
-     * job_id at construction, never 0, so two jobs never share a coinbase. */
+     * job_id at construction, never 0, so two jobs from one template
+     * practically never share a coinbase (32 bits: a collision is possible,
+     * just negligible over a template's lifetime). */
     uint32_t cb_salt;
 
     char   **tx_hex_list;   /* owned */
