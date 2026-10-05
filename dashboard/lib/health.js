@@ -28,6 +28,14 @@ import { rateVerification } from './stats.js';
  * drynet3. An hour means something is genuinely wrong, not slow. */
 const PAYOUT_STALL_SEC = 3600;
 
+/* The enforcer's first template after a new block carries only the witness
+ * commitment; the sidechain commitments follow on the next poll, ~30s later.
+ * Measured on betanet: every block, never longer than one 30s poll. A bare
+ * template younger than this is that gap, not a fault — four polls of grace,
+ * and an enforcer that really stopped committing still fails within one
+ * monitor interval after it. */
+const TEMPLATE_COMMIT_GRACE_SEC = 120;
+
 /* The block subsidy at a height, on the standard schedule: 50 BTC, halved
  * every 210,000 blocks. Chains derived from Bitcoin — mainnet, testnet,
  * signet, and forknets that keep their parent's height — all share it;
@@ -415,10 +423,14 @@ export function health(handle) {
      * so nothing else complains — but no sidechain can be merge-mined into
      * them, which is what stalled Thunder before. */
     checks.push(guard('template_commitments', 'Templates carry sidechain commitments', () => {
-        const r = one(d, `SELECT source, cb_op_returns FROM templates
-                           ORDER BY id DESC LIMIT 1`);
+        const r = one(d, `SELECT source, cb_op_returns,
+                                 strftime('%s','now') - ts AS age
+                            FROM templates ORDER BY id DESC LIMIT 1`);
         if (!r) return { ok: true, unavailable: true, detail: 'no templates recorded yet' };
         const ok = r.source === 'enforcer' && Number(r.cb_op_returns) > 1;
+        if (!ok && Number(r.age) < TEMPLATE_COMMIT_GRACE_SEC)
+            return { ok: true, value: Number(r.cb_op_returns),
+                     detail: 'new block — commitments pending' };
         return { ok, value: Number(r.cb_op_returns),
                  detail: ok ? null
                     : `mining ${r.source} templates with ${r.cb_op_returns} OP_RETURN(s) — no sidechain can merge-mine` };

@@ -293,6 +293,31 @@ test('an enforcer template with only a witness commitment is caught', () => {
     assert.ok(failing(health(db)).includes('template_commitments'));
 });
 
+/* Every new block opens with one bare enforcer template for ~30s before the
+ * commitments arrive. That gap must not raise the alarm. */
+test('a bare template only seconds old is the new-block gap, not a failure', () => {
+    const db = makeDb();
+    db.prepare(`INSERT INTO templates (ts,height,prev_hash,bits,network_difficulty,
+                    coinbase_value_sats,tx_count,tx_fees_sats,source,cb_spendable,
+                    cb_op_returns,longpoll,rate_sats_per_diff)
+                VALUES (?, 3, 'bb', '1a', 111157.455, 312500000, 1, 0,
+                        'enforcer', 1, 1, 1, ?)`).run(Math.floor(Date.now() / 1000) - 20, RATE);
+    const h = health(db);
+    assert.ok(!failing(h).includes('template_commitments'));
+    assert.match(h.checks.find(c => c.id === 'template_commitments').detail, /pending/);
+});
+
+/* ...but one that outlives the grace is the real thing. */
+test('a bare template past the grace period is caught', () => {
+    const db = makeDb();
+    db.prepare(`INSERT INTO templates (ts,height,prev_hash,bits,network_difficulty,
+                    coinbase_value_sats,tx_count,tx_fees_sats,source,cb_spendable,
+                    cb_op_returns,longpoll,rate_sats_per_diff)
+                VALUES (?, 3, 'bb', '1a', 111157.455, 312500000, 1, 0,
+                        'enforcer', 1, 1, 1, ?)`).run(Math.floor(Date.now() / 1000) - 180, RATE);
+    assert.ok(failing(health(db)).includes('template_commitments'));
+});
+
 /* A check that cannot run must not read as a pass, and must not take the
  * page down either. */
 test('a DB missing a table degrades to unavailable, not to healthy', () => {
