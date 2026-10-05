@@ -507,15 +507,66 @@ void coinbase_parts_free(coinbase_parts_t *p) {
     free(p->cb2); p->cb2 = NULL; p->cb2_len = 0;
 }
 
+/* Largest tag push (1 + 75) plus the salt push, rounded up. */
+#define CB_TAG_PUSH_MAX 88
+
+/* ---- coinbase tag + per-job salt push ----
+ *
+ * The operator's tag as one data push, then -- when job_salt is non-zero -- a
+ * second push carrying the salt: 0x04 followed by 4 bytes, little-endian.
+ * The salt exists so that two jobs built from the SAME template are still
+ * different work. A pool re-issues a job whenever it re-polls, and when the
+ * template has not moved the coinbase, the merkle root and therefore every
+ * header a rig can build are byte-identical to the previous job's. Rigs that
+ * restart their search on each job then re-find hashes the pool has already
+ * credited, and the pool answers with a storm of duplicate-share rejections.
+ * A different salt per job changes the merkle root, so a repeated search
+ * cannot repeat a header. The tag push itself is untouched.
+ *
+ * Bytes added: COINBASE_JOB_SALT_PUSH_BYTES (5). Every builder counts them
+ * against the 100-byte scriptSig cap, and every byte-budget model of the
+ * coinbase (the window builders' probes) counts them as well. Salt 0 means
+ * "no push" and keeps the previous layout byte for byte. */
+static size_t cb_tag_push(const char *coinbase_tag, uint32_t job_salt,
+                          uint8_t out[CB_TAG_PUSH_MAX]) {
+    size_t n = 0;
+    if (coinbase_tag && *coinbase_tag) {
+        size_t tlen = strlen(coinbase_tag);
+        if (tlen > 75) tlen = 75;
+        out[n++] = (uint8_t)tlen;
+        memcpy(out + n, coinbase_tag, tlen);
+        n += tlen;
+    }
+    if (job_salt) {
+        out[n++] = 4;
+        out[n++] = (uint8_t)(job_salt);
+        out[n++] = (uint8_t)(job_salt >> 8);
+        out[n++] = (uint8_t)(job_salt >> 16);
+        out[n++] = (uint8_t)(job_salt >> 24);
+    }
+    return n;
+}
+
+/* Size cb_tag_push() would emit, for the probes that only need a length. */
+static size_t cb_tag_push_len(const char *coinbase_tag, uint32_t job_salt) {
+    size_t n = 0;
+    if (coinbase_tag && *coinbase_tag) {
+        size_t t = strlen(coinbase_tag);
+        n += (t > 75 ? 75 : t) + 1;
+    }
+    if (job_salt) n += COINBASE_JOB_SALT_PUSH_BYTES;
+    return n;
+}
+
 int coinbase_build(uint32_t height, int64_t value_sats,
                    const char *payout_address,
                    const char *witness_commitment_hex,
-                   const char *coinbase_tag,
+                   const char *coinbase_tag, uint32_t job_salt,
                    size_t extranonce1_size, size_t extranonce2_size,
                    coinbase_parts_t *out, char *errbuf, size_t errlen) {
     return coinbase_build_split(height, value_sats,
                                 payout_address, NULL, 0,
-                                witness_commitment_hex, coinbase_tag,
+                                witness_commitment_hex, coinbase_tag, job_salt,
                                 extranonce1_size, extranonce2_size,
                                 out, NULL, NULL, errbuf, errlen);
 }
@@ -525,7 +576,7 @@ int coinbase_build_split(uint32_t height, int64_t value_sats,
                          const char *operator_address,
                          int fee_bps,
                          const char *witness_commitment_hex,
-                         const char *coinbase_tag,
+                         const char *coinbase_tag, uint32_t job_salt,
                          size_t extranonce1_size, size_t extranonce2_size,
                          coinbase_parts_t *out,
                          int64_t *out_miner_sats, int64_t *out_fee_sats,
@@ -590,15 +641,8 @@ int coinbase_build_split(uint32_t height, int64_t value_sats,
     size_t height_push_len = bip34_height_push(height, height_push);
 
     /* Tag push. */
-    uint8_t tag_push[80];
-    size_t tag_push_len = 0;
-    if (coinbase_tag && *coinbase_tag) {
-        size_t tlen = strlen(coinbase_tag);
-        if (tlen > 75) tlen = 75;
-        tag_push[0] = (uint8_t)tlen;
-        memcpy(tag_push + 1, coinbase_tag, tlen);
-        tag_push_len = tlen + 1;
-    }
+    uint8_t tag_push[CB_TAG_PUSH_MAX];
+    size_t tag_push_len = cb_tag_push(coinbase_tag, job_salt, tag_push);
 
     size_t en_total = extranonce1_size + extranonce2_size;
     size_t script_sig_len = height_push_len + tag_push_len + en_total;
@@ -606,6 +650,7 @@ int coinbase_build_split(uint32_t height, int64_t value_sats,
     /* Consensus caps the coinbase scriptSig at 100 bytes; a block that
      * exceeds it is rejected outright. The budget is the BIP34 height push
      * plus the operator's coinbase_tag (up to 76 bytes with its length byte)
+     * plus the 5-byte job salt push when job_salt is non-zero
      * plus both extranonces, so a long tag and a wide extranonce can reach it
      * together. The coinbasetxn path below checks this already -- check here
      * too rather than emitting a coinbase that only fails at the network. */
@@ -960,7 +1005,7 @@ int coinbase_build_window(uint32_t height, int64_t value_sats,
                           const coinbase_payee_t *payees, size_t n_payees,
                           const char *operator_address, int fee_bps,
                           const char *witness_commitment_hex,
-                          const char *coinbase_tag,
+                          const char *coinbase_tag, uint32_t job_salt,
                           size_t extranonce1_size, size_t extranonce2_size,
                           size_t max_coinbase_bytes,
                           int64_t payout_floor_sats,
@@ -977,11 +1022,7 @@ int coinbase_build_window(uint32_t height, int64_t value_sats,
     size_t wc_probe_len = 0;
     if (witness_commitment_hex && *witness_commitment_hex)
         wc_probe_len = strlen(witness_commitment_hex) / 2;
-    size_t tag_len_probe = 0;
-    if (coinbase_tag && *coinbase_tag) {
-        size_t t = strlen(coinbase_tag);
-        tag_len_probe = (t > 75 ? 75 : t) + 1;
-    }
+    size_t tag_len_probe = cb_tag_push_len(coinbase_tag, job_salt);
     uint8_t hp_probe[8];
     size_t ss_probe = bip34_height_push(height, hp_probe) + tag_len_probe
                     + extranonce1_size + extranonce2_size;
@@ -1041,15 +1082,8 @@ int coinbase_build_window(uint32_t height, int64_t value_sats,
 
     uint8_t height_push[8];
     size_t  height_push_len = bip34_height_push(height, height_push);
-    uint8_t tag_push[80];
-    size_t  tag_push_len = 0;
-    if (coinbase_tag && *coinbase_tag) {
-        size_t tlen = strlen(coinbase_tag);
-        if (tlen > 75) tlen = 75;
-        tag_push[0] = (uint8_t)tlen;
-        memcpy(tag_push + 1, coinbase_tag, tlen);
-        tag_push_len = tlen + 1;
-    }
+    uint8_t tag_push[CB_TAG_PUSH_MAX];
+    size_t  tag_push_len = cb_tag_push(coinbase_tag, job_salt, tag_push);
     size_t en_total = extranonce1_size + extranonce2_size;
     size_t script_sig_len = height_push_len + tag_push_len + en_total;
     if (script_sig_len < 2 || script_sig_len > 100) {
@@ -1090,7 +1124,7 @@ oom:
 
 static int build_from_template_impl(const char *coinbase_tx_hex,
                                     cb_repl_fn repl_fn, void *repl_ctx,
-                                    const char *coinbase_tag,
+                                    const char *coinbase_tag, uint32_t job_salt,
                                     size_t extranonce1_size,
                                     size_t extranonce2_size,
                                     coinbase_parts_t *out,
@@ -1205,11 +1239,7 @@ static int build_from_template_impl(const char *coinbase_tx_hex,
      * commitment OP_RETURNs the enforcer put in the template: they are why
      * the same 16 payouts can fit under one budget and not another, and why
      * a cap counted in outputs cannot express the limit at all. */
-    size_t tag_probe = 0;
-    if (coinbase_tag && *coinbase_tag) {
-        size_t t = strlen(coinbase_tag);
-        tag_probe = (t > 75 ? 75 : t) + 1;
-    }
+    size_t tag_probe = cb_tag_push_len(coinbase_tag, job_salt);
     size_t ss_probe = (size_t)ss_len + tag_probe
                     + extranonce1_size + extranonce2_size;
     size_t fixed_bytes = 4 + 1 + 36 + (ss_probe < 253 ? 1 : 3) + ss_probe
@@ -1240,14 +1270,8 @@ static int build_from_template_impl(const char *coinbase_tx_hex,
     }
 
     /* Optional coinbase tag, appended into the scriptSig. */
-    uint8_t tag_push[80]; size_t tag_push_len = 0;
-    if (coinbase_tag && *coinbase_tag) {
-        size_t tlen = strlen(coinbase_tag);
-        if (tlen > 75) tlen = 75;
-        tag_push[0] = (uint8_t)tlen;
-        memcpy(tag_push + 1, coinbase_tag, tlen);
-        tag_push_len = tlen + 1;
-    }
+    uint8_t tag_push[CB_TAG_PUSH_MAX];
+    size_t tag_push_len = cb_tag_push(coinbase_tag, job_salt, tag_push);
 
     /* New scriptSig = server scriptSig (BIP34 height + any server data) +
      * tag + extranonce placeholder. Coinbase scriptSig is capped at 100. */
@@ -1380,7 +1404,7 @@ int coinbase_build_from_template(const char *coinbase_tx_hex,
                                  const char *miner_address,
                                  const char *operator_address,
                                  int fee_bps,
-                                 const char *coinbase_tag,
+                                 const char *coinbase_tag, uint32_t job_salt,
                                  size_t extranonce1_size,
                                  size_t extranonce2_size,
                                  coinbase_parts_t *out,
@@ -1399,7 +1423,8 @@ int coinbase_build_from_template(const char *coinbase_tx_hex,
     ctx.out_miner_sats = out_miner_sats;
     ctx.out_fee_sats = out_fee_sats;
     return build_from_template_impl(coinbase_tx_hex, repl_single, &ctx,
-                                    coinbase_tag, extranonce1_size,
+                                    coinbase_tag, job_salt,
+                                    extranonce1_size,
                                     extranonce2_size, out, out_has_witness,
                                     errbuf, errlen);
 }
@@ -1409,7 +1434,7 @@ int coinbase_build_window_from_template(const char *coinbase_tx_hex,
                                         size_t n_payees,
                                         const char *operator_address,
                                         int fee_bps,
-                                        const char *coinbase_tag,
+                                        const char *coinbase_tag, uint32_t job_salt,
                                         size_t extranonce1_size,
                                         size_t extranonce2_size,
                                         size_t max_coinbase_bytes,
@@ -1433,7 +1458,8 @@ int coinbase_build_window_from_template(const char *coinbase_tx_hex,
     ctx.payout_floor_sats = payout_floor_sats;
     ctx.res = res;
     return build_from_template_impl(coinbase_tx_hex, repl_window, &ctx,
-                                    coinbase_tag, extranonce1_size,
+                                    coinbase_tag, job_salt,
+                                    extranonce1_size,
                                     extranonce2_size, out, out_has_witness,
                                     errbuf, errlen);
 }
@@ -1469,7 +1495,8 @@ size_t coinbase_expected_payout_slots(size_t max_coinbase_bytes,
     size_t budget = max_coinbase_bytes ? max_coinbase_bytes
                                        : (size_t)COINBASE_DEFAULT_MAX_BYTES;
     /* The envelope the builder always pays: version, input, scriptSig with a
-     * generous extranonce and tag, output count, locktime, and a reserved
+     * generous extranonce, tag and job salt push (160 covers a scriptSig at
+     * its 100-byte cap), output count, locktime, and a reserved
      * operator output. Deliberately on the pessimistic side -- reserving one
      * slot too few costs a rotation, reserving one too many costs a payout. */
     size_t fixed = 160;
@@ -1531,7 +1558,7 @@ int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_sats) {
     /* The replacement machinery hands the callback the reward it computed;
      * we keep the number and put the output back unchanged. */
     if (build_from_template_impl(coinbase_tx_hex, cb_reward_probe, &reward,
-                                 NULL, 4, 4, &throwaway, NULL,
+                                 NULL, 0, 4, 4, &throwaway, NULL,
                                  err, sizeof err) < 0) {
         return -1;
     }

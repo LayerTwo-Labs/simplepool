@@ -11,6 +11,20 @@ typedef struct {
     size_t   cb2_len;
 } coinbase_parts_t;
 
+/* Per-job salt (every coinbase_build* function takes one, right after the
+ * tag). When non-zero the scriptSig gets ONE extra push after the tag:
+ *
+ *     0x04 | salt[0] | salt[1] | salt[2] | salt[3]     (little-endian)
+ *
+ * which is COINBASE_JOB_SALT_PUSH_BYTES (5) bytes. It makes two jobs built
+ * from the same template different work: without it the coinbase, merkle root
+ * and every header are identical between re-polls of an unchanged template,
+ * and rigs that restart their search per job re-find hashes already credited.
+ * The 5 bytes count against the 100-byte scriptSig cap and against every
+ * byte-budget model of the coinbase. Salt 0 emits no push and the layout is
+ * byte-identical to a build without one; probes and tests pass 0. */
+#define COINBASE_JOB_SALT_PUSH_BYTES 5
+
 /* Build coinbase1/coinbase2 halves around the extranonce placeholder,
  * single-payout — the entire value_sats goes to payout_address.
  *
@@ -22,7 +36,7 @@ typedef struct {
 int coinbase_build(uint32_t height, int64_t value_sats,
                    const char *payout_address,
                    const char *witness_commitment_hex,
-                   const char *coinbase_tag,
+                   const char *coinbase_tag, uint32_t job_salt,
                    size_t extranonce1_size, size_t extranonce2_size,
                    coinbase_parts_t *out, char *errbuf, size_t errlen);
 
@@ -42,7 +56,7 @@ int coinbase_build_split(uint32_t height, int64_t value_sats,
                          const char *operator_address,
                          int fee_bps,
                          const char *witness_commitment_hex,
-                         const char *coinbase_tag,
+                         const char *coinbase_tag, uint32_t job_salt,
                          size_t extranonce1_size, size_t extranonce2_size,
                          coinbase_parts_t *out,
                          int64_t *out_miner_sats, int64_t *out_fee_sats,
@@ -170,7 +184,7 @@ int coinbase_build_window(uint32_t height, int64_t value_sats,
                           const coinbase_payee_t *payees, size_t n_payees,
                           const char *operator_address, int fee_bps,
                           const char *witness_commitment_hex,
-                          const char *coinbase_tag,
+                          const char *coinbase_tag, uint32_t job_salt,
                           size_t extranonce1_size, size_t extranonce2_size,
                           size_t max_coinbase_bytes,
                           int64_t payout_floor_sats,
@@ -203,7 +217,7 @@ int coinbase_build_from_template(const char *coinbase_tx_hex,
                                  const char *miner_address,
                                  const char *operator_address,
                                  int fee_bps,
-                                 const char *coinbase_tag,
+                                 const char *coinbase_tag, uint32_t job_salt,
                                  size_t extranonce1_size,
                                  size_t extranonce2_size,
                                  coinbase_parts_t *out,
@@ -281,7 +295,7 @@ int coinbase_build_window_from_template(const char *coinbase_tx_hex,
                                         size_t n_payees,
                                         const char *operator_address,
                                         int fee_bps,
-                                        const char *coinbase_tag,
+                                        const char *coinbase_tag, uint32_t job_salt,
                                         size_t extranonce1_size,
                                         size_t extranonce2_size,
                                         size_t max_coinbase_bytes,

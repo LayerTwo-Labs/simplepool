@@ -10,6 +10,18 @@ somebody money if they go unread.
 
 ## Unreleased
 
+### Jobs built from an unchanged template are now distinct work
+
+The pool re-issues a job every 30 s even when the template has not moved, and
+until now that job's coinbase, merkle root and every header were byte-identical
+to the previous one's. Rigs that restart their search on each job re-found
+hashes the pool had already credited, which showed up as a storm of "duplicate
+share" rejections. Each job now carries its own 4-byte salt in the coinbase
+scriptSig (one 5-byte push after the tag; derived from the job id). The push
+counts against the 100-byte scriptSig cap and against `coinbase_max_bytes`, so
+a coinbase sitting exactly at either limit can lose its last payout or be
+refused where it was not before. Nothing to configure.
+
 ### Operators: the dashboard now listens on loopback by default
 
 `dashboard/server.js` binds `DASHBOARD_BIND`, default `127.0.0.1`, where it

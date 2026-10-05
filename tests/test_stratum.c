@@ -1,5 +1,6 @@
 #include "../src/stratum.h"
 #include "../src/share.h"
+#include "../src/sha256.h"
 #include "../src/store.h"   /* store_fraction_delta_t, for the payout-queue observer */
 #include "../src/cjson/cJSON.h"
 
@@ -1751,6 +1752,94 @@ static void test_extranonce1_unique_across_connections(void) {
     stratum_server_free(s);
 }
 
+/* Pull params[idx] (a string) out of the mining.notify line in buf. */
+static char *notify_param_str(const char *buf, size_t len, int idx) {
+    char *copy = malloc(len + 1), *res = NULL;
+    if (!copy) return NULL;
+    memcpy(copy, buf, len); copy[len] = '\0';
+    for (char *line = strtok(copy, "\n"); line; line = strtok(NULL, "\n")) {
+        if (!strstr(line, "mining.notify")) continue;
+        cJSON *msg = cJSON_Parse(line);
+        if (!msg) continue;
+        cJSON *params = cJSON_GetObjectItem(msg, "params");
+        cJSON *v = cJSON_IsArray(params) ? cJSON_GetArrayItem(params, idx) : NULL;
+        if (cJSON_IsString(v)) res = strdup(v->valuestring);
+        cJSON_Delete(msg);
+        break;
+    }
+    free(copy);
+    return res;
+}
+
+/* coinb1 / coinb2 the server sends for `job`, to a fresh connection. */
+static void job_coinbase_parts(stratum_server_t *s, stratum_job_t *job,
+                               char **cb1, char **cb2) {
+    stratum_server_set_job(s, job, 1);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}", &out, &olen);
+    *cb1 = out ? notify_param_str(out, olen, 2) : NULL;
+    *cb2 = out ? notify_param_str(out, olen, 3) : NULL;
+    free(out);
+    stratum_conn_free_for_test(c);
+}
+
+/* The defect: the pool re-issues a job on an unchanged template, and the
+ * coinbase -- hence merkle root -- came out byte-identical. Jobs built from
+ * the same template with different ids must now differ in coinbase, and
+ * through it in merkle root; a job whose salt is forced to 0 carries no push,
+ * which is 5 bytes (10 hex chars) less. */
+static void test_jobs_from_one_template_have_distinct_coinbases(void) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0 };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    snprintf(cfg.coinbase_tag, sizeof cfg.coinbase_tag, "/sp/");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+    uint8_t net[32]; memset(net, 0xff, 32);
+
+    stratum_job_t *a = make_test_job("18f3a0c1d2e", net);
+    stratum_job_t *b = make_test_job("18f3a0c1d4f", net);   /* 30 s later */
+    stratum_job_t *z = make_test_job("18f3a0c1d50", net);
+    stratum_job_set_cb_salt_for_test(z, 0);
+    CHECK(stratum_job_cb_salt_for_test(a) != 0);
+    CHECK(stratum_job_cb_salt_for_test(b) != 0);
+    CHECK(stratum_job_cb_salt_for_test(a) != stratum_job_cb_salt_for_test(b));
+
+    char *a1, *a2, *b1, *b2, *z1, *z2;
+    job_coinbase_parts(s, a, &a1, &a2);
+    job_coinbase_parts(s, b, &b1, &b2);
+    job_coinbase_parts(s, z, &z1, &z2);
+    CHECK(a1 && a2 && b1 && b2 && z1 && z2);
+    if (a1 && a2 && b1 && b2 && z1 && z2) {
+        CHECK(strcmp(a1, b1) != 0);                 /* different coinbase     */
+        CHECK(strcmp(a2, b2) == 0);                 /* nothing else moved     */
+        CHECK(strlen(a1) == strlen(z1) + 10);       /* 5 bytes = 10 hex chars */
+        CHECK(strcmp(a2, z2) == 0);
+
+        /* With no other transactions the coinbase txid is the merkle root. */
+        char *cbs[2] = { a1, b1 }, *cb2s[2] = { a2, b2 };
+        uint8_t root[2][32];
+        for (int j = 0; j < 2; ++j) {
+            size_t l1 = strlen(cbs[j]) / 2, l2 = strlen(cb2s[j]) / 2;
+            size_t n = l1 + STRATUM_EXTRANONCE1_SIZE + STRATUM_EXTRANONCE2_SIZE + l2;
+            uint8_t *tx = calloc(1, n);
+            for (size_t i = 0; i < l1; ++i) { unsigned v; sscanf(cbs[j] + 2*i, "%2x", &v); tx[i] = (uint8_t)v; }
+            for (size_t i = 0; i < l2; ++i) { unsigned v; sscanf(cb2s[j] + 2*i, "%2x", &v);
+                tx[l1 + STRATUM_EXTRANONCE1_SIZE + STRATUM_EXTRANONCE2_SIZE + i] = (uint8_t)v; }
+            uint8_t h[32]; sha256(tx, n, h); sha256(h, 32, root[j]);
+            free(tx);
+        }
+        CHECK(memcmp(root[0], root[1], 32) != 0);
+    }
+    free(a1); free(a2); free(b1); free(b2); free(z1); free(z2);
+    stratum_server_free(s);
+}
+
 /* The per-connection ring keys on (job_id|en2|ntime|nonce|version), so the
  * same solution resubmitted under a *different* job id slips past it. When
  * both jobs carry the same template the header — and therefore the hash — is
@@ -1767,7 +1856,8 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    stratum_job_t *j1 = make_test_job("J1", net);
+    stratum_server_set_job(s, j1, 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -1785,8 +1875,13 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     CHECK(obs.shares == 1);
     free(out); out=NULL; olen=0;
 
-    /* Same template, new id. Identical header -> identical hash. */
-    stratum_server_set_job(s, make_test_job("J2", net), 1);
+    /* Same template, new id, and -- pinned for this test -- the same coinbase
+     * salt, so the header really is identical. In production every job gets
+     * its own salt (see the J3 block below), which is why this ring is the
+     * second line of defence and not the first. */
+    stratum_job_t *j2 = make_test_job("J2", net);
+    stratum_job_set_cb_salt_for_test(j2, stratum_job_cb_salt_for_test(j1));
+    stratum_server_set_job(s, j2, 1);
     stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
         "\"params\":[\"w\",\"J2\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
@@ -1794,6 +1889,24 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     CHECK(obs.shares == 1);  /* still one */
     CHECK(obs.rejects >= 1);
     CHECK(strstr(obs.last_reason, "duplicate") != NULL);
+    free(out); out=NULL; olen=0;
+
+    /* Same template AGAIN under a third id, this time with its own salt (the
+     * production path): the coinbase differs, so the same (en2, ntime, nonce)
+     * is a different header and a genuinely new share. A rig that re-searches
+     * identical work no longer re-finds credited hashes, because the work is
+     * no longer identical. */
+    stratum_job_t *j3 = make_test_job("J3", net);
+    CHECK(stratum_job_cb_salt_for_test(j3) != stratum_job_cb_salt_for_test(j1));
+    CHECK(stratum_job_cb_salt_for_test(j3) != 0);
+    stratum_server_set_job(s, j3, 1);
+    int rejects_before = obs.rejects;
+    stratum_handle_message(s, c,
+        "{\"id\":5,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J3\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(obs.shares == 2);
+    CHECK(obs.rejects == rejects_before);
     free(out);
 
     stratum_conn_free_for_test(c);
@@ -3585,6 +3698,7 @@ int main(void) {
     test_socket_setup_disabled();
     test_extranonce1_unique_across_connections();
     test_dedupe_same_hash_across_job_ids();
+    test_jobs_from_one_template_have_distinct_coinbases();
     test_share_dedupe_index_tracks_the_ring();
     test_rejected_candidate_is_not_a_block();
     test_accepted_candidate_reports_accepted();

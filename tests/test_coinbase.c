@@ -1,5 +1,6 @@
 #include "coinbase.h"
 #include "stratum.h"
+#include "sha256.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -92,7 +93,7 @@ static void test_build_coinbase_structural(void) {
 
     int rc = coinbase_build(800000, 625000000,
                             "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
-                            wc_hex, "/drivepool/", 4, 4,
+                            wc_hex, "/drivepool/", 0, 4, 4,
                             &parts, err, sizeof err);
     if (rc != 0) {
         fprintf(stderr, "coinbase_build err: %s\n", err);
@@ -191,7 +192,7 @@ static void test_build_coinbase_split_fee_math(void) {
         800000, 5000000000LL,
         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
-        100, NULL, "/simplepool/", 4, 4,
+        100, NULL, "/simplepool/", 0, 4, 4,
         &parts, &miner_sats, &fee_sats, err, sizeof err);
     assert(rc == 0);
     assert(fee_sats   == 50000000LL);
@@ -203,7 +204,7 @@ static void test_build_coinbase_split_fee_math(void) {
         800000, 5000000000LL,
         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
-        0, NULL, "/simplepool/", 4, 4,
+        0, NULL, "/simplepool/", 0, 4, 4,
         &parts, &miner_sats, &fee_sats, err, sizeof err);
     assert(rc == 0);
     assert(fee_sats   == 0);
@@ -216,7 +217,7 @@ static void test_build_coinbase_split_fee_math(void) {
         800000, 30000LL,
         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
-        100, NULL, "/simplepool/", 4, 4,
+        100, NULL, "/simplepool/", 0, 4, 4,
         &parts, &miner_sats, &fee_sats, err, sizeof err);
     assert(rc == 0);
     assert(fee_sats   == 0);
@@ -236,7 +237,7 @@ static void test_bip34_small_height_uses_opn(void) {
     /* height = 5 should produce scriptSig starting with OP_5 = 0x55. */
     int rc = coinbase_build(5, 5000000000LL,
                             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
-                            NULL, "/simplepool/", 4, 4,
+                            NULL, "/simplepool/", 0, 4, 4,
                             &parts, err, sizeof err);
     assert(rc == 0);
 
@@ -294,7 +295,7 @@ static void test_build_from_template(void) {
     int64_t miner_sats = 0, fee_sats = 0;
 
     int rc = coinbase_build_from_template(
-        ENF_COINBASE_HEX, ENF_ADDR, NULL, 0, "/x/", 4, 4,
+        ENF_COINBASE_HEX, ENF_ADDR, NULL, 0, "/x/", 0, 4, 4,
         &parts, &has_witness, &miner_sats, &fee_sats, err, sizeof err);
     if (rc != 0) fprintf(stderr, "build_from_template err: %s\n", err);
     assert(rc == 0);
@@ -388,7 +389,7 @@ static void test_build_from_template_fee_split(void) {
     int64_t miner_sats = 0, fee_sats = 0;
 
     int rc = coinbase_build_from_template(
-        ENF_COINBASE_HEX, ENF_ADDR, ENF_ADDR, 100, "/x/", 4, 4,
+        ENF_COINBASE_HEX, ENF_ADDR, ENF_ADDR, 100, "/x/", 0, 4, 4,
         &parts, &has_witness, &miner_sats, &fee_sats, err, sizeof err);
     assert(rc == 0);
     assert(fee_sats == 50000000LL);       /* 1% of 50 BTC */
@@ -446,7 +447,7 @@ static void test_count_outputs(void) {
                                 /* witness_commitment_hex */
                                 "6a24aa21a9ed2222222222222222222222222222"
                                 "222222222222222222222222222222222222",
-                                /* coinbase_tag */ NULL,
+                                /* coinbase_tag */ NULL, 0,
                                 4, 4, &parts, NULL, NULL, err, sizeof err) == 0);
     /* cb1 + extranonce1 + extranonce2 + cb2 is the coinbase a miner submits. */
     size_t n = parts.cb1_len * 2 + 16 + parts.cb2_len * 2 + 1;
@@ -527,7 +528,7 @@ static void test_scriptsig_length_matches_advertised_extranonce(void) {
     assert(coinbase_build_split(800000, 5000000000LL, ENF_ADDR, ENF_ADDR, 100,
                                 "6a24aa21a9ed2222222222222222222222222222"
                                 "222222222222222222222222222222222222",
-                                "/simplepool/",
+                                "/simplepool/", 0,
                                 en1, en2, &parts, NULL, NULL,
                                 err, sizeof err) == 0);
 
@@ -573,7 +574,7 @@ static void test_wrong_width_extranonce_desyncs_the_parse(void) {
     assert(coinbase_build_split(800000, 5000000000LL, ENF_ADDR, ENF_ADDR, 100,
                                 "6a24aa21a9ed2222222222222222222222222222"
                                 "222222222222222222222222222222222222",
-                                "/simplepool/",
+                                "/simplepool/", 0,
                                 STRATUM_EXTRANONCE1_SIZE,
                                 STRATUM_EXTRANONCE2_SIZE, &parts, NULL, NULL,
                                 err, sizeof err) == 0);
@@ -611,7 +612,7 @@ static void test_scriptsig_over_100_is_rejected(void) {
     coinbase_parts_t parts = {0};
     char err[256] = {0};
     int rc = coinbase_build_split(800000, 5000000000LL, ENF_ADDR, NULL, 0,
-                                  NULL, "/simplepool/",
+                                  NULL, "/simplepool/", 0,
                                   /* en1 */ 4, /* en2 */ 90,
                                   &parts, NULL, NULL, err, sizeof err);
     assert(rc < 0);
@@ -877,7 +878,7 @@ static void test_the_result_names_which_payees_were_paid(void) {
         { WC, 49999900LL },
     };
     assert(coinbase_build_window(800000, 100000000LL, payees, 3,
-                                 NULL, 0, NULL, NULL, 4, 8,
+                                 NULL, 0, NULL, NULL, 0, 4, 8,
                                  0, 0, &parts, &res, err, sizeof err) == 0);
     assert(res.paid_count == 2);
     assert(res.dropped_below_floor == 1);
@@ -907,7 +908,7 @@ static void test_the_result_names_which_payees_were_paid(void) {
         { WC, 59999500LL },
     };
     assert(coinbase_build_window(800000, 100000000LL, mid, 3,
-                                 NULL, 0, NULL, NULL, 4, 8,
+                                 NULL, 0, NULL, NULL, 0, 4, 8,
                                  0, 0, &parts, &res, err, sizeof err) == 0);
     assert(res.paid_count == 2);
     assert(res.paid_payee[0] == 1);
@@ -920,7 +921,7 @@ static void test_the_result_names_which_payees_were_paid(void) {
     /* Nothing dropped: every payee is marked, and only those. */
     const coinbase_payee_t all[] = { { WA, 60000000LL }, { WB, 40000000LL } };
     assert(coinbase_build_window(800000, 100000000LL, all, 2,
-                                 NULL, 0, NULL, NULL, 4, 8,
+                                 NULL, 0, NULL, NULL, 0, 4, 8,
                                  0, 0, &parts, &res, err, sizeof err) == 0);
     assert(res.paid_payee[0] == 1 && res.paid_payee[1] == 1);
     assert(res.paid_payee[2] == 0);
@@ -946,7 +947,7 @@ static void test_the_template_builder_reports_the_same_paid_set(void) {
         { WC, reward - 100 - b },
     };
     assert(coinbase_build_window_from_template(ENF_COINBASE_HEX, payees, 3,
-                                               NULL, 0, NULL, 4, 4, 0, 0,
+                                               NULL, 0, NULL, 0, 4, 4, 0, 0,
                                                &parts, NULL, &res,
                                                err, sizeof err) == 0);
     assert(res.paid_count == 2);
@@ -966,7 +967,7 @@ static void test_window_pays_each_miner_its_own_output(void) {
         { WA, 2475000000LL }, { WB, 1485000000LL }, { WC, 990000000LL },
     };
     int rc = coinbase_build_window(800000, 5000000000LL, payees, 3,
-                                   WOP, 100, NULL, "/simplepool/", 4, 8,
+                                   WOP, 100, NULL, "/simplepool/", 0, 4, 8,
                                    0, 0, &parts, &res, err, sizeof err);
     assert(rc == 0);
     assert(res.paid_count == 3);
@@ -988,14 +989,14 @@ static void test_a_split_that_does_not_add_up_is_refused(void) {
     coinbase_parts_t parts; char err[256];
     const coinbase_payee_t short_[] = { { WA, 1000000LL } };
     int rc = coinbase_build_window(800000, 5000000000LL, short_, 1,
-                                   WOP, 100, NULL, NULL, 4, 8,
+                                   WOP, 100, NULL, NULL, 0, 4, 8,
                                    0, 0, &parts, NULL, err, sizeof err);
     assert(rc < 0);
     assert(strstr(err, "payees sum to") != NULL);
 
     const coinbase_payee_t over[] = { { WA, 9000000000LL } };
     rc = coinbase_build_window(800000, 5000000000LL, over, 1,
-                               WOP, 100, NULL, NULL, 4, 8,
+                               WOP, 100, NULL, NULL, 0, 4, 8,
                                0, 0, &parts, NULL, err, sizeof err);
     assert(rc < 0);
     printf("ok: a window split that does not sum to the block is refused\n");
@@ -1020,7 +1021,7 @@ static void test_a_payee_below_the_floor_is_shared_out_not_given_to_the_operator
         { WB, 100LL },              /* far below the 546-sat dust limit */
     };
     int rc = coinbase_build_window(800000, 100000000LL, payees, 2,
-                                   WOP, 100, NULL, NULL, 4, 8,
+                                   WOP, 100, NULL, NULL, 0, 4, 8,
                                    0, 0, &parts, &res, err, sizeof err);
     assert(rc == 0);
     assert(res.paid_count == 1);
@@ -1067,7 +1068,7 @@ static void test_the_operator_cannot_profit_by_shrinking_the_coinbase(void) {
         coinbase_parts_t parts; char err[256];
         coinbase_window_result_t res;
         assert(coinbase_build_window(800000, 5000000000LL, payees, N, WOP, 100,
-                                     NULL, "/sp/", 4, 8, budgets[b], 546,
+                                     NULL, "/sp/", 0, 4, 8, budgets[b], 546,
                                      &parts, &res, err, sizeof err) == 0);
         /* The fee never moves, whatever the budget does. */
         assert(res.fee_sats == 50000000LL);
@@ -1096,7 +1097,7 @@ static void test_the_payout_floor_is_configurable(void) {
 
     /* Default floor (dust): both are paid. */
     assert(coinbase_build_window(800000, 100000000LL, payees, 2,
-                                 WOP, 0, NULL, NULL, 4, 8,
+                                 WOP, 0, NULL, NULL, 0, 4, 8,
                                  0, 0, &parts, &res, err, sizeof err) == 0);
     assert(res.paid_count == 2);
     assert(res.redistributed_sats == 0);
@@ -1104,7 +1105,7 @@ static void test_the_payout_floor_is_configurable(void) {
 
     /* Floor above the small claim: it is forfeited, not carried. */
     assert(coinbase_build_window(800000, 100000000LL, payees, 2,
-                                 WOP, 0, NULL, NULL, 4, 8,
+                                 WOP, 0, NULL, NULL, 0, 4, 8,
                                  0, 50000, &parts, &res, err, sizeof err) == 0);
     assert(res.paid_count == 1);
     assert(res.dropped_below_floor == 1);
@@ -1116,7 +1117,7 @@ static void test_the_payout_floor_is_configurable(void) {
      * to have and pretending otherwise would build an unspendable block. */
     const coinbase_payee_t dusty[] = { { WA, 99999900LL }, { WB, 100LL } };
     assert(coinbase_build_window(800000, 100000000LL, dusty, 2,
-                                 WOP, 0, NULL, NULL, 4, 8,
+                                 WOP, 0, NULL, NULL, 0, 4, 8,
                                  0, 1, &parts, &res, err, sizeof err) == 0);
     assert(res.paid_count == 1);
     assert(res.dropped_below_floor == 1);
@@ -1139,7 +1140,7 @@ static void test_the_cap_falls_on_whoever_is_last_in_the_order(void) {
     };
     int64_t value = 1000000LL + 3000000LL + 6000000LL;   /* fee_bps 0: no fee */
     int rc = coinbase_build_window(800000, value, payees, 3,
-                                   WOP, 0, NULL, NULL, 4, 8,
+                                   WOP, 0, NULL, NULL, 0, 4, 8,
                                    /* Byte budget admitting exactly two of the
                                     * three payouts: the envelope, scriptSig
                                     * and reserved operator output come to
@@ -1176,7 +1177,7 @@ static void test_the_caller_can_promote_a_small_claim(void) {
         { WA, 1000000LL }, { WC, 6000000LL }, { WB, 3000000LL },
     };
     int64_t value = 10000000LL;
-    assert(coinbase_build_window(800000, value, payees, 3, WOP, 0, NULL, NULL,
+    assert(coinbase_build_window(800000, value, payees, 3, WOP, 0, NULL, NULL, 0,
                                  4, 8, 180, 0, &parts, &res,
                                  err, sizeof err) == 0);
     assert(res.paid_count == 2);
@@ -1203,7 +1204,7 @@ static void test_a_dropped_claim_needs_no_operator_address(void) {
         { WA, 999900LL }, { WB, 100LL },     /* the second is dust */
     };
     int rc = coinbase_build_window(800000, 1000000LL, payees, 2,
-                                   NULL, 0, NULL, NULL, 4, 8,
+                                   NULL, 0, NULL, NULL, 0, 4, 8,
                                    0, 0, &parts, &res, err, sizeof err);
     assert(rc == 0);
     assert(res.dropped_below_floor == 1);
@@ -1228,7 +1229,7 @@ static void test_no_operator_address_means_no_fee(void) {
     coinbase_window_result_t res;
     const coinbase_payee_t payees[] = { { WA, 990000LL }, { WB, 10000LL } };
     int rc = coinbase_build_window(800000, 1000000LL, payees, 2,
-                                   NULL, 100, NULL, NULL, 4, 8,
+                                   NULL, 100, NULL, NULL, 0, 4, 8,
                                    0, 0, &parts, &res, err, sizeof err);
     assert(rc == 0);
     assert(res.fee_sats == 0);              /* fee_bps=100 but nowhere to pay */
@@ -1247,7 +1248,7 @@ static void test_a_window_of_only_dust_is_refused(void) {
     coinbase_parts_t parts; char err[256];
     const coinbase_payee_t payees[] = { { WA, 100LL }, { WB, 100LL } };
     int rc = coinbase_build_window(800000, 200LL, payees, 2,
-                                   WOP, 0, NULL, NULL, 4, 8,
+                                   WOP, 0, NULL, NULL, 0, 4, 8,
                                    0, 0, &parts, NULL, err, sizeof err);
     assert(rc < 0);
     assert(strstr(err, "payout floor") != NULL);
@@ -1257,7 +1258,7 @@ static void test_a_window_of_only_dust_is_refused(void) {
 static void test_an_empty_window_is_refused(void) {
     coinbase_parts_t parts; char err[256];
     int rc = coinbase_build_window(800000, 5000000000LL, NULL, 0,
-                                   WOP, 100, NULL, NULL, 4, 8,
+                                   WOP, 100, NULL, NULL, 0, 4, 8,
                                    0, 0, &parts, NULL, err, sizeof err);
     assert(rc < 0);
     assert(strstr(err, "nobody to pay") != NULL);
@@ -1273,7 +1274,7 @@ static void test_the_witness_commitment_is_preserved(void) {
     const char *wc = "6a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9";
     const coinbase_payee_t payees[] = { { WA, 5000000000LL } };
     int rc = coinbase_build_window(800000, 5000000000LL, payees, 1,
-                                   NULL, 0, wc, NULL, 4, 8,
+                                   NULL, 0, wc, NULL, 0, 4, 8,
                                    0, 0, &parts, &res, err, sizeof err);
     assert(rc == 0);
     uint64_t n = 0; int64_t sum = 0;
@@ -1293,9 +1294,9 @@ static void test_the_coinbase_is_deterministic(void) {
     };
     int64_t value = 5000000LL;
     assert(coinbase_build_window(800000, value, payees, 3, NULL, 0, NULL,
-                                 "/sp/", 4, 8, 0, 0, &a, NULL, err, sizeof err) == 0);
+                                 "/sp/", 0, 4, 8, 0, 0, &a, NULL, err, sizeof err) == 0);
     assert(coinbase_build_window(800000, value, payees, 3, NULL, 0, NULL,
-                                 "/sp/", 4, 8, 0, 0, &b, NULL, err, sizeof err) == 0);
+                                 "/sp/", 0, 4, 8, 0, 0, &b, NULL, err, sizeof err) == 0);
     assert(a.cb2_len == b.cb2_len);
     assert(memcmp(a.cb2, b.cb2, a.cb2_len) == 0);
     coinbase_parts_free(&a);
@@ -1354,7 +1355,7 @@ static void test_window_from_template_preserves_commitments(void) {
      * split below is exact without hardcoding the fixture's reward. */
     coinbase_parts_t probe; int64_t reward = 0, unused = 0;
     assert(coinbase_build_from_template(ENF_COINBASE_HEX, ENF_ADDR, NULL, 0,
-                                        NULL, 4, 4, &probe, NULL, &reward,
+                                        NULL, 0, 4, 4, &probe, NULL, &reward,
                                         &unused, err, sizeof err) == 0);
     coinbase_parts_free(&probe);
     assert(reward > 0);
@@ -1363,7 +1364,7 @@ static void test_window_from_template_preserves_commitments(void) {
     int64_t a = (reward * 6) / 10;
     const coinbase_payee_t payees[] = { { WA, a }, { WB, reward - a } };
     int rc = coinbase_build_window_from_template(
-        ENF_COINBASE_HEX, payees, 2, NULL, 0, "/x/", 4, 4, 0, 0,
+        ENF_COINBASE_HEX, payees, 2, NULL, 0, "/x/", 0, 4, 4, 0, 0,
         &parts, &has_witness, &res, err, sizeof err);
     if (rc != 0) fprintf(stderr, "window_from_template err: %s\n", err);
     assert(rc == 0);
@@ -1400,7 +1401,7 @@ static void test_the_template_reward_matches_what_the_builder_splits(void) {
     char err[256] = {0};
     coinbase_parts_t probe; int64_t builder_reward = 0, unused = 0;
     assert(coinbase_build_from_template(ENF_COINBASE_HEX, ENF_ADDR, NULL, 0,
-                                        NULL, 4, 4, &probe, NULL,
+                                        NULL, 0, 4, 4, &probe, NULL,
                                         &builder_reward, &unused,
                                         err, sizeof err) == 0);
     coinbase_parts_free(&probe);
@@ -1417,7 +1418,7 @@ static void test_the_template_reward_matches_what_the_builder_splits(void) {
     const coinbase_payee_t payees[] = { { WA, reward / 2 },
                                         { WB, reward - reward / 2 } };
     assert(coinbase_build_window_from_template(ENF_COINBASE_HEX, payees, 2,
-                                               NULL, 0, NULL, 4, 4, 0, 0,
+                                               NULL, 0, NULL, 0, 4, 4, 0, 0,
                                                &parts, NULL, &res,
                                                err, sizeof err) == 0);
     assert(res.paid_sats == reward);
@@ -1472,7 +1473,7 @@ static void test_the_slot_estimate_tracks_what_the_builder_admits(void) {
                 coinbase_parts_t parts;
                 coinbase_window_result_t r;
                 if (coinbase_build_window(800000, 5000000000LL, p, (size_t)n,
-                                          WOP, 100, NULL, "/sp/", 4, 8,
+                                          WOP, 100, NULL, "/sp/", 0, 4, 8,
                                           BUDGETS[b], 546, &parts, &r,
                                           err, sizeof err) != 0) break;
                 coinbase_parts_free(&parts);
@@ -1511,7 +1512,7 @@ static void test_both_window_builders_split_identically(void) {
 
     coinbase_parts_t probe; int64_t reward = 0, unused = 0;
     assert(coinbase_build_from_template(ENF_COINBASE_HEX, ENF_ADDR, NULL, 0,
-                                        NULL, 4, 4, &probe, NULL, &reward,
+                                        NULL, 0, 4, 4, &probe, NULL, &reward,
                                         &unused, err, sizeof err) == 0);
     coinbase_parts_free(&probe);
 
@@ -1523,9 +1524,9 @@ static void test_both_window_builders_split_identically(void) {
         { WA, payable - 40000 - 100 }, { WB, 40000 }, { WC, 100 },
     };
     assert(coinbase_build_window(800000, reward, payees, 3, WOP, 100, NULL,
-                                 "/x/", 4, 4, 0, 0, &p1, &r1, err, sizeof err) == 0);
+                                 "/x/", 0, 4, 4, 0, 0, &p1, &r1, err, sizeof err) == 0);
     assert(coinbase_build_window_from_template(ENF_COINBASE_HEX, payees, 3,
-                                               WOP, 100, "/x/", 4, 4, 0, 0,
+                                               WOP, 100, "/x/", 0, 4, 4, 0, 0,
                                                &p2, NULL, &r2, err, sizeof err) == 0);
     assert(r1.paid_count   == r2.paid_count);
     assert(r1.paid_sats    == r2.paid_sats);
@@ -1559,7 +1560,7 @@ static void test_commitments_eat_the_payout_budget(void) {
 
     coinbase_parts_t probe; int64_t reward = 0, unused = 0;
     assert(coinbase_build_from_template(ENF_COINBASE_HEX, ENF_ADDR, NULL, 0,
-                                        NULL, 4, 4, &probe, NULL, &reward,
+                                        NULL, 0, 4, 4, &probe, NULL, &reward,
                                         &unused, err, sizeof err) == 0);
     coinbase_parts_free(&probe);
 
@@ -1578,7 +1579,7 @@ static void test_commitments_eat_the_payout_budget(void) {
      * enforcer template admits 5 and a bare coinbase admits 6. */
     const size_t BUDGET = 300;
     assert(coinbase_build_window_from_template(ENF_COINBASE_HEX, payees, N,
-                                               WOP, 0, NULL, 4, 4, BUDGET, 0,
+                                               WOP, 0, NULL, 0, 4, 4, BUDGET, 0,
                                                &parts, NULL, &res,
                                                err, sizeof err) == 0);
     size_t paid_with_template = res.paid_count;
@@ -1595,7 +1596,7 @@ static void test_commitments_eat_the_payout_budget(void) {
     /* The same window and the same budget, built from scratch — no template,
      * so no commitment OP_RETURNs spending the budget. More miners fit. */
     assert(coinbase_build_window(800000, reward, payees, N, WOP, 0, NULL,
-                                 NULL, 4, 4, BUDGET, 0, &parts, &res,
+                                 NULL, 0, 4, 4, BUDGET, 0, &parts, &res,
                                  err, sizeof err) == 0);
     assert(res.paid_count > paid_with_template);
     coinbase_parts_free(&parts);
@@ -1622,7 +1623,7 @@ static void test_the_built_coinbase_respects_its_budget(void) {
 
     for (size_t budget = 200; budget <= 600; budget += 100) {
         assert(coinbase_build_window(800000, total, payees, N, WOP, 0, NULL,
-                                     "/sp/", 4, 8, budget, 0, &parts, &res,
+                                     "/sp/", 0, 4, 8, budget, 0, &parts, &res,
                                      err, sizeof err) == 0);
         /* cb1 + extranonce + cb2 is the whole serialized coinbase. */
         size_t built = parts.cb1_len + 12 + parts.cb2_len;
@@ -1633,6 +1634,228 @@ static void test_the_built_coinbase_respects_its_budget(void) {
         coinbase_parts_free(&parts);
     }
     printf("ok: a built coinbase never exceeds its byte budget\n");
+}
+
+/* ---------------------------------------------------------------------------
+ * Per-job coinbase salt.
+ *
+ * Two jobs built from the same template must be different work, or a rig that
+ * restarts its search per job re-finds hashes the pool already credited. The
+ * salt is ONE push after the tag: 0x04 + 4 bytes little-endian, counted
+ * against the 100-byte scriptSig cap and against the window byte budgets.
+ * Salt 0 emits nothing. Every builder is exercised through one dispatcher so
+ * a builder that forgets the salt cannot hide.
+ * ------------------------------------------------------------------------- */
+
+enum { K_PLAIN, K_SPLIT, K_WINDOW, K_TEMPLATE, K_WINDOW_TEMPLATE, K_COUNT };
+static const char *const KIND_NAME[K_COUNT] = {
+    "coinbase_build", "coinbase_build_split", "coinbase_build_window",
+    "coinbase_build_from_template", "coinbase_build_window_from_template" };
+
+/* budget 0 = default. *paid receives the window's paid_count (windows only). */
+static int build_kind(int kind, uint32_t salt, const char *tag,
+                      size_t en1, size_t en2, size_t budget,
+                      coinbase_parts_t *p, size_t *paid,
+                      char *err, size_t errlen) {
+    coinbase_window_result_t res; memset(&res, 0, sizeof res);
+    int rc = -1;
+    int64_t reward = 0;
+    switch (kind) {
+    case K_PLAIN:
+        rc = coinbase_build(800000, 5000000000LL, WA, NULL, tag, salt,
+                            en1, en2, p, err, errlen);
+        break;
+    case K_SPLIT:
+        rc = coinbase_build_split(800000, 5000000000LL, WA, WOP, 100, NULL,
+                                  tag, salt, en1, en2, p, NULL, NULL,
+                                  err, errlen);
+        break;
+    case K_WINDOW: {
+        enum { N = 12 };
+        coinbase_payee_t py[N];
+        for (int i = 0; i < N; ++i) { py[i].address = (i % 2) ? WA : WB; py[i].sats = 1000000LL; }
+        rc = coinbase_build_window(800000, N * 1000000LL, py, N, NULL, 0, NULL,
+                                   tag, salt, en1, en2, budget, 0, p, &res,
+                                   err, errlen);
+        break; }
+    case K_TEMPLATE:
+        rc = coinbase_build_from_template(ENF_COINBASE_HEX, WA, WOP, 100, tag,
+                                          salt, en1, en2, p, NULL, NULL, NULL,
+                                          err, errlen);
+        break;
+    case K_WINDOW_TEMPLATE: {
+        assert(coinbase_template_reward(ENF_COINBASE_HEX, &reward) == 0);
+        enum { N = 12 };
+        coinbase_payee_t py[N];
+        int64_t each = reward / N, used = 0;
+        for (int i = 0; i < N; ++i) {
+            py[i].address = (i % 2) ? WA : WB;
+            py[i].sats = (i == N - 1) ? reward - used : each;
+            used += py[i].sats;
+        }
+        rc = coinbase_build_window_from_template(ENF_COINBASE_HEX, py, N, NULL,
+                                                 0, tag, salt, en1, en2,
+                                                 budget, 0, p, NULL, &res,
+                                                 err, errlen);
+        break; }
+    }
+    if (paid) *paid = res.paid_count;
+    return rc;
+}
+
+/* cb1 = version(4) | in_count(1) | prevout(36) | varint(scriptSig len) |
+ * scriptSig up to the extranonce. The scriptSig is under 253 bytes, so its
+ * length varint is one byte. */
+#define CB1_SS_LEN_OFF 41
+#define CB1_SS_OFF 42
+
+/* The salted cb1 is the unsalted one with the length byte raised by 5 and
+ * the 5-byte push appended where the extranonce begins -- after the tag,
+ * after everything else already in the scriptSig. cb2 is untouched. */
+static void assert_salt_layout(const coinbase_parts_t *u, const coinbase_parts_t *s,
+                               uint32_t salt) {
+    assert(s->cb1_len == u->cb1_len + COINBASE_JOB_SALT_PUSH_BYTES);
+    assert(s->cb2_len == u->cb2_len && memcmp(s->cb2, u->cb2, u->cb2_len) == 0);
+    assert(s->cb1[CB1_SS_LEN_OFF] == u->cb1[CB1_SS_LEN_OFF] + 5);
+    assert(memcmp(s->cb1, u->cb1, CB1_SS_LEN_OFF) == 0);
+    assert(memcmp(s->cb1 + CB1_SS_OFF, u->cb1 + CB1_SS_OFF,
+                  u->cb1_len - CB1_SS_OFF) == 0);
+    const uint8_t *push = s->cb1 + u->cb1_len;
+    assert(push[0] == 0x04);
+    assert(push[1] == (uint8_t)salt);
+    assert(push[2] == (uint8_t)(salt >> 8));
+    assert(push[3] == (uint8_t)(salt >> 16));
+    assert(push[4] == (uint8_t)(salt >> 24));
+}
+
+static void test_job_salt_push(void) {
+    const uint32_t SALT = 0xA1B2C3D4u;
+    for (int k = 0; k < K_COUNT; ++k) {
+        coinbase_parts_t u = {0}, s = {0}, s2 = {0}; char err[256] = {0};
+        assert(build_kind(k, 0, "/sp/", 4, 8, 0, &u, NULL, err, sizeof err) == 0);
+        assert(build_kind(k, SALT, "/sp/", 4, 8, 0, &s, NULL, err, sizeof err) == 0);
+        assert_salt_layout(&u, &s, SALT);
+        /* A different salt changes those 4 bytes and nothing else. */
+        assert(build_kind(k, SALT + 1, "/sp/", 4, 8, 0, &s2, NULL, err, sizeof err) == 0);
+        assert(s2.cb1_len == s.cb1_len && memcmp(s2.cb1, s.cb1, s.cb1_len) != 0);
+        assert(memcmp(s2.cb1, s.cb1, s.cb1_len - 4) == 0);
+        /* Same with no tag at all: the push is the only thing added. */
+        coinbase_parts_t nu = {0}, ns = {0};
+        assert(build_kind(k, 0, NULL, 4, 8, 0, &nu, NULL, err, sizeof err) == 0);
+        assert(build_kind(k, SALT, NULL, 4, 8, 0, &ns, NULL, err, sizeof err) == 0);
+        assert_salt_layout(&nu, &ns, SALT);
+        coinbase_parts_free(&u); coinbase_parts_free(&s); coinbase_parts_free(&s2);
+        coinbase_parts_free(&nu); coinbase_parts_free(&ns);
+    }
+    printf("ok: job salt is one 5-byte push after the tag, in every builder\n");
+}
+
+/* Salt 0 must be byte-identical to the layout without a salt. Derived here
+ * from the serialization rules, independently of the builder. */
+static void test_job_salt_zero_is_the_classic_layout(void) {
+    coinbase_parts_t p = {0}; char err[256] = {0};
+    assert(coinbase_build(800000, 5000000000LL, WA, NULL, "/sp/", 0, 4, 8,
+                          &p, err, sizeof err) == 0);
+    /* height push 03 00 35 0c | tag push 04 "/sp/" | 12 extranonce bytes */
+    static const uint8_t ss[] = { 0x03, 0x00, 0x35, 0x0c,
+                                  0x04, '/', 's', 'p', '/' };
+    assert(p.cb1_len == 4 + 1 + 36 + 1 + sizeof ss);
+    assert(p.cb1[CB1_SS_LEN_OFF] == sizeof ss + 12);
+    assert(memcmp(p.cb1 + CB1_SS_OFF, ss, sizeof ss) == 0);
+    coinbase_parts_free(&p);
+    printf("ok: salt 0 emits no push\n");
+}
+
+/* The 100-byte cap counts the push, in every builder: whatever extranonce
+ * width the unsalted build can reach, the salted one reaches exactly 5 less. */
+static void test_job_salt_counts_against_the_scriptsig_cap(void) {
+    for (int k = 0; k < K_COUNT; ++k) {
+        coinbase_parts_t p = {0}; char err[256] = {0};
+        size_t max0 = 0, max1 = 0;
+        for (size_t en2 = 1; en2 <= 100; ++en2) {
+            if (build_kind(k, 0, "/sp/", 4, en2, 0, &p, NULL, err, sizeof err) == 0) {
+                coinbase_parts_free(&p); max0 = en2;
+            }
+            if (build_kind(k, 7, "/sp/", 4, en2, 0, &p, NULL, err, sizeof err) == 0) {
+                coinbase_parts_free(&p); max1 = en2;
+            }
+        }
+        if (max0 != max1 + 5) fprintf(stderr, "%s: max en2 %zu unsalted, %zu salted\n",
+                                      KIND_NAME[k], max0, max1);
+        assert(max0 > 5 && max0 == max1 + 5);
+        /* Exactly at the cap it builds and the scriptSig is 100 bytes... */
+        assert(build_kind(k, 7, "/sp/", 4, max1, 0, &p, NULL, err, sizeof err) == 0);
+        assert(p.cb1[CB1_SS_LEN_OFF] == 100);   /* length byte includes the extranonces */
+        coinbase_parts_free(&p);
+        /* ...and one byte more is refused, where unsalted it is still fine. */
+        assert(build_kind(k, 7, "/sp/", 4, max1 + 1, 0, &p, NULL, err, sizeof err) < 0);
+        assert(strstr(err, "scriptSig length") != NULL);
+        assert(build_kind(k, 0, "/sp/", 4, max1 + 1, 0, &p, NULL, err, sizeof err) == 0);
+        coinbase_parts_free(&p);
+    }
+    printf("ok: the salt push counts against the 100-byte scriptSig cap\n");
+}
+
+/* The window builders' byte budget is the whole transaction, so the push has
+ * to be in it. Find the smallest budget that pays all 12 miners; with a salt
+ * that threshold must move up by exactly the 5 bytes the push adds. */
+static void test_job_salt_counts_against_the_window_byte_budget(void) {
+    for (int k = K_WINDOW; k <= K_WINDOW_TEMPLATE; k += (K_WINDOW_TEMPLATE - K_WINDOW)) {
+        size_t need0 = 0, need1 = 0;
+        for (int salted = 0; salted < 2; ++salted) {
+            size_t need = 0;
+            for (size_t b = 100; b <= 2000 && !need; ++b) {
+                coinbase_parts_t p = {0}; char err[256] = {0}; size_t paid = 0;
+                if (build_kind(k, salted ? 9 : 0, "/sp/", 4, 8, b, &p, &paid,
+                               err, sizeof err) == 0) {
+                    coinbase_parts_free(&p);
+                    if (paid == 12) need = b;
+                }
+            }
+            if (salted) need1 = need; else need0 = need;
+        }
+        if (need1 != need0 + COINBASE_JOB_SALT_PUSH_BYTES)
+            fprintf(stderr, "%s: budget to pay all %zu unsalted, %zu salted\n",
+                    KIND_NAME[k], need0, need1);
+        assert(need0 > 0 && need1 == need0 + COINBASE_JOB_SALT_PUSH_BYTES);
+
+        /* At the edge, the salted coinbase really is within the budget. */
+        coinbase_parts_t p = {0}; char err[256] = {0}; size_t paid = 0;
+        assert(build_kind(k, 9, "/sp/", 4, 8, need1, &p, &paid, err, sizeof err) == 0);
+        assert(paid == 12);
+        size_t en = 12;
+        size_t actual = p.cb1_len + en + p.cb2_len;
+        assert(actual <= need1);
+        coinbase_parts_free(&p);
+        /* One byte under it, somebody is cut. */
+        assert(build_kind(k, 9, "/sp/", 4, 8, need1 - 1, &p, &paid, err, sizeof err) == 0);
+        assert(paid < 12);
+        coinbase_parts_free(&p);
+    }
+    printf("ok: the window byte budget counts the salt push (edge: +5 exactly)\n");
+}
+
+/* Same template, different salt: different coinbase, so a different txid --
+ * and with no other transactions that txid IS the merkle root. */
+static void test_job_salt_makes_distinct_work(void) {
+    for (int k = 0; k < K_COUNT; ++k) {
+        uint8_t root[2][32];
+        for (int j = 0; j < 2; ++j) {
+            coinbase_parts_t p = {0}; char err[256] = {0};
+            assert(build_kind(k, 1000 + (uint32_t)j, "/sp/", 4, 8, 0, &p, NULL,
+                              err, sizeof err) == 0);
+            size_t n = p.cb1_len + 12 + p.cb2_len;
+            uint8_t *tx = malloc(n); assert(tx);
+            memcpy(tx, p.cb1, p.cb1_len);
+            memset(tx + p.cb1_len, 0x11, 12);
+            memcpy(tx + p.cb1_len + 12, p.cb2, p.cb2_len);
+            uint8_t h1[32];
+            sha256(tx, n, h1); sha256(h1, 32, root[j]);
+            free(tx); coinbase_parts_free(&p);
+        }
+        assert(memcmp(root[0], root[1], 32) != 0);
+    }
+    printf("ok: two salts from one template give different merkle roots\n");
 }
 
 int main(void) {
@@ -1670,6 +1893,11 @@ int main(void) {
     test_scriptsig_length_matches_advertised_extranonce();
     test_wrong_width_extranonce_desyncs_the_parse();
     test_scriptsig_over_100_is_rejected();
+    test_job_salt_push();
+    test_job_salt_zero_is_the_classic_layout();
+    test_job_salt_counts_against_the_scriptsig_cap();
+    test_job_salt_counts_against_the_window_byte_budget();
+    test_job_salt_makes_distinct_work();
     test_bip350_supported();
     test_bip350_refused_by_policy();
     test_bip350_invalid();
