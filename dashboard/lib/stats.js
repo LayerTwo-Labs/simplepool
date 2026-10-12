@@ -42,6 +42,8 @@ const EMPTY_OVERVIEW = {
     blocks_orphaned: 0,
     blocks_rejected: 0,
     workers_active: 0,
+    users_active: 0,
+    mined_sats_lifetime: 0,
     hashrate: 0,
     window_sec: 86400,
     window_effective_sec: 86400,
@@ -88,6 +90,17 @@ export function overview(handle, windowSec = 86400) {
     const wk = d.prepare(
         'SELECT COUNT(DISTINCT worker_id) AS n FROM shares WHERE ts >= ?'
     ).get(since);
+    /* Same key leaderboardByAddress groups on, so the count matches its rows. */
+    const users = d.prepare(`
+        SELECT COUNT(DISTINCT COALESCE(NULLIF(w.payout_address, ''), w.name)) AS n
+          FROM shares s JOIN workers w ON w.id = s.worker_id
+         WHERE s.ts >= ?
+    `).get(since);
+    /* reward_sats is the block value net of the operator fee (fee_sats is
+     * the fee output), and only a confirmed block has mined anything. */
+    const mined = d.prepare(
+        `SELECT COALESCE(SUM(reward_sats), 0) AS sats FROM blocks_found WHERE ${CONFIRMED}`
+    ).get();
     const lifetime = d.prepare(
         'SELECT COUNT(*) AS shares, COALESCE(MAX(difficulty),0) AS best, MIN(ts) AS oldest_ts FROM shares'
     ).get();
@@ -114,6 +127,8 @@ export function overview(handle, windowSec = 86400) {
         blocks_orphaned: Number(candidates?.orphaned || 0),
         blocks_rejected: Number(candidates?.rejected || 0),
         workers_active: wk.n,
+        users_active: users.n,
+        mined_sats_lifetime: Number(mined.sats),
         hashrate: (acc.sum_diff * TWO_32) / accSpan,     // 24h estimate
         hashrate_1h: hashrateOver(d, nowSec, 3600),
         hashrate_5m: hashrateOver(d, nowSec, 300),
@@ -844,8 +859,17 @@ export function nodeStatus(handle) {
  * independently, so a difficulty frozen at yesterday's value next to a
  * ticking tip height has to be visible as such rather than read as current.
  *
+ * The network hashrate rides along with it, and is implied by it rather than
+ * measured: difficulty D means a block takes D * 2^32 hashes on average, and
+ * the chain retargets toward one block per 600 s, so D * 2^32 / 600 is the
+ * hashrate the chain is currently priced for. The dashboard has no RPC to
+ * bitcoind to time recent blocks, and deriving it here keeps it from ever
+ * disagreeing with the difficulty printed next to it. It lags a real change
+ * in hashrate by up to a retarget period, which the card says.
+ *
  * Returns {} — not nulls — on a DB that predates pool_meta, so the caller
  * spreads nothing and the field is simply absent. */
+const BLOCK_SPACING_SEC = 600;
 function networkDifficulty(d) {
     try {
         const r = d.prepare(
@@ -856,10 +880,79 @@ function networkDifficulty(d) {
         return {
             network_difficulty: n,
             network_difficulty_at: Number(r.updated_at || 0) || null,
+            network_hashrate: (n * TWO_32) / BLOCK_SPACING_SEC,
         };
     } catch {
         return {};   /* pre-pool_meta DB */
     }
+}
+
+/* Network hashrate measured from block arrivals over a window, rather than
+ * implied by the difficulty (see networkDifficulty).
+ *
+ * The dashboard has no RPC to bitcoind, so the block times come from the
+ * templates table: every time the proxy first sees a template at a new
+ * height, a block has just arrived. Each arrival contributes its difficulty
+ * × 2^32 hashes of expected work, and the total is divided by the span the
+ * rows actually cover, so a pool up for three hours reports three hours, not
+ * three hours of blocks spread over twenty-four.
+ *
+ * Heights are compared against the running maximum, not the previous row:
+ * a reorg that steps back and forward again would otherwise count the same
+ * height twice. A jump of several heights (the proxy was down, or a poll
+ * missed a block) counts every height it skipped — those blocks happened
+ * inside the span, they just were not seen one at a time.
+ *
+ * These are arrival times as this pool saw them, not header timestamps,
+ * which miners set and can skew by hours. The clock starts at the first row
+ * in the window, so that row's own arrival (if it was one) is not counted.
+ *
+ * Returns null with fewer than MIN_BLOCKS arrivals: one or two blocks is a
+ * coin toss, not a rate, and the caller falls back to the implied figure. */
+const NET_HASHRATE_MIN_BLOCKS = 6;
+export function networkHashrate(handle, windowSec = 86400) {
+    const d = db(handle);
+    if (!d) return null;
+    const nowSec = Math.floor(Date.now() / 1000);
+    let r;
+    try {
+        r = d.prepare(`
+            WITH t AS (
+                SELECT ts, height, network_difficulty AS diff,
+                       MAX(height) OVER (ORDER BY ts, id
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev
+                  FROM templates
+                 WHERE ts >= ?
+            )
+            SELECT MIN(ts) AS start_ts,
+                   COALESCE(SUM(CASE WHEN height > prev THEN height - prev END), 0) AS blocks,
+                   COALESCE(SUM(CASE WHEN height > prev THEN (height - prev) * diff END), 0) AS work
+              FROM t
+        `).get(nowSec - windowSec);
+    } catch {
+        return null;   /* pre-templates DB */
+    }
+    const span = r && r.start_ts ? nowSec - r.start_ts : 0;
+    if (!r || r.blocks < NET_HASHRATE_MIN_BLOCKS || span <= 0) return null;
+    return {
+        hashrate: (r.work * TWO_32) / span,
+        blocks: r.blocks,
+        span_sec: span,
+        window_sec: windowSec,
+    };
+}
+
+/* The block height at which the next difficulty retarget takes effect.
+ * Every 2016 blocks on every network simplepool runs on except regtest,
+ * which never retargets — null there, so the view shows nothing rather than
+ * a countdown to an event that will not happen. */
+const RETARGET_INTERVAL = 2016;
+export function nextRetarget(tipHeight, network) {
+    if (tipHeight == null || network === 'regtest') return null;
+    const h = Number(tipHeight);
+    if (!isFinite(h) || h < 0) return null;
+    const at = (Math.floor(h / RETARGET_INTERVAL) + 1) * RETARGET_INTERVAL;
+    return { height: at, blocks_away: at - h };
 }
 
 export function recentBlocks(handle, limit = 25) {
@@ -927,6 +1020,9 @@ export function fmtBtc(sats) {
 const UNITS = ['H/s', 'KH/s', 'MH/s', 'GH/s', 'TH/s', 'PH/s', 'EH/s'];
 export function fmtHashrate(hps) {
     if (!hps || !isFinite(hps) || hps <= 0) return '0 H/s';
+    /* A forknet's implied network hashrate can sit far under 1 H/s; toFixed(2)
+     * would render it as "0.00 H/s", the same lie fmtDifficulty avoids. */
+    if (hps < 1) return `${hps.toPrecision(3)} H/s`;
     let i = 0;
     let v = hps;
     while (v >= 1000 && i < UNITS.length - 1) {

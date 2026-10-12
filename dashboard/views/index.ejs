@@ -19,6 +19,58 @@ const shortHash = (h) => h ? (h.slice(0, 10) + '…' + h.slice(-8)) : '—';
             </div>
         <% } %>
 
+<%
+/* Network hashrate: measured from block arrivals when there are enough of
+ * them (stats.networkHashrate), otherwise the figure the difficulty implies.
+ * The subtitle says which, because they can differ by a lot right after a
+ * swing in hashrate. Pool share is only computed against a measured figure. */
+const net      = locals.net || null;
+const retarget = locals.retarget || null;
+const _netHr   = net ? net.hashrate : (node && node.network_hashrate) || 0;
+const _netSub  = net
+    ? (net.span_sec >= net.window_sec * 0.95 ? '24h' : 'last ' + Math.max(1, Math.round(net.span_sec / 3600)) + 'h')
+      + ' · from ' + fmtN(net.blocks) + ' block times'
+    : (_netHr ? 'implied by difficulty' : 'no data yet');
+const _share   = net && net.hashrate > 0 && ov.hashrate > 0 ? (ov.hashrate / net.hashrate) * 100 : null;
+const _feeBps  = pool ? pool.fee_bps : null;
+const _feeOut  = pool && pool.operator_address && pool.operator_address !== pool.pool_btc_address;
+%>
+        <section class="card">
+            <h2>Pool at a glance</h2>
+            <div class="grid grid-stats">
+                <div><label>Network hashrate</label>
+                    <strong title="<%= net ? 'Expected work of the ' + net.blocks + ' blocks that arrived, divided by the time they took, as seen by this pool.' : 'Difficulty × 2^32 ÷ 600 s: the hashrate the chain is retargeted for. Shown until enough block arrivals have been recorded to measure it.' %>"><%= _netHr ? fmtHashrate(_netHr) : '—' %></strong>
+                    <small><%= _netSub %></small></div>
+                <div><label>Pool share (24h)</label>
+                    <strong><%= _share != null ? fmtPct(_share) : '—' %></strong>
+                    <small>pool and network over 24h</small></div>
+                <div><label>Network difficulty</label>
+                    <strong<% if (node && node.network_difficulty) { %> title="Exactly <%= node.network_difficulty %>"<% } %>><%= node ? fmtDifficulty(node.network_difficulty) : '—' %></strong>
+                    <small><%= node && node.network_difficulty_at ? 'as of ' + ago(node.network_difficulty_at) : '\u00a0' %></small></div>
+                <div><label>Block height</label>
+                    <strong><%= node && node.tip_height != null ? fmtN(node.tip_height) : '—' %></strong>
+                    <small><%= node && node.tip_observed_at ? 'last block ' + ago(node.tip_observed_at) : '\u00a0' %></small></div>
+                <div><label>Next retarget</label>
+                    <strong><%= retarget ? fmtN(retarget.height) : '—' %></strong>
+                    <small><%= retarget ? fmtN(retarget.blocks_away) + ' blocks away' : (pool && pool.network === 'regtest' ? 'regtest never retargets' : '\u00a0') %></small></div>
+                <div><label>Pool hashrate (1h)</label>
+                    <strong><%= fmtHashrate(ov.hashrate_1h) %></strong>
+                    <small><%= fmtHashrate(ov.hashrate) %> over 24h</small></div>
+                <div><label>Blocks mined (24h)</label>
+                    <strong title="confirmed to be in the chain"><%= fmtN(ov.blocks) %></strong>
+                    <small><%= fmtN(ov.blocks_lifetime) %> confirmed, all time</small></div>
+                <div><label>Coins mined</label>
+                    <strong><%= fmtBtc(ov.mined_sats_lifetime) %></strong>
+                    <small>confirmed only, after fee</small></div>
+                <div><label>Active users</label>
+                    <strong title="distinct payout addresses with shares in the last 24h"><%= fmtN(ov.users_active) %></strong>
+                    <small><%= fmtN(ov.workers_active) %> workers hashing (24h)</small></div>
+                <div><label>Fee</label>
+                    <strong><%= _feeBps != null ? (_feeBps / 100).toFixed(2).replace(/\.?0+$/, '') + '%' : '—' %></strong>
+                    <small><%= _feeOut ? 'verifiable in each coinbase' : (_feeBps != null ? 'of each block' : 'not published yet') %></small></div>
+            </div>
+        </section>
+
         <%- include('partial/about-numbers') %>
 
         <section class="card">

@@ -165,8 +165,10 @@ app.get('/', (_req, res) => {
     const lbAddr = stats.leaderboardByAddress(db);
     const blocks = stats.recentBlocks(db, 5);
     const node   = stats.nodeStatus(db);
+    const net    = stats.networkHashrate(db);
+    const retarget = stats.nextRetarget(node?.tip_height, res.locals.pool?.network);
     res.render('index', {
-        ov, lb, lbAddr, blocks, node,
+        ov, lb, lbAddr, blocks, node, net, retarget,
         fmtHashrate: stats.fmtHashrate,
         fmtBtc:      stats.fmtBtc,
     });
