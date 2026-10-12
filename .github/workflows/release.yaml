@@ -9,6 +9,9 @@
 #
 # Trigger:
 #   git tag v0.2.0 && git push origin v0.2.0
+# or publish a release (with a new v* tag) from the GitHub UI. Either way the
+# tag push runs this; if the release already exists, the tarballs and
+# SHA256SUMS are attached to it and its notes are left as written.
 #
 # The tag must match VERSION in the Makefile. That is checked, not assumed:
 # the version is compiled into the binary and reported by `--version`, so a
@@ -186,7 +189,18 @@ jobs:
             echo "Ubuntu 24.04 and Debian 12. Each tarball carries a \`RELEASE\` file and a"
             echo "\`build/simplepool.build.json\` pinning the binary to this commit by sha256."
           } > notes.md
-          gh release create "$GITHUB_REF_NAME" \
-            --title "simplepool $version" \
-            --notes-file notes.md \
-            staging/*
+          # Publishing a release from the web UI pushes the tag, and that
+          # push is what started this run -- so the release can already
+          # exist by the time we get here. Attach the artifacts to it and
+          # leave the maintainer's title and notes alone, rather than failing
+          # with "a release with the same tag name already exists" and
+          # shipping a release with no binaries (v0.4.0).
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; attaching artifacts"
+            gh release upload "$GITHUB_REF_NAME" --clobber staging/*
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "simplepool $version" \
+              --notes-file notes.md \
+              staging/*
+          fi
