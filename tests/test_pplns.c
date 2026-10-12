@@ -217,7 +217,7 @@ static void test_the_floor_and_dust_boundaries_are_exact(void) {
     char berr[256] = {0};
     coinbase_payee_t whole[] = { { A, 54500LL } };
     CHECK(coinbase_build_window(800000, 54500LL, whole, 1, A, 100, NULL,
-                                NULL, 4, 8, 0, 546, &parts, NULL,
+                                NULL, 0, 4, 8, 0, 546, &parts, NULL,
                                 berr, sizeof berr) == 0);
     coinbase_parts_free(&parts);
     printf("ok: the floor and dust boundaries are exact, and the builder agrees\n");
@@ -285,7 +285,7 @@ static void test_the_builder_accepts_what_the_splitter_produces(void) {
             coinbase_parts_t parts;
             char berr[256] = {0};
             int rc = coinbase_build_window(800000, REWARDS[i], out, 3,
-                                           A, FEES[j], NULL, "/sp/", 4, 8,
+                                           A, FEES[j], NULL, "/sp/", 0, 4, 8,
                                            0, 546, &parts, NULL,
                                            berr, sizeof berr);
             if (rc != 0) {
@@ -344,7 +344,7 @@ static void test_a_window_nobody_clears_is_predicted_and_refused(void) {
      * it would render nothing on every connection. */
     coinbase_parts_t parts;
     char berr[256] = {0};
-    CHECK(coinbase_build_window(800000, 5000, out, N, NULL, 0, NULL, NULL,
+    CHECK(coinbase_build_window(800000, 5000, out, N, NULL, 0, NULL, NULL, 0,
                                 4, 8, 0, 0, &parts, NULL,
                                 berr, sizeof berr) < 0);
     CHECK(strstr(berr, "no payee fits") != NULL);
@@ -355,7 +355,7 @@ static void test_a_window_nobody_clears_is_predicted_and_refused(void) {
     CHECK(pplns_split_window(5000, 0, 0, claims, N, 100.0 + (N - 1), 0,
                              out, N, &r, err, sizeof err) == 0);
     CHECK(r.below_floor == (size_t)(N - 1));
-    CHECK(coinbase_build_window(800000, 5000, out, N, NULL, 0, NULL, NULL,
+    CHECK(coinbase_build_window(800000, 5000, out, N, NULL, 0, NULL, NULL, 0,
                                 4, 8, 0, 0, &parts, NULL,
                                 berr, sizeof berr) == 0);
     coinbase_parts_free(&parts);
@@ -499,7 +499,7 @@ static void test_oversizing_the_slot_estimate_starves_the_largest_claims(void) {
         coinbase_window_result_t res;
         char berr[256] = {0};
         CHECK(coinbase_build_window(800000, 5000000000LL, payees, N, NULL, 0,
-                                    NULL, NULL, 4, 8, TIGHT, 546,
+                                    NULL, NULL, 0, 4, 8, TIGHT, 546,
                                     &parts, &res, berr, sizeof berr) == 0);
         /* Claim 0 is the largest in the window. Where did it land, and was
          * that position paid? */

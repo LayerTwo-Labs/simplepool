@@ -32,7 +32,8 @@ typedef struct stratum_job stratum_job_t;
  * a submitted extranonce2 of any other length yields a coinbase whose
  * declared scriptSig length disagrees with its contents. handle_submit
  * rejects on length for exactly that reason. Keep the coinbase scriptSig
- * (BIP34 height push + coinbase_tag + en1 + en2) within 100 bytes. */
+ * (BIP34 height push + coinbase_tag + job salt push + en1 + en2) within 100
+ * bytes; the salt push is 5 bytes when present (see coinbase.h). */
 #define STRATUM_EXTRANONCE1_SIZE 4
 #define STRATUM_EXTRANONCE2_SIZE 8
 
@@ -379,6 +380,11 @@ void stratum_server_free(stratum_server_t *s);
 /* A small per-connection state used by stratum_handle_message. Tests
  * construct one of these directly. */
 typedef struct stratum_conn stratum_conn_t;
+
+/* Override a job's coinbase salt. Only for tests that need two job ids to be
+ * the SAME work (the hash-dedupe ring); production salts come from job_id. */
+void            stratum_job_set_cb_salt_for_test(stratum_job_t *j, uint32_t salt);
+uint32_t        stratum_job_cb_salt_for_test(const stratum_job_t *j);
 
 /* Allocate a connection state attached to a server. Used by tests; the
  * real listener uses an internal allocator. */

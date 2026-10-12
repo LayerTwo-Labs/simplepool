@@ -920,6 +920,7 @@ footer .wrap > p { max-width: 46rem; }
   <div class="bytes">
     <div class="f"><b>height push</b><span>BIP34</span></div>
     <div class="f"><b>coinbase_tag</b><span>e.g. <code>/simplepool/</code></span></div>
+    <div class="f"><b>job salt</b><span>5 B · per job</span></div>
     <div class="f pool"><b>extranonce1</b><span>4 B · pool assigns</span></div>
     <div class="f miner"><b>extranonce2</b><span>8 B · miner sweeps</span></div>
   </div>
@@ -2515,7 +2516,7 @@ simplepool --help | -h</code></pre>
       <tbody>
         <tr><td><code>operator_address</code></td><td>—</td><td><strong>required</strong>; must decode, else exit 2</td><td>Receives the <code>fee_bps</code> output. A network mismatch with the node (mainnet vs test) only warns.</td></tr>
         <tr><td><code>fee_bps</code></td><td><code>100</code></td><td>0–1000, else refuse to start</td><td>Fee in basis points; 100 = 1%. 0 removes the fee output. A fee below 546 sats is dropped rather than made dust.</td></tr>
-        <tr><td><code>coinbase_tag</code></td><td><code>/simplepool/</code></td><td>≤63 chars; scriptSig must stay ≤100 bytes</td><td>Text in the coinbase scriptSig after the BIP34 height.</td></tr>
+        <tr><td><code>coinbase_tag</code></td><td><code>/simplepool/</code></td><td>≤63 chars; the whole scriptSig (height, any template scriptSig, tag, the 5-byte job salt, 12 bytes of extranonce) must stay ≤100 bytes</td><td>Text in the coinbase scriptSig after the BIP34 height.</td></tr>
       </tbody>
     </table>
   </div>
@@ -2997,13 +2998,16 @@ listener = port=3335 min_diff=500000 max_coinbase_bytes=900 label=rental</code><
     <div class="f"><b>prevout</b><span>32 × 00 · ffffffff</span></div>
     <div class="f"><b>BIP34 height</b><span>minimal push</span></div>
     <div class="f"><b>tag</b><span><code>coinbase_tag</code>, ≤ 75 B</span></div>
+    <div class="f"><b>job salt</b><span>04 + 4 B LE</span></div>
     <div class="f pool"><b>extranonce1</b><span>4 B</span></div>
     <div class="f miner"><b>extranonce2</b><span>8 B</span></div>
     <div class="f"><b>sequence</b><span>ffffffff</span></div>
   </div>
   <p>
-    <code>coinb1</code> ends just before extranonce1; <code>coinb2</code> starts
-    at the sequence. The whole scriptSig must be 2–100 bytes. When the template
+    <code>coinb1</code> ends just before extranonce1 (after the job salt push, a
+    per-job value so jobs rebuilt from an unchanged template are distinct work);
+    <code>coinb2</code> starts at the sequence. The whole scriptSig, salt
+    included, must be 2–100 bytes. When the template
     supplies its own coinbase (<code>coinbasetxn</code>, as the enforcer does),
     its scriptSig, version and locktime are kept and the tag and extranonces are
     appended to it.
