@@ -516,12 +516,12 @@ void coinbase_parts_free(coinbase_parts_t *p) {
  * second push carrying the salt: 0x04 followed by 4 bytes, little-endian.
  * The salt exists so that two jobs built from the SAME template are still
  * different work. A pool re-issues a job whenever it re-polls, and when the
- * template has not moved the coinbase, the merkle root and therefore every
- * header a rig can build are byte-identical to the previous job's. Rigs that
- * restart their search on each job then re-find hashes the pool has already
- * credited, and the pool answers with a storm of duplicate-share rejections.
- * A different salt per job changes the merkle root, so a repeated search
- * cannot repeat a header. The tag push itself is untouched.
+ * template has not moved the coinbase and the merkle root are byte-identical
+ * to the previous job's; only ntime differs. Rigs that restart their search
+ * on each job and roll ntime can then re-find hashes the pool has already
+ * credited, and the pool rejects them as duplicate shares. A different salt
+ * per job changes the merkle root, so a repeated search cannot repeat a
+ * header. The tag push itself is untouched.
  *
  * Bytes added: COINBASE_JOB_SALT_PUSH_BYTES (5). Every builder counts them
  * against the 100-byte scriptSig cap, and every byte-budget model of the

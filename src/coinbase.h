@@ -17,9 +17,10 @@ typedef struct {
  *     0x04 | salt[0] | salt[1] | salt[2] | salt[3]     (little-endian)
  *
  * which is COINBASE_JOB_SALT_PUSH_BYTES (5) bytes. It makes two jobs built
- * from the same template different work: without it the coinbase, merkle root
- * and every header are identical between re-polls of an unchanged template,
- * and rigs that restart their search per job re-find hashes already credited.
+ * from the same template different work: without it the coinbase and merkle
+ * root are identical between re-polls of an unchanged template (only ntime
+ * moves), and rigs that restart their search per job and roll ntime can
+ * re-find hashes already credited.
  * The 5 bytes count against the 100-byte scriptSig cap and against every
  * byte-budget model of the coinbase. Salt 0 emits no push and the layout is
  * byte-identical to a build without one; probes and tests pass 0. */
