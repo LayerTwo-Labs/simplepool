@@ -90,6 +90,12 @@ test('too few blocks is no measurement, not a wild one', () => {
     assert.equal(stats.networkHashrate(db), null);
 });
 
+test('fmtBtc labels amounts with the chain\'s coin', () => {
+    assert.equal(stats.fmtBtc(1148800000000), '11488 BTC');
+    assert.equal(stats.fmtBtc(1148800000000, 'pECX'), '11488 pECX');
+    assert.equal(stats.fmtBtc(null, 'pECX'), '—');
+});
+
 test('next retarget is the next multiple of 2016, never on regtest', () => {
     assert.deepEqual(stats.nextRetarget(973730, 'forknet'), { height: 975744, blocks_away: 2014 });
     /* On a boundary the retarget has just happened; the next one is 2016 on. */
@@ -107,6 +113,9 @@ function seedPool(d, now) {
     const s = d.prepare('INSERT INTO shares (ts, worker_id, difficulty) VALUES (?, ?, ?)');
     s.run(now - 60, 1, 1000); s.run(now - 60, 2, 1000); s.run(now - 60, 3, 1000);
     s.run(now - 900000, 4, 1000);
+    /* bob.rig2 hashed this morning and stopped: active today, not hashing. */
+    w.run('bob.rig2', now, now - 7200, 'addrB');
+    s.run(now - 7200, 5, 1000);
     const b = d.prepare(`INSERT INTO blocks_found (ts, height, hash, reward_sats, fee_sats, status)
                          VALUES (?, ?, ?, ?, ?, ?)`);
     b.run(now - 100, 500, 'h1', 312500000, 3125000, 'confirmed');
@@ -118,7 +127,8 @@ function seedPool(d, now) {
 test('active users are payout addresses, coins mined are confirmed and net of fee', () => {
     const ov = stats.overview(makeDb(seedPool));
     assert.equal(ov.users_active, 2, 'two addresses in 24h, the third is stale');
-    assert.equal(ov.workers_active, 3);
+    assert.equal(ov.workers_active, 4);
+    assert.equal(ov.workers_hashing, 3, 'only rigs with a share in the last 15 min');
     assert.equal(ov.mined_sats_lifetime, 625000000, 'pending and orphaned mined nothing');
 });
 
@@ -150,6 +160,12 @@ test('the overview renders the card, and survives an empty pool', async () => {
     assert.match(html, /24h · from 850 block times/);
     assert.match(html, /2,014 blocks away/);
     assert.match(html, /6\.25 BTC/);
+    assert.match(html, /3 workers hashing/);
+
+    /* The unit follows COIN_SYMBOL, which server.js binds into fmtBtc. */
+    const ecx = await render(db, { fmtBtc: (sats) => stats.fmtBtc(sats, 'pECX') });
+    assert.match(ecx, /6\.25 pECX/);
+    assert.doesNotMatch(ecx, /6\.25 BTC/);
 
     /* No published difficulty, no block arrivals: dashes, not zeros. */
     const empty = await render(makeDb(() => {}));

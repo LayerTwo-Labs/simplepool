@@ -63,8 +63,8 @@ const _feeOut  = pool && pool.operator_address && pool.operator_address !== pool
                     <strong><%= fmtBtc(ov.mined_sats_lifetime) %></strong>
                     <small>confirmed only, after fee</small></div>
                 <div><label>Active users</label>
-                    <strong title="distinct payout addresses with shares in the last 24h"><%= fmtN(ov.users_active) %></strong>
-                    <small><%= fmtN(ov.workers_active) %> workers hashing (24h)</small></div>
+                    <strong title="Distinct payout addresses with shares in the last 24h. Workers hashing counts rigs with a share in the last 15 minutes."><%= fmtN(ov.users_active) %></strong>
+                    <small><%= fmtN(ov.workers_hashing) %> workers hashing</small></div>
                 <div><label>Fee</label>
                     <strong><%= _feeBps != null ? (_feeBps / 100).toFixed(2).replace(/\.?0+$/, '') + '%' : '—' %></strong>
                     <small><%= _feeOut ? 'verifiable in each coinbase' : (_feeBps != null ? 'of each block' : 'not published yet') %></small></div>

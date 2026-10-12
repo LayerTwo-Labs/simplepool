@@ -29,6 +29,10 @@ const PORT     = parseInt(process.env.PORT || '8081', 10);
 // interface. Set DASHBOARD_BIND=0.0.0.0 (or ::) to serve it directly.
 const BIND     = process.env.DASHBOARD_BIND || '127.0.0.1';
 const DB_PATH  = process.env.PROXY_DB_PATH || '../data/shares.db';
+// The unit block rewards are shown in. A forknet pays in its own coin, and
+// labelling that BTC overstates it, so set this to the chain's ticker.
+const COIN_SYMBOL = (process.env.COIN_SYMBOL || 'BTC').trim() || 'BTC';
+const fmtCoin  = (sats) => stats.fmtBtc(sats, COIN_SYMBOL);
 
 const app = express();
 app.engine('ejs', renderFile);
@@ -170,7 +174,7 @@ app.get('/', (_req, res) => {
     res.render('index', {
         ov, lb, lbAddr, blocks, node, net, retarget,
         fmtHashrate: stats.fmtHashrate,
-        fmtBtc:      stats.fmtBtc,
+        fmtBtc:      fmtCoin,
     });
 });
 
@@ -199,7 +203,7 @@ app.get('/blocks', (req, res) => {
     res.render('blocks', {
         rows: page.rows,
         next_before: page.next_before,
-        fmtBtc: stats.fmtBtc,
+        fmtBtc: fmtCoin,
     });
 });
 
@@ -211,7 +215,7 @@ app.get('/templates', (req, res) => {
     const limit = req.query.limit ? Number(req.query.limit) : 50;
     res.render('templates', {
         templates: stats.templates(db, { limit }),
-        fmtBtc: stats.fmtBtc,
+        fmtBtc: fmtCoin,
     });
 });
 

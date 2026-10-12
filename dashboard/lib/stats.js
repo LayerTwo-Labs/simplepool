@@ -43,6 +43,7 @@ const EMPTY_OVERVIEW = {
     blocks_rejected: 0,
     workers_active: 0,
     users_active: 0,
+    workers_hashing: 0,
     mined_sats_lifetime: 0,
     hashrate: 0,
     window_sec: 86400,
@@ -73,6 +74,11 @@ function hashrateOver(d, nowSec, windowSec) {
     return (row.sum_diff * TWO_32) / spanFor(row.first_ts, nowSec, windowSec);
 }
 
+/* How recent a share has to be for its worker to count as hashing right now.
+ * Long enough that a low-difficulty-per-hashrate rig between shares is not
+ * dropped, short enough that a rig switched off this morning is. */
+export const HASHING_WINDOW_SEC = 900;
+
 export function overview(handle, windowSec = 86400) {
     const d = db(handle);
     if (!d) return { ...EMPTY_OVERVIEW, window_sec: windowSec, window_effective_sec: windowSec };
@@ -90,6 +96,11 @@ export function overview(handle, windowSec = 86400) {
     const wk = d.prepare(
         'SELECT COUNT(DISTINCT worker_id) AS n FROM shares WHERE ts >= ?'
     ).get(since);
+    /* "Hashing" is now, not "some time today": a worker that stopped this
+     * morning still counts in workers_active. */
+    const hashing = d.prepare(
+        'SELECT COUNT(DISTINCT worker_id) AS n FROM shares WHERE ts >= ?'
+    ).get(nowSec - HASHING_WINDOW_SEC);
     /* Same key leaderboardByAddress groups on, so the count matches its rows. */
     const users = d.prepare(`
         SELECT COUNT(DISTINCT COALESCE(NULLIF(w.payout_address, ''), w.name)) AS n
@@ -128,6 +139,7 @@ export function overview(handle, windowSec = 86400) {
         blocks_rejected: Number(candidates?.rejected || 0),
         workers_active: wk.n,
         users_active: users.n,
+        workers_hashing: hashing.n,
         mined_sats_lifetime: Number(mined.sats),
         hashrate: (acc.sum_diff * TWO_32) / accSpan,     // 24h estimate
         hashrate_1h: hashrateOver(d, nowSec, 3600),
@@ -1010,11 +1022,14 @@ export function allBlocks(handle, { limit = 50, beforeTs = null } = {}) {
 }
 
 const SATS_PER_BTC = 100000000;
-export function fmtBtc(sats) {
+/* `symbol` is the chain's coin, not always BTC: a forknet's blocks pay in
+ * its own unit, and labelling them BTC claims mainnet value they don't have.
+ * server.js binds it from COIN_SYMBOL. */
+export function fmtBtc(sats, symbol = 'BTC') {
     if (sats == null) return '—';
     const v = Number(sats) / SATS_PER_BTC;
     if (!isFinite(v)) return '—';
-    return v.toFixed(8).replace(/0+$/, '').replace(/\.$/, '') + ' BTC';
+    return v.toFixed(8).replace(/0+$/, '').replace(/\.$/, '') + ' ' + symbol;
 }
 
 const UNITS = ['H/s', 'KH/s', 'MH/s', 'GH/s', 'TH/s', 'PH/s', 'EH/s'];
