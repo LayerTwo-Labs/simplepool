@@ -682,7 +682,10 @@ stage "assert a pool that cannot measure its window publishes NO job"
 # same path out of store_pplns_window(), and it exercises the real binary
 # rather than a redirected sqlite3_step.
 JOBS_BEFORE="$(grep -c 'new job: height=' "$MIX_LOG")"
-sqlite3 "$MIX_DB" "ALTER TABLE shares RENAME TO shares_hidden;"
+# The pool holds the DB open and retries its window query on every poll, so
+# the rename can land while it holds a lock. The sqlite3 CLI has no busy
+# timeout by default and fails at once with "database is locked"; wait instead.
+sqlite3 -cmd ".timeout 10000" "$MIX_DB" "ALTER TABLE shares RENAME TO shares_hidden;"
 echo "  shares table hidden; forcing a rebuild with a new tip"
 
 # A new tip is when it matters most, and it forces a rebuild immediately
@@ -700,7 +703,7 @@ done
 grep -qE 'window query failed|did not cover' "$MIX_LOG" || {
     echo "FAIL: the window became unreadable and the pool never said so" >&2
     tail -20 "$MIX_LOG" >&2
-    sqlite3 "$MIX_DB" "ALTER TABLE shares_hidden RENAME TO shares;" 2>/dev/null
+    sqlite3 -cmd ".timeout 10000" "$MIX_DB" "ALTER TABLE shares_hidden RENAME TO shares;" 2>/dev/null
     exit 1; }
 echo "  refused: $(grep -oE '(window query failed|pplns window walk did not cover)[^\"]{0,40}' "$MIX_LOG" | tail -1)"
 
@@ -711,12 +714,12 @@ JOBS_BROKEN="$(grep -c 'new job: height=' "$MIX_LOG")"
 [ "$JOBS_BROKEN" = "$JOBS_BEFORE" ] || {
     echo "FAIL: the pool could not measure its window and published a job anyway" >&2
     echo "      ($JOBS_BEFORE jobs before, $JOBS_BROKEN after)" >&2
-    sqlite3 "$MIX_DB" "ALTER TABLE shares_hidden RENAME TO shares;" 2>/dev/null
+    sqlite3 -cmd ".timeout 10000" "$MIX_DB" "ALTER TABLE shares_hidden RENAME TO shares;" 2>/dev/null
     exit 1; }
 echo "  published no job while the window was unreadable ($JOBS_BEFORE, unchanged)"
 
 # Recovery: it is a hold, not a latch.
-sqlite3 "$MIX_DB" "ALTER TABLE shares_hidden RENAME TO shares;"
+sqlite3 -cmd ".timeout 10000" "$MIX_DB" "ALTER TABLE shares_hidden RENAME TO shares;"
 mine_one
 for _ in $(seq 1 40); do
     JOBS_AFTER="$(grep -c 'new job: height=' "$MIX_LOG")"
