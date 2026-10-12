@@ -137,3 +137,21 @@ test('an unpublished difficulty renders a dash on the card, not "0"', async () =
     assert.doesNotMatch(html, /Exactly /);
     assert.match(html, /The proxy publishes the difficulty with each block template/);
 });
+
+/* Network hashrate is implied by the difficulty (D * 2^32 / 600), so it has
+ * to follow it everywhere: present with it, absent with it, and readable at
+ * both ends of the range the difficulty itself has to survive. */
+test('the network hashrate is implied by the published difficulty', () => {
+    const node = stats.nodeStatus(makeDb());
+    assert.equal(node.network_hashrate, MAINNET_DIFF * 4294967296 / 600);
+    assert.equal(stats.fmtHashrate(node.network_hashrate), '908.96 EH/s');
+    for (const diff of [null, 0]) {
+        assert.ok(!('network_hashrate' in stats.nodeStatus(makeDb(diff))));
+    }
+});
+
+test('a forknet network hashrate is not rounded to zero', () => {
+    const out = stats.fmtHashrate(FORKNET_DIFF * 4294967296 / 600);
+    assert.equal(out, '0.00334 H/s');
+});
+
