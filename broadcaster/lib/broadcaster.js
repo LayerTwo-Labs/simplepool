@@ -5,8 +5,10 @@
  *     later orphaned or rejected
  *   - announces shares stopping / resuming, and ledger health failing /
  *     recovering, once the new state has held for `debounce` polls
- *   - posts the daily digest once per UTC day, at or after DIGEST_UTC_HOUR
- *   - posts a stats summary once per BROADCASTER_SUMMARY_HOURS period
+ *   - posts the daily digest once per UTC day, at or after DIGEST_UTC_HOUR,
+ *     unless no share was accepted in the last 24h
+ *   - posts a stats summary once per BROADCASTER_SUMMARY_HOURS period,
+ *     unless the pool is quiet
  *   - refreshes the live message (BROADCASTER_LIVE=1), pinned unless
  *     BROADCASTER_LIVE_PIN=0
  *
@@ -108,19 +110,25 @@ export class Broadcaster {
         const now = new Date(nowMs);
         const today = utcDate(now);
         if (now.getUTCHours() < this.cfg.digestHour || this.state.lastDigestDate === today) return;
-        await this.#post(msg.digest({ status, blocks, nowSec: Math.floor(nowMs / 1000), ...this.#ctx() }));
+        // A day without shares is a report of zeros. The day is still marked
+        // done, so shares resuming later does not post it at an odd hour.
+        if (status.pool?.accepted > 0) {
+            await this.#post(msg.digest({ status, blocks, nowSec: Math.floor(nowMs / 1000), ...this.#ctx() }));
+        }
         this.state.lastDigestDate = today;
         this.persist();
     }
 
     /* A new message per period, unlike the live one, which is edited. The
      * first period seen (first run, or the option just turned on) is
-     * recorded without a post, so enabling it does not post on the spot. */
+     * recorded without a post, so enabling it does not post on the spot.
+     * While the pool is quiet the periods pass without a post: the quiet
+     * notice already said so, and the "back" notice will say when it ends. */
     async #summary(status, blocks, nowMs) {
         if (this.cfg.summaryHours == null) return;
         const slot = this.#summarySlot(nowMs);
         if (this.state.lastSummarySlot === slot) return;
-        if (this.state.lastSummarySlot != null) {
+        if (this.state.lastSummarySlot != null && this.state.sharesFlowing !== false) {
             await this.#post(msg.summary({
                 status,
                 blocks,

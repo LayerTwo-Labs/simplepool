@@ -304,3 +304,42 @@ test('chain tip line appears with node status and is left out without it', async
     await other.b.tick(T0);
     assert.doesNotMatch(other.telegram.posts[0], /Chain tip/);
 });
+
+test('summary is skipped while the pool is quiet, and resumes with shares', async () => {
+    const H = 60 * MIN;
+    const { b, dashboard, telegram, state } = setup({ summaryHours: 1, digestHour: null });
+    await b.tick(T0);                                  // seeds, shares flowing
+    dashboard.s = status({ lastShareTs: T0 / 1000 });  // and then they stop
+    await b.tick(T0 + 20 * MIN);
+    await b.tick(T0 + 21 * MIN);
+    assert.equal(telegram.posts.length, 1);
+    assert.match(telegram.posts[0], /no shares accepted/);
+    assert.equal(state.sharesFlowing, false);
+
+    for (let h = 1; h <= 5; h++) await b.tick(T0 + h * H);
+    assert.equal(telegram.posts.length, 1, 'no summaries while quiet');
+    assert.equal(state.lastSummarySlot, Math.floor((T0 + 5 * H) / H), 'periods still pass');
+
+    dashboard.s = status({ lastShareTs: (T0 + 5 * H + MIN) / 1000 });
+    await b.tick(T0 + 5 * H + MIN);
+    await b.tick(T0 + 5 * H + 2 * MIN);
+    assert.match(telegram.posts.at(-1), /coming in again/);
+    dashboard.s = status({ lastShareTs: (T0 + 6 * H) / 1000 });
+    await b.tick(T0 + 6 * H);
+    assert.match(telegram.posts.at(-1), /— update/);
+    assert.equal(telegram.posts.length, 3);
+});
+
+test('digest is skipped on a day without shares, and not posted late', async () => {
+    const { b, dashboard, telegram, state } = setup();
+    await b.tick(T0);                                  // 10:00
+    dashboard.s = status({ lastShareTs: T0 / 1000 - 86400 });
+    dashboard.s.pool.accepted = 0;
+    await b.tick(T0 + 2 * 60 * MIN);                   // 12:00
+    assert.equal(telegram.posts.filter((p) => p.includes('daily report')).length, 0);
+    assert.equal(state.lastDigestDate, '2026-09-30');
+
+    dashboard.s = status({ lastShareTs: (T0 + 3 * 60 * MIN) / 1000 });
+    await b.tick(T0 + 3 * 60 * MIN);                   // 13:00, shares again
+    assert.equal(telegram.posts.filter((p) => p.includes('daily report')).length, 0);
+});
