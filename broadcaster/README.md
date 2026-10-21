@@ -17,14 +17,14 @@ if Telegram or the service goes down, the pool is unaffected.
 
 | | when |
 |---|---|
-| **Daily digest** | once per UTC day at `DIGEST_UTC_HOUR` (default 12): hashrate now (5m), 1h and 24h, active workers, accepted and rejected shares, best share, blocks in the last 24h and all time, mode and fee |
+| **Daily digest** | once per UTC day at `DIGEST_UTC_HOUR` (default 12): hashrate now (5m), 1h and 24h, active workers, accepted and rejected shares, best share, blocks in the last 24h and all time, mode and fee. Skipped on a day with no accepted shares |
 | **Block found** | the first time a block appears in `/api/blocks` as `pending` or `confirmed` |
 | **Block lost** | a block it announced turns `orphaned` or `rejected` |
 | **Pool quiet / back** | no share accepted for `STALE_SHARES_SEC` (default 15m), and when shares resume |
 | **Health failing / recovered** | `/health` changes state, with the failing checks listed |
 | **Pinned live message** (`BROADCASTER_LIVE=1`) | one message, pinned unless `BROADCASTER_LIVE_PIN=0`, edited every `BROADCASTER_LIVE_MS` (default 5m) with current stats, the chain tip and the pool's last mined block |
 | **`/pool_status`** (`BROADCASTER_COMMANDS=1`) | when someone sends it in the chat: the current stats, as a reply in the same topic, at most once per `BROADCASTER_COMMAND_COOLDOWN_SEC` (default 30) |
-| **Periodic update** (`BROADCASTER_SUMMARY_HOURS=N`) | the same stats as a new message every N hours, on UTC boundaries (6 → 00, 06, 12, 18 UTC) |
+| **Periodic update** (`BROADCASTER_SUMMARY_HOURS=N`) | the same stats as a new message every N hours, on UTC boundaries (6 → 00, 06, 12, 18 UTC). Skipped while the pool is quiet |
 
 - **Edited is not posted.** Telegram does not notify anyone of an edit or
   move the message down the chat, so the pinned live message stays where it
