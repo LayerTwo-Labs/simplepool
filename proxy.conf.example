@@ -181,6 +181,12 @@ commit_max_shares = 100
 # reads this table; the ledger lives in shares and rate_history.
 templates_retention_days = 30
 
+# Reject rows written per second, pool-wide; the rest are not recorded (the
+# miner still gets its error). A reject costs the sender no work, so without a
+# cap a flood of them grows the rejects table without bound. Default 0 = no
+# limit.
+# rejects_max_per_sec = 0
+
 # Redis broadcast (optional). When set, accepted shares / rejects / blocks /
 # tip changes are PUBLISHed on channels pool:shares / pool:rejects /
 # pool:blocks / pool:tip as JSON. SQLite remains the source of truth — the

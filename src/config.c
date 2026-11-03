@@ -306,6 +306,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "commit_window_ms")          == 0) cfg->commit_window_ms = atoi(v);
         else if (strcmp(k, "commit_max_shares")         == 0) cfg->commit_max_shares = atoi(v);
         else if (strcmp(k, "templates_retention_days")  == 0) cfg->templates_retention_days = atoi(v);
+        else if (strcmp(k, "rejects_max_per_sec")       == 0) cfg->rejects_max_per_sec = atoi(v);
         else if (strcmp(k, "redis_url")                 == 0) copy_str(cfg->redis_url, sizeof cfg->redis_url, v);
         else if (strcmp(k, "redis_publish_timeout_ms")  == 0) cfg->redis_publish_timeout_ms = atoi(v);
         else if (strcmp(k, "redis_reconnect_backoff_ms")== 0) cfg->redis_reconnect_backoff_ms = atoi(v);

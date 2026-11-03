@@ -480,6 +480,9 @@ struct store {
     int commit_window_ms;
     int commit_max_shares;
     int templates_retention_days;   /* 0 = keep every row */
+    int rejects_max_per_sec;        /* 0 = no limit */
+    uint64_t reject_sec;            /* under mu: the second being counted */
+    int      rejects_in_sec;        /* under mu */
 
     worker_slot_t cache[WORKER_CACHE_SLOTS];
 
@@ -826,9 +829,10 @@ static void *writer_main(void *arg) {
 
 /* ---- enqueue ---------------------------------------------------------- */
 
-static int enqueue(store_t *s, const event_t *ev) {
+/* Enqueues only while fewer than `limit` events are waiting. */
+static int enqueue_below(store_t *s, const event_t *ev, size_t limit) {
     pthread_mutex_lock(&s->mu);
-    if (s->ring_count == s->ring_cap) {
+    if (s->ring_count >= limit) {
         pthread_mutex_unlock(&s->mu);
         return -1;
     }
@@ -839,6 +843,30 @@ static int enqueue(store_t *s, const event_t *ev) {
     pthread_cond_signal(&s->cv_not_empty);
     pthread_mutex_unlock(&s->mu);
     return 0;
+}
+
+static int enqueue(store_t *s, const event_t *ev) {
+    return enqueue_below(s, ev, s->ring_cap);
+}
+
+/* Rejects take no work to send, so a flood of them must not crowd shares and
+ * blocks out of the ring: they stop at three quarters full. */
+static int enqueue_reject(store_t *s, const event_t *ev) {
+    return enqueue_below(s, ev, s->ring_cap - s->ring_cap / 4);
+}
+
+static int reject_within_rate(store_t *s, uint64_t ts_ms) {
+    if (s->rejects_max_per_sec <= 0) return 1;
+    pthread_mutex_lock(&s->mu);
+    uint64_t sec = ts_ms / 1000;
+    if (sec != s->reject_sec) {
+        s->reject_sec = sec;
+        s->rejects_in_sec = 0;
+    }
+    int ok = s->rejects_in_sec < s->rejects_max_per_sec;
+    if (ok) s->rejects_in_sec++;
+    pthread_mutex_unlock(&s->mu);
+    return ok;
 }
 
 /* ---- public API ------------------------------------------------------- */
@@ -852,6 +880,8 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
     s->commit_max_shares = cfg->commit_max_shares > 0 ? cfg->commit_max_shares : 100;
     s->templates_retention_days =
         cfg->templates_retention_days > 0 ? cfg->templates_retention_days : 0;
+    s->rejects_max_per_sec =
+        cfg->rejects_max_per_sec > 0 ? cfg->rejects_max_per_sec : 0;
     s->ring_cap = g_test_ring_cap > 0 ? g_test_ring_cap : 65536;
     s->ring = calloc(s->ring_cap, sizeof(event_t));
     if (!s->ring) { free(s); return -1; }
@@ -1046,13 +1076,14 @@ int store_record_reject(store_t *s, const char *worker_name,
                         uint64_t ts_ms, const char *reason)
 {
     if (!s || !reason) return -1;
+    if (!reject_within_rate(s, ts_ms)) return 0;
     event_t ev;
     memset(&ev, 0, sizeof(ev));
     ev.kind = EV_REJECT;
     ev.ts_ms = ts_ms;
     if (worker_name) strncpy(ev.worker_name, worker_name, WORKER_NAME_MAX - 1);
     strncpy(ev.reason, reason, REASON_MAX - 1);
-    if (enqueue(s, &ev) != 0) {
+    if (enqueue_reject(s, &ev) != 0) {
         atomic_fetch_add(&s->shares_dropped, 1);
         return -1;
     }
@@ -1301,9 +1332,17 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
     if (finder_name) strncpy(ev.worker_name, finder_name, WORKER_NAME_MAX - 1);
     if (finder_address)
         strncpy(ev.payout_address, finder_address, ADDR_MAX - 1);
-    if (enqueue(s, &ev) != 0) {
-        atomic_fetch_add(&s->shares_dropped, 1);
-        return -1;
+    /* A found block is never dropped for a full ring: wait (up to 30 s) for
+     * the writer to make room. */
+    for (int waited_ms = 0; enqueue(s, &ev) != 0; waited_ms += 10) {
+        if (waited_ms >= 30000) {
+            LOG_ERROR("store: ring full for 30 s; block %s was NOT recorded",
+                      hash);
+            atomic_fetch_add(&s->shares_dropped, 1);
+            return -1;
+        }
+        struct timespec ts = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
     }
     return 0;
 }

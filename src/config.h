@@ -123,6 +123,7 @@ typedef struct {
     int  commit_window_ms;
     int  commit_max_shares;
     int  templates_retention_days;  /* template history kept; 0 = forever */
+    int  rejects_max_per_sec;       /* reject rows written per second; 0 = no limit */
 
     /* redis broadcast — optional. Empty url disables the module. */
     char redis_url[256];
