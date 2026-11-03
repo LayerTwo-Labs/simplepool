@@ -147,6 +147,21 @@ static void test_parse_coinbasetxn(void) {
     cJSON_Delete(root);
 }
 
+/* BIP22 allows both fields. The server's coinbase carries mandatory outputs
+ * (drivechain commitments), so it must win over building our own. */
+static void test_parse_prefers_coinbasetxn(void) {
+    cJSON *root = cJSON_Parse(SAMPLE_GBT_COINBASETXN);
+    assert(root);
+    cJSON_AddNumberToObject(root, "coinbasevalue", 1234);
+    bitcoind_template_t *t = NULL;
+    char err[256] = {0};
+    CHECK(bitcoind_parse_template(root, &t, err, sizeof(err)) == 0);
+    CHECK(t != NULL && t->coinbasetxn_hex != NULL);
+    CHECK(t != NULL && t->coinbase_value_sats == 5000000000LL);
+    bitcoind_template_free(t);
+    cJSON_Delete(root);
+}
+
 static void test_parse_missing_prevhash(void) {
     const char *bad =
         "{ \"version\":1, \"coinbasevalue\":100, \"target\":\"00\","
@@ -459,6 +474,7 @@ static void test_getblockhash_returns_the_hash(void) {
 int main(void) {
     test_parse_ok();
     test_parse_coinbasetxn();
+    test_parse_prefers_coinbasetxn();
     test_parse_missing_prevhash();
     test_parse_empty_txs();
     test_double_free_safe();
