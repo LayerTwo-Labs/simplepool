@@ -12,6 +12,7 @@
 #include "stratum.h"
 #include "version.h"
 
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
@@ -21,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -129,6 +131,8 @@ typedef struct {
      * is the single most valuable call this process makes and there is no
      * prize for giving up early, so it gets its own generous budget. */
     bitcoind_client_t *btc_submit;
+    /* submit_fallback_url's client, or NULL. */
+    bitcoind_client_t *btc_submit_fallback;
     store_t           *store;
     broadcast_t       *bcast;
     stratum_server_t  *srv;
@@ -185,6 +189,11 @@ typedef struct {
  * block has just been found network-wide. A submission we abandon is a block
  * we may lose; one that takes 45 s and lands is a block we keep. */
 #define SUBMIT_BLOCK_TIMEOUT_MS 60000L
+
+/* A submission that gets no answer at all is retried, with backoff, until
+ * this much time has passed since the first attempt. Each connection has its
+ * own thread, so only the finder's connection waits. */
+#define SUBMIT_BLOCK_RETRY_BUDGET_MS 120000ULL
 
 /* The rate this proxy will credit at: the operator's override verbatim if
  * set, otherwise fair value derived from the template. See the
@@ -886,6 +895,37 @@ static void on_reject_cb(void *ctx, const char *worker_name, uint64_t ts_ms,
 /* Returns 0 when the node accepted the block, non-zero when it refused.
  * The caller records the candidate accordingly — a refusal that goes only to
  * the log is what let rejected candidates be counted as pool revenue. */
+/* Writes the block to <db dir>/found-blocks/<ms>.hex before it is submitted,
+ * so a block no node would take can still be submitted by hand
+ * (bitcoin-cli submitblock "$(cat FILE)"). Best effort. */
+static void save_block_hex(const server_ctx_t *s, const char *block_hex,
+                           char *path, size_t path_len) {
+    path[0] = '\0';
+    if (!s->cfg) return;
+    char dir[600];
+    const char *slash = strrchr(s->cfg->db_path, '/');
+    if (slash) {
+        snprintf(dir, sizeof dir, "%.*s/found-blocks",
+                 (int)(slash - s->cfg->db_path), s->cfg->db_path);
+    } else {
+        snprintf(dir, sizeof dir, "found-blocks");
+    }
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+        LOG_WARN("could not create %s: %s", dir, strerror(errno));
+        return;
+    }
+    snprintf(path, path_len, "%s/%llu.hex", dir, (unsigned long long)now_ms());
+    FILE *f = fopen(path, "w");
+    if (!f || fputs(block_hex, f) < 0 || fclose(f) != 0) {
+        LOG_WARN("could not save block to %s", path);
+        path[0] = '\0';
+    }
+}
+
+/* Returns 0 when the node took the block or may have taken it, non-zero only
+ * when a node refused it. A block that no node answered for is filed
+ * 'pending', not 'rejected': it may have got in, and reconcile settles that
+ * from the chain, while 'rejected' is final and would lose it for good. */
 static int on_block_cb(void *ctx, const char *block_hex,
                        char *errbuf, size_t errlen) {
     server_ctx_t *s = (server_ctx_t *)ctx;
@@ -893,13 +933,47 @@ static int on_block_cb(void *ctx, const char *block_hex,
         snprintf(errbuf, errlen, "no bitcoind client");
         return -1;
     }
-    int rc = bitcoind_submit_block(s->btc_submit, block_hex, errbuf, errlen);
+    char saved[700];
+    save_block_hex(s, block_hex, saved, sizeof saved);
+
+    uint64_t start = now_ms();
+    unsigned delay_ms = 500;
+    int rc = -1;
+    for (int attempt = 1; ; ++attempt) {
+        rc = bitcoind_submit_block(s->btc_submit, block_hex, errbuf, errlen);
+        if (rc == 0 || rc == BITCOIND_SUBMIT_REFUSED) break;
+        LOG_ERROR("submitblock attempt %d failed: %s", attempt, errbuf);
+        if (s->btc_submit_fallback) {
+            char ferr[256] = {0};
+            rc = bitcoind_submit_block(s->btc_submit_fallback, block_hex,
+                                       ferr, sizeof ferr);
+            if (rc == 0 || rc == BITCOIND_SUBMIT_REFUSED) {
+                snprintf(errbuf, errlen, "%s", ferr);
+                LOG_WARN("submitblock went through the fallback node");
+                break;
+            }
+            LOG_ERROR("submitblock to the fallback node failed: %s", ferr);
+        }
+        if (now_ms() - start + delay_ms > SUBMIT_BLOCK_RETRY_BUDGET_MS) break;
+        struct timespec pause = { (time_t)(delay_ms / 1000),
+                                  (long)(delay_ms % 1000) * 1000000L };
+        nanosleep(&pause, NULL);
+        if (delay_ms < 8000) delay_ms *= 2;
+    }
     if (rc == 0) {
         LOG_INFO("submitted block to bitcoind successfully");
-    } else {
-        LOG_ERROR("submitblock failed: %s", errbuf);
+        return 0;
     }
-    return rc;
+    if (rc == BITCOIND_SUBMIT_REFUSED) {
+        LOG_ERROR("submitblock refused: %s (block saved at %s)", errbuf,
+                  saved[0] ? saved : "nowhere");
+        return rc;
+    }
+    LOG_ERROR("submitblock: no node answered for %llu s (%s). The block is "
+              "saved at %s; it stays pending until the chain shows whether it "
+              "got in.", (unsigned long long)((now_ms() - start) / 1000),
+              errbuf, saved[0] ? saved : "nowhere");
+    return 0;
 }
 
 static void on_block_found_cb(void *ctx, const char *worker_name,
@@ -1462,6 +1536,20 @@ int main(int argc, char **argv) {
     sctx.btc    = &btc;
     sctx.btc_lp = &btc_lp;
     sctx.btc_submit = &btc_submit;
+    bitcoind_client_t btc_submit_fb = {0};
+    if (cfg.submit_fallback_url[0]) {
+        bitcoind_cfg_t bcfg_fb = {0};
+        snprintf(bcfg_fb.url,  sizeof bcfg_fb.url,  "%s", cfg.submit_fallback_url);
+        snprintf(bcfg_fb.user, sizeof bcfg_fb.user, "%s", cfg.submit_fallback_user);
+        snprintf(bcfg_fb.pass, sizeof bcfg_fb.pass, "%s", cfg.submit_fallback_pass);
+        bcfg_fb.timeout_ms = SUBMIT_BLOCK_TIMEOUT_MS;
+        if (bitcoind_client_init(&btc_submit_fb, &bcfg_fb) == 0) {
+            sctx.btc_submit_fallback = &btc_submit_fb;
+            LOG_INFO("submitblock fallback: %s", cfg.submit_fallback_url);
+        } else {
+            LOG_WARN("submitblock fallback client failed to start; continuing without it");
+        }
+    }
     sctx.store  = store;
     sctx.bcast = bcast;
     sctx.cfg   = &cfg;
@@ -1775,6 +1863,7 @@ int main(int argc, char **argv) {
     bitcoind_client_free(&btc);
     bitcoind_client_free(&btc_lp);
     bitcoind_client_free(&btc_submit);
+    bitcoind_client_free(&btc_submit_fb);
     pthread_mutex_destroy(&sctx.lock);
 
     LOG_INFO("simplepool exited cleanly");

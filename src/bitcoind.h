@@ -88,6 +88,10 @@ int bitcoind_get_block_template_lp(bitcoind_client_t *c,
                                    bitcoind_template_t **out,
                                    char *errbuf, size_t errlen);
 
+/* bitcoind_submit_block's return when the node answered and refused the
+ * block. Every other non-zero return means no usable answer arrived. */
+#define BITCOIND_SUBMIT_REFUSED (-30)
+
 /* Submit a serialized block (raw hex). Returns 0 if accepted, negative on
  * error. errbuf gets the rejection reason on negative. */
 int bitcoind_submit_block(bitcoind_client_t *c, const char *block_hex,

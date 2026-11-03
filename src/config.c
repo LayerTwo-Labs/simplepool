@@ -279,6 +279,9 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "bitcoind_user")             == 0) copy_str(cfg->bitcoind_user, sizeof cfg->bitcoind_user, v);
         else if (strcmp(k, "bitcoind_pass")             == 0) copy_str(cfg->bitcoind_pass, sizeof cfg->bitcoind_pass, v);
         else if (strcmp(k, "bitcoind_poll_interval_ms") == 0) cfg->bitcoind_poll_interval_ms = atoi(v);
+        else if (strcmp(k, "submit_fallback_url")       == 0) copy_str(cfg->submit_fallback_url, sizeof cfg->submit_fallback_url, v);
+        else if (strcmp(k, "submit_fallback_user")      == 0) copy_str(cfg->submit_fallback_user, sizeof cfg->submit_fallback_user, v);
+        else if (strcmp(k, "submit_fallback_pass")      == 0) copy_str(cfg->submit_fallback_pass, sizeof cfg->submit_fallback_pass, v);
         else if (strcmp(k, "operator_address")          == 0) copy_str(cfg->operator_address, sizeof cfg->operator_address, v);
         else if (strcmp(k, "fee_bps")                   == 0) cfg->fee_bps = atoi(v);
         else if (strcmp(k, "payout_address")            == 0) {

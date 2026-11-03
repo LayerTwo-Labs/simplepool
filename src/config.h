@@ -112,6 +112,11 @@ typedef struct {
     char bitcoind_user[128];
     char bitcoind_pass[256];
     int  bitcoind_poll_interval_ms;
+    /* Optional second node for submitblock only, tried when bitcoind_url
+     * gives no answer (down, restarting, timing out). Empty = none. */
+    char submit_fallback_url[512];
+    char submit_fallback_user[128];
+    char submit_fallback_pass[256];
 
     /* coinbase */
     char operator_address[128];   /* 1% (fee_bps) fee recipient */
