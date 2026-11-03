@@ -241,6 +241,56 @@ static void test_authorize_triggers_setdiff_notify(void) {
     stratum_server_free(s);
 }
 
+/* coinb2 (params[3]) of the mining.notify in `out`, copied, or NULL. */
+static char *notify_coinb2(const char *out) {
+    const char *line = strstr(out, "{\"id\":null,\"method\":\"mining.notify\"");
+    if (!line) line = strstr(out, "mining.notify");
+    if (!line) return NULL;
+    while (line > out && line[-1] != '\n') line--;
+    const char *end = strchr(line, '\n');
+    char *copy = strndup(line, end ? (size_t)(end - line) : strlen(line));
+    cJSON *msg = cJSON_Parse(copy);
+    free(copy);
+    char *cb2 = NULL;
+    cJSON *cb = msg ? cJSON_GetArrayItem(cJSON_GetObjectItem(msg, "params"), 3) : NULL;
+    if (cJSON_IsString(cb)) cb2 = strdup(cb->valuestring);
+    cJSON_Delete(msg);
+    return cb2;
+}
+
+/* A second mining.authorize on one connection switches who the coinbase
+ * pays at once, not at the next job: the cached coinbase for the current job
+ * still paid the first address. */
+static void test_reauthorize_pays_new_address(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                           .ctx = &obs };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("0001", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen);
+    free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c, "{\"id\":2,\"method\":\"mining.authorize\","
+                           "\"params\":[\"" TEST_ADDR ".a\",\"x\"]}", &out, &olen);
+    char *first = out ? notify_coinb2(out) : NULL;
+    free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c, "{\"id\":3,\"method\":\"mining.authorize\","
+                           "\"params\":[\"" TEST_ADDR2 ".b\",\"x\"]}", &out, &olen);
+    char *second = out ? notify_coinb2(out) : NULL;
+    CHECK(first != NULL && second != NULL);
+    if (first && second) CHECK(strcmp(first, second) != 0);
+    CHECK(strcmp(stratum_conn_payout_address_for_test(c), TEST_ADDR2) == 0);
+    free(first); free(second); free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 static void test_submit_unknown_job(void) {
     obs_t obs = {0};
     stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
@@ -3730,6 +3780,7 @@ int main(void) {
     test_failed_bind_does_not_close_stdin();
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
+    test_reauthorize_pays_new_address();
     test_submit_unknown_job();
     test_submit_share_and_dedupe();
     test_submit_rejects_wrong_extranonce2_size();
