@@ -250,6 +250,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         if      (strcmp(k, "listen_addr")               == 0) copy_str(cfg->listen_addr, sizeof cfg->listen_addr, v);
         else if (strcmp(k, "listen_port")               == 0) cfg->listen_port = atoi(v);
         else if (strcmp(k, "max_conns")                 == 0) cfg->max_conns = atoi(v);
+        else if (strcmp(k, "max_conns_per_ip")          == 0) cfg->max_conns_per_ip = atoi(v);
         else if (strcmp(k, "listen_backlog")            == 0) cfg->listen_backlog = atoi(v);
         else if (strcmp(k, "max_submits_per_sec")       == 0) cfg->max_submits_per_sec = atoi(v);
         else if (strcmp(k, "auth_max_failures")        == 0) cfg->auth_max_failures = atoi(v);

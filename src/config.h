@@ -10,6 +10,7 @@ typedef struct {
     char listen_addr[64];
     int  listen_port;
     int  max_conns;
+    int  max_conns_per_ip;   /* 0 = no limit */
     /* listen() backlog for every stratum listener. 0 -> STRATUM_DEFAULT_BACKLOG.
      * The kernel clamps it to net.core.somaxconn. */
     int  listen_backlog;
