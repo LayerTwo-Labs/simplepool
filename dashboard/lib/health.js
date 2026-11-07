@@ -368,14 +368,27 @@ export function health(handle) {
      * a template far behind the tip), not chain noise to be swallowed.
      *
      * Only settled candidates count toward the ratio: 'pending' means nothing
-     * has been able to verify it yet, which is not evidence either way. */
+     * has been able to verify it yet, which is not evidence either way.
+     *
+     * The unit is a HEIGHT, not a row. A template stuck on an old tip (an
+     * enforcer wedged in a mempool re-sync, say) keeps miners solving the same
+     * height, and every solve is its own rejected row: one incident on
+     * vaultnet left six rows at 974,037, which kept this check red for over a
+     * week after the fix while every block since had confirmed. A height
+     * counts as reached if any candidate there confirmed, and as lost if all
+     * of them were orphaned or rejected. A pool losing blocks at many heights
+     * still fails exactly as before. */
     checks.push(guard('orphan_rate', 'Blocks reaching the chain', () => {
         const r = one(d, `
-            SELECT COUNT(*) FILTER (WHERE status = 'confirmed') AS good,
-                   COUNT(*) FILTER (WHERE status IN ('orphaned','rejected')) AS lost
-              FROM (SELECT status FROM blocks_found
-                     WHERE status <> 'pending'
-                     ORDER BY ts DESC LIMIT 100)`);
+            SELECT COUNT(*) FILTER (WHERE reached = 1) AS good,
+                   COUNT(*) FILTER (WHERE reached = 0) AS lost
+              FROM (SELECT height,
+                           MAX(status = 'confirmed') AS reached,
+                           MAX(ts) AS last_ts
+                      FROM blocks_found
+                     WHERE status IN ('confirmed','orphaned','rejected')
+                     GROUP BY height
+                     ORDER BY last_ts DESC LIMIT 100)`);
         const good = Number(r?.good || 0);
         const lost = Number(r?.lost || 0);
         const settled = good + lost;
@@ -388,7 +401,7 @@ export function health(handle) {
             value: Math.round(pct),
             detail: pct >= 50
                 ? null
-                : `only ${good} of the last ${settled} candidates reached the chain`,
+                : `only ${good} of the last ${settled} heights the pool solved reached the chain`,
         };
     }));
 
