@@ -126,6 +126,48 @@ test('a pool whose candidates never reach the chain is caught', () => {
     assert.ok(failing(h).includes('orphan_rate'));
 });
 
+/* The vaultnet incident, 2026-10-29: a wedged enforcer pinned the template at
+ * 974,037 and six solves there were rejected, one incident. Every block after
+ * the fix confirmed. Counted per row that is 4 of 10 and red for a week;
+ * counted per height it is 4 of 5. */
+test('many rejected solves at one stuck height are one incident', () => {
+    const db = makeDb();
+    db.prepare('DELETE FROM blocks_found').run();
+    const ins = db.prepare(`INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status)
+                            VALUES (?, ?, ?, 0, 0, ?)`);
+    ins.run(1700000000, 974036, 'ok0', 'confirmed');
+    for (let i = 0; i < 6; i++) ins.run(1700000100 + i, 974037, `stuck${i}`, 'rejected');
+    ins.run(1700001000, 982926, 'ok1', 'confirmed');
+    ins.run(1700002000, 982965, 'ok2', 'confirmed');
+    ins.run(1700003000, 983139, 'ok3', 'confirmed');
+    const h = health(db);
+    assert.ok(!failing(h).includes('orphan_rate'));
+});
+
+/* A losing candidate at a height another candidate of ours won is not a lost
+ * height: the pool got that block. */
+test('a height the pool won is reached despite a losing sibling', () => {
+    const db = makeDb();
+    db.prepare('DELETE FROM blocks_found').run();
+    const ins = db.prepare(`INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status)
+                            VALUES (?, ?, ?, 0, 0, ?)`);
+    ins.run(1700000000, 500, 'lose', 'orphaned');
+    ins.run(1700000001, 500, 'win', 'confirmed');
+    const h = health(db);
+    assert.ok(!failing(h).includes('orphan_rate'));
+});
+
+/* Grouping must not hide a pool that really is losing blocks: rejects at
+ * many distinct heights still outweigh the confirmed ones. */
+test('lost blocks at many heights still fail', () => {
+    const db = makeDb();
+    const ins = db.prepare(`INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status)
+                            VALUES (?, ?, ?, 0, 0, 'rejected')`);
+    for (let i = 0; i < 3; i++) ins.run(1700000100 + i, 900000 + i, `rej${i}`);
+    const h = health(db);
+    assert.ok(failing(h).includes('orphan_rate'));
+});
+
 /* A pool that has found nothing yet has not failed at anything. */
 test('no settled candidates is not an orphan-rate failure', () => {
     const db = makeDb();
