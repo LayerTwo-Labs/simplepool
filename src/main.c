@@ -1710,11 +1710,13 @@ int main(int argc, char **argv) {
              cfg.listen_addr, cfg.listen_port, cfg.initial_diff);
     for (int i = 0; i < cfg.listener_count; ++i) {
         const stratum_listener_t *l = &cfg.listeners[i];
-        LOG_INFO("stratum listening on %s:%d%s%s (difficulty from %g, floor %g)",
+        LOG_INFO("stratum listening on %s:%d%s%s (difficulty from %g, floor %g)%s",
                  cfg.listen_addr, l->port,
                  l->label[0] ? " — " : "", l->label[0] ? l->label : "",
                  l->initial_diff > 0 ? l->initial_diff : cfg.initial_diff,
-                 l->vardiff_min > 0 ? l->vardiff_min : cfg.vardiff_min);
+                 l->vardiff_min > 0 ? l->vardiff_min : cfg.vardiff_min,
+                 l->never_clean_jobs
+                     ? "; clean_jobs=never (no clean flag on a new tip)" : "");
     }
 
     /* Signals. */

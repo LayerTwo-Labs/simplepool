@@ -2281,6 +2281,65 @@ static void test_clean_jobs_only_on_a_new_tip(void) {
     stratum_server_free(s);
 }
 
+/* A listener with clean_jobs=never sends clean_jobs=false on a new tip too,
+ * but only to its own connections: a default-listener miner in the same
+ * broadcast still gets true (the control; a build that dropped the flag for
+ * everyone would pass a never-only assertion). The notify sent right after
+ * authorize keeps clean_jobs=true even on the never port. */
+static void test_clean_jobs_never_is_per_listener(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 4, .initial_diff = 1.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_listener_t never = { .port = 3335, .never_clean_jobs = 1 };
+    stratum_conn_t *c[2];
+    int sv[2][2];
+    for (int i = 0; i < 2; ++i) {
+        c[i] = stratum_conn_new_for_test(s);
+        if (i == 0) stratum_conn_apply_listener_for_test(c[i], &never);
+        char *out = NULL; size_t olen = 0;
+        stratum_handle_message(s, c[i],
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+            &out, &olen); free(out); out = NULL; olen = 0;
+        stratum_handle_message(s, c[i],
+            "{\"id\":2,\"method\":\"mining.authorize\","
+             "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+            &out, &olen);
+        CHECK(out != NULL && notify_clean_flag(out, olen) == 1);
+        free(out);
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv[i]) == 0);
+        stratum_conn_attach_for_test(s, c[i], sv[i][0]);
+    }
+
+    char rx[8192];
+    stratum_server_set_job(s, make_test_job("J2", net), 1);   /* new tip */
+    for (int i = 0; i < 2; ++i) {
+        ssize_t n = read(sv[i][1], rx, sizeof rx);
+        CHECK(n > 0);
+        CHECK(n > 0 && notify_clean_flag(rx, (size_t)n) == (i == 0 ? 0 : 1));
+    }
+
+    /* The retired job is still solvable on the never port: nothing but the
+     * flag changed. */
+    stratum_job_t *held = stratum_job_find_for_test(s, "J1");
+    CHECK(held != NULL);
+    if (held) stratum_job_free(held);
+
+    for (int i = 0; i < 2; ++i) {
+        stratum_conn_detach_for_test(s, c[i]);
+        close(sv[i][0]); close(sv[i][1]);
+        stratum_conn_free_for_test(c[i]);
+    }
+    stratum_server_free(s);
+}
+
 /* The counterpart. A port that says min_diff is making a promise a
  * marketplace will measure on the wire, so that floor is kept even where the
  * chain is easier -- and the miner then discards blocks it solved, which is
@@ -3778,6 +3837,7 @@ int main(void) {
     test_pplns_thunder_takes_a_thunder_username();
     test_pplns_is_never_gated();
     test_clean_jobs_only_on_a_new_tip();
+    test_clean_jobs_never_is_per_listener();
     test_promised_min_diff_survives_the_network_clamp();
     test_vardiff_cannot_retarget_below_a_promised_floor();
     test_ntime_rolling_is_accepted();

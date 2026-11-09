@@ -357,6 +357,34 @@ static void test_a_listener_line_becomes_a_port_policy(void) {
     CHECK(strcmp(cfg.listeners[0].label, "rental-a") == 0);
 }
 
+/* clean_jobs=never marks the listener; absent or `tip` is the default, and a
+ * misspelling is refused rather than read as either. The second listener
+ * checks the flag does not leak to ports that did not ask for it. */
+static void test_listener_clean_jobs_field(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[640];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listener = port=3335 min_diff=500000 label=a clean_jobs=never\n"
+             "listener = port=3336 clean_jobs=tip\n"
+             "listener = port=3337 min_diff=1000\n", VALID_ADDR);
+    memset(&cfg, 0xa5, sizeof cfg);   /* a zeroed struct would hide a missing init */
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.listener_count == 3);
+    CHECK(cfg.listeners[0].never_clean_jobs == 1);
+    CHECK(cfg.listeners[0].min_diff == 500000.0);
+    CHECK(strcmp(cfg.listeners[0].label, "a") == 0);
+    CHECK(cfg.listeners[1].never_clean_jobs == 0);
+    CHECK(cfg.listeners[2].never_clean_jobs == 0);
+
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listener = port=3335 clean_jobs=nevr\n", VALID_ADDR);
+    err[0] = '\0';
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "clean_jobs") != NULL);
+}
+
 static void test_several_listeners_keep_their_own_policies(void) {
     proxy_config_t cfg; char err[256] = {0};
     char body[512];
@@ -552,6 +580,7 @@ int main(void) {
     test_a_listener_without_a_port_is_refused();
     test_listeners_beyond_the_bindable_count_are_refused();
     test_a_listener_field_that_is_not_key_value_is_refused();
+    test_listener_clean_jobs_field();
     test_several_listeners_keep_their_own_policies();
     test_a_listener_line_becomes_a_port_policy();
     test_the_window_defaults_to_two();

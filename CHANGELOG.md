@@ -10,6 +10,21 @@ somebody money if they go unread.
 
 ## Unreleased
 
+### Operators: per-listener `clean_jobs=never`
+
+A `listener` line takes a new field, `clean_jobs=tip|never`; the default is
+`tip`, which is today's behaviour, so nothing changes unless you set it. Some
+hashrate-marketplace proxies flush their whole fleet's in-flight work when a
+notify carries `clean_jobs=true` and report the flushed shares as rejects on
+their own meter, and can stop routing hashrate to the pool. On a `never` port
+every broadcast carries `clean_jobs=false`, including on a new block. The
+trade-off: miners on that port keep hashing the previous block's job a little
+longer. Those shares are still accepted, because retired jobs stay solvable,
+but a share that meets the network target on the old tip is a block on the old
+parent and will be stale. Use it only on a port where the clean flag does more
+harm. The first notify after authorize keeps `clean_jobs=true`. Any value other
+than `tip` or `never` is a startup error.
+
 ### Jobs built from an unchanged template are now distinct work
 
 The pool re-issues a job every 30 s even when the template has not moved, and

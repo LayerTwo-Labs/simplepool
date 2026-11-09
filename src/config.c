@@ -168,6 +168,17 @@ static int parse_listener(const char *v, stratum_listener_t *out,
         else if (strcmp(fk, "max_diff")     == 0) out->vardiff_max = atof(fv);
         else if (strcmp(fk, "max_coinbase_bytes") == 0) out->max_coinbase_bytes = atoi(fv);
         else if (strcmp(fk, "label")        == 0) copy_str(out->label, sizeof out->label, fv);
+        else if (strcmp(fk, "clean_jobs")   == 0) {
+            /* Refuse anything but the two spellings: a typo here would
+             * silently decide whether miners are told to drop stale work. */
+            if      (strcmp(fv, "tip")   == 0) out->never_clean_jobs = 0;
+            else if (strcmp(fv, "never") == 0) out->never_clean_jobs = 1;
+            else {
+                set_err(errbuf, errlen,
+                        "listener clean_jobs must be 'tip' or 'never', got '%s'", fv);
+                return -1;
+            }
+        }
         else {
             set_err(errbuf, errlen, "unknown listener field '%s'", fk);
             return -1;
