@@ -3812,6 +3812,64 @@ static void test_stale_difficulty_shares_do_not_drive_vardiff(void) {
            fresh, stale);
 }
 
+/* Opt-in fast first climb: 201 current-difficulty shares in 5+ s against a
+ * 60 spm target is a rate ~39x over target. Off (the default), the 30 s window
+ * has not elapsed and nothing moves. On, the window is acted on early and the
+ * step follows the measured ratio instead of the 4x cap. */
+static double vardiff_fast_case(int fast) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-9,
+                          .vardiff_enabled = 1,
+                          .vardiff_target_spm = 60.0,
+                          .vardiff_min = 1e-12,
+                          .vardiff_max = 1e15,
+                          .vardiff_window_sec = 30,
+                          .vardiff_min_samples = 20,
+                          .vardiff_max_window_mult = 8,
+                          .vardiff_idle_step = 2.0,
+                          .vardiff_fast_climb = fast,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    enum { N = 201 };
+    uint32_t nonce[N], from = 1;
+    for (int i = 0; i < N; ++i) {
+        if (mine_nonce(s, c, "J1", "deadbeefcafebabe", 1e-9, 3.9e-9, from, &nonce[i]) <= 0.0)
+            { stratum_conn_free_for_test(c); stratum_server_free(s); return -2.0; }
+        from = nonce[i] + 1;
+    }
+    char *out = NULL; size_t olen = 0;
+    for (int i = 0; i < N - 1; ++i) {
+        submit_nonce(s, c, "deadbeefcafebabe", nonce[i], &out, &olen);
+        CHECK(set_diff_value(out) < 0.0);    /* under 5 s: nothing yet */
+        free(out); out = NULL; olen = 0;
+    }
+    sleep_ms(5200);
+    submit_nonce(s, c, "deadbeefcafebabe", nonce[N - 1], &out, &olen);
+    double d = set_diff_value(out);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    return d;
+}
+
+static void test_vardiff_fast_first_climb_is_opt_in(void) {
+    double off = vardiff_fast_case(0);
+    double on  = vardiff_fast_case(1);
+    if (off == -2.0 || on == -2.0) { CHECK(0); return; }
+    CHECK(off < 0.0);                        /* default: window not elapsed */
+    CHECK(on > 2.0e-8 && on < 1024e-9);      /* ~39x, well past the 4x cap */
+    printf("ok: fast first climb is opt-in (off %g, on %g)\n", off, on);
+}
+
 int main(void) {
     test_password_diff_raises();
     test_password_diff_never_lowers();
@@ -3832,6 +3890,7 @@ int main(void) {
     test_block_wins_over_low_difficulty();
     test_vardiff_tracks_miner_local_floor();
     test_stale_difficulty_shares_do_not_drive_vardiff();
+    test_vardiff_fast_first_climb_is_opt_in();
     test_vardiff_still_lowers_for_a_matched_miner();
     test_vardiff_clamped_to_network_diff();
     test_vardiff_waits_for_min_samples();

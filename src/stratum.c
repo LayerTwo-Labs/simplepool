@@ -1214,6 +1214,14 @@ static double conn_job_difficulty(stratum_conn_t *c, const char *job_id) {
  * we act, and how close under the observed floor we then aim. */
 #define VD_FLOOR_MIN_SAMPLES 5
 #define VD_FLOOR_TRIGGER     4.0
+/* Fast first climb (cfg.vardiff_fast_climb, off by default). With
+ * VD_FAST_SAMPLES shares the rate is known to ~7% (1/sqrt(200)), so a window
+ * that far over target is acted on after VD_FAST_MIN_MS and steps up by the
+ * measured ratio (up to VD_FAST_MAX_STEP) instead of 4x. A connection at its
+ * target never holds that many shares in a window. */
+#define VD_FAST_SAMPLES   200
+#define VD_FAST_MIN_MS    5000
+#define VD_FAST_MAX_STEP  1024.0
 #define VD_FLOOR_BACKOFF     0.95
 
 /* How far a miner may roll ntime away from the value its job went out with.
@@ -1315,7 +1323,15 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
     }
     uint64_t elapsed_ms = now - c->vd_window_start_ms;
     uint64_t window_ms  = (uint64_t)s->cfg.vardiff_window_sec * 1000ULL;
-    if (elapsed_ms < window_ms) return;
+    int fast_up = 0;
+    if (s->cfg.vardiff_fast_climb && c->vd_window_shares >= VD_FAST_SAMPLES &&
+        elapsed_ms >= VD_FAST_MIN_MS &&
+        c->vd_window_stale_diff_shares <= c->vd_window_shares &&
+        s->cfg.vardiff_target_spm > 0.0) {
+        double spm = ((double)c->vd_window_shares * 60000.0) / (double)elapsed_ms;
+        if (spm / s->cfg.vardiff_target_spm > 2.0) fast_up = 1;
+    }
+    if (elapsed_ms < window_ms && !fast_up) return;
 
     /* A window made mostly of shares credited at an earlier difficulty is
      * draining, not idle. Those shares are kept out of vd_window_shares, so a
@@ -1379,6 +1395,12 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
             c->vd_window_shares < (uint32_t)s->cfg.vardiff_min_samples) {
             max_step = s->cfg.vardiff_idle_step > 1.0
                          ? s->cfg.vardiff_idle_step : 2.0;
+        }
+        /* Fast first climb: a well-sampled upward move steps by the measured
+         * ratio; the 4x cap exists to damp noise and 200 samples have little. */
+        if (s->cfg.vardiff_fast_climb && ratio > 2.0 &&
+            c->vd_window_shares >= VD_FAST_SAMPLES) {
+            max_step = ratio < VD_FAST_MAX_STEP ? ratio : VD_FAST_MAX_STEP;
         }
         if (new_diff > old_diff * max_step) new_diff = old_diff * max_step;
         if (new_diff < old_diff / max_step) new_diff = old_diff / max_step;

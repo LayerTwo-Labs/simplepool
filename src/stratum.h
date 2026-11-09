@@ -284,6 +284,8 @@ typedef struct {
     int    vardiff_min_samples;
     int    vardiff_max_window_mult;
     double vardiff_idle_step;
+    /* See config.h: opt-in fast first climb. 0 = off. */
+    int    vardiff_fast_climb;
 
     /* Drop a connection whose recv() has been silent for this long. Guards
      * against half-open TCPs from crashed miners and misconfigured clients

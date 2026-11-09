@@ -10,6 +10,15 @@ somebody money if they go unread.
 
 ## Unreleased
 
+### Vardiff: opt-in fast first climb
+
+New `vardiff_fast_climb` (default `0`, off). A connection far below its
+hashrate submits hundreds of shares a window, and the 4x-per-window step can
+take minutes to reach the right difficulty. With `vardiff_fast_climb = 1`, a
+window holding at least 200 shares at the current difficulty whose rate is over
+twice the target retargets up after 5 s by the measured ratio (capped at
+1024x). Downward moves and all other windows are unchanged.
+
 ### Vardiff no longer chases shares mined at an earlier difficulty
 
 A retarget sends `mining.set_difficulty` without re-notifying, so a miner keeps
