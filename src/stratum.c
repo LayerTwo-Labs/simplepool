@@ -505,6 +505,13 @@ struct stratum_conn {
      * at a floor above its assignment. 0 until the first share lands. */
     double   vd_window_max_assigned;
 
+    /* Accepted shares in this window that were credited at a difficulty other
+     * than the one now in force. They are not evidence about the current
+     * difficulty, so they stay out of vd_window_shares; counted separately so
+     * a window that holds only such shares is recognised as draining rather
+     * than idle (see vardiff_maybe_retarget). */
+    uint32_t vd_window_stale_diff_shares;
+
     /* The difficulty each job was notified to this connection under, so a
      * submit is judged at the difficulty that was in force for THAT job
      * rather than whatever the connection has drifted to since. A miner
@@ -1303,11 +1310,29 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
         c->vd_window_shares = 0;
         c->vd_window_min_achieved = HUGE_VAL;
         c->vd_window_max_assigned = 0.0;
+        c->vd_window_stale_diff_shares = 0;
         return;
     }
     uint64_t elapsed_ms = now - c->vd_window_start_ms;
     uint64_t window_ms  = (uint64_t)s->cfg.vardiff_window_sec * 1000ULL;
     if (elapsed_ms < window_ms) return;
+
+    /* A window made mostly of shares credited at an earlier difficulty is
+     * draining, not idle. Those shares are kept out of vd_window_shares, so a
+     * window holding only them reads a rate of zero and would take the idle
+     * step down -- repeatedly, while the miner submits good work. Its
+     * pipeline still holds jobs issued before the last retarget; they expire
+     * (RECENT_JOB_TTL_MS) and the shares stop. Until then there is no
+     * measurement of the current difficulty, so restart the window and decide
+     * on clean data. A genuinely idle connection has no stale shares either,
+     * does not match, and still takes its idle step. */
+    if (c->vd_window_stale_diff_shares > c->vd_window_shares) {
+        c->vd_window_start_ms = now;
+        c->vd_window_stale_diff_shares = 0;
+        c->vd_window_min_achieved = HUGE_VAL;
+        c->vd_window_max_assigned = 0.0;
+        return;
+    }
 
     /* A window's share RATE only means something if the window holds enough
      * shares to measure one. At the default target_spm = 12 over a 30 s
@@ -1426,6 +1451,7 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
     c->vd_window_shares = 0;
     c->vd_window_min_achieved = HUGE_VAL;
     c->vd_window_max_assigned = 0.0;
+    c->vd_window_stale_diff_shares = 0;
 
     if (new_diff != old_diff) {
         c->difficulty = new_diff;
@@ -1924,6 +1950,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     c->vd_window_shares = 0;
     c->vd_window_min_achieved = HUGE_VAL;
     c->vd_window_max_assigned = 0.0;
+    c->vd_window_stale_diff_shares = 0;
 
     /* respond true */
     emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
@@ -2398,10 +2425,22 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * gives exactly that: how much harder than difficulty 1 this solution
      * was. The running minimum is what exposes a miner filtering at a local
      * floor above its assigned difficulty. */
-    c->vd_window_shares++;
-    double achieved = target_to_diff(hash_be);
-    if (achieved < c->vd_window_min_achieved) {
-        c->vd_window_min_achieved = achieved;
+    /* Only a share credited at the difficulty now in force is evidence about
+     * it. A retarget sends mining.set_difficulty without re-notifying, so
+     * after a downward step the miner keeps returning shares for jobs issued
+     * at the old, higher difficulty; counting them reads as a rate spike,
+     * steps difficulty back up, and the next window then reads low. share_diff
+     * (the credited value) is the test, not the job's difficulty: a share
+     * accepted under the grace rule above is credited at the current value
+     * and does measure it. */
+    if (share_diff == c->difficulty) {
+        c->vd_window_shares++;
+        double achieved = target_to_diff(hash_be);
+        if (achieved < c->vd_window_min_achieved) {
+            c->vd_window_min_achieved = achieved;
+        }
+    } else {
+        c->vd_window_stale_diff_shares++;
     }
     /* assigned_diff, not c->difficulty: this share was mined against the
      * difficulty ITS job went out under, which a retarget earlier in this
@@ -2731,6 +2770,7 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     c->difficulty = c->pol_initial_diff;
     c->vd_window_min_achieved = HUGE_VAL;
     c->vd_window_max_assigned = 0.0;
+    c->vd_window_stale_diff_shares = 0;
     pthread_mutex_init(&c->write_lock, NULL);
     pthread_mutex_init(&c->jobdiff_lock, NULL);
     pthread_mutex_init(&c->cb_lock, NULL);
@@ -2809,12 +2849,17 @@ int stratum_conn_subscribed_for_test(const stratum_conn_t *c) {
     return c ? c->subscribed : 0;
 }
 
+void stratum_conn_force_difficulty_for_test(stratum_conn_t *c, double diff) {
+    if (c) c->difficulty = diff;
+}
+
 void stratum_conn_rearm_vardiff_for_test(stratum_conn_t *c) {
     if (!c) return;
     c->vd_window_start_ms = now_ms();
     c->vd_window_shares = 0;
     c->vd_window_min_achieved = HUGE_VAL;
     c->vd_window_max_assigned = 0.0;
+    c->vd_window_stale_diff_shares = 0;
 }
 
 /* ---- real connection thread ------------------------------------------ */

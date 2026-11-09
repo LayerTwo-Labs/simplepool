@@ -10,6 +10,17 @@ somebody money if they go unread.
 
 ## Unreleased
 
+### Vardiff no longer chases shares mined at an earlier difficulty
+
+A retarget sends `mining.set_difficulty` without re-notifying, so a miner keeps
+returning shares for jobs issued at the previous difficulty. Those shares were
+counted as evidence about the new difficulty: after a downward step they read
+as a rate spike, pushed difficulty straight back up, and the next window then
+read low and stepped down again. Only shares credited at the difficulty now in
+force are counted toward the rate. A window made mostly of earlier-difficulty
+shares is treated as draining rather than idle: it restarts instead of taking
+the idle step down. Nothing to configure.
+
 ### Jobs built from an unchanged template are now distinct work
 
 The pool re-issues a job every 30 s even when the template has not moved, and

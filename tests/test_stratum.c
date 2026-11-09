@@ -1296,17 +1296,15 @@ static void test_job_difficulty_survives_repeated_retargets(void) {
     CHECK(obs.shares == 1);
     free(out); out=NULL; olen=0;
 
-    /* Second retarget: the 4x step cap takes it to 4e12. This is the one that
-     * used to be fatal -- it overwrote the remembered 1e-12 with 1e12. */
+    /* Second difficulty change, to 4e12. Forced rather than earned: with
+     * stale-difficulty shares kept out of the rate window, no J1 share can
+     * trigger it (they were all mined under the 1e-12 J1 was notified at),
+     * and a share that clears 1e12 cannot be mined in a test. What matters
+     * here is that J1's remembered difficulty survives a second change. */
     sleep_ms(1100);
-    stratum_handle_message(s, c,
-        "{\"id\":4,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000002\"]}",
-        &out, &olen);
-    double second = set_diff_value(out);
-    CHECK(second > 3.99e12 && second < 4.01e12);
-    CHECK(obs.shares == 2);
-    free(out); out=NULL; olen=0;
+    stratum_conn_force_difficulty_for_test(c, 4e12);
+    CHECK(stratum_conn_difficulty_for_test(c) == 4e12);
+    CHECK(obs.shares == 1);
 
     /* Still J1, still mined at the 1e-12 it was notified under. It clears
      * neither 4e12 nor the 1e12 from one retarget ago, so nothing but the
@@ -1315,7 +1313,7 @@ static void test_job_difficulty_survives_repeated_retargets(void) {
         "{\"id\":5,\"method\":\"mining.submit\","
         "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000003\"]}",
         &out, &olen);
-    CHECK(obs.shares == 3);
+    CHECK(obs.shares == 2);
     CHECK(obs.rejects == 0);
     free(out);
 
@@ -3720,6 +3718,100 @@ static void test_authorize_call_ceiling(void) {
     stratum_server_free(s);
 }
 
+/* Shares credited at an earlier difficulty must not drive vardiff.
+ *
+ * A retarget sends mining.set_difficulty without re-notifying, so a miner
+ * keeps returning shares for jobs issued at the previous difficulty. Counted
+ * as evidence about the new one, they inflate the rate and push the
+ * difficulty straight back up.
+ *
+ * Phase 1 forces a retarget (1e-9 -> 4e-9). Phase 2 then submits six shares
+ * in one window. The twin differs in exactly one thing: whether J1 still
+ * carries its old difficulty (stale) or was re-notified at the new one
+ * (fresh, via a repeat authorize). Fresh must raise; stale must do nothing
+ * at all -- not a rise, and not an idle-step fall either, because a window
+ * holding only stale shares is draining, not idle. */
+static double vardiff_stale_case(int stale) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-9,
+                          .vardiff_enabled = 1,
+                          .vardiff_target_spm = 60.0,
+                          .vardiff_min = 1e-12,
+                          .vardiff_max = 1e15,
+                          .vardiff_window_sec = 1,
+                          .vardiff_min_samples = 2,
+                          .vardiff_max_window_mult = 1,
+                          .vardiff_idle_step = 2.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    /* Below 4x the assigned difficulty so the miner-floor check stays out of
+     * phase 1; the fresh half needs shares that clear 4e-9. */
+    uint32_t a[13], b[6], from = 1;
+    for (int i = 0; i < 13; ++i) {
+        if (mine_nonce(s, c, "J1", "deadbeefcafebabe", 1e-9, 3.9e-9, from, &a[i]) <= 0.0)
+            { stratum_conn_free_for_test(c); stratum_server_free(s); return -2.0; }
+        from = a[i] + 1;
+    }
+    for (int i = 0; i < 6; ++i) {
+        if (mine_nonce(s, c, "J1", "deadbeefcafebabe", 4.1e-9, 1.5e-8, from, &b[i]) <= 0.0)
+            { stratum_conn_free_for_test(c); stratum_server_free(s); return -2.0; }
+        from = b[i] + 1;
+    }
+
+    char *out = NULL; size_t olen = 0;
+    for (int i = 0; i < 6; ++i) {
+        submit_nonce(s, c, "deadbeefcafebabe", a[i], &out, &olen);
+        free(out); out = NULL; olen = 0;
+    }
+    sleep_ms(1100);
+    submit_nonce(s, c, "deadbeefcafebabe", a[6], &out, &olen);   /* retarget up, 4x cap */
+    double d1 = set_diff_value(out);
+    free(out); out = NULL; olen = 0;
+    CHECK(d1 > 3.99e-9 && d1 < 4.01e-9);
+
+    if (!stale) {
+        /* Re-notify: J1 now records 4e-9, and the window restarts. */
+        stratum_handle_message(s, c,
+            "{\"id\":2,\"method\":\"mining.authorize\","
+            "\"params\":[\"" TEST_ADDR "\",\"x\"]}", &out, &olen);
+        free(out); out = NULL; olen = 0;
+    }
+    double last = -1.0;
+    for (int i = 0; i < 5; ++i) {
+        submit_nonce(s, c, "deadbeefcafebabe", stale ? a[7 + i] : b[i], &out, &olen);
+        free(out); out = NULL; olen = 0;
+    }
+    sleep_ms(1100);
+    submit_nonce(s, c, "deadbeefcafebabe", stale ? a[12] : b[5], &out, &olen);
+    last = set_diff_value(out);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    return last;
+}
+
+static void test_stale_difficulty_shares_do_not_drive_vardiff(void) {
+    double fresh = vardiff_stale_case(0);
+    double stale = vardiff_stale_case(1);
+    if (fresh == -2.0 || stale == -2.0) { CHECK(0); return; }
+    /* Control: current-difficulty shares at that rate do raise it (4x cap). */
+    CHECK(fresh > 1.59e-8 && fresh < 1.61e-8);
+    /* Stale-only window: no set_difficulty at all. A rise is the oscillation;
+     * a fall is the idle step misreading a draining window as quiet. */
+    CHECK(stale < 0.0);
+    printf("ok: stale-difficulty shares leave vardiff alone (fresh %g, stale %g)\n",
+           fresh, stale);
+}
+
 int main(void) {
     test_password_diff_raises();
     test_password_diff_never_lowers();
@@ -3739,6 +3831,7 @@ int main(void) {
     test_authorize_address_with_label();
     test_block_wins_over_low_difficulty();
     test_vardiff_tracks_miner_local_floor();
+    test_stale_difficulty_shares_do_not_drive_vardiff();
     test_vardiff_still_lowers_for_a_matched_miner();
     test_vardiff_clamped_to_network_diff();
     test_vardiff_waits_for_min_samples();
