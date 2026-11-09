@@ -20,7 +20,21 @@ again. A hash is now forgotten only once its job can no longer be named, and
 only shares that met their share target (or the network target) are recorded.
 When every hash in the ring still covers a solvable job, a new share is
 refused with `duplicate check full, share not credited` instead; a share that
-meets the network target is still submitted as a block and recorded.
+meets the network target is still submitted as a block and recorded. The ring
+now holds 262144 hashes (12 MB, up from 640 KB), enough for about 790 shares/s
+sustained pool-wide at the default 30 s job cadence; with no new job, a stall
+fills it after 262144 shares (about 44 min at 100 shares/s).
+
+**Capacity, and why it refuses.** The ring holds 262144 hashes for up to
+~330 s each, so it covers about 790 shares/s. The hashrate that fills it is
+790 × the lowest difficulty a connection can have (`initial_diff`, or
+`vardiff_min` with vardiff on) × 2^32: at difficulty 1, the default, that is
+only ~3.4 TH/s of real work, e.g. from connections reopened before vardiff
+raises them. Set `vardiff_min` / `initial_diff` so this is well above any
+single miner the pool expects; the pool logs the figure at startup and warns
+below 1 PH/s. The trade-off is deliberate: a bounded memory must either forget
+keys of live jobs (and pay a share twice) or refuse when full, and this
+chooses refusing.
 
 **Operators: watch the log for `duplicate check full`.** It is reported once
 per 10 s per connection, with the count refused, and means the pool is taking

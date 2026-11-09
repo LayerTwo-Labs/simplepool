@@ -455,8 +455,22 @@ int stratum_socket_setup_for_test(int fd, int idle_timeout_sec);
 stratum_job_t *stratum_job_find_for_test(stratum_server_t *s, const char *job_id);
 uint32_t stratum_job_height_for_test(const stratum_job_t *j);
 /* Capacity of the server-wide share-dedupe ring, in header hashes. Public so
- * tests fill the ring from the real value rather than a copy of it. */
-#define SHARE_DEDUPE_RING 16384
+ * tests fill the ring from the real value rather than a copy of it.
+ *
+ * A hash is kept until its job can no longer be named: at most about 330 s
+ * at the default 30 s job cadence (current job, then RECENT_JOB_TTL_MS in the
+ * recent ring, swept at the next job). So this covers a sustained ~790
+ * shares/s pool-wide; above that, shares are refused as "duplicate check
+ * full" rather than risk crediting one twice. ~48 bytes per entry with the
+ * index (12 MB). Raise it, with SHARE_DEDUPE_SLOT_BITS, for a busier pool.
+ * Real shares at the lowest connection difficulty fill it at ~790 x that
+ * difficulty x 2^32 H/s (~3.4 TH/s at difficulty 1); the server logs this at
+ * startup and warns below 1 PH/s, so raise vardiff_min / initial_diff.
+ *
+ * If no new job arrives (template source down), jobs never expire, so after
+ * SHARE_DEDUPE_RING shares (~44 min at 100 shares/s) ordinary shares are
+ * refused until one does. */
+#define SHARE_DEDUPE_RING (1u << 18)
 /* Test-only, one-shot hook (cleared before it is called). Points:
  *   PRE_DEDUPE   -- in mining.submit, after find_job() and validation, just
  *                   before the server-wide dedupe check (no lock held);

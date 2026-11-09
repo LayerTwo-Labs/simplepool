@@ -2938,8 +2938,26 @@ listener = port=3335 min_diff=500000 max_coinbase_bytes=900 label=rental</code><
     Step 7 records the share key before the later checks run, so resubmitting a
     share that failed validation answers <em>duplicate share</em>. The
     per-connection ring keys on <code>job_id|extranonce2|ntime|nonce|version</code>
-    (1024 entries); the server-wide ring keys on the header hash itself (16384
-    entries), so it holds across connections and reconnects.
+    (1024 entries); the server-wide ring keys on the header hash itself (262144
+    entries), so it holds across connections and reconnects. It records a hash
+    only after the share has passed the difficulty check, and keeps it until
+    its job can no longer be named. If the ring is full of such hashes a new
+    share is refused (<em>duplicate check full</em>, logged once per 10 s per
+    connection) rather than forgetting one: above roughly 790 shares/s
+    sustained, or when no new job has arrived for a long time, since the old
+    jobs then never expire. A share that meets the network target is still
+    submitted; where every share is a block (regtest) the oldest hash is
+    always dropped.
+  </p>
+  <p>
+    Capacity: 262144 hashes over a ~330 s key lifetime is ~790 shares/s. The
+    hashrate that fills it is that × the lowest difficulty a connection can
+    have (<code>initial_diff</code>, or <code>vardiff_min</code> with vardiff
+    on) × 2<sup>32</sup>: only ~3.4 TH/s at the default difficulty 1. Set those
+    so it is well above any single miner the pool expects; the pool logs the
+    figure at startup and warns below 1 PH/s. The trade-off is deliberate: a
+    bounded memory must either forget keys of live jobs (paying a share twice)
+    or refuse when full, and this chooses refusing.
   </p>
   <p>
     A share is judged at the difficulty <em>its job</em> was notified under (34
@@ -3303,7 +3321,7 @@ rejected                        (terminal: submitblock refused it)</code></pre>
         <tr><td>Consecutive unusable lines before close</td><td>8</td></tr>
         <tr><td>Retained jobs · job lifetime</td><td>current + 16 · 5 min</td></tr>
         <tr><td>Per-connection job-difficulty memory</td><td>34 jobs</td></tr>
-        <tr><td>Duplicate rings</td><td>1024 per connection · 16384 server-wide</td></tr>
+        <tr><td>Duplicate rings</td><td>1024 per connection · 262144 server-wide (≈790 shares/s)</td></tr>
         <tr><td>Authorize call budget</td><td>60 per 10 s per connection; 1024-slot per-IP table</td></tr>
         <tr><td>Periodic job refresh</td><td>30 s</td></tr>
         <tr><td>Template backend timeouts</td><td>10 s per RPC, 90 s long-poll; retry 1 s → 32 s</td></tr>

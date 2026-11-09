@@ -49,11 +49,14 @@
 
 #define MAX_LINE_BYTES 16384
 #define DEDUPE_RING    1024
-/* Index over that ring: open addressing, linear probing, power-of-two slots.
- * Four slots per ring entry keeps the load at or under 25%, where a lookup
- * touches ~1.2 slots on average and the longest probe run stays short. 512 KB. */
-#define SHARE_DEDUPE_SLOT_BITS 16
+/* Index over the share-dedupe ring (SHARE_DEDUPE_RING, in stratum.h): open
+ * addressing, linear probing, power-of-two slots. Four slots per ring entry
+ * keeps the load at or under 25%, where a lookup touches ~1.2 slots on
+ * average and the longest probe run stays short. 8 MB. */
+#define SHARE_DEDUPE_SLOT_BITS 20
 #define SHARE_DEDUPE_SLOTS (1u << SHARE_DEDUPE_SLOT_BITS)
+_Static_assert(SHARE_DEDUPE_SLOTS >= 4u * SHARE_DEDUPE_RING,
+               "share-dedupe index must have 4 slots per ring entry");
 /* Matches store.c's REASON_MAX so a submitblock reason survives the trip to
  * the DB intact rather than being truncated twice. */
 #define REASON_TEXT_MAX   128
@@ -372,9 +375,8 @@ struct stratum_server {
     /* Two structures over one set of keys. The ring is what bounds memory and
      * decides which hash is forgotten next (the oldest, FIFO, and only once
      * its job can no longer be named -- see share_dedupe_key_check_and_add).
-     * The index is
-     * how a submit asks "have I seen this?" without walking the ring: that
-     * walk was 16384 compares under this one mutex on EVERY credited share,
+     * The index is how a submit asks "have I seen this?" without walking the
+     * ring: that walk was 16384 compares under this one mutex on EVERY credited share,
      * so the whole pool's submit path was serialised through a 128 KB scan.
      *
      * Invariants: the ring never holds a key twice (a key is only inserted
@@ -2045,8 +2047,8 @@ static inline int dd_home_between(size_t hole, size_t home, size_t j) {
  * that would cut the probe chain for every key that was pushed past it, and
  * a later lookup would stop at the new hole and call a present key absent --
  * which here means the same share credited twice. Tombstones would fix that
- * but accumulate for the life of the process under a constant churn of 16384
- * evictions per 16384 inserts. Backward-shift deletion (Knuth 6.4, algorithm
+ * but accumulate for the life of the process under a constant churn of one
+ * eviction per insert. Backward-shift deletion (Knuth 6.4, algorithm
  * R) walks the rest of the cluster and moves back any key the hole would
  * strand, so the table stays exactly as if h had never been inserted. */
 static void dd_index_remove(stratum_server_t *s, uint64_t h) {
@@ -3317,6 +3319,45 @@ static void *listener_thread(void *arg) {
     return NULL;
 }
 
+/* Longest a dedupe key can have to be kept, in seconds: its job is current
+ * for up to one refresh (30 s at the default cadence), then stays in the
+ * recent ring for RECENT_JOB_TTL_MS, swept at the next job. */
+#define SHARE_DEDUPE_KEY_LIFE_S (RECENT_JOB_TTL_MS / 1000 + 30)
+
+/* Say at startup how fast the share-dedupe ring can be filled. A full ring
+ * refuses ordinary shares, and real shares at the lowest difficulty any
+ * connection can start at are the cheapest way to fill it, so the hashrate
+ * that does it is the number an operator has to compare with their miners. */
+static void log_dedupe_capacity(const stratum_cfg_t *cfg) {
+    double floor = cfg->initial_diff;
+    if (cfg->vardiff_enabled && cfg->vardiff_min > 0.0 && cfg->vardiff_min < floor)
+        floor = cfg->vardiff_min;
+    for (int i = 0; i < STRATUM_MAX_LISTENERS; ++i) {
+        const stratum_listener_t *l = &cfg->listeners[i];
+        if (l->port <= 0) continue;
+        if (l->initial_diff > 0.0 && l->initial_diff < floor) floor = l->initial_diff;
+        if (cfg->vardiff_enabled && l->vardiff_min > 0.0 && l->vardiff_min < floor)
+            floor = l->vardiff_min;
+    }
+    double rate = (double)SHARE_DEDUPE_RING / SHARE_DEDUPE_KEY_LIFE_S;
+    double hps  = rate * floor * 4294967296.0;
+    static const char *const unit[] = { "H", "kH", "MH", "GH", "TH", "PH", "EH" };
+    double v = hps;
+    int u = 0;
+    while (v >= 1000.0 && u < 6) { v /= 1000.0; u++; }
+    if (hps < 1e15) {
+        LOG_WARN("stratum: duplicate check holds %u shares (~%.0f shares/s); "
+                 "%.1f %s/s at the lowest difficulty a connection can have "
+                 "(%g) fills it, and then shares are refused as \"duplicate "
+                 "check full\". Raise vardiff_min / initial_diff",
+                 (unsigned)SHARE_DEDUPE_RING, rate, v, unit[u], floor);
+    } else {
+        LOG_INFO("stratum: duplicate check holds %u shares (~%.0f shares/s); "
+                 "%.1f %s/s at the lowest difficulty (%g) fills it",
+                 (unsigned)SHARE_DEDUPE_RING, rate, v, unit[u], floor);
+    }
+}
+
 int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     if (!cfg || !out) return -1;
     stratum_server_t *s = calloc(1, sizeof(*s));
@@ -3327,6 +3368,7 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     /* Negative → explicit disable. 0 → apply default. Positive kept. */
     if (s->cfg.idle_timeout_sec == 0) s->cfg.idle_timeout_sec = 600;
     else if (s->cfg.idle_timeout_sec < 0) s->cfg.idle_timeout_sec = 0;
+    log_dedupe_capacity(&s->cfg);
     /* Negative is kept as-is rather than folded to 0: for this field 0 means
      * "unset, use the default" and negative means "never reap an authorized
      * miner", and conn_idle_budget_sec has to be able to tell them apart. */

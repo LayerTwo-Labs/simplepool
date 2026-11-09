@@ -3747,7 +3747,7 @@ static void test_share_dedupe_index_tracks_the_ring(void) {
     stratum_server_t *s = NULL;
     stratum_server_start(&cfg, &s);
 
-    enum { RING = 16384 };   /* SHARE_DEDUPE_RING; a mismatch fails below */
+    enum { RING = SHARE_DEDUPE_RING };
     uint64_t *keys = malloc(sizeof(uint64_t) * 2 * RING);
     uint64_t st = 0x5EEDu;
     for (int i = 0; i < 2 * RING; ++i) keys[i] = dd_next(&st);

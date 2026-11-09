@@ -304,6 +304,13 @@ would be effort spent to reach the same answer more slowly.
     never expire). A share that meets the network target is still
     submitted as a block and recorded, dropping the oldest hash if
     it must; where every share is a block (regtest), that is always.
+    Capacity: ~790 shares/s = 262144 hashes / ~330 s. The hashrate
+    that fills it is that × the lowest connection difficulty
+    (`initial_diff`, or `vardiff_min` with vardiff on) × 2^32 — only
+    ~3.4 TH/s at difficulty 1 — so set those well above any single
+    miner the pool expects (logged at startup; a warning below
+    1 PH/s). Refusing when full is deliberate: a bounded memory must
+    either forget live keys (paying a share twice) or refuse.
 11. Log a `[SUBMIT CHECK]` line with `sent_hash`, `worker_target`,
     `network_target`, and version fields (this is what appears in
     `logs/simplepool.log`).
