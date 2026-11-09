@@ -10,6 +10,23 @@ somebody money if they go unread.
 
 ## Unreleased
 
+### Reject guard: close connections that send almost only bad shares (opt-in)
+
+A connection could send bad shares for ever: the pool kept the socket open,
+wrote a reject row per submit and validated each one. Set
+`reject_guard_pct` (for example `90`) and a connection whose judged share
+attempts -- accepted, low difficulty, invalid, duplicate, unknown or stale job
+-- are more than that percentage rejected, after `reject_guard_min_samples`
+(default 200) of them, gets one error and is closed. The worker is then
+refused at authorize for `reject_guard_cooldown_sec` (default 600), doubling
+for each repeat while the last offence is remembered (24 h after its cooldown
+ends), up to `reject_guard_max_cooldown_sec` (default
+86400). The cooldown is keyed on (worker name, peer address), so other rigs
+behind the same address are untouched; it is a soft cooldown (a new worker
+label avoids it), while the close always holds: the counts belong to the
+connection, and re-authorizing or renaming does not restart them. Default off:
+nothing changes unless you set it. See `proxy.conf.example`.
+
 ### Jobs built from an unchanged template are now distinct work
 
 The pool re-issues a job every 30 s even when the template has not moved, and

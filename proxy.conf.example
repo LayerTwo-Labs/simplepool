@@ -151,6 +151,30 @@ max_submits_per_sec = 20000
 auth_max_failures = 3
 auth_fail_lockout_sec = 60
 
+# Reject guard. A connection that sends almost nothing but bad shares keeps a
+# socket open and costs a reject row and a validation per submit. Per
+# connection, the share attempts that were judged -- accepted, low difficulty,
+# invalid, duplicate, unknown or stale job; NOT a malformed request, and NOT
+# one the submit rate limiter refused -- are counted. Once there are
+# reject_guard_min_samples of them and more than reject_guard_pct % were
+# rejected, the miner gets one error and the connection is closed. The worker
+# is then refused at authorize for reject_guard_cooldown_sec, doubling for
+# each repeat while the last offence is remembered (24 h after
+# its cooldown ends), up to reject_guard_max_cooldown_sec. The cooldown
+# is keyed on (worker name, peer address): never the address alone, since many
+# rigs can share one, and never the name alone. The counts restart every
+# 2 x min_samples while below the threshold; they belong to the connection, so
+# re-authorizing or changing the worker name does not restart them. Unknown or
+# stale job ids count only after the connection's first accepted share, or
+# after 10 x min_samples of them. 0 = off (the default). The cooldown is a
+# soft one for honest but broken rigs: a client can dodge it by changing its
+# worker label; closing the connection is the part that always holds.
+# Ranges: pct 0..99; min_samples >= 50; cooldown > 0; max >= cooldown.
+#reject_guard_pct = 90
+#reject_guard_min_samples = 200
+#reject_guard_cooldown_sec = 600
+#reject_guard_max_cooldown_sec = 86400
+
 # Idle-connection reaper, in seconds. Two budgets, because the two states are
 # not the same risk:
 #
