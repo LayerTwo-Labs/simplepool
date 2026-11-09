@@ -10,6 +10,27 @@ somebody money if they go unread.
 
 ## Unreleased
 
+### A share can no longer be credited twice after the duplicate ring turns over
+
+The server-wide duplicate check forgot its oldest hash whenever a new one
+arrived, whatever its age. Jobs stay solvable for up to 5 minutes, so on a pool
+taking more than about 55 shares/s a share's hash could leave the ring while
+its job could still be named, and the same share sent again was credited
+again. A hash is now forgotten only once its job can no longer be named, and
+only shares that met their share target (or the network target) are recorded.
+When every hash in the ring still covers a solvable job, a new share is
+refused with `duplicate check full, share not credited` instead; a share that
+meets the network target is still submitted as a block and recorded.
+
+**Operators: watch the log for `duplicate check full`.** It is reported once
+per 10 s per connection, with the count refused, and means the pool is taking
+shares faster than the ring covers. It also appears if no new job arrives for
+a long time (template source down): the current and recent jobs then never
+expire, so once the ring has filled every ordinary share is refused until a
+new job comes. On a network whose target is easier than the share target
+(e.g. regtest) every share is a block, so the oldest hash is always dropped
+and the ring behaves as before.
+
 ### Jobs built from an unchanged template are now distinct work
 
 The pool re-issues a job every 30 s even when the template has not moved, and

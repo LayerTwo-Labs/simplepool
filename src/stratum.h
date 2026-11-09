@@ -454,6 +454,26 @@ int stratum_socket_setup_for_test(int fd, int idle_timeout_sec);
  * for a holder even after the tip watcher has retired and freed it. */
 stratum_job_t *stratum_job_find_for_test(stratum_server_t *s, const char *job_id);
 uint32_t stratum_job_height_for_test(const stratum_job_t *j);
+/* Capacity of the server-wide share-dedupe ring, in header hashes. Public so
+ * tests fill the ring from the real value rather than a copy of it. */
+#define SHARE_DEDUPE_RING 16384
+/* Test-only, one-shot hook (cleared before it is called). Points:
+ *   PRE_DEDUPE   -- in mining.submit, after find_job() and validation, just
+ *                   before the server-wide dedupe check (no lock held);
+ *   JOB_SWAPPED  -- in stratum_server_set_job, after the new job is current
+ *                   and job_lock is released (the old job must already be
+ *                   findable in the recent ring). */
+/* Test-only: count one "duplicate check full" refusal on c at the given
+ * monotonic time, exactly as the submit path does (reports at most once per
+ * 10 s per connection; stratum_conn_free_for_test flushes the rest). */
+void stratum_conn_dedupe_full_refused_for_test(stratum_server_t *s,
+                                               stratum_conn_t *c,
+                                               uint64_t now_mono);
+#define STRATUM_TEST_HOOK_PRE_DEDUPE  1
+#define STRATUM_TEST_HOOK_JOB_SWAPPED 2
+void stratum_server_set_test_hook_for_test(stratum_server_t *s,
+                                           void (*hook)(void *arg, int where),
+                                           void *arg);
 /* Server-wide share dedupe, on a precomputed key rather than a header hash:
  * 1 = already recorded, 0 = recorded now. Lets a test drive the index through
  * eviction with keys it chooses. */

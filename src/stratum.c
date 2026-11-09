@@ -49,9 +49,6 @@
 
 #define MAX_LINE_BYTES 16384
 #define DEDUPE_RING    1024
-/* Server-wide ring, so it has to cover every live connection's recent
- * submissions rather than just one's. */
-#define SHARE_DEDUPE_RING 16384
 /* Index over that ring: open addressing, linear probing, power-of-two slots.
  * Four slots per ring entry keeps the load at or under 25%, where a lookup
  * touches ~1.2 slots on average and the longest probe run stays short. 512 KB. */
@@ -194,7 +191,12 @@ struct stratum_job {
      * production pool), and a garbage network_target_be can make any hash
      * look like a solved block. */
     _Atomic int refs;
+    /* Unique for the life of the process, never 0: names this job in the
+     * server-wide dedupe ring (share_dedupe_job[]). */
+    uint64_t seq;
 };
+
+static _Atomic uint64_t g_job_seq;
 
 /* Defined with the dedupe helpers below; the job constructor needs it first. */
 static uint64_t fnv1a(const char *s);
@@ -218,6 +220,7 @@ stratum_job_t *stratum_job_new(
     /* Set before anything can `goto fail`: the failure path releases, and a
      * count of 0 there would decrement past zero and leak instead of free. */
     atomic_init(&j->refs, 1);
+    j->seq = atomic_fetch_add(&g_job_seq, 1) + 1;
     snprintf(j->job_id, sizeof(j->job_id), "%s", job_id ? job_id : "");
     j->version = version;
     if (prev_hash_le) memcpy(j->prev_hash_le, prev_hash_le, 32);
@@ -367,7 +370,9 @@ struct stratum_server {
 
     pthread_mutex_t share_dedupe_lock;
     /* Two structures over one set of keys. The ring is what bounds memory and
-     * decides which hash is forgotten next (the oldest, FIFO). The index is
+     * decides which hash is forgotten next (the oldest, FIFO, and only once
+     * its job can no longer be named -- see share_dedupe_key_check_and_add).
+     * The index is
      * how a submit asks "have I seen this?" without walking the ring: that
      * walk was 16384 compares under this one mutex on EVERY credited share,
      * so the whole pool's submit path was serialised through a 128 KB scan.
@@ -377,9 +382,14 @@ struct stratum_server {
      * index and nothing else is; 0 is the empty marker, so a real key of 0
      * is stored as 1. */
     uint64_t        share_dedupe_ring[SHARE_DEDUPE_RING];
+    uint64_t        share_dedupe_job[SHARE_DEDUPE_RING]; /* job seq per key */
     size_t          share_dedupe_head;      /* next ring slot to overwrite */
     size_t          share_dedupe_count;     /* live keys, <= SHARE_DEDUPE_RING */
     uint64_t        share_dedupe_index[SHARE_DEDUPE_SLOTS];
+    /* Test-only, one-shot: called with the STRATUM_TEST_HOOK_* point. NULL in
+     * production. Set with stratum_server_set_test_hook_for_test(). */
+    void (*test_hook)(void *arg, int where);
+    void  *test_hook_arg;
 
     pthread_rwlock_t job_lock;
     stratum_job_t   *current_job;          /* protected by job_lock */
@@ -534,6 +544,11 @@ struct stratum_conn {
     uint32_t rl_limited;        /* refused since the last report */
     uint64_t rl_limited_total;  /* refused over the connection's life */
     uint64_t rl_reported_ms;
+    /* Shares refused because the server-wide duplicate check was full, folded
+     * into one periodic report like the rate limit above. */
+    uint32_t ddfull_refused;     /* since the last report */
+    uint64_t ddfull_total;       /* over the connection's life */
+    uint64_t ddfull_reported_ms;
 
     /* Monotonic timestamp of the most recent recv() that got any bytes.
      * The conn thread checks this against cfg.idle_timeout_sec after each
@@ -1117,6 +1132,47 @@ static void submit_rate_report(stratum_server_t *s, stratum_conn_t *c,
     }
     c->rl_limited = 0;
     c->rl_reported_ms = now_mono;
+}
+
+/* Once per RL_REPORT_INTERVAL_MS per connection: shares refused because every
+ * key in the server-wide duplicate check still covers a solvable job. Seeing
+ * this means the pool is taking shares faster than SHARE_DEDUPE_RING covers
+ * (or no new job has arrived for a long time); raise SHARE_DEDUPE_RING or the
+ * share difficulty. */
+static void dedupe_full_report(stratum_server_t *s, stratum_conn_t *c,
+                               uint64_t now_mono) {
+    if (c->ddfull_refused == 0) return;
+    if (c->ddfull_reported_ms != 0 &&
+        now_mono - c->ddfull_reported_ms < RL_REPORT_INTERVAL_MS) return;
+    LOG_WARN("stratum: %s — %u share(s) refused since the last report, %llu "
+             "on this connection: duplicate check full (%u hashes, all of "
+             "jobs still solvable); not credited",
+             c->worker_name[0] ? c->worker_name : "(unauthorized)",
+             c->ddfull_refused, (unsigned long long)c->ddfull_total,
+             (unsigned)SHARE_DEDUPE_RING);
+    if (s->cfg.on_reject) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "duplicate check full: %u refused (%llu total)",
+                 c->ddfull_refused, (unsigned long long)c->ddfull_total);
+        s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(), msg);
+    }
+    c->ddfull_refused = 0;
+    c->ddfull_reported_ms = now_mono;
+}
+
+/* Count one share refused for a full duplicate check, and report if due. */
+static void dedupe_full_refused(stratum_server_t *s, stratum_conn_t *c,
+                                uint64_t now_mono) {
+    c->ddfull_refused++;
+    c->ddfull_total++;
+    dedupe_full_report(s, c, now_mono);
+}
+
+void stratum_conn_dedupe_full_refused_for_test(stratum_server_t *s,
+                                               stratum_conn_t *c,
+                                               uint64_t now_mono) {
+    dedupe_full_refused(s, c, now_mono);
 }
 
 /* The difficulty actually assignable to a connection: the network ceiling
@@ -2011,41 +2067,102 @@ static void dd_index_remove(stratum_server_t *s, uint64_t h) {
     s->share_dedupe_index[i] = 0;
 }
 
-/* The set operation on a precomputed key: 1 if present, else record it --
- * evicting the oldest key when the ring is full -- and return 0. */
-static int share_dedupe_key_check_and_add(stratum_server_t *s, uint64_t h) {
+/* Can a share still name the job with this seq? find_job() resolves only the
+ * current job and the recent ring, and a job never returns once it has left
+ * both, so this is exact. Takes job_lock then recent_lock (the order
+ * stratum_server_set_job uses); called with share_dedupe_lock held, and
+ * nothing takes share_dedupe_lock while holding either of them. */
+static int job_seq_live(stratum_server_t *s, uint64_t seq) {
+    int live = 0;
+    pthread_rwlock_rdlock(&s->job_lock);
+    if (s->current_job && s->current_job->seq == seq) live = 1;
+    if (!live) {
+        pthread_mutex_lock(&s->recent_lock);
+        for (size_t i = 0; i < RECENT_JOBS && !live; ++i)
+            if (s->recent[i] && s->recent[i]->seq == seq) live = 1;
+        pthread_mutex_unlock(&s->recent_lock);
+    }
+    pthread_rwlock_unlock(&s->job_lock);
+    return live;
+}
+
+enum {
+    DD_NEW  = 0,   /* recorded now */
+    DD_DUP  = 1,   /* already recorded */
+    DD_FULL = 2,   /* not recorded: every key still covers a solvable job */
+    DD_GONE = 3,   /* not recorded: own job left the recent ring meanwhile */
+};
+
+/* The set operation on a precomputed key.
+ *
+ * A key may be forgotten only once its job can no longer be named: until
+ * then the same share can be sent again and would be credited again. So on
+ * a full ring the oldest key is dropped only if its job is gone; otherwise
+ * the new share is refused (DD_FULL) rather than opening that hole. `force`
+ * (a share that meets the network target) drops the oldest key regardless,
+ * so a block is never refused and is itself always recorded. (Where the
+ * network target is easier than the share target, as on regtest, every
+ * share is a block and the oldest key is always dropped, as before.)
+ *
+ * DD_GONE: this share's own job was found by the caller but has left the
+ * recent ring since, so earlier keys of that job may already have been
+ * forgotten and this could be one of them sent again. Only possible once the
+ * ring has been full (nothing is forgotten before that, and the count never
+ * goes down). job_seq 0 marks a key with no job (test hooks): always
+ * forgettable, never DD_GONE. */
+static int share_dedupe_key_check_and_add(stratum_server_t *s, uint64_t h,
+                                          uint64_t job_seq, int force) {
     if (h == 0) h = 1;   /* 0 is the index's empty marker */
-    int dup = 0;
+    int rc = DD_NEW;
     pthread_mutex_lock(&s->share_dedupe_lock);
     if (dd_index_find(s, h)) {
-        dup = 1;
-    } else {
-        if (s->share_dedupe_count == SHARE_DEDUPE_RING) {
-            dd_index_remove(s, s->share_dedupe_ring[s->share_dedupe_head]);
+        rc = DD_DUP;
+    } else if (s->share_dedupe_count == SHARE_DEDUPE_RING) {
+        size_t head = s->share_dedupe_head;
+        uint64_t head_job = s->share_dedupe_job[head];
+        if (!force && job_seq != 0 && !job_seq_live(s, job_seq)) {
+            rc = DD_GONE;
+        } else if (force || head_job == 0 || !job_seq_live(s, head_job)) {
+            dd_index_remove(s, s->share_dedupe_ring[head]);
         } else {
-            s->share_dedupe_count++;
+            rc = DD_FULL;
         }
+    } else {
+        s->share_dedupe_count++;
+    }
+    if (rc == DD_NEW) {
         s->share_dedupe_ring[s->share_dedupe_head] = h;
+        s->share_dedupe_job[s->share_dedupe_head] = job_seq;
         s->share_dedupe_head = (s->share_dedupe_head + 1) % SHARE_DEDUPE_RING;
         dd_index_insert(s, h);
     }
     pthread_mutex_unlock(&s->share_dedupe_lock);
-    return dup;
+    return rc;
 }
 
-/* Server-wide dedupe on the assembled header hash. Returns 1 if this exact
- * hash has already been credited on any connection, else records it and
- * returns 0. Called after the header is built, so it catches duplicates the
+/* Server-wide dedupe on the assembled header hash. Returns DD_DUP if this
+ * exact hash has already been credited on any connection, DD_NEW once it is
+ * recorded, or DD_FULL / DD_GONE when it could not be checked safely (see
+ * share_dedupe_key_check_and_add). Called after the header is built, so it catches duplicates the
  * per-connection ring structurally cannot: a resubmission on a reconnected
  * or parallel connection, or the same work reframed under a different job
  * id. Two identical hashes represent one solution and must be paid once. */
 static int share_dedupe_check_and_add(stratum_server_t *s,
-                                      const uint8_t hash_be[32]) {
-    return share_dedupe_key_check_and_add(s, fnv1a_bytes(hash_be, 32));
+                                      const uint8_t hash_be[32],
+                                      const stratum_job_t *job, int is_block) {
+    return share_dedupe_key_check_and_add(s, fnv1a_bytes(hash_be, 32),
+                                          job->seq, is_block);
+}
+
+void stratum_server_set_test_hook_for_test(stratum_server_t *s,
+                                           void (*hook)(void *arg, int where),
+                                           void *arg) {
+    s->test_hook_arg = arg;
+    s->test_hook = hook;
 }
 
 int stratum_share_dedupe_key_for_test(stratum_server_t *s, uint64_t key) {
-    return share_dedupe_key_check_and_add(s, key);
+    return share_dedupe_key_check_and_add(s, key, 0, 0);
 }
 
 size_t stratum_share_dedupe_live_for_test(stratum_server_t *s,
@@ -2258,20 +2375,6 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     uint8_t hash_be[32];
     hash_header(header, hash_be);
 
-    /* Reject before any crediting: this hash is one solution regardless of
-     * which connection produced it or how the submission was framed. */
-    if (share_dedupe_check_and_add(s, hash_be)) {
-        free(cb);
-        LOG_INFO("stratum: reject from worker '%s' - Reason: duplicate share "
-                 "(hash already credited)", c->worker_name);
-        if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "duplicate share");
-        }
-        cJSON *err = make_error(22, "duplicate share");
-        return emit_response(buf, len, id, NULL, err);
-    }
-
     /* Judge the share at the difficulty THIS job went out under, not at
      * whatever the connection has drifted to since. A miner applies a
      * set_difficulty on the next job it is notified, so every share for a job
@@ -2346,6 +2449,47 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         }
         free(cb);
         cJSON *err = make_error(23, "low difficulty");
+        return emit_response(buf, len, id, NULL, err);
+    }
+
+    /* Server-wide dedupe, only now that the share has met its share target
+     * or the network target: a key is recorded only for work that will be
+     * credited, so shares that fail validation cannot fill the ring. A block
+     * is always recorded there, never refused for a full ring. One hash is
+     * one solution regardless of which connection produced it or how the
+     * submission was framed. */
+    if (s->test_hook) {
+        void (*hook)(void *, int) = s->test_hook;
+        s->test_hook = NULL;                 /* one-shot */
+        hook(s->test_hook_arg, STRATUM_TEST_HOOK_PRE_DEDUPE);
+    }
+    int dd = share_dedupe_check_and_add(s, hash_be, job, is_block);
+    if (dd == DD_FULL) {
+        free(cb);
+        dedupe_full_refused(s, c, mono_ms());
+        cJSON *err = make_error(20, "duplicate check full, share not credited");
+        return emit_response(buf, len, id, NULL, err);
+    }
+    if (dd == DD_GONE) {
+        free(cb);
+        LOG_INFO("stratum: reject from worker '%s' - Reason: stale or unknown "
+                 "job (left the recent ring during the submit)", c->worker_name);
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "stale or unknown job");
+        }
+        cJSON *err = make_error(21, "stale or unknown job");
+        return emit_response(buf, len, id, NULL, err);
+    }
+    if (dd == DD_DUP) {
+        free(cb);
+        LOG_INFO("stratum: reject from worker '%s' - Reason: duplicate share "
+                 "(hash already credited)", c->worker_name);
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "duplicate share");
+        }
+        cJSON *err = make_error(22, "duplicate share");
         return emit_response(buf, len, id, NULL, err);
     }
 
@@ -2746,6 +2890,10 @@ void stratum_conn_free_for_test(stratum_conn_t *c) {
     if (c->server && c->rl_limited > 0) {
         c->rl_reported_ms = 0;   /* bypass the interval; this is the last one */
         submit_rate_report(c->server, c, mono_ms());
+    }
+    if (c->server && c->ddfull_refused > 0) {   /* the same, for dedupe-full */
+        c->ddfull_reported_ms = 0;
+        dedupe_full_report(c->server, c, mono_ms());
     }
     conn_clear_coinbase(c);
     pthread_mutex_destroy(&c->write_lock);
@@ -3313,8 +3461,18 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
     pthread_rwlock_wrlock(&s->job_lock);
     stratum_job_t *old = s->current_job;
     s->current_job = new_job;
-    pthread_rwlock_unlock(&s->job_lock);
+    /* Retire before releasing job_lock, so a job being replaced is always
+     * either current or in the recent ring: share_dedupe's job_seq_live()
+     * reads both under job_lock and must never see it in neither, or it
+     * would forget keys of a job that is about to be solvable again.
+     * Order job_lock -> recent_lock, as in job_seq_live(). */
     if (old) retire_job(s, old);
+    pthread_rwlock_unlock(&s->job_lock);
+    if (s->test_hook) {
+        void (*hook)(void *, int) = s->test_hook;
+        s->test_hook = NULL;                 /* one-shot */
+        hook(s->test_hook_arg, STRATUM_TEST_HOOK_JOB_SWAPPED);
+    }
 
     /* Broadcast the new job. Each conn renders its own coinbase against it
      * (paying its miner address). clean_jobs is passed through from the

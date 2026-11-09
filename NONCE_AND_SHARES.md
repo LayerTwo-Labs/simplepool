@@ -292,7 +292,18 @@ would be effort spent to reach the same answer more slowly.
 10. **Global hash dedupe.** If this exact hash has already been
     credited — on any connection, under any job id — → reject with
     `duplicate share`. One solution is one solution regardless of how
-    the submission was framed.
+    the submission was framed. Checked after the difficulty test in
+    step 12, so only shares that are credited (or are blocks) are
+    recorded. A hash is kept until its job can no longer be named (not
+    current, not in the recent ring). If the ring is full of hashes
+    that still cover solvable jobs, the share is refused with
+    `duplicate check full, share not credited` rather than forgetting
+    one, and a `duplicate check full` warning is logged once per 10 s
+    per connection. That happens above the rate the ring covers, or
+    when no new job has arrived for a long time (the old jobs then
+    never expire). A share that meets the network target is still
+    submitted as a block and recorded, dropping the oldest hash if
+    it must; where every share is a block (regtest), that is always.
 11. Log a `[SUBMIT CHECK]` line with `sent_hash`, `worker_target`,
     `network_target`, and version fields (this is what appears in
     `logs/simplepool.log`).
