@@ -171,6 +171,13 @@ auth_fail_lockout_sec = 60
 idle_timeout_sec            = 600
 idle_timeout_authorized_sec = 7200
 
+# Time, in ms, one job broadcast may spend writing to every miner together
+# (50..10000). The deadline is shared, so miners that stopped reading delay
+# everyone else's new job by at most this in total. A miner whose socket is
+# still full when it passes is disconnected; one that is reading takes the
+# notify in microseconds and is never affected.
+bcast_send_budget_ms = 300
+
 db_path = ./data/shares.db
 commit_window_ms = 100
 commit_max_shares = 100

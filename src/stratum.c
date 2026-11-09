@@ -100,9 +100,11 @@ _Static_assert((uint64_t)RECENT_JOBS * 30000u >= RECENT_JOB_TTL_MS,
  * entry, judging a correct submit at the wrong difficulty. */
 #define JOB_DIFF_RING  ((RECENT_JOBS + 1) * 2)
 
-/* Upper bound on a single send() to a miner. Only reached by a peer that has
- * stopped reading; a healthy miner drains these in microseconds. */
+/* Upper bound on writing one reply to a miner. Only reached by a peer that
+ * has stopped reading; a healthy miner drains these in microseconds. A job
+ * broadcast has its own, much shorter budget: cfg.bcast_send_budget_ms. */
 #define SEND_TIMEOUT_SEC 10
+#define DEFAULT_BCAST_SEND_BUDGET_MS 300
 
 /* Per-address authorize-failure table: fixed, bounded, and never allocated on
  * the client's schedule. 1024 slots keyed by peer address, probed linearly up
@@ -390,6 +392,9 @@ struct stratum_server {
     /* List of live connections — for broadcasting notify on job swap. */
     pthread_mutex_t  conns_lock;
     struct stratum_conn *conns_head;
+    /* Signalled, under conns_lock, when a broadcast drops its references.
+     * conn_unregister waits on it; see stratum_conn.bcast_refs. */
+    pthread_cond_t   conns_cond;
 };
 
 struct stratum_conn {
@@ -470,8 +475,8 @@ struct stratum_conn {
      * Innermost lock — never acquire another while holding it.
      *
      * One write is deliberately NOT under it: conn_clear_coinbase, on the way
-     * out. See its comment — the exclusivity there comes from conns_lock, and
-     * it has to, because the mutex is destroyed two lines later. */
+     * out. See its comment — the exclusivity there comes from conn_unregister,
+     * and it has to, because the mutex is destroyed two lines later. */
     pthread_mutex_t cb_lock;
     uint8_t *cb1;
     size_t   cb1_len;
@@ -549,17 +554,29 @@ struct stratum_conn {
 
     pthread_mutex_t write_lock;
 
+    /* Broadcasts currently holding this connection, protected by conns_lock.
+     *
+     * stratum_server_set_job takes one per connection it will notify while it
+     * holds conns_lock, then drops the lock before rendering and writing, so
+     * a miner that stopped reading cannot hold accept and teardown on it.
+     * While a reference is held the connection may be unlinked but not closed
+     * or freed: conn_unregister waits on conns_cond until this is zero, and
+     * every path that closes or frees a registered connection calls it
+     * first. That also keeps the fd number from being reused under the
+     * broadcast's write. The wait is bounded by one broadcast's send budget. */
+    int bcast_refs;
+
     struct stratum_conn *next;  /* server->conns_head linked list */
 };
 
 /* Frees the rendered coinbase WITHOUT taking cb_lock, which is safe only
  * because of where it is called from, so check that before moving it.
  *
- * Its one caller runs after conn_unregister has unlinked the connection under
- * conns_lock — and conns_lock is held by the job broadcast for its entire
- * traversal. So a broadcast already walking the list has finished and released
- * it before unregister could acquire it, and no later broadcast can reach this
- * connection at all. The connection belongs to this thread alone by then.
+ * Its one caller runs after conn_unregister, which unlinks the connection
+ * under conns_lock and then waits until no broadcast holds a reference to it
+ * (stratum_conn.bcast_refs). So a broadcast that picked it up has finished
+ * with it, and no later broadcast can reach it at all. The connection belongs
+ * to this thread alone by then.
  *
  * That exclusivity is required regardless: the mutexes are destroyed
  * immediately after, and destroying one another thread could still take is
@@ -2819,20 +2836,30 @@ void stratum_conn_rearm_vardiff_for_test(stratum_conn_t *c) {
 
 /* ---- real connection thread ------------------------------------------ */
 
-static int write_all(int fd, const char *buf, size_t len) {
+/* Write the whole buffer by `deadline` (mono_ms) or fail.
+ *
+ * One deadline for the whole message, not per send(): SO_SNDTIMEO bounds
+ * each call, and a peer draining a few bytes at a time could keep a partial
+ * write going far past it. So every send is non-blocking and the wait between
+ * them is a poll() for the time left. A non-blocking attempt is made even when
+ * the deadline has already passed, so a peer whose buffer has room (one that
+ * is reading) is never refused for arriving late in a broadcast. A peer that
+ * stopped reading makes this return -1 with EAGAIN at the deadline. A failed
+ * write may have left a partial line on the wire, so the caller has to drop
+ * the connection, not retry it. */
+static int write_all(int fd, const char *buf, size_t len, uint64_t deadline) {
     size_t off = 0;
     while (off < len) {
-        ssize_t n = send(fd, buf + off, len - off, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            /* EAGAIN/EWOULDBLOCK here is SO_SNDTIMEO firing: the peer has
-             * stopped reading and its socket buffer is full. Treat it as a
-             * write failure rather than retrying — the caller drops the
-             * connection, which is what keeps one stalled miner from holding
-             * up a broadcast that runs under conns_lock. */
-            return -1;
-        }
-        off += (size_t)n;
+        ssize_t n = send(fd, buf + off, len - off, MSG_DONTWAIT);
+        if (n >= 0) { off += (size_t)n; continue; }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+        uint64_t now = mono_ms();
+        if (now >= deadline) { errno = EAGAIN; return -1; }
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
+        int pr = poll(&pfd, 1, (int)(deadline - now));
+        if (pr < 0 && errno != EINTR) return -1;
+        /* pr == 0: loop once more; the deadline check above ends it. */
     }
     return 0;
 }
@@ -2867,10 +2894,10 @@ static int conn_socket_setup(int fd, int idle_timeout_sec) {
     (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
 #endif
 
-    /* Bound every write. Without this, send() to a miner that has stopped
-     * reading blocks until TCP gives up minutes later — and because job
-     * broadcast writes to each connection while holding conns_lock, one such
-     * miner freezes notifies for every other miner on the pool. */
+    /* Bound every blocking write. write_all no longer blocks (it sends
+     * MSG_DONTWAIT under its own whole-message deadline), so this is a
+     * backstop: any other send on this socket must not be able to wait on a
+     * peer that stopped reading until TCP gives up minutes later. */
     {
         struct timeval sndtv = { .tv_sec = SEND_TIMEOUT_SEC, .tv_usec = 0 };
         if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sndtv, sizeof(sndtv)) < 0) {
@@ -2914,6 +2941,10 @@ void stratum_conn_register_for_test(stratum_server_t *s, stratum_conn_t *c,
     conn_register(s, c);
 }
 
+/* Unlink, then wait out any broadcast still holding a reference (see
+ * stratum_conn.bcast_refs). Every path that closes or frees a registered
+ * connection comes through here first, so once this returns nothing else can
+ * reach `c` or its fd. */
 static void conn_unregister(stratum_server_t *s, stratum_conn_t *c) {
     pthread_mutex_lock(&s->conns_lock);
     struct stratum_conn **p = &s->conns_head;
@@ -2921,6 +2952,7 @@ static void conn_unregister(stratum_server_t *s, stratum_conn_t *c) {
         if (*p == c) { *p = c->next; break; }
         p = &(*p)->next;
     }
+    while (c->bcast_refs > 0) pthread_cond_wait(&s->conns_cond, &s->conns_lock);
     pthread_mutex_unlock(&s->conns_lock);
 }
 
@@ -2947,6 +2979,30 @@ static int conn_idle_budget_sec(const stratum_server_t *s,
     return s->cfg.idle_timeout_authorized_sec;
 }
 
+/* write_lock for a broadcast write, waited for no later than the broadcast
+ * deadline -- but at least BCAST_LOCK_FLOOR_MS, so a miner whose reply happens
+ * to be mid-write is not dropped for it. A connection thread holds write_lock
+ * only while it writes a reply; still holding it after the floor means that
+ * miner's socket is full (or its link too slow to take one reply in that
+ * time), the same as a notify that cannot be written. So each miner stuck in
+ * its own reply costs the broadcast at most one floor, not the 10 s reply
+ * timeout: after the budget is spent, N such miners cost N x the floor.
+ * A trylock loop on the monotonic clock, not pthread_mutex_timedlock: that
+ * one is missing on macOS and takes a wall-clock deadline, which a clock step
+ * would stretch or cut. Returns 0 with the lock held, ETIMEDOUT without. */
+#define BCAST_LOCK_FLOOR_MS 20u
+static int bcast_lock_write(stratum_conn_t *c, uint64_t deadline) {
+    uint64_t now = mono_ms();
+    uint64_t until = deadline > now + BCAST_LOCK_FLOOR_MS
+                   ? deadline : now + BCAST_LOCK_FLOOR_MS;
+    for (;;) {
+        if (pthread_mutex_trylock(&c->write_lock) == 0) return 0;
+        if (mono_ms() >= until) return ETIMEDOUT;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000L };   /* 1 ms */
+        nanosleep(&ts, NULL);
+    }
+}
+
 /* Test hooks for the broadcast path. stratum_conn_new_for_test hands back a
  * connection the server does not know about — good enough for the handler
  * tests, which drive it directly, but stratum_server_set_job only walks
@@ -2958,6 +3014,14 @@ void stratum_conn_attach_for_test(stratum_server_t *s, stratum_conn_t *c,
     if (!s || !c) return;
     c->fd = fd;
     conn_register(s, c);
+}
+
+/* Lock or unlock a connection's write_lock from a test thread, standing in for
+ * a connection thread stuck writing a reply to a full socket. */
+void stratum_conn_write_lock_for_test(stratum_conn_t *c, int lock) {
+    if (!c) return;
+    if (lock) pthread_mutex_lock(&c->write_lock);
+    else      pthread_mutex_unlock(&c->write_lock);
 }
 
 void stratum_conn_detach_for_test(stratum_server_t *s, stratum_conn_t *c) {
@@ -3056,8 +3120,14 @@ static void *conn_thread(void *arg) {
             int rc = stratum_handle_message(s, c, line, &out, &olen);
             if (out && olen) {
                 pthread_mutex_lock(&c->write_lock);
-                write_all(c->fd, out, olen);
+                int wrc = write_all(c->fd, out, olen,
+                                    mono_ms() + (uint64_t)SEND_TIMEOUT_SEC * 1000u);
                 pthread_mutex_unlock(&c->write_lock);
+                if (wrc < 0) {
+                    /* Possibly mid-line: nothing written after it would parse. */
+                    free(out);
+                    goto done;
+                }
             }
             free(out);
             if (rc < 0) goto done;
@@ -3067,12 +3137,11 @@ static void *conn_thread(void *arg) {
         }
     }
 done:
-    /* Unlink before closing, not after. While the connection is still on
-     * s->conns the job-broadcast thread may write to c->fd; once the fd is
-     * closed its number is free for accept() to hand straight back out, so a
-     * notify meant for the departing miner lands in whichever connection
-     * inherited the number. The listener's own error path already had this
-     * order. */
+    /* Unlink before closing, not after. conn_unregister also waits out any
+     * job broadcast still writing to c->fd; once the fd is closed its number
+     * is free for accept() to hand straight back out, so a notify meant for
+     * the departing miner would land in whichever connection inherited the
+     * number. The listener's own error path already had this order. */
     conn_unregister(s, c);
     close(c->fd);
     atomic_fetch_sub(&s->conn_count, 1);
@@ -3183,9 +3252,12 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
      * "unset, use the default" and negative means "never reap an authorized
      * miner", and conn_idle_budget_sec has to be able to tell them apart. */
     if (s->cfg.idle_timeout_authorized_sec == 0) s->cfg.idle_timeout_authorized_sec = 7200;
+    if (s->cfg.bcast_send_budget_ms <= 0)
+        s->cfg.bcast_send_budget_ms = DEFAULT_BCAST_SEND_BUDGET_MS;
     pthread_rwlock_init(&s->job_lock, NULL);
     pthread_mutex_init(&s->recent_lock, NULL);
     pthread_mutex_init(&s->conns_lock, NULL);
+    pthread_cond_init(&s->conns_cond, NULL);
     pthread_mutex_init(&s->auth_fail_lock, NULL);
     pthread_mutex_init(&s->share_dedupe_lock, NULL);
     atomic_init(&s->stop, 0);
@@ -3320,26 +3392,75 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
      * (paying its miner address). clean_jobs is passed through from the
      * caller rather than assumed: only a tip change invalidates the work a
      * miner is holding, and telling it otherwise on every template refresh
-     * throws that work away for nothing. See stratum.h. */
+     * throws that work away for nothing. See stratum.h.
+     *
+     * No socket is written while conns_lock is held. The connections to
+     * notify are snapshotted with a reference each (stratum_conn.bcast_refs)
+     * and the lock is dropped, so accept and teardown never queue behind a
+     * miner that stopped reading. And the whole broadcast shares ONE deadline,
+     * cfg.bcast_send_budget_ms from now: a write that has to wait only gets
+     * what is left of it, so N stalled miners delay everyone else by at most
+     * one budget in total, not N times a per-socket timeout. A miner whose
+     * own reply write holds its write_lock costs at most BCAST_LOCK_FLOOR_MS
+     * more (bcast_lock_write) and is dropped like a full socket.
+     *
+     * Broadcasts come from one thread (the tip watcher). Two at once would
+     * still be memory-safe — the references count, and write_lock keeps each
+     * line whole — but could reach a miner in either order. */
     pthread_mutex_lock(&s->conns_lock);
+    size_t n_snap = 0, cap_snap = 0;
+    for (stratum_conn_t *c = s->conns_head; c; c = c->next) ++cap_snap;
+    stratum_conn_t **snap = cap_snap ? malloc(cap_snap * sizeof(*snap)) : NULL;
+    if (cap_snap && !snap) {
+        pthread_mutex_unlock(&s->conns_lock);
+        LOG_ERROR("stratum: out of memory snapshotting %zu connections — "
+                  "job not broadcast", cap_snap);
+        return;
+    }
     for (stratum_conn_t *c = s->conns_head; c; c = c->next) {
         if (!c->subscribed || c->fd < 0 || !c->authorized) continue;
+        c->bcast_refs++;
+        snap[n_snap++] = c;
+    }
+    pthread_mutex_unlock(&s->conns_lock);
+
+    const uint64_t deadline = mono_ms() + (uint64_t)s->cfg.bcast_send_budget_ms;
+    for (size_t i = 0; i < n_snap; ++i) {
+        stratum_conn_t *c = snap[i];
         char *out = NULL; size_t olen = 0;
         send_current_notify(s, c, &out, &olen, clean_jobs ? 1 : 0);
         if (out) {
-            pthread_mutex_lock(&c->write_lock);
-            int wrc = write_all(c->fd, out, olen);
-            pthread_mutex_unlock(&c->write_lock);
+            int wrc;
+            int lrc = bcast_lock_write(c, deadline);
+            if (lrc == 0) {
+                wrc = write_all(c->fd, out, olen, deadline);
+                pthread_mutex_unlock(&c->write_lock);
+            } else {
+                wrc = -1;               /* stuck in its own reply: socket full */
+                errno = lrc;
+            }
             if (wrc < 0) {
-                /* Timed out or errored. Wake its own thread and let that run
-                 * the normal teardown — unregistering it here would free a
-                 * connection this loop is still walking. */
+                /* Out of budget or errored, possibly mid-line. We cannot
+                 * close() the fd here — the connection thread owns it — but
+                 * shutdown() is safe from another thread and wakes that
+                 * thread's recv() so it runs the normal teardown, which waits
+                 * for our reference to go first. */
+                LOG_WARN("stratum: dropping fd=%d worker='%s' — notify write "
+                         "failed within the %d ms broadcast budget (%s)",
+                         c->fd,
+                         c->worker_name[0] ? c->worker_name : "(unauthorized)",
+                         s->cfg.bcast_send_budget_ms, strerror(errno));
                 shutdown(c->fd, SHUT_RDWR);
             }
             free(out);
         }
     }
+
+    pthread_mutex_lock(&s->conns_lock);
+    for (size_t i = 0; i < n_snap; ++i) snap[i]->bcast_refs--;
+    pthread_cond_broadcast(&s->conns_cond);
     pthread_mutex_unlock(&s->conns_lock);
+    free(snap);
 }
 
 void stratum_server_stop(stratum_server_t *s) {
@@ -3376,6 +3497,7 @@ void stratum_server_free(stratum_server_t *s) {
     pthread_rwlock_destroy(&s->job_lock);
     pthread_mutex_destroy(&s->recent_lock);
     pthread_mutex_destroy(&s->conns_lock);
+    pthread_cond_destroy(&s->conns_cond);
     pthread_mutex_destroy(&s->auth_fail_lock);
     pthread_mutex_destroy(&s->share_dedupe_lock);
     free(s);

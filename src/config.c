@@ -69,6 +69,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->vardiff_idle_step       = 2.0;
     cfg->idle_timeout_sec   = 600;    /* 10 min silent recv → reap */
     cfg->idle_timeout_authorized_sec = 7200;  /* 2 h once a miner is working */
+    cfg->bcast_send_budget_ms = 300;
 
     cfg->redis_url[0] = '\0';
     cfg->redis_publish_timeout_ms   = 200;
@@ -302,6 +303,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "vardiff_idle_step")        == 0) cfg->vardiff_idle_step = atof(v);
         else if (strcmp(k, "idle_timeout_sec")          == 0) cfg->idle_timeout_sec = atoi(v);
         else if (strcmp(k, "idle_timeout_authorized_sec") == 0) cfg->idle_timeout_authorized_sec = atoi(v);
+        else if (strcmp(k, "bcast_send_budget_ms")      == 0) cfg->bcast_send_budget_ms = atoi(v);
         else if (strcmp(k, "db_path")                   == 0) copy_str(cfg->db_path, sizeof cfg->db_path, v);
         else if (strcmp(k, "commit_window_ms")          == 0) cfg->commit_window_ms = atoi(v);
         else if (strcmp(k, "commit_max_shares")         == 0) cfg->commit_max_shares = atoi(v);
@@ -500,6 +502,15 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                 "config: 'auth_fail_lockout_sec' must be > 0 when "
                 "'auth_max_failures' is set (set auth_max_failures = 0 to "
                 "disable the authorize budget)");
+        return -13;
+    }
+    /* Below 50 ms a busy but healthy host could miss it and drop miners that
+     * are reading; above 10 s it no longer protects the other miners from a
+     * stalled one. Neither end is a policy anyone means to set. */
+    if (cfg->bcast_send_budget_ms < 50 || cfg->bcast_send_budget_ms > 10000) {
+        set_err(errbuf, errlen,
+                "config: 'bcast_send_budget_ms' = %d is outside 50..10000 "
+                "(300 is the default)", cfg->bcast_send_budget_ms);
         return -13;
     }
     if (cfg->block_interval_sec <= 0) {
