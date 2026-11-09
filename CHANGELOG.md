@@ -17,7 +17,8 @@ hashrate submits hundreds of shares a window, and the 4x-per-window step can
 take minutes to reach the right difficulty. With `vardiff_fast_climb = 1`, a
 window holding at least 200 shares at the current difficulty whose rate is over
 twice the target retargets up after 5 s by the measured ratio (capped at
-1024x). Downward moves and all other windows are unchanged.
+1024x). Downward moves and all other windows are unchanged. It needs
+`vardiff_min_samples` at 200 or below; above that it never fires.
 
 ### Vardiff no longer chases shares mined at an earlier difficulty
 
@@ -28,7 +29,9 @@ as a rate spike, pushed difficulty straight back up, and the next window then
 read low and stepped down again. Only shares credited at the difficulty now in
 force are counted toward the rate. A window made mostly of earlier-difficulty
 shares is treated as draining rather than idle: it restarts instead of taking
-the idle step down. Nothing to configure.
+the idle step down. A client that keeps returning shares for older jobs can
+hold vardiff still for up to the job retention time (300 s) after a change; it
+cannot stay stuck beyond that, since those jobs expire. Nothing to configure.
 
 ### Jobs built from an unchanged template are now distinct work
 
