@@ -38,6 +38,11 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->max_submits_per_sec = 20000;
     cfg->auth_max_failures     = 3;
     cfg->auth_fail_lockout_sec = 60;
+    /* Reject guard: off unless the operator names a percentage. */
+    cfg->reject_guard_pct              = 0;
+    cfg->reject_guard_min_samples      = 200;
+    cfg->reject_guard_cooldown_sec     = 600;
+    cfg->reject_guard_max_cooldown_sec = 86400;
 
     snprintf(cfg->bitcoind_url,  sizeof cfg->bitcoind_url,  "%s", "http://127.0.0.1:18443");
     /* No default credentials: when bitcoind_user/bitcoind_pass are omitted the
@@ -254,6 +259,10 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "max_submits_per_sec")       == 0) cfg->max_submits_per_sec = atoi(v);
         else if (strcmp(k, "auth_max_failures")        == 0) cfg->auth_max_failures = atoi(v);
         else if (strcmp(k, "auth_fail_lockout_sec")    == 0) cfg->auth_fail_lockout_sec = atoi(v);
+        else if (strcmp(k, "reject_guard_pct")         == 0) cfg->reject_guard_pct = atoi(v);
+        else if (strcmp(k, "reject_guard_min_samples") == 0) cfg->reject_guard_min_samples = atoi(v);
+        else if (strcmp(k, "reject_guard_cooldown_sec") == 0) cfg->reject_guard_cooldown_sec = atoi(v);
+        else if (strcmp(k, "reject_guard_max_cooldown_sec") == 0) cfg->reject_guard_max_cooldown_sec = atoi(v);
         else if (strcmp(k, "initial_diff")              == 0) cfg->initial_diff = atof(v);
         else if (strcmp(k, "listener")                  == 0) {
             /* Repeatable, unlike every other key here: each one adds a port
@@ -500,6 +509,25 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                 "config: 'auth_fail_lockout_sec' must be > 0 when "
                 "'auth_max_failures' is set (set auth_max_failures = 0 to "
                 "disable the authorize budget)");
+        return -13;
+    }
+    if (cfg->reject_guard_pct < 0 || cfg->reject_guard_pct > 99) {
+        set_err(errbuf, errlen,
+                "config: 'reject_guard_pct' must be 0..99 (0 disables)");
+        return -13;
+    }
+    if (cfg->reject_guard_min_samples < 50) {
+        /* Fewer samples and a healthy miner's first unlucky stretch could
+         * trip it. */
+        set_err(errbuf, errlen,
+                "config: 'reject_guard_min_samples' must be >= 50");
+        return -13;
+    }
+    if (cfg->reject_guard_cooldown_sec <= 0 ||
+        cfg->reject_guard_max_cooldown_sec < cfg->reject_guard_cooldown_sec) {
+        set_err(errbuf, errlen,
+                "config: 'reject_guard_cooldown_sec' must be > 0 and "
+                "'reject_guard_max_cooldown_sec' must be >= it");
         return -13;
     }
     if (cfg->block_interval_sec <= 0) {

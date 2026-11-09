@@ -341,6 +341,37 @@ typedef struct {
     int    auth_max_failures;
     int    auth_fail_lockout_sec;
 
+    /* Reject guard. A connection that sends almost nothing but bad shares
+     * keeps a socket open, costs a reject row per submit and a hash per
+     * validation, and nothing else bounds it.
+     *
+     * Per connection, count the share attempts that were judged: accepted,
+     * low difficulty, invalid (bad hex, ntime out of range, wrong extranonce2
+     * size), duplicate, and unknown or stale job. Not judged: a malformed
+     * request (bad params), a submit the rate limiter refused, and
+     * pool-side failures. Once reject_guard_min_samples are judged and more
+     * than reject_guard_pct % of them were rejected, the miner gets one
+     * error (code 20) and the connection is closed. The worker is then
+     * refused at mining.authorize for reject_guard_cooldown_sec, doubling for
+     * each repeat while the last offence is remembered (24 h after
+     * its cooldown ends), capped at reject_guard_max_cooldown_sec.
+     *
+     * The cooldown is keyed on (worker name, peer address), never the address
+     * alone -- many rigs share one NAT address -- and never the name alone,
+     * which anyone could use to lock a public name out. The counts belong to
+     * the connection (re-authorizing or renaming does not restart them), and
+     * unknown or stale job ids are spared until its first accepted share, for
+     * at most 10 x min_samples of them. The counts restart
+     * whenever 2 x min_samples have been judged below the threshold, so one
+     * bad stretch in a long good session does not add up to a trip.
+     *
+     * pct 0 = off (default). A min_samples or cooldown of 0 here means 200,
+     * 600 s and 86400 s. */
+    int    reject_guard_pct;
+    int    reject_guard_min_samples;
+    int    reject_guard_cooldown_sec;
+    int    reject_guard_max_cooldown_sec;
+
     void  *ctx;
     share_observer_fn  on_share;
     reject_observer_fn on_reject;
@@ -457,6 +488,9 @@ uint32_t stratum_job_height_for_test(const stratum_job_t *j);
 /* Server-wide share dedupe, on a precomputed key rather than a header hash:
  * 1 = already recorded, 0 = recorded now. Lets a test drive the index through
  * eviction with keys it chooses. */
+/* Moves the reject guard's clock forward, so cooldown expiry and doubling can
+ * be tested without waiting. */
+void   stratum_reject_guard_advance_for_test(uint64_t ms);
 int    stratum_share_dedupe_key_for_test(stratum_server_t *s, uint64_t key);
 /* Returns the ring's live count; *index_live gets the number of occupied
  * index slots. The two must be equal -- that equality is the whole invariant

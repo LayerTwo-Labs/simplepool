@@ -493,6 +493,53 @@ static void test_a_zero_lockout_window_is_refused(void) {
     CHECK(load_text(body, &off, err2, sizeof err2) == 0);
 }
 
+/* ---- reject guard -------------------------------------------------------- */
+
+/* Off by default; the other keys carry the documented values. */
+static void test_the_reject_guard_is_off_by_default(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body, "operator_address = %s\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.reject_guard_pct == 0);
+    CHECK(cfg.reject_guard_min_samples == 200);
+    CHECK(cfg.reject_guard_cooldown_sec == 600);
+    CHECK(cfg.reject_guard_max_cooldown_sec == 86400);
+}
+
+static void test_the_reject_guard_keys_load(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\nreject_guard_pct = 99\n"
+             "reject_guard_min_samples = 50\nreject_guard_cooldown_sec = 30\n"
+             "reject_guard_max_cooldown_sec = 30\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.reject_guard_pct == 99);
+    CHECK(cfg.reject_guard_min_samples == 50);
+    CHECK(cfg.reject_guard_cooldown_sec == 30);
+    CHECK(cfg.reject_guard_max_cooldown_sec == 30);
+}
+
+/* Out-of-range values are typos, not "off": refused, naming the key. */
+static void test_reject_guard_bounds_are_refused(void) {
+    static const struct { const char *kv; const char *key; } bad[] = {
+        { "reject_guard_pct = -1\n",                 "reject_guard_pct" },
+        { "reject_guard_pct = 100\n",                "reject_guard_pct" },
+        { "reject_guard_min_samples = 49\n",         "reject_guard_min_samples" },
+        { "reject_guard_cooldown_sec = 0\n",         "reject_guard_cooldown_sec" },
+        { "reject_guard_cooldown_sec = 700\n"
+          "reject_guard_max_cooldown_sec = 600\n",   "reject_guard_max_cooldown_sec" },
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i) {
+        proxy_config_t cfg; char err[256] = {0};
+        char body[512];
+        snprintf(body, sizeof body, "operator_address = %s\n%s", VALID_ADDR, bad[i].kv);
+        CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+        CHECK(strstr(err, bad[i].key) != NULL);
+    }
+}
+
 /* The backlog defaults to 0, which stratum.c reads as "use
  * STRATUM_DEFAULT_BACKLOG". 0 is the sentinel on purpose: config.c must not
  * depend on the stratum header just to name a default. */
@@ -565,6 +612,9 @@ int main(void) {
     test_a_zero_authorize_budget_loads();
     test_a_negative_authorize_budget_is_refused();
     test_a_zero_lockout_window_is_refused();
+    test_the_reject_guard_is_off_by_default();
+    test_the_reject_guard_keys_load();
+    test_reject_guard_bounds_are_refused();
     test_listen_backlog_defaults_to_sentinel();
     test_listen_backlog_parses();
     test_a_negative_listen_backlog_is_refused();
