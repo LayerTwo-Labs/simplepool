@@ -2042,6 +2042,472 @@ static void test_pplns_takes_the_operator_fee(void) {
     printf("  ok test_pplns_takes_the_operator_fee\n");
 }
 
+
+/* Replaying one accepted share must not create additional PPS liability.
+ * Model the single share event used by main.c's on_share_cb().
+ * Run only against a fresh disposable test database. */
+static int test_replayed_share_cannot_double_credit(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    const char *hash =
+        "0123456789abcdef0123456789abcdef"
+        "0123456789abcdef0123456789abcdef";
+
+    for (int i = 0; i < 2; ++i) {
+        uint64_t ts = 1700000000000ULL + (uint64_t)i;
+        assert(store_record_share_addr(
+            s, "replay_worker", "replay_addr",
+            ts, 2.0, 0, hash, 100, 50.0) == 0);
+    }
+
+    assert(store_flush(s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+
+    int64_t rows = scalar_i64(db,
+        "SELECT COUNT(*) FROM shares");
+    int64_t credit = scalar_i64(db,
+        "SELECT COALESCE(SUM(accrued_sats),0) "
+        "FROM pps_credits");
+
+    fprintf(stderr,
+        "REPRO observed: shares=%lld accrued=%lld; "
+        "expected shares=1 accrued=100\n",
+        (long long)rows, (long long)credit);
+
+    sqlite3_close(db);
+    store_close(s);
+
+    return rows == 1 && credit == 100;
+}
+
+
+/* A replay after closing and reopening the store must not accrue again.
+ * A distinct hash must still receive normal PPS credit. */
+static void test_replay_after_store_restart(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+
+    const char *h1 =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const char *h2 =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    assert(store_record_share_addr(
+        s, "restart_worker", "addr1",
+        1700000000000ULL, 2.0, 0, h1, 100, 50.0) == 0);
+
+    assert(store_flush(s) == 0);
+    store_close(s);
+    s = NULL;
+
+    /* Simulate a real pool process restart. */
+    assert(store_open(&cfg, &s) == 0);
+
+    assert(store_record_share_addr(
+        s, "restart_worker", "addr1",
+        1700000001000ULL, 2.0, 0, h1, 100, 50.0) == 0);
+
+    assert(store_record_share_addr(
+        s, "restart_worker", "addr1",
+        1700000002000ULL, 2.0, 0, h2, 50, 25.0) == 0);
+
+    assert(store_flush(s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+
+    int64_t rows = scalar_i64(
+        db, "SELECT COUNT(*) FROM shares");
+    int64_t credit = scalar_i64(
+        db, "SELECT COALESCE(SUM(accrued_sats),0) "
+            "FROM pps_credits");
+
+    printf("RESTART TEST: shares=%lld credit=%lld\n",
+           (long long)rows, (long long)credit);
+
+    assert(rows == 2);
+    assert(credit == 150);
+
+    sqlite3_close(db);
+    store_close(s);
+
+    printf("  ok test_replay_after_store_restart\n");
+}
+
+
+/* Installing accounting protection must preserve existing duplicate rows,
+ * accrued liabilities, and paid balances. Only future replays are ignored. */
+static void test_historical_duplicate_rows_survive_upgrade(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    store_close(s);
+
+    /* Simulate an earlier schema without the new index and triggers. */
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "DROP TRIGGER IF EXISTS shares_skip_duplicate;"
+        "DROP TRIGGER IF EXISTS shares_pps_credit;"
+        "DROP INDEX IF EXISTS shares_hash_idx;"
+        "INSERT INTO workers "
+        "(name, first_seen, last_seen, payout_address) "
+        "VALUES ('historical_worker',1700,1701,'addr1');"
+        "INSERT INTO shares "
+        "(worker_id,ts,difficulty,is_block,block_hash,credited_sats,rate_used) "
+        "SELECT id,1700,2.0,0,lower(hex(zeroblob(32))),100,50.0 "
+        "FROM workers WHERE name='historical_worker';"
+        "INSERT INTO shares "
+        "(worker_id,ts,difficulty,is_block,block_hash,credited_sats,rate_used) "
+        "SELECT id,1701,2.0,0,lower(hex(zeroblob(32))),100,50.0 "
+        "FROM workers WHERE name='historical_worker';"
+        "INSERT INTO pps_credits "
+        "(worker_id,accrued_sats,paid_sats,last_updated) "
+        "SELECT id,200,40,1701 FROM workers "
+        "WHERE name='historical_worker';",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+
+    /* Reopening installs the new accounting protections. */
+    assert(store_open(&cfg, &s) == 0);
+
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM shares") == 2);
+    assert(scalar_i64(db,
+        "SELECT accrued_sats FROM pps_credits") == 200);
+    assert(scalar_i64(db,
+        "SELECT paid_sats FROM pps_credits") == 40);
+    /* The C writer now owns duplicate prevention and PPS accrual.
+     * The schema retains only the supporting hash index. */
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM sqlite_master "
+                         "WHERE type='trigger' AND name IN "
+                         "('shares_skip_duplicate','shares_pps_credit')") == 0);
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM sqlite_master "
+                         "WHERE type='index' AND name='shares_hash_idx'") == 1);
+    assert(scalar_i64(db,
+        "SELECT COUNT(*) FROM sqlite_master "
+        "WHERE type='index' AND name='shares_hash_idx'") == 1);
+    sqlite3_close(db);
+
+    const char *old_hash =
+        "00000000000000000000000000000000"
+        "00000000000000000000000000000000";
+    const char *new_hash =
+        "dddddddddddddddddddddddddddddddd"
+        "dddddddddddddddddddddddddddddddd";
+
+    assert(store_record_share_addr(
+        s, "historical_worker", "addr1",
+        1700000003000ULL, 2.0, 0,
+        old_hash, 100, 50.0) == 0);
+
+    assert(store_record_share_addr(
+        s, "historical_worker", "addr1",
+        1700000004000ULL, 1.0, 0,
+        new_hash, 50, 50.0) == 0);
+
+    assert(store_flush(s) == 0);
+
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    int64_t rows = scalar_i64(db,
+        "SELECT COUNT(*) FROM shares");
+    int64_t accrued = scalar_i64(db,
+        "SELECT accrued_sats FROM pps_credits");
+    int64_t paid = scalar_i64(db,
+        "SELECT paid_sats FROM pps_credits");
+
+    printf("MIGRATION TEST: shares=%lld accrued=%lld paid=%lld\n",
+           (long long)rows,
+           (long long)accrued,
+           (long long)paid);
+
+    assert(rows == 3);
+    assert(accrued == 250);
+    assert(paid == 40);
+    assert(scalar_i64(db,
+        "SELECT COUNT(*) FROM shares "
+        "WHERE block_hash=lower(hex(zeroblob(32)))") == 2);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_historical_duplicate_rows_survive_upgrade\n");
+}
+
+
+/* An injected PPS credit failure must roll back the share insert.
+ * After removing the fault, the same hash must be creditable. */
+static void test_failed_pps_credit_is_atomic(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+
+    assert(sqlite3_exec(db,
+        "CREATE TRIGGER force_pps_failure "
+        "BEFORE INSERT ON pps_credits "
+        "BEGIN "
+        "SELECT RAISE(ABORT, 'simulated PPS credit failure'); "
+        "END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+
+    const char *hash =
+        "cccccccccccccccccccccccccccccccc"
+        "cccccccccccccccccccccccccccccccc";
+
+    assert(store_record_share_addr(
+        s, "fault_worker", "addr1",
+        1700000000000ULL, 2.0, 0,
+        hash, 100, 50.0) == 0);
+
+    int flush_rc = store_flush(s);
+
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    int64_t rows = scalar_i64(db,
+        "SELECT COUNT(*) FROM shares");
+    int64_t accrued = scalar_i64(db,
+        "SELECT COALESCE(SUM(accrued_sats),0) "
+        "FROM pps_credits");
+
+    printf("FAULT TEST: shares=%lld accrued=%lld flush=%d\n",
+           (long long)rows, (long long)accrued, flush_rc);
+
+    assert(rows == 0);
+    assert(accrued == 0);
+    assert(flush_rc == -2);
+
+    assert(sqlite3_exec(db,
+        "DROP TRIGGER force_pps_failure;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+
+    /* Reopen to clear the permanent failure indicator. */
+    store_close(s);
+    s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* The failed first attempt must not permanently claim the hash. */
+    assert(store_record_share_addr(
+        s, "fault_worker", "addr1",
+        1700000001000ULL, 2.0, 0,
+        hash, 100, 50.0) == 0);
+
+    assert(store_flush(s) == 0);
+
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    rows = scalar_i64(db,
+        "SELECT COUNT(*) FROM shares");
+    accrued = scalar_i64(db,
+        "SELECT COALESCE(SUM(accrued_sats),0) "
+        "FROM pps_credits");
+
+    printf("RECOVERY TEST: shares=%lld accrued=%lld\n",
+           (long long)rows, (long long)accrued);
+
+    assert(rows == 1);
+    assert(accrued == 100);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_failed_pps_credit_is_atomic\n");
+}
+
+
+/* A later successful batch must not hide an earlier permanent loss.
+ * The loss indicator clears only when a new store instance opens. */
+static void test_permanent_loss_remains_visible(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "CREATE TRIGGER inject_credit_failure "
+        "BEFORE INSERT ON pps_credits "
+        "BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+
+    const char *failed_hash =
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const char *good_hash =
+        "ffffffffffffffffffffffffffffffff"
+        "ffffffffffffffffffffffffffffffff";
+
+    assert(store_record_share_addr(
+        s, "latch_worker", "addr1", 1700000000000ULL,
+        2.0, 0, failed_hash, 100, 50.0) == 0);
+
+    int first_flush = store_flush(s);
+    assert(first_flush == -2);
+
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM shares") == 0);
+    assert(sqlite3_exec(db,
+        "DROP TRIGGER inject_credit_failure;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+
+    /* A different, valid share can now commit successfully. */
+    assert(store_record_share_addr(
+        s, "latch_worker", "addr1", 1700000001000ULL,
+        1.0, 0, good_hash, 50, 50.0) == 0);
+
+    int later_flush = store_flush(s);
+
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    int64_t rows = scalar_i64(
+        db, "SELECT COUNT(*) FROM shares");
+    int64_t accrued = scalar_i64(
+        db, "SELECT COALESCE(SUM(accrued_sats),0) "
+            "FROM pps_credits");
+    sqlite3_close(db);
+
+    store_stats_t stats = {0};
+    store_get_stats(s, &stats);
+
+    printf("LATCH TEST: first=%d later=%d "
+           "shares=%lld accrued=%lld lost=%llu committed=%llu\n",
+           first_flush, later_flush,
+           (long long)rows, (long long)accrued,
+           (unsigned long long)stats.events_lost,
+           (unsigned long long)stats.shares_committed);
+
+    assert(later_flush == -2);
+    assert(rows == 1);
+    assert(accrued == 50);
+    assert(stats.events_lost == 1);
+    assert(stats.shares_committed == 1);
+
+    store_close(s);
+
+    /* A new process/store starts with a new error-reporting epoch. */
+    assert(store_open(&cfg, &s) == 0);
+    assert(store_flush(s) == 0);
+    store_close(s);
+
+    printf("  ok test_permanent_loss_remains_visible\n");
+}
+
+
+/* A temporary writer lock must not lose or double-credit accepted work. */
+static void test_transient_writer_lock_recovers_once(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    sqlite3 *blocker = NULL;
+    assert(sqlite3_open(path, &blocker) == SQLITE_OK);
+    assert(sqlite3_exec(blocker, "BEGIN IMMEDIATE",
+                        NULL, NULL, NULL) == SQLITE_OK);
+
+    assert(store_record_share_addr(
+        s, "retry_worker_a", "addr_a", 1700000000000ULL,
+        2.0, 0,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        100, 50.0) == 0);
+
+    assert(store_record_share_addr(
+        s, "retry_worker_b", "addr_b", 1700000001000ULL,
+        1.0, 0,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        50, 50.0) == 0);
+
+    /* Observe a failed BEGIN before releasing the external lock.
+     * Poll statistics instead of assuming a particular sleep duration. */
+    store_stats_t stats = {0};
+    int saw_busy = 0;
+    struct timespec pause = { .tv_sec = 0, .tv_nsec = 10000000L };
+
+    for (int i = 0; i < 2000; i++) {
+        store_get_stats(s, &stats);
+        if (stats.pg_errors > 0) {
+            saw_busy = 1;
+            break;
+        }
+        nanosleep(&pause, NULL);
+    }
+
+    /* Always release the lock before asserting, even on timeout. */
+    assert(sqlite3_exec(blocker, "COMMIT",
+                        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(blocker);
+
+    assert(saw_busy);
+    assert(store_flush(s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+
+    int64_t shares = scalar_i64(
+        db, "SELECT COUNT(*) FROM shares");
+    int64_t accrued = scalar_i64(
+        db, "SELECT COALESCE(SUM(accrued_sats),0) "
+            "FROM pps_credits");
+
+    sqlite3_close(db);
+
+    store_get_stats(s, &stats);
+
+    printf("TRANSIENT TEST: shares=%lld accrued=%lld "
+           "committed=%llu lost=%llu\n",
+           (long long)shares,
+           (long long)accrued,
+           (unsigned long long)stats.shares_committed,
+           (unsigned long long)stats.events_lost);
+
+    assert(shares == 2);
+    assert(accrued == 150);
+    assert(stats.shares_committed == 2);
+    assert(stats.events_lost == 0);
+
+    store_close(s);
+    printf("  ok test_transient_writer_lock_recovers_once\n");
+}
+
 int main(void) {
     log_init(2 /* WARN */);
     printf("running test_store...\n");
@@ -2078,7 +2544,17 @@ int main(void) {
     test_a_worker_with_no_address_is_left_out_of_the_split();
     test_the_window_now_matches_the_distributor();
     test_schema_sql_matches_store_schema();
+    int replay_ok = test_replayed_share_cannot_double_credit();
+    test_replay_after_store_restart();
+    test_historical_duplicate_rows_survive_upgrade();
+    test_failed_pps_credit_is_atomic();
+    test_permanent_loss_remains_visible();
+    test_transient_writer_lock_recovers_once();
     cleanup_dbs();
+    if (!replay_ok) {
+        fprintf(stderr, "REPRO FAIL: replay was not idempotent\n");
+        return 1;
+    }
     printf("all tests passed\n");
     return 0;
 }

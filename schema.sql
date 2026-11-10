@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS shares (
 );
 CREATE INDEX IF NOT EXISTS shares_ts_idx ON shares(ts);
 CREATE INDEX IF NOT EXISTS shares_worker_ts_idx ON shares(worker_id, ts);
+CREATE INDEX IF NOT EXISTS shares_hash_idx ON shares(block_hash);
 
 CREATE TABLE IF NOT EXISTS rejects (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,

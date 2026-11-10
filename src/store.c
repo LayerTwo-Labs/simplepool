@@ -412,7 +412,7 @@ typedef struct {
      * a retarget. See the migration note on blocks_found. */
     double   pplns_window_diff;
     uint8_t  block_status;      /* EV_BLOCK only: STORE_BLOCK_* */
-    int64_t  delta_sats;        /* EV_CREDIT only */
+    int64_t  delta_sats;        /* EV_SHARE or EV_CREDIT */
     double   rate_used;         /* EV_SHARE only: multiplicand for delta_sats */
     char     worker_name[WORKER_NAME_MAX];
     char     payout_address[ADDR_MAX];   /* EV_SHARE, EV_BLOCK, EV_CREDIT: may be empty */
@@ -500,6 +500,7 @@ struct store {
      * enqueue_seq taken at flush() entry. */
     uint64_t enqueue_seq;
     uint64_t committed_seq;
+    uint64_t first_failed_seq;
     pthread_cond_t cv_committed;
 };
 
@@ -584,7 +585,7 @@ static int64_t resolve_worker_id(store_t *s, const char *name,
     int rc = sqlite3_step(s->st_upsert_worker);
     if (rc == SQLITE_ROW) {
         id = sqlite3_column_int64(s->st_upsert_worker, 0);
-    } else if (!cached) {
+    } else {
         atomic_fetch_add(&s->pg_errors, 1);
         id = -1;
     }
@@ -595,13 +596,18 @@ static int64_t resolve_worker_id(store_t *s, const char *name,
 
 /* ---- writer thread ---------------------------------------------------- */
 
-static void process_event(store_t *s, const event_t *ev) {
+typedef struct {
+    uint64_t shares, rejects, blocks, credits;
+} batch_counts_t;
+
+static int process_event(store_t *s, const event_t *ev,
+                         batch_counts_t *counts) {
     if (ev->kind == EV_SHARE) {
         int64_t wid = resolve_worker_id(s, ev->worker_name,
                                         ev->payout_address, ev->ts_ms);
         if (wid < 0) {
             atomic_fetch_add(&s->pg_errors, 1);
-            return;
+            return -1;
         }
         sqlite3_reset(s->st_insert_share);
         sqlite3_clear_bindings(s->st_insert_share);
@@ -609,22 +615,53 @@ static void process_event(store_t *s, const event_t *ev) {
         sqlite3_bind_int64(s->st_insert_share, 2, (sqlite3_int64)(ev->ts_ms / 1000));
         sqlite3_bind_double(s->st_insert_share, 3, ev->difficulty);
         sqlite3_bind_int(s->st_insert_share, 4, ev->is_block);
-        if (ev->hash[0])
+        if (ev->hash[0]) {
             sqlite3_bind_text(s->st_insert_share, 5, ev->hash, -1, SQLITE_TRANSIENT);
-        else
+            sqlite3_bind_text(s->st_insert_share, 8, ev->hash, -1, SQLITE_TRANSIENT);
+        } else {
             sqlite3_bind_null(s->st_insert_share, 5);
+            sqlite3_bind_null(s->st_insert_share, 8);
+        }
         /* What this share was credited, at the rate in force when it was
          * accepted, and the rate itself. 0 in solo mode. Both come from the
          * same computation in the caller, so the pair is always internally
          * consistent — see the shares schema comment. */
         sqlite3_bind_int64 (s->st_insert_share, 6, ev->delta_sats);
         sqlite3_bind_double(s->st_insert_share, 7, ev->rate_used);
-        if (sqlite3_step(s->st_insert_share) != SQLITE_DONE) {
+        int share_rc = sqlite3_step(s->st_insert_share);
+        if (share_rc != SQLITE_DONE) {
+            LOG_WARN("store: st_insert_share failed: %s", sqlite3_errmsg(s->db));
             atomic_fetch_add(&s->pg_errors, 1);
-        } else {
-            atomic_fetch_add(&s->shares_committed, 1);
+            sqlite3_reset(s->st_insert_share);
+            return -1;
         }
+
+        int inserted = sqlite3_changes(s->db) > 0;
         sqlite3_reset(s->st_insert_share);
+
+        if (inserted) {
+            counts->shares++;
+
+            if (ev->delta_sats > 0) {
+                sqlite3_reset(s->st_upsert_credit);
+                sqlite3_clear_bindings(s->st_upsert_credit);
+                sqlite3_bind_int64(s->st_upsert_credit, 1, wid);
+                sqlite3_bind_int64(s->st_upsert_credit, 2, ev->delta_sats);
+                sqlite3_bind_int64(s->st_upsert_credit, 3,
+                                  (sqlite3_int64)(ev->ts_ms / 1000));
+
+                if (sqlite3_step(s->st_upsert_credit) != SQLITE_DONE) {
+                    LOG_WARN("store: PPS credit failed: %s",
+                             sqlite3_errmsg(s->db));
+                    atomic_fetch_add(&s->pg_errors, 1);
+                    sqlite3_reset(s->st_upsert_credit);
+                    return -1;
+                }
+
+                sqlite3_reset(s->st_upsert_credit);
+                counts->credits++;
+            }
+        }
     } else if (ev->kind == EV_REJECT) {
         sqlite3_reset(s->st_insert_reject);
         sqlite3_clear_bindings(s->st_insert_reject);
@@ -635,9 +672,12 @@ static void process_event(store_t *s, const event_t *ev) {
         sqlite3_bind_int64(s->st_insert_reject, 2, (sqlite3_int64)(ev->ts_ms / 1000));
         sqlite3_bind_text(s->st_insert_reject, 3, ev->reason, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(s->st_insert_reject) != SQLITE_DONE) {
+            LOG_WARN("store: st_insert_reject failed: %s", sqlite3_errmsg(s->db));
             atomic_fetch_add(&s->pg_errors, 1);
+            sqlite3_reset(s->st_insert_reject);
+            return -1;
         } else {
-            atomic_fetch_add(&s->rejects_committed, 1);
+            counts->rejects++;
         }
         sqlite3_reset(s->st_insert_reject);
     } else if (ev->kind == EV_BLOCK) {
@@ -677,14 +717,17 @@ static void process_event(store_t *s, const event_t *ev) {
             sqlite3_bind_null(s->st_insert_block, 9);
         sqlite3_bind_double(s->st_insert_block, 10, ev->pplns_window_diff);
         if (sqlite3_step(s->st_insert_block) != SQLITE_DONE) {
+            LOG_WARN("store: st_insert_block failed: %s", sqlite3_errmsg(s->db));
             atomic_fetch_add(&s->pg_errors, 1);
+            sqlite3_reset(s->st_insert_block);
+            return -1;
         } else if (sqlite3_changes(s->db) > 0 &&
                    ev->block_status != STORE_BLOCK_REJECTED) {
             /* Candidates submitblock refused are recorded but not counted:
              * the whole point of this column is that they are not blocks.
              * An OR IGNORE that changed nothing is a duplicate hash, which
              * is not a new block either. */
-            atomic_fetch_add(&s->blocks_committed, 1);
+            counts->blocks++;
         }
         sqlite3_reset(s->st_insert_block);
     } else if (ev->kind == EV_CREDIT) {
@@ -692,7 +735,7 @@ static void process_event(store_t *s, const event_t *ev) {
                                         ev->payout_address, ev->ts_ms);
         if (wid < 0) {
             atomic_fetch_add(&s->pg_errors, 1);
-            return;
+            return -1;
         }
         sqlite3_reset(s->st_upsert_credit);
         sqlite3_clear_bindings(s->st_upsert_credit);
@@ -700,12 +743,16 @@ static void process_event(store_t *s, const event_t *ev) {
         sqlite3_bind_int64(s->st_upsert_credit, 2, ev->delta_sats);
         sqlite3_bind_int64(s->st_upsert_credit, 3, (sqlite3_int64)(ev->ts_ms / 1000));
         if (sqlite3_step(s->st_upsert_credit) != SQLITE_DONE) {
+            LOG_WARN("store: st_upsert_credit failed: %s", sqlite3_errmsg(s->db));
             atomic_fetch_add(&s->pg_errors, 1);
+            sqlite3_reset(s->st_upsert_credit);
+            return -1;
         } else {
-            atomic_fetch_add(&s->credits_committed, 1);
+            counts->credits++;
         }
         sqlite3_reset(s->st_upsert_credit);
     }
+    return 0;
 }
 
 /* Attempts to land one batch. The events are already out of the ring, so a
@@ -737,20 +784,38 @@ static int commit_batch(store_t *s, event_t *batch, size_t take) {
             continue;
         }
 
-        for (size_t i = 0; i < take; ++i) process_event(s, &batch[i]);
+        batch_counts_t counts = {0};
+        int events_ok = 1;
+        for (size_t i = 0; i < take; ++i) {
+            if (process_event(s, &batch[i], &counts) != 0) {
+                events_ok = 0;
+                break;
+            }
+        }
+        if (!events_ok) {
+            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+            memset(s->cache, 0, sizeof(s->cache));
+            pthread_mutex_unlock(&s->txn_mu);
+            backoff_sleep(attempt);
+            continue;
+        }
 
         if (sqlite3_exec(s->db, "COMMIT", NULL, NULL, &err) == SQLITE_OK) {
             pthread_mutex_unlock(&s->txn_mu);
+            atomic_fetch_add(&s->shares_committed, counts.shares);
+            atomic_fetch_add(&s->rejects_committed, counts.rejects);
+            atomic_fetch_add(&s->blocks_committed, counts.blocks);
+            atomic_fetch_add(&s->credits_committed, counts.credits);
             atomic_fetch_add(&s->batches, 1);
             return 0;
         }
         LOG_WARN("store: COMMIT failed (attempt %d/%d): %s",
                  attempt, STORE_COMMIT_ATTEMPTS, err ? err : "?");
         sqlite3_free(err);
-        /* Nothing was durably written, so replaying the batch is safe. The
-         * per-event counters process_event() bumped are lost accuracy we
-         * accept: they describe attempts, the ledger describes reality. */
+        /* Roll back the failed transaction before retrying.
+         * Committed-event counters advance only after a successful COMMIT. */
         sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        memset(s->cache, 0, sizeof(s->cache));
         pthread_mutex_unlock(&s->txn_mu);
         atomic_fetch_add(&s->pg_errors, 1);
         backoff_sleep(attempt);
@@ -802,7 +867,8 @@ static void *writer_main(void *arg) {
         pthread_mutex_unlock(&s->mu);
 
         /* BEGIN/COMMIT outside the producer mutex */
-        if (commit_batch(s, batch, take) != 0) {
+        int batch_failed = commit_batch(s, batch, take) != 0;
+        if (batch_failed) {
             /* Out of retries. These events left the ring before the
              * transaction opened and cannot be put back, so say so plainly —
              * this is accepted work that will never be credited, not a
@@ -814,6 +880,8 @@ static void *writer_main(void *arg) {
         }
 
         pthread_mutex_lock(&s->mu);
+        if (batch_failed && s->first_failed_seq == 0)
+            s->first_failed_seq = seq_after;
         s->committed_seq = seq_after;
         pthread_cond_broadcast(&s->cv_committed);
         if (s->ring_count == 0) pthread_cond_broadcast(&s->cv_drained);
@@ -899,6 +967,29 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         }
     }
 
+
+    /* Accelerate durable hash deduplication in the C share writer. */
+    static const char *SHARE_ACCOUNTING_SQL =
+        "CREATE INDEX IF NOT EXISTS shares_hash_idx "
+        "ON shares(block_hash);";
+
+    err = NULL;
+    if (sqlite3_exec(s->db, SHARE_ACCOUNTING_SQL,
+                     NULL, NULL, &err) != SQLITE_OK) {
+        LOG_ERROR("store: share accounting setup failed: %s",
+                  err ? err : "?");
+        sqlite3_free(err);
+        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        sqlite3_close(s->db);
+        pthread_cond_destroy(&s->cv_committed);
+        pthread_cond_destroy(&s->cv_drained);
+        pthread_cond_destroy(&s->cv_not_empty);
+        pthread_mutex_destroy(&s->mu);
+        free(s->ring);
+        free(s);
+        return -3;
+    }
+
     /* Prepared statements. The workers upsert sets payout_address on first
      * INSERT only — once set, it is immutable for that worker name. */
     static const char *Q_UPSERT =
@@ -911,7 +1002,9 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
     static const char *Q_INS_SHARE =
         "INSERT INTO shares "
         "  (worker_id, ts, difficulty, is_block, block_hash, credited_sats, rate_used) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)";
+        "SELECT ?, ?, ?, ?, ?, ?, ? "
+        "WHERE NOT EXISTS "
+        "(SELECT 1 FROM shares WHERE block_hash = ?)";
     static const char *Q_INS_REJECT =
         "INSERT INTO rejects (worker_name, ts, reason) VALUES (?, ?, ?)";
     /* OR IGNORE so a re-found hash cannot fail the step. The dedupe guard
@@ -1991,7 +2084,11 @@ int store_flush(store_t *s) {
             return -1;
         }
     }
+    int failed = s->first_failed_seq != 0 &&
+                 s->first_failed_seq <= target;
     pthread_mutex_unlock(&s->mu);
+
+    if (failed) return -2;
 
     /* Avoid unused-warning suppression */
     (void)now_ms;
