@@ -1856,8 +1856,14 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         return emit_response(buf, len, id, NULL, err);
     }
 
+    /* Under cb_lock, and dropping the cached coinbase with it: on a second
+     * authorize the cache still holds the coinbase paying the previous
+     * address, and would be handed out again for the rest of this job. */
+    pthread_mutex_lock(&c->cb_lock);
     memcpy(c->payout_address, worker, addr_len);
     c->payout_address[addr_len] = '\0';
+    c->cb_for_job_id[0] = '\0';
+    pthread_mutex_unlock(&c->cb_lock);
 
     char    derr[128] = {0};
     if (s->cfg.username_is_thunder) {
