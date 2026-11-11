@@ -110,6 +110,10 @@ jobs:
   node-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['20', '24']
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -117,7 +121,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ matrix.node-version }}
 
       - name: Install dashboard dependencies
         working-directory: dashboard
