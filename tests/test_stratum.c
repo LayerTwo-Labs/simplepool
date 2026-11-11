@@ -3812,6 +3812,107 @@ static void test_stale_difficulty_shares_do_not_drive_vardiff(void) {
            fresh, stale);
 }
 
+/* A window restarted because it was mostly stale must start from zero.
+ *
+ * After a retarget, J1 still carries the old difficulty and J2 the new one.
+ * One window takes five fresh shares (J2) and six stale ones (J1): stale
+ * outnumbers fresh, so the window restarts. The next window then holds ONE
+ * fresh share in ~1.1 s against a 60 spm target -- inside the deadband, so
+ * no retarget. Had the restart kept the five fresh shares it should have
+ * thrown away, the window would read six shares in 1.1 s (~330 spm) and
+ * raise the difficulty on evidence from a window that no longer exists. */
+static void submit_nonce_job(stratum_server_t *s, stratum_conn_t *c,
+                             const char *job_id, const char *en2_hex,
+                             uint32_t nonce, char **out, size_t *olen) {
+    char msg[256];
+    snprintf(msg, sizeof msg,
+             "{\"id\":9,\"method\":\"mining.submit\","
+             "\"params\":[\"w\",\"%s\",\"%s\",\"60000000\",\"%08x\"]}",
+             job_id, en2_hex, nonce);
+    stratum_handle_message(s, c, msg, out, olen);
+}
+
+static void test_stale_restart_drops_the_window_shares(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-9,
+                          .vardiff_enabled = 1,
+                          .vardiff_target_spm = 60.0,
+                          .vardiff_min = 1e-12,
+                          .vardiff_max = 1e15,
+                          .vardiff_window_sec = 1,
+                          .vardiff_min_samples = 2,
+                          .vardiff_max_window_mult = 1,
+                          .vardiff_idle_step = 2.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    /* Phase 1: retarget 1e-9 -> 4e-9 on J1, as in vardiff_stale_case. */
+    uint32_t a[13], from = 1;
+    for (int i = 0; i < 13; ++i) {
+        if (mine_nonce(s, c, "J1", "deadbeefcafebabe", 1e-9, 3.9e-9, from, &a[i]) <= 0.0)
+            { CHECK(0); goto out; }
+        from = a[i] + 1;
+    }
+    char *out = NULL; size_t olen = 0;
+    for (int i = 0; i < 6; ++i) {
+        submit_nonce(s, c, "deadbeefcafebabe", a[i], &out, &olen);
+        free(out); out = NULL; olen = 0;
+    }
+    sleep_ms(1100);
+    submit_nonce(s, c, "deadbeefcafebabe", a[6], &out, &olen);
+    double d1 = set_diff_value(out);
+    free(out); out = NULL; olen = 0;
+    CHECK(d1 > 3.99e-9 && d1 < 4.01e-9);
+
+    /* J2 goes out at the new difficulty; J1 keeps the old one. */
+    stratum_server_set_job(s, make_test_job("J2", net), 0);
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+        "\"params\":[\"" TEST_ADDR "\",\"x\"]}", &out, &olen);
+    free(out); out = NULL; olen = 0;
+
+    uint32_t b[6]; from = 1;
+    for (int i = 0; i < 6; ++i) {
+        if (mine_nonce(s, c, "J2", "deadbeefcafebabe", 4.1e-9, 1.5e-8, from, &b[i]) <= 0.0)
+            { CHECK(0); goto out; }
+        from = b[i] + 1;
+    }
+
+    /* Window A: five fresh, six stale -> stale wins, the window restarts. */
+    for (int i = 0; i < 5; ++i) {
+        submit_nonce_job(s, c, "J2", "deadbeefcafebabe", b[i], &out, &olen);
+        CHECK(set_diff_value(out) < 0.0);
+        free(out); out = NULL; olen = 0;
+    }
+    for (int i = 7; i < 12; ++i) {
+        submit_nonce(s, c, "deadbeefcafebabe", a[i], &out, &olen);
+        free(out); out = NULL; olen = 0;
+    }
+    sleep_ms(1100);
+    submit_nonce(s, c, "deadbeefcafebabe", a[12], &out, &olen);   /* 6th stale: restart */
+    CHECK(set_diff_value(out) < 0.0);
+    free(out); out = NULL; olen = 0;
+
+    /* Window B: one fresh share. Nothing to retarget on. */
+    sleep_ms(1100);
+    submit_nonce_job(s, c, "J2", "deadbeefcafebabe", b[5], &out, &olen);
+    double d2 = set_diff_value(out);
+    free(out);
+    CHECK(d2 < 0.0);
+    printf("ok: a stale-majority restart drops the window's shares (next %g)\n", d2);
+out:
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 /* Opt-in fast first climb: 201 current-difficulty shares in 5+ s against a
  * 60 spm target is a rate ~39x over target. Off (the default), the 30 s window
  * has not elapsed and nothing moves. On, the window is acted on early and the
@@ -3890,6 +3991,7 @@ int main(void) {
     test_block_wins_over_low_difficulty();
     test_vardiff_tracks_miner_local_floor();
     test_stale_difficulty_shares_do_not_drive_vardiff();
+    test_stale_restart_drops_the_window_shares();
     test_vardiff_fast_first_climb_is_opt_in();
     test_vardiff_still_lowers_for_a_matched_miner();
     test_vardiff_clamped_to_network_diff();

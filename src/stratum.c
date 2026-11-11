@@ -1343,7 +1343,11 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
      * on clean data. A genuinely idle connection has no stale shares either,
      * does not match, and still takes its idle step. */
     if (c->vd_window_stale_diff_shares > c->vd_window_shares) {
+        /* All of it, the fresh count too: kept, those shares would be read
+         * against the new start time and min_achieved below, and a single
+         * share in the next window could then trip the floor rule. */
         c->vd_window_start_ms = now;
+        c->vd_window_shares = 0;
         c->vd_window_stale_diff_shares = 0;
         c->vd_window_min_achieved = HUGE_VAL;
         c->vd_window_max_assigned = 0.0;
