@@ -164,14 +164,17 @@ const HAS_PROC = fs.existsSync('/proc/self/exe');
 
 test('the version comes from the running process, not the file that replaced it',
      { skip: HAS_PROC ? false : 'requires /proc' }, async () => {
-    /* `sleep --version` prints "sleep (GNU coreutils) 9.x" — a real binary
-     * that stays alive and reports a parseable version, which a shell script
-     * cannot do (its /proc/<pid>/exe would resolve to the shell). */
+    /* A copy of the node running this test: a real binary that stays alive and
+     * reports a parseable version ("v24.14.0"), which a shell script cannot do
+     * (its /proc/<pid>/exe would resolve to the shell). Not /bin/sleep: from
+     * Ubuntu 26.04 that is uutils' multi-call binary, which picks the utility
+     * from argv[0] — copied to "daemon" (or run as /proc/<pid>/exe) it is no
+     * utility at all and exits at once, leaving no process to find. */
     const dir = tmpdir('replaced');
     const bin = path.join(dir, 'daemon');
-    fs.copyFileSync('/bin/sleep', bin);
+    fs.copyFileSync(process.execPath, bin);
 
-    const child = spawn(bin, ['300'], { stdio: 'ignore' });
+    const child = spawn(bin, ['-e', 'setInterval(() => {}, 1e6)'], { stdio: 'ignore' });
     try {
         for (let i = 0; i < 50 && !fs.existsSync(`/proc/${child.pid}/exe`); i++) {
             await sleep(20);
@@ -190,7 +193,7 @@ test('the version comes from the running process, not the file that replaced it'
         assert.equal(c.running.version_source, 'process');
         /* The point of the whole exercise: what is running, not what is
          * staged to run. */
-        assert.match(c.running.version, /^sleep /);
+        assert.equal(c.running.version, process.version);
         assert.equal(c.running.build_commit, null);
         /* And the pending build is reported alongside rather than instead. */
         assert.equal(c.on_disk.version, 'daemon 99.9.9');
