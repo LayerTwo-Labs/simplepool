@@ -53,7 +53,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # release.sh runs `git archive HEAD` and records the commit, so it
           # needs real history rather than a detached blob.
@@ -106,7 +106,7 @@ jobs:
           cat "$root/RELEASE"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: simplepool-${{ matrix.arch }}
           path: dist/*
@@ -122,10 +122,10 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: staging
           pattern: simplepool-*

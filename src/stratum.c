@@ -2843,6 +2843,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
                              "stale or unknown job");
         }
+        c->rg_verdict = RG_V_JOB;   /* judged like any other stale job id */
         cJSON *err = make_error(21, "stale or unknown job");
         return emit_response(buf, len, id, NULL, err);
     }
@@ -3941,6 +3942,48 @@ bind_failed:
     return -1;
 }
 
+/* Notify one connection of the current job as part of a broadcast, within
+ * the broadcast's shared *deadline. Rendering the notify (each connection's
+ * own coinbase) is CPU work, not waiting on a miner, so the time it takes
+ * moves the deadline back: otherwise a broadcast to many miners would spend
+ * its budget rendering, and the ones reached last would get only a single
+ * non-blocking attempt however healthy they were. A failed write drops the
+ * connection (see below). */
+static void bcast_one(stratum_server_t *s, stratum_conn_t *c, int clean_jobs,
+                      uint64_t *deadline) {
+    char *out = NULL; size_t olen = 0;
+    uint64_t t0 = mono_ms();
+    /* A listener with clean_jobs=never never gets the flag, tip change
+     * or not; see stratum_listener_t.never_clean_jobs. */
+    send_current_notify(s, c, &out, &olen,
+                        (clean_jobs && !c->pol_never_clean_jobs) ? 1 : 0);
+    *deadline += mono_ms() - t0;
+    if (!out) return;
+    int wrc;
+    int lrc = bcast_lock_write(c, *deadline);
+    if (lrc == 0) {
+        wrc = write_all(c->fd, out, olen, *deadline);
+        pthread_mutex_unlock(&c->write_lock);
+    } else {
+        wrc = -1;               /* stuck in its own reply: socket full */
+        errno = lrc;
+    }
+    if (wrc < 0) {
+        /* Out of budget or errored, possibly mid-line. We cannot
+         * close() the fd here — the connection thread owns it — but
+         * shutdown() is safe from another thread and wakes that
+         * thread's recv() so it runs the normal teardown, which waits
+         * for our reference to go first. */
+        LOG_WARN("stratum: dropping fd=%d worker='%s' — notify write "
+                 "failed within the %d ms broadcast budget (%s)",
+                 c->fd,
+                 c->worker_name[0] ? c->worker_name : "(unauthorized)",
+                 s->cfg.bcast_send_budget_ms, strerror(errno));
+        shutdown(c->fd, SHUT_RDWR);
+    }
+    free(out);
+}
+
 void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
                             int clean_jobs) {
     if (!s || !new_job) return;
@@ -3984,9 +4027,17 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
     for (stratum_conn_t *c = s->conns_head; c; c = c->next) ++cap_snap;
     stratum_conn_t **snap = cap_snap ? malloc(cap_snap * sizeof(*snap)) : NULL;
     if (cap_snap && !snap) {
-        pthread_mutex_unlock(&s->conns_lock);
+        /* Still broadcast: a job nobody hears about is a pool that stops
+         * earning. Write under conns_lock, the pre-snapshot way -- accept and
+         * teardown wait out this one broadcast, which is the lesser cost. */
         LOG_ERROR("stratum: out of memory snapshotting %zu connections — "
-                  "job not broadcast", cap_snap);
+                  "broadcasting under conns_lock", cap_snap);
+        uint64_t deadline = mono_ms() + (uint64_t)s->cfg.bcast_send_budget_ms;
+        for (stratum_conn_t *c = s->conns_head; c; c = c->next) {
+            if (!c->subscribed || c->fd < 0 || !c->authorized) continue;
+            bcast_one(s, c, clean_jobs, &deadline);
+        }
+        pthread_mutex_unlock(&s->conns_lock);
         return;
     }
     for (stratum_conn_t *c = s->conns_head; c; c = c->next) {
@@ -3996,40 +4047,9 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
     }
     pthread_mutex_unlock(&s->conns_lock);
 
-    const uint64_t deadline = mono_ms() + (uint64_t)s->cfg.bcast_send_budget_ms;
-    for (size_t i = 0; i < n_snap; ++i) {
-        stratum_conn_t *c = snap[i];
-        char *out = NULL; size_t olen = 0;
-        /* A listener with clean_jobs=never never gets the flag, tip change
-         * or not; see stratum_listener_t.never_clean_jobs. */
-        send_current_notify(s, c, &out, &olen,
-                            (clean_jobs && !c->pol_never_clean_jobs) ? 1 : 0);
-        if (out) {
-            int wrc;
-            int lrc = bcast_lock_write(c, deadline);
-            if (lrc == 0) {
-                wrc = write_all(c->fd, out, olen, deadline);
-                pthread_mutex_unlock(&c->write_lock);
-            } else {
-                wrc = -1;               /* stuck in its own reply: socket full */
-                errno = lrc;
-            }
-            if (wrc < 0) {
-                /* Out of budget or errored, possibly mid-line. We cannot
-                 * close() the fd here — the connection thread owns it — but
-                 * shutdown() is safe from another thread and wakes that
-                 * thread's recv() so it runs the normal teardown, which waits
-                 * for our reference to go first. */
-                LOG_WARN("stratum: dropping fd=%d worker='%s' — notify write "
-                         "failed within the %d ms broadcast budget (%s)",
-                         c->fd,
-                         c->worker_name[0] ? c->worker_name : "(unauthorized)",
-                         s->cfg.bcast_send_budget_ms, strerror(errno));
-                shutdown(c->fd, SHUT_RDWR);
-            }
-            free(out);
-        }
-    }
+    uint64_t deadline = mono_ms() + (uint64_t)s->cfg.bcast_send_budget_ms;
+    for (size_t i = 0; i < n_snap; ++i)
+        bcast_one(s, snap[i], clean_jobs, &deadline);
 
     pthread_mutex_lock(&s->conns_lock);
     for (size_t i = 0; i < n_snap; ++i) snap[i]->bcast_refs--;

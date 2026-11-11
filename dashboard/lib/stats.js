@@ -216,6 +216,11 @@ export function leaderboardByAddress(handle, windowSec = 86400, limit = 50) {
 
     // Aggregate recent shares by worker before joining payout addresses.
     // The timestamp index avoids scanning unrelated historical shares.
+    // INDEXED BY is a requirement, not a hint: without shares_ts_idx the
+    // query fails ("no such index") rather than falling back to a scan. The
+    // pool creates it at startup (src/store.c) and schema.sql has it; left to
+    // itself, SQLite picks shares_worker_ts_idx, a full scan that grows with
+    // history.
     // Workers without an address retain their name as the grouping key.
     const rows = d.prepare(`
         WITH worker_totals AS (
@@ -249,7 +254,7 @@ export function leaderboardByAddress(handle, windowSec = 86400, limit = 50) {
         const labels = (r.worker_names || '').split(',').map(n => {
             const dot = n.indexOf('.');
             return dot >= 0 ? n.slice(dot + 1) : '';
-        }).filter(Boolean);
+        }).filter(Boolean).sort();   // GROUP_CONCAT order is unspecified
         return {
             address: r.addr,
             rigs: r.rigs,
