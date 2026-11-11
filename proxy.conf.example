@@ -4,6 +4,10 @@ listen_port = 3334
 # Maximum concurrent stratum connections, across every listener. A connection
 # past this is closed immediately at accept. Each one costs a thread and an fd.
 max_conns = 500
+# Most connections one IP may hold at once; past it a connection is closed at
+# accept. Without it one host can take every max_conns slot. A farm behind one
+# NAT address needs it above its rig count. Default 0 = no limit.
+# max_conns_per_ip = 0
 # listen() backlog for every stratum listener: completed handshakes the kernel
 # holds until the pool accepts them. Default 1024 (when unset or 0). A full
 # queue drops connections silently -- watch TcpExt:ListenOverflows. The kernel
@@ -198,7 +202,9 @@ auth_fail_lockout_sec = 60
 # not the same risk:
 #
 #   idle_timeout_sec            a socket that has not authorized. It has told
-#                               us nothing and costs an fd for nothing.
+#                               us nothing and costs an fd for nothing. Its
+#                               budget runs from connect: bytes alone (blank
+#                               lines) do not extend it.
 #   idle_timeout_authorized_sec a miner that HAS authorized. Having nothing to
 #                               say is its normal resting state — the pool
 #                               asks it nothing between shares — so a small

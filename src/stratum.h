@@ -205,6 +205,9 @@ typedef struct {
     char   bind_addr[64];
     int    bind_port;
     int    max_conns;            /* default 500 */
+    /* Most connections one IP may hold at once; <= 0 = no limit. Without it
+     * one host can take every slot. */
+    int    max_conns_per_ip;
     /* listen() backlog: how many completed handshakes the kernel may hold
      * before accept() takes them. <= 0 uses STRATUM_DEFAULT_BACKLOG.
      *

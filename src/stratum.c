@@ -627,6 +627,7 @@ struct stratum_conn {
      * The conn thread checks this against cfg.idle_timeout_sec after each
      * SO_RCVTIMEO wake-up so silent connections are reaped. */
     uint64_t last_activity_ms;
+    uint64_t connected_ms;         /* mono_ms() at accept */
 
     /* Consecutive lines this connection sent that were not a request we
      * could act on. Reset by any line we could. A single one is noise to
@@ -3442,6 +3443,15 @@ int stratum_socket_setup_for_test(int fd, int idle_timeout_sec) {
     return conn_socket_setup(fd, idle_timeout_sec);
 }
 
+static int conns_from_ip(stratum_server_t *s, const char *ip) {
+    int n = 0;
+    pthread_mutex_lock(&s->conns_lock);
+    for (stratum_conn_t *c = s->conns_head; c; c = c->next)
+        if (strcmp(c->peer_ip, ip) == 0) n++;
+    pthread_mutex_unlock(&s->conns_lock);
+    return n;
+}
+
 static void conn_register(stratum_server_t *s, stratum_conn_t *c) {
     pthread_mutex_lock(&s->conns_lock);
     c->next = s->conns_head;
@@ -3590,6 +3600,7 @@ static void *conn_thread(void *arg) {
     /* Seed activity tracking at connect time — a client that never sends
      * a single byte is still governed by the idle budget. */
     c->last_activity_ms = mono_ms();
+    c->connected_ms = c->last_activity_ms;
 
     while (!atomic_load(&s->stop)) {
         ssize_t n = recv(c->fd, buf + blen, sizeof(buf) - 1 - blen, 0);
@@ -3613,6 +3624,20 @@ static void *conn_thread(void *arg) {
             break;  /* real socket error */
         }
         if (n == 0) break;  /* peer closed */
+        /* Until it authorizes, a connection's budget runs from connect, and
+         * is checked here as well as on the SO_RCVTIMEO wake: a peer sending
+         * a blank line more often than that wake would otherwise never be
+         * checked at all, and could hold a slot for ever without a valid
+         * username. */
+        if (!c->authorized) {
+            int budget_sec = conn_idle_budget_sec(s, c);
+            if (budget_sec > 0 &&
+                mono_ms() - c->connected_ms > (uint64_t)budget_sec * 1000u) {
+                LOG_INFO("stratum: not authorized after %ds — closing fd=%d",
+                         budget_sec, c->fd);
+                goto done;
+            }
+        }
         c->last_activity_ms = mono_ms();
         blen += (size_t)n;
         buf[blen] = '\0';
@@ -3704,6 +3729,13 @@ static void *listener_thread(void *arg) {
             continue;
         }
         if (atomic_load(&s->conn_count) >= s->cfg.max_conns) {
+            close(fd);
+            continue;
+        }
+        char ip[INET6_ADDRSTRLEN];
+        peer_ip_from_sockaddr(&cli, ip, sizeof ip);
+        if (s->cfg.max_conns_per_ip > 0 && ip[0] &&
+            conns_from_ip(s, ip) >= s->cfg.max_conns_per_ip) {
             close(fd);
             continue;
         }

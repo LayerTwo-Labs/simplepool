@@ -7,6 +7,7 @@
 #include "../src/cjson/cJSON.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3267,6 +3268,113 @@ static void test_ipv4_default_still_refuses_ipv6(void) {
 }
 
 
+/* ---- connection limits -------------------------------------------------- */
+
+static stratum_server_t *start_limited(int *port, int per_ip, int idle_sec) {
+    for (int p = *port; p < *port + 20; p++) {
+        stratum_cfg_t cfg = { .bind_port = p, .max_conns = 8,
+                              .max_conns_per_ip = per_ip,
+                              .idle_timeout_sec = idle_sec,
+                              .initial_diff = 1.0, .vardiff_enabled = 0 };
+        snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+        stratum_server_t *s = NULL;
+        if (stratum_server_start(&cfg, &s) != 0) continue;
+        *port = p;
+        return s;
+    }
+    return NULL;
+}
+
+/* Has the server closed fd? Reads without blocking: 0 = still open. */
+static int peer_closed(int fd) {
+    char b[512];
+    for (;;) {
+        ssize_t n = recv(fd, b, sizeof b, MSG_DONTWAIT);
+        if (n > 0) continue;
+        if (n == 0) return 1;
+        return errno != EAGAIN && errno != EWOULDBLOCK;
+    }
+}
+
+/* One host may not hold more than max_conns_per_ip; the next is closed at
+ * accept, and the ones already held are untouched. */
+static void test_max_conns_per_ip(void) {
+    int port = 39424;
+    stratum_server_t *s = start_limited(&port, 2, 0);
+    CHECK(s != NULL);
+    if (!s) return;
+    int a = dial(AF_INET, port);
+    int b = dial(AF_INET, port);
+    sleep_ms(150);
+    int c = dial(AF_INET, port);
+    CHECK(a >= 0 && b >= 0 && c >= 0);
+    sleep_ms(300);
+    CHECK(c >= 0 && peer_closed(c));
+    CHECK(a >= 0 && !peer_closed(a));
+    CHECK(b >= 0 && !peer_closed(b));
+    if (a >= 0) close(a);
+    if (b >= 0) close(b);
+    if (c >= 0) close(c);
+    sleep_ms(150);
+    stratum_server_free(s);
+    printf("ok: max_conns_per_ip closes one host's extra connection\n");
+}
+
+/* Sends a blank line every 200 ms for up to `ms`; returns 1 once the server
+ * has closed the connection. */
+static int closed_while_chatting(int fd, int ms) {
+    for (int t = 0; t < ms; t += 200) {
+        if (peer_closed(fd)) return 1;
+        if (send(fd, "\n", 1, 0) < 0) return 1;
+        sleep_ms(200);
+    }
+    return peer_closed(fd);
+}
+
+/* A connection that never authorizes gets idle_timeout_sec from connect, not
+ * from its last byte: blank lines alone, sent faster than the receive
+ * timeout wakes, used to hold a slot for ever. */
+static void test_unauthorized_deadline_runs_from_connect(void) {
+    int port = 39454;
+    stratum_server_t *s = start_limited(&port, 0, 1);
+    CHECK(s != NULL);
+    if (!s) return;
+    int fd = dial(AF_INET, port);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        CHECK(closed_while_chatting(fd, 3000));
+        close(fd);
+    }
+    sleep_ms(150);
+    stratum_server_free(s);
+    printf("ok: an unauthorized connection is closed however chatty it is\n");
+}
+
+/* ...while an authorized miner keeping its TCP warm with blank lines is not
+ * touched: its budget is idle_timeout_authorized_sec, from its last byte. */
+static void test_authorized_keepalive_is_not_reaped(void) {
+    int port = 39484;
+    stratum_server_t *s = start_limited(&port, 0, 1);
+    CHECK(s != NULL);
+    if (!s) return;
+    uint8_t net[32]; memset(net, 0xff, sizeof net);
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    int fd = dial(AF_INET, port);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        const char *hello =
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n"
+            "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" TEST_ADDR "\",\"x\"]}\n";
+        CHECK(send(fd, hello, strlen(hello), 0) == (ssize_t)strlen(hello));
+        CHECK(!closed_while_chatting(fd, 2500));
+        close(fd);
+    }
+    sleep_ms(150);
+    stratum_server_free(s);
+    printf("ok: an authorized connection's keepalives keep it open\n");
+}
+
+
 /* ---- miner-requested difficulty ---------------------------------------- */
 
 static stratum_server_t *dr_server(obs_t *obs, double max_suggested) {
@@ -5034,6 +5142,9 @@ int main(void) {
     test_dual_stack_accepts_ipv6();
     test_dual_stack_still_accepts_ipv4();
     test_ipv4_default_still_refuses_ipv6();
+    test_max_conns_per_ip();
+    test_unauthorized_deadline_runs_from_connect();
+    test_authorized_keepalive_is_not_reaped();
     test_authorize_failures_close_the_connection();
     test_authorize_lockout_is_per_address();
     test_authorize_budget_zero_disables();
