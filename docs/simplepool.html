@@ -2572,6 +2572,7 @@ simplepool --help | -h</code></pre>
         <tr><td><code>vardiff_min_samples</code></td><td><code>20</code></td><td>0 = previous behaviour</td><td>Shares a window must hold before its rate is trusted; below it the window is extended.</td></tr>
         <tr><td><code>vardiff_max_window_mult</code></td><td><code>8</code></td><td>≤0 → 8</td><td>How far a window may be extended waiting for samples.</td></tr>
         <tr><td><code>vardiff_idle_step</code></td><td><code>2</code></td><td>≤1 → 2</td><td>Max step for an under-sampled window (a full one may move 4×).</td></tr>
+        <tr><td><code>vardiff_fast_climb</code></td><td><code>0</code></td><td>1 = on</td><td>Opt-in. A window with ≥200 current-difficulty shares and a rate over 2× target retargets up after 5 s by the measured ratio (cap 1024×) instead of 4× per window. Has no effect when <code>vardiff_min_samples</code> is above 200.</td></tr>
         <tr><td><code>max_suggested_diff</code></td><td><code>5e7</code></td><td>≤0 <strong>disables</strong> requests</td><td>Ceiling on a miner-requested floor (<code>d=</code> or <code>mining.suggest_difficulty</code>). Size it against <code>idle_timeout_authorized_sec</code>: at 50M a 25 TH/s rig expects one share per ~8600 s.</td></tr>
       </tbody>
     </table>

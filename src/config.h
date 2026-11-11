@@ -94,6 +94,16 @@ typedef struct {
      * too low". */
     double vardiff_idle_step;        /* default 2.0 */
 
+    /* Opt-in fast first climb, default 0 (off). A connection far below its
+     * hashrate (a new rig at vardiff_min, a rental at its port floor) submits
+     * hundreds of shares a window, and the 4x-per-window step takes minutes to
+     * reach the right difficulty. When on, a window holding at least 200
+     * current-difficulty shares (rate known to ~7%) whose rate is over twice
+     * the target is acted on after 5 s rather than a full window, and steps UP
+     * by the measured ratio, capped at 1024x, instead of 4x. Downward moves
+     * and every other window are unchanged. */
+    int    vardiff_fast_climb;       /* default 0 */
+
     /* Idle-connection reaper. A connection that hasn't sent any bytes in
      * idle_timeout_sec is closed. Guards against half-open TCPs from
      * crashed miners and clients that connect but never authenticate.

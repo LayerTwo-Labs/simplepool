@@ -67,6 +67,14 @@ vardiff_max_window_mult = 8
 # windows cut its difficulty 16x.
 vardiff_idle_step = 2
 
+# Opt-in fast first climb (default 0 = off). A connection far below its
+# hashrate submits hundreds of shares a window and the 4x-per-window step can
+# take minutes to arrive. With 1, a window holding at least 200 shares at the
+# current difficulty and a rate over twice the target is acted on after 5
+# seconds and steps UP by the measured ratio (cap 1024x) instead of 4x.
+# Downward moves are unchanged.
+vardiff_fast_climb = 0
+
 # Extra stratum ports, each with its own difficulty policy. Repeatable —
 # unlike every other key here, a second `listener` line adds a port rather
 # than replacing the first. listen_port above is always served too, on the

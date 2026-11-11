@@ -301,6 +301,8 @@ typedef struct {
     int    vardiff_min_samples;
     int    vardiff_max_window_mult;
     double vardiff_idle_step;
+    /* See config.h: opt-in fast first climb. 0 = off. */
+    int    vardiff_fast_climb;
 
     /* Drop a connection whose recv() has been silent for this long. Guards
      * against half-open TCPs from crashed miners and misconfigured clients
@@ -481,6 +483,8 @@ int         stratum_conn_subscribed_for_test(const stratum_conn_t *c);
  * -- which makes it pass or fail on timing rather than on behaviour. Call
  * this after the setup work and before the submits that matter. */
 void        stratum_conn_rearm_vardiff_for_test(stratum_conn_t *c);
+/* Set the connection's difficulty without a retarget or notification. */
+void        stratum_conn_force_difficulty_for_test(stratum_conn_t *c, double diff);
 
 /* Put a test connection on the server's broadcast list with a real fd (one
  * end of a socketpair), so a test can read exactly what

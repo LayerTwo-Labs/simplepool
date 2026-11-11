@@ -95,6 +95,29 @@ refused until a new job comes. On a network whose target is easier than the shar
 (e.g. regtest) every share is a block, so the oldest hash is always dropped
 and the ring behaves as before.
 
+### Vardiff: opt-in fast first climb
+
+New `vardiff_fast_climb` (default `0`, off). A connection far below its
+hashrate submits hundreds of shares a window, and the 4x-per-window step can
+take minutes to reach the right difficulty. With `vardiff_fast_climb = 1`, a
+window holding at least 200 shares at the current difficulty whose rate is over
+twice the target retargets up after 5 s by the measured ratio (capped at
+1024x). Downward moves and all other windows are unchanged. It needs
+`vardiff_min_samples` at 200 or below; above that it never fires.
+
+### Vardiff no longer chases shares mined at an earlier difficulty
+
+A retarget sends `mining.set_difficulty` without re-notifying, so a miner keeps
+returning shares for jobs issued at the previous difficulty. Those shares were
+counted as evidence about the new difficulty: after a downward step they read
+as a rate spike, pushed difficulty straight back up, and the next window then
+read low and stepped down again. Only shares credited at the difficulty now in
+force are counted toward the rate. A window made mostly of earlier-difficulty
+shares is treated as draining rather than idle: it restarts instead of taking
+the idle step down. A client that keeps returning shares for older jobs can
+hold vardiff still for up to the job retention time (300 s) after a change; it
+cannot stay stuck beyond that, since those jobs expire. Nothing to configure.
+
 ### Jobs built from an unchanged template are now distinct work
 
 The pool re-issues a job every 30 s even when the template has not moved, and
