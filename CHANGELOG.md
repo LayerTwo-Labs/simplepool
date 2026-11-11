@@ -8,6 +8,45 @@ Anything that changes what a miner is paid, or what an operator has to tell
 their miners, is called out explicitly — those are the changes that cost
 somebody money if they go unread.
 
+## 0.5.1 — `simplepoolctl upgrade` installs what it says it installed
+
+Installer-only release; the pool, dashboard and payout code are the same as
+0.5.0.
+
+### Operators: check what you are actually running
+
+`simplepoolctl upgrade <tag>` on a source install whose tree is not a git
+checkout (for example one unpacked from a tarball or zip) rebuilt the code
+already on disk and then reported `built from source (<tag>)`. Nothing was
+upgraded. Check with:
+
+    /home/simplepool/build/simplepool --version
+
+If that does not say the version you upgraded to, the scripts on the box are
+the old ones and cannot fix themselves. Install the release over the tree
+instead, after backing up the database; `proxy.conf` and `shares.db` are kept:
+
+    sudo sqlite3 /home/simplepool/data/shares.db ".backup /root/shares-pre-0.5.1.db"
+    sudo bash /home/simplepool/scripts/install.sh --non-interactive --yes --from-release v0.5.1
+
+That also records the box as a release install, so later upgrades fetch
+releases. Coming from 0.4.x or earlier, the first start builds an index on
+`shares(block_hash)` before accepting miners (see 0.5.0).
+
+### Fixed
+
+- The installer refuses a requested branch or tag on a tree without `.git`,
+  and says how to install the release instead, rather than rebuilding the old
+  code. A plain re-run with no `--branch` still builds the tree as it is.
+- `simplepoolctl upgrade <tag>` on a git checkout no longer fails: a tag has no
+  `origin/<tag>` to reset to, so tags are now checked out detached. An unknown
+  name stops the install instead of half-running it.
+- The install summary prints the version and commit the built binary reports,
+  not the branch name that was asked for.
+- `simplepoolctl upgrade` stops on a non-git source tree before running the
+  installer, stops when the installer fails, and checks after the build that
+  the binary reports the requested release version.
+
 ## 0.5.0 — a share is paid once, and one miner can no longer hold up the pool
 
 The headline is accounting: a share is now credited exactly once, in memory

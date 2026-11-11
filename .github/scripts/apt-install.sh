@@ -40,8 +40,42 @@ apt_install() {
     sudo -E apt-get install -y --no-install-recommends "${APT_OPTS[@]}" "$@"
 }
 
+# On 2026-11-11 plain-HTTP Ubuntu mirrors stopped answering from GitHub's
+# runners: the Azure mirror and archive.ubuntu.com over http:// both took 20s
+# per .deb to be `Ign`'d, so 26 packages ran far past the step's limit, while
+# HTTPS hosts (packages.microsoft.com) answered at once. Probe the mirror the
+# runner uses first, and if it does not answer, move every Ubuntu mirror to
+# HTTPS before apt touches the network.
+bounded_install() { sudo -E timeout "$1" apt-get install -y --no-install-recommends "${APT_OPTS[@]}" "${@:2}"; }
+
+# The lists on disk are keyed by the mirror+file URI, not by the host serving
+# it, so rewriting the mirror list needs no index refresh: only where the .debs
+# come from changes.
+use_https_mirrors() {
+    local f=/etc/apt/apt-mirrors.txt
+    [ -f "$f" ] || { echo "==> no $f; leaving apt sources alone"; return 0; }
+    echo "==> mirror list was:"; sed 's/^/    /' "$f"
+    printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://security.ubuntu.com/ubuntu/\tpriority:2\n' \
+        | sudo tee "$f" >/dev/null
+    echo "==> mirror list now:"; sed 's/^/    /' "$f"
+}
+
+mirror_answers() {
+    local f=/etc/apt/apt-mirrors.txt url codename
+    [ -f "$f" ] || return 0
+    url="$(awk 'NR==1{print $1}' "$f")"; url="${url%/}"
+    codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+    [ -n "$url" ] && [ -n "$codename" ] || return 0
+    curl -fsS -m 10 -o /dev/null "$url/dists/$codename/Release"
+}
+
+if ! mirror_answers; then
+    echo "::warning::the runner's Ubuntu mirror did not answer in 10s; switching to HTTPS mirrors."
+    use_https_mirrors
+fi
+
 echo "==> installing without an index refresh: $*"
-if apt_install "$@"; then
+if bounded_install 240 "$@"; then
     exit 0
 fi
 

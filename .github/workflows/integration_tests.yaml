@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install dependencies
-        timeout-minutes: 5
+        timeout-minutes: 10
         # No `apt-get update` — see .github/scripts/apt-install.sh for why.
         run: >
           .github/scripts/apt-install.sh
@@ -164,7 +164,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install dependencies
-        timeout-minutes: 5
+        timeout-minutes: 10
         # Every one of these is already on the GitHub runner image; the call
         # is kept so the job states its own dependencies rather than relying
         # on the image silently continuing to carry them.

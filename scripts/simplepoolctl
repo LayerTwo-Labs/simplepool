@@ -384,10 +384,27 @@ cmd_upgrade() {
             return 0
         fi
         echo "${BOLD}==> upgrading ${RELEASE_TAG:-unknown} -> $tag${OFF}"
-        bash "$installer" --non-interactive --yes --from-release "$tag"
+        bash "$installer" --non-interactive --yes --from-release "$tag" \
+            || die "the installer failed — nothing was upgraded past the step it names above"
+        target="$tag"
     else
-        echo "${BOLD}==> rebuilding from ${BRANCH:-main}${OFF}"
-        bash "$installer" --non-interactive --yes --from-source ${target:+--branch "$target"}
+        # A tree with no .git has nothing to fetch, so a source rebuild would
+        # just rebuild the code already here and look like it worked.
+        [[ -d "$ROOT/.git" ]] || die "$ROOT is not a git checkout, so there is nothing to upgrade it from.
+    To install a published release over it (proxy.conf and the database are kept):
+        sudo bash $installer --non-interactive --yes --from-release ${target:-<tag>}"
+        echo "${BOLD}==> rebuilding from ${target:-${BRANCH:-main}}${OFF}"
+        bash "$installer" --non-interactive --yes --from-source ${target:+--branch "$target"} \
+            || die "the installer failed — nothing was upgraded past the step it names above"
+    fi
+
+    # Trust the binary, not the request. For a release tag the version it
+    # reports must match; a branch has no version to check against.
+    local got
+    got="$("$BIN" --version 2>/dev/null | head -1)"
+    say "now running: ${got:-unknown}"
+    if [[ "$target" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$got" != "simplepool ${target#v}" ]]; then
+        die "asked for $target but $BIN reports '${got:-nothing}' — the upgrade did not take"
     fi
 }
 
