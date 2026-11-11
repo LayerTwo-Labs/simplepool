@@ -26,7 +26,7 @@ jobs:
     if: github.repository_owner == 'LayerTwo-Labs'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install dependencies
         timeout-minutes: 5
@@ -80,7 +80,7 @@ jobs:
 
       - name: Upload logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: e2e-logs-${{ github.run_id }}
           path: |
@@ -116,10 +116,10 @@ jobs:
         node-version: ['20', '24']
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node-version }}
 
@@ -161,7 +161,7 @@ jobs:
     if: github.repository_owner == 'LayerTwo-Labs'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install dependencies
         timeout-minutes: 5
@@ -187,7 +187,7 @@ jobs:
 
       - name: Upload logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: payout-logs-${{ github.run_id }}
           path: |
