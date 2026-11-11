@@ -40,8 +40,33 @@ apt_install() {
     sudo -E apt-get install -y --no-install-recommends "${APT_OPTS[@]}" "$@"
 }
 
+# Bounded the same way as the refresh below. On 2026-11-11 the Azure mirror
+# stopped answering for the amd64v3 packages Ubuntu 26.04 runners pull: each
+# .deb took ~40s to be `Ign`'d, so 26 packages ran far past the job's 5-minute
+# limit and the step was killed before any fallback could run.
+bounded_install() { sudo -E timeout "$1" apt-get install -y --no-install-recommends "${APT_OPTS[@]}" "${@:2}"; }
+
+# Point apt at the Ubuntu archive instead of the runner's mirror list. The
+# lists on disk are keyed by the mirror+file URI, not by the host serving it,
+# so this needs no index refresh: only where the .debs come from changes.
+use_ubuntu_archive() {
+    local f=/etc/apt/apt-mirrors.txt
+    [ -f "$f" ] || return 0
+    echo "==> mirror list was:"; sed 's/^/    /' "$f"
+    printf 'http://archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://security.ubuntu.com/ubuntu/\tpriority:2\n' \
+        | sudo tee "$f" >/dev/null
+    echo "==> mirror list now:"; sed 's/^/    /' "$f"
+}
+
 echo "==> installing without an index refresh: $*"
-if apt_install "$@"; then
+if bounded_install 120 "$@"; then
+    exit 0
+fi
+
+echo "::warning::apt-get install did not finish from the runner's mirror;" \
+     "retrying from archive.ubuntu.com."
+use_ubuntu_archive
+if bounded_install 150 "$@"; then
     exit 0
 fi
 

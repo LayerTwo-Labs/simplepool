@@ -60,7 +60,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install build dependencies
-        timeout-minutes: 5
+        timeout-minutes: 10
         # No `apt-get update` — see .github/scripts/apt-install.sh for why.
         run: >
           .github/scripts/apt-install.sh
