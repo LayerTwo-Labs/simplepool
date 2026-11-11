@@ -78,6 +78,17 @@ vardiff_idle_step = 2
 #   initial_diff   starting difficulty, if it should differ from min_diff
 #   max_diff       vardiff ceiling for this port
 #   label          shown in the log and on the dashboard; [A-Za-z0-9_-]
+#   clean_jobs     tip (default) | never. `never` sends every broadcast on
+#                  this port with clean_jobs=false, even on a new block. For
+#                  hashrate-marketplace proxies that flush their whole fleet
+#                  on clean_jobs=true and report the flushed shares as
+#                  rejects on their own meter. The cost: miners here keep
+#                  hashing the previous block's job a little longer. Those
+#                  shares are still accepted (retired jobs stay solvable),
+#                  but a share that meets the network target on the old tip
+#                  is a block on the old parent and will be stale. Use it
+#                  only where the clean flag does more harm. The first
+#                  notify after authorize still carries clean_jobs=true.
 #
 # Why a second port at all: one difficulty cannot serve both a home ASIC and
 # rented hashrate. Rented hashrate does not arrive as many small miners — a

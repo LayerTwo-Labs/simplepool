@@ -168,6 +168,23 @@ typedef struct {
     /* Free-form, for logs and for the dashboard to tell miners which port to
      * point which machine at. Empty for the default listener. */
     char   label[32];
+    /* Set by `listener = port=3335 clean_jobs=never`. Default 0 (= `tip`):
+     * the clean_jobs flag goes out on every tip change, the correct stratum
+     * answer, since work on the old tip can only produce a stale block.
+     *
+     * Some hashrate-marketplace proxies flush their whole fleet's in-flight
+     * work on clean_jobs=true and report the flushed shares as rejects on
+     * their own meter; enough of those and they stop routing hashrate here.
+     * With the flag off on that port, miners keep hashing the previous job a
+     * little longer. Those shares are still accepted -- retired jobs stay
+     * solvable in the recent-jobs ring -- but a share that meets the network
+     * target on a retired tip is a block on the old parent and will be stale.
+     *
+     * Only the broadcast on a new job honours this. The notify sent right
+     * after authorize keeps clean_jobs=true: a fresh connection has no work
+     * to flush. Copied to the connection at accept like every other policy
+     * field, so a reload never moves a live connection. */
+    int    never_clean_jobs;
 } stratum_listener_t;
 
 /* Default listen() backlog. A marketplace order arrives as one burst of

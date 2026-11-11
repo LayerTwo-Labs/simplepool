@@ -450,6 +450,10 @@ struct stratum_conn {
     /* This connection's coinbase byte ceiling, from its listener; 0 means the
      * server-wide one. See stratum_listener_t.max_coinbase_bytes. */
     int    pol_max_coinbase_bytes;
+    /* 1 when this connection's listener says clean_jobs=never: broadcasts
+     * go out with clean_jobs=false even on a tip change. See
+     * stratum_listener_t.never_clean_jobs. */
+    int    pol_never_clean_jobs;
     /* Difficulty policy inherited from the listener this connection was
      * accepted on, resolved once at accept time so nothing downstream has to
      * know which port it came in on. Seeded from the server-wide defaults,
@@ -2928,6 +2932,7 @@ static void conn_apply_listener(stratum_conn_t *c,
     c->pol_min_diff = pol->min_diff;   /* 0 unless the port promised one */
     c->pol_max_coinbase_bytes = pol->max_coinbase_bytes;  /* 0 = server-wide */
     c->pol_port = pol->port;
+    c->pol_never_clean_jobs = pol->never_clean_jobs;
     snprintf(c->pol_label, sizeof c->pol_label, "%s", pol->label);
     /* Before authorize the connection has no assigned difficulty yet, so
      * seeding it here keeps a subscribe-only conn reporting its port's value
@@ -3645,7 +3650,10 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
     for (size_t i = 0; i < n_snap; ++i) {
         stratum_conn_t *c = snap[i];
         char *out = NULL; size_t olen = 0;
-        send_current_notify(s, c, &out, &olen, clean_jobs ? 1 : 0);
+        /* A listener with clean_jobs=never never gets the flag, tip change
+         * or not; see stratum_listener_t.never_clean_jobs. */
+        send_current_notify(s, c, &out, &olen,
+                            (clean_jobs && !c->pol_never_clean_jobs) ? 1 : 0);
         if (out) {
             int wrc;
             int lrc = bcast_lock_write(c, deadline);
