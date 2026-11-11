@@ -296,12 +296,16 @@ would be effort spent to reach the same answer more slowly.
     step 12, so only shares that are credited (or are blocks) are
     recorded. A hash is kept until its job can no longer be named (not
     current, not in the recent ring). If the ring is full of hashes
-    that still cover solvable jobs, the share is refused with
-    `duplicate check full, share not credited` rather than forgetting
-    one, and a `duplicate check full` warning is logged once per 10 s
-    per connection. That happens above the rate the ring covers, or
-    when no new job has arrived for a long time (the old jobs then
-    never expire). A share that meets the network target is still
+    that still cover solvable jobs, a connection holding a quarter
+    of the ring or more has the share refused with
+    `duplicate check full, share not credited` rather than a live
+    hash forgotten for it, and a `duplicate check full` warning is
+    logged once per 10 s per connection; the refused share still
+    counts toward its vardiff, so it climbs out. Every other
+    connection is still credited, the oldest hash being forgotten for
+    it as before this change. That happens above the rate the ring
+    covers, or when no new job has arrived for a long time (the old
+    jobs then never expire). A share that meets the network target is still
     submitted as a block and recorded, dropping the oldest hash if
     it must; where every share is a block (regtest), that is always.
     Capacity: ~790 shares/s = 262144 hashes / ~330 s. The hashrate
@@ -309,8 +313,9 @@ would be effort spent to reach the same answer more slowly.
     (`initial_diff`, or `vardiff_min` with vardiff on) × 2^32 — only
     ~3.4 TH/s at difficulty 1 — so set those well above any single
     miner the pool expects (logged at startup; a warning below
-    1 PH/s). Refusing when full is deliberate: a bounded memory must
-    either forget live keys (paying a share twice) or refuse.
+    1 PH/s). A bounded memory must either forget live keys (risking
+    a share paid twice) or refuse; it refuses the connection filling
+    it, never the rest of the pool.
 11. Log a `[SUBMIT CHECK]` line with `sent_hash`, `worker_target`,
     `network_target`, and version fields (this is what appears in
     `logs/simplepool.log`).

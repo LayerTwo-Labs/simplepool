@@ -3574,6 +3574,48 @@ static void test_dedupe_full_still_submits_block(void) {
     printf("ok: a full dedupe ring still submits a block\n");
 }
 
+/* A full ring refuses only the connection filling it. A fills the whole ring
+ * with live keys (well past DD_OWNER_QUOTA); B, a different miner holding
+ * none, must still be credited -- refusing B too would let one flooding
+ * connection stop the whole pool being paid. A's next share stays refused. */
+static void test_dedupe_full_refuses_only_the_filler(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                          .initial_diff = 1e-12,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};                       /* never a block */
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    stratum_conn_t *a = dd_ready_conn(s);
+    stratum_conn_t *b = dd_ready_conn(s);
+
+    for (uint32_t n = 1; n <= (uint32_t)SHARE_DEDUPE_RING; ++n)
+        dd_submit(s, a, "J1", n);
+    CHECK(obs.shares == SHARE_DEDUPE_RING);
+
+    int before = obs.shares;
+    CHECK(dd_submit(s, a, "J1", SHARE_DEDUPE_RING + 1) == 0);
+    CHECK(obs.shares == before);                 /* A: over quota, refused */
+    CHECK(strstr(obs.last_reason, "duplicate check full") != NULL);
+    for (uint32_t n = 1; n <= 100; ++n)
+        dd_submit(s, b, "J1", n);
+    CHECK(obs.shares == before + 100);           /* B: every one credited */
+    CHECK(dd_submit(s, b, "J1", 50) == 0);
+    CHECK(obs.shares == before + 100);           /* and still deduplicated */
+    CHECK(dd_submit(s, a, "J1", SHARE_DEDUPE_RING + 2) == 0);
+    CHECK(obs.shares == before + 100);           /* A: still refused */
+
+    /* Freeing a connection whose keys outlive it, then the server, must
+     * neither leak nor double-free the owner (run under make asan). */
+    stratum_conn_free_for_test(a);
+    stratum_conn_free_for_test(b);
+    stratum_server_free(s);
+    printf("ok: a full dedupe ring refuses only the connection filling it\n");
+}
+
 /* A share that fails its share target must not take a dedupe slot: only
  * work that is credited (or is a block) is recorded. Otherwise shares with no
  * work behind them fill the ring with keys of the current job, and every
@@ -4022,6 +4064,7 @@ int main(void) {
     test_share_dedupe_index_tracks_the_ring();
     test_dedupe_holds_keys_while_job_is_solvable();
     test_dedupe_full_still_submits_block();
+    test_dedupe_full_refuses_only_the_filler();
     test_dedupe_ignores_low_difficulty_shares();
     test_dedupe_refuses_share_whose_job_left_meanwhile();
     test_set_job_retires_before_release();

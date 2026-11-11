@@ -372,6 +372,10 @@ struct stratum_server {
     } auth_fail[AUTH_FAIL_SLOTS];
 
     pthread_mutex_t share_dedupe_lock;
+    /* Which connection recorded each key (NULL: a test hook). Lets a full
+     * ring refuse only the connection that is filling it -- see
+     * DD_OWNER_QUOTA. Same slots as share_dedupe_ring. */
+    struct dd_owner *share_dedupe_owner[SHARE_DEDUPE_RING];
     /* Two structures over one set of keys. The ring is what bounds memory and
      * decides which hash is forgotten next (the oldest, FIFO, and only once
      * its job can no longer be named -- see share_dedupe_key_check_and_add).
@@ -404,8 +408,26 @@ struct stratum_server {
     struct stratum_conn *conns_head;
 };
 
+/* A connection's share of the server-wide dedupe ring: how many of the keys
+ * in it this connection recorded. Lives apart from stratum_conn because the
+ * keys outlive the connection; freed when both the connection is gone and
+ * its last key has left the ring. All fields under share_dedupe_lock. */
+/* While the ring is full, a connection holding this many of its keys has its
+ * ordinary shares refused ("duplicate check full") instead of having a live
+ * key forgotten for it. A quarter of the ring is ~200 credited shares/s from
+ * one connection sustained over a key's whole life -- far past anything a
+ * connection at a sane difficulty sends, and reachable only by one that is
+ * flooding the pool with low-difficulty work. */
+#define DD_OWNER_QUOTA (SHARE_DEDUPE_RING / 4)
+
+struct dd_owner {
+    uint32_t live;        /* keys of this connection still in the ring */
+    int      conn_gone;   /* the connection has been freed */
+};
+
 struct stratum_conn {
     stratum_server_t *server;
+    struct dd_owner  *dd_owner;   /* NULL if it could not be allocated */
     int fd;                  /* -1 in tests */
     uint8_t  extranonce1[STRATUM_EXTRANONCE1_SIZE];
     double   difficulty;
@@ -2099,8 +2121,10 @@ enum {
  *
  * A key may be forgotten only once its job can no longer be named: until
  * then the same share can be sent again and would be credited again. So on
- * a full ring the oldest key is dropped only if its job is gone; otherwise
- * the new share is refused (DD_FULL) rather than opening that hole. `force`
+ * a full ring the oldest key is dropped if its job is gone, or if the
+ * submitting connection holds fewer than DD_OWNER_QUOTA keys; otherwise the
+ * new share is refused (DD_FULL) -- only that connection's, so one
+ * connection filling the ring cannot stop everyone else being credited. `force`
  * (a share that meets the network target) drops the oldest key regardless,
  * so a block is never refused and is itself always recorded. (Where the
  * network target is easier than the share target, as on regtest, every
@@ -2112,8 +2136,16 @@ enum {
  * ring has been full (nothing is forgotten before that, and the count never
  * goes down). job_seq 0 marks a key with no job (test hooks): always
  * forgettable, never DD_GONE. */
+/* Drop one key's claim on its owner. share_dedupe_lock held. */
+static void dd_owner_put(struct dd_owner *o) {
+    if (!o) return;
+    if (o->live > 0) o->live--;
+    if (o->live == 0 && o->conn_gone) free(o);
+}
+
 static int share_dedupe_key_check_and_add(stratum_server_t *s, uint64_t h,
-                                          uint64_t job_seq, int force) {
+                                          uint64_t job_seq, int force,
+                                          struct dd_owner *owner) {
     if (h == 0) h = 1;   /* 0 is the index's empty marker */
     int rc = DD_NEW;
     pthread_mutex_lock(&s->share_dedupe_lock);
@@ -2124,10 +2156,22 @@ static int share_dedupe_key_check_and_add(stratum_server_t *s, uint64_t h,
         uint64_t head_job = s->share_dedupe_job[head];
         if (!force && job_seq != 0 && !job_seq_live(s, job_seq)) {
             rc = DD_GONE;
-        } else if (force || head_job == 0 || !job_seq_live(s, head_job)) {
+        } else if (force || head_job == 0 || !job_seq_live(s, head_job) ||
+                   !owner || owner->live < DD_OWNER_QUOTA) {
+            /* A live head is forgotten only for a connection holding less
+             * than its quota: refusing everyone would let one connection
+             * that fills the ring stop the whole pool being credited. The
+             * cost is that this one key's share could be credited again if
+             * it came back while its job lives -- the pre-retention
+             * behaviour, now confined to a ring some connection is
+             * overfilling. Same-connection resubmits are still caught by
+             * the connection's own ring, and a different connection cannot
+             * produce the same hash without the same extranonce1. */
             dd_index_remove(s, s->share_dedupe_ring[head]);
+            dd_owner_put(s->share_dedupe_owner[head]);
+            s->share_dedupe_owner[head] = NULL;
         } else {
-            rc = DD_FULL;
+            rc = DD_FULL;   /* this connection holds >= its quota: refuse it */
         }
     } else {
         s->share_dedupe_count++;
@@ -2135,6 +2179,8 @@ static int share_dedupe_key_check_and_add(stratum_server_t *s, uint64_t h,
     if (rc == DD_NEW) {
         s->share_dedupe_ring[s->share_dedupe_head] = h;
         s->share_dedupe_job[s->share_dedupe_head] = job_seq;
+        s->share_dedupe_owner[s->share_dedupe_head] = owner;
+        if (owner) owner->live++;
         s->share_dedupe_head = (s->share_dedupe_head + 1) % SHARE_DEDUPE_RING;
         dd_index_insert(s, h);
     }
@@ -2151,9 +2197,10 @@ static int share_dedupe_key_check_and_add(stratum_server_t *s, uint64_t h,
  * id. Two identical hashes represent one solution and must be paid once. */
 static int share_dedupe_check_and_add(stratum_server_t *s,
                                       const uint8_t hash_be[32],
-                                      const stratum_job_t *job, int is_block) {
+                                      const stratum_job_t *job, int is_block,
+                                      struct dd_owner *owner) {
     return share_dedupe_key_check_and_add(s, fnv1a_bytes(hash_be, 32),
-                                          job->seq, is_block);
+                                          job->seq, is_block, owner);
 }
 
 void stratum_server_set_test_hook_for_test(stratum_server_t *s,
@@ -2164,7 +2211,7 @@ void stratum_server_set_test_hook_for_test(stratum_server_t *s,
 }
 
 int stratum_share_dedupe_key_for_test(stratum_server_t *s, uint64_t key) {
-    return share_dedupe_key_check_and_add(s, key, 0, 0);
+    return share_dedupe_key_check_and_add(s, key, 0, 0, NULL);
 }
 
 size_t stratum_share_dedupe_live_for_test(stratum_server_t *s,
@@ -2220,6 +2267,29 @@ static char *assemble_block_hex(const stratum_job_t *j,
     bytes_to_hex(block, len, out);
     free(block);
     return out;
+}
+
+/* Count one share that met its target toward the vardiff window, and track
+ * the difficulty it actually achieved. Reading the hash as a target gives
+ * exactly that: how much harder than difficulty 1 this solution was. The
+ * running minimum is what exposes a miner filtering at a local floor above
+ * its assigned difficulty. */
+static void vardiff_count_share(stratum_server_t *s, stratum_conn_t *c,
+                                const uint8_t hash_be[32],
+                                double assigned_diff,
+                                char **buf, size_t *len) {
+    c->vd_window_shares++;
+    double achieved = target_to_diff(hash_be);
+    if (achieved < c->vd_window_min_achieved) {
+        c->vd_window_min_achieved = achieved;
+    }
+    /* assigned_diff, not c->difficulty: this share was mined against the
+     * difficulty ITS job went out under, which a retarget earlier in this
+     * window may already have moved on from. */
+    if (assigned_diff > c->vd_window_max_assigned) {
+        c->vd_window_max_assigned = assigned_diff;
+    }
+    vardiff_maybe_retarget(s, c, now_ms(), buf, len);
 }
 
 /* The body of mining.submit, with `job` guaranteed live for the duration.
@@ -2465,10 +2535,15 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         s->test_hook = NULL;                 /* one-shot */
         hook(s->test_hook_arg, STRATUM_TEST_HOOK_PRE_DEDUPE);
     }
-    int dd = share_dedupe_check_and_add(s, hash_be, job, is_block);
+    int dd = share_dedupe_check_and_add(s, hash_be, job, is_block,
+                                        c->dd_owner);
     if (dd == DD_FULL) {
         free(cb);
         dedupe_full_refused(s, c, mono_ms());
+        /* Not credited, but it is real work at this difficulty: count it, so
+         * vardiff climbs the connection out of the rate that filled the ring
+         * instead of leaving it refused at the bottom. */
+        vardiff_count_share(s, c, hash_be, assigned_diff, buf, len);
         cJSON *err = make_error(20, "duplicate check full, share not credited");
         return emit_response(buf, len, id, NULL, err);
     }
@@ -2544,18 +2619,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * gives exactly that: how much harder than difficulty 1 this solution
      * was. The running minimum is what exposes a miner filtering at a local
      * floor above its assigned difficulty. */
-    c->vd_window_shares++;
-    double achieved = target_to_diff(hash_be);
-    if (achieved < c->vd_window_min_achieved) {
-        c->vd_window_min_achieved = achieved;
-    }
-    /* assigned_diff, not c->difficulty: this share was mined against the
-     * difficulty ITS job went out under, which a retarget earlier in this
-     * window may already have moved on from. */
-    if (assigned_diff > c->vd_window_max_assigned) {
-        c->vd_window_max_assigned = assigned_diff;
-    }
-    vardiff_maybe_retarget(s, c, now_ms(), buf, len);
+    vardiff_count_share(s, c, hash_be, assigned_diff, buf, len);
     /* What this block's coinbase actually paid, and what it forfeited.
      *
      * Recomputed rather than remembered: the split is deterministic from the
@@ -2868,6 +2932,7 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     stratum_conn_t *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->server = s;
+    c->dd_owner = calloc(1, sizeof(*c->dd_owner));   /* NULL: no quota, as before */
     c->fd = -1;
     c->pol_initial_diff = s ? s->cfg.initial_diff : 1.0;
     c->pol_vardiff_min  = s ? s->cfg.vardiff_min  : 1.0;
@@ -2896,6 +2961,18 @@ void stratum_conn_free_for_test(stratum_conn_t *c) {
     if (c->server && c->ddfull_refused > 0) {   /* the same, for dedupe-full */
         c->ddfull_reported_ms = 0;
         dedupe_full_report(c->server, c, mono_ms());
+    }
+    if (c->dd_owner) {
+        /* Its keys stay in the ring after it; the last one out frees this. */
+        if (c->server) {
+            pthread_mutex_lock(&c->server->share_dedupe_lock);
+            c->dd_owner->conn_gone = 1;
+            if (c->dd_owner->live == 0) free(c->dd_owner);
+            pthread_mutex_unlock(&c->server->share_dedupe_lock);
+        } else {
+            free(c->dd_owner);
+        }
+        c->dd_owner = NULL;
     }
     conn_clear_coinbase(c);
     pthread_mutex_destroy(&c->write_lock);
@@ -3325,7 +3402,7 @@ static void *listener_thread(void *arg) {
 #define SHARE_DEDUPE_KEY_LIFE_S (RECENT_JOB_TTL_MS / 1000 + 30)
 
 /* Say at startup how fast the share-dedupe ring can be filled. A full ring
- * refuses ordinary shares, and real shares at the lowest difficulty any
+ * refuses ordinary shares from the connection filling it (DD_OWNER_QUOTA), and real shares at the lowest difficulty any
  * connection can start at are the cheapest way to fill it, so the hashrate
  * that does it is the number an operator has to compare with their miners. */
 static void log_dedupe_capacity(const stratum_cfg_t *cfg) {
@@ -3348,8 +3425,9 @@ static void log_dedupe_capacity(const stratum_cfg_t *cfg) {
     if (hps < 1e15) {
         LOG_WARN("stratum: duplicate check holds %u shares (~%.0f shares/s); "
                  "%.1f %s/s at the lowest difficulty a connection can have "
-                 "(%g) fills it, and then shares are refused as \"duplicate "
-                 "check full\". Raise vardiff_min / initial_diff",
+                 "(%g) fills it; a connection holding a quarter of it then has "
+                 "its shares refused as \"duplicate check full\" until "
+                 "vardiff climbs it. Raise vardiff_min / initial_diff",
                  (unsigned)SHARE_DEDUPE_RING, rate, v, unit[u], floor);
     } else {
         LOG_INFO("stratum: duplicate check holds %u shares (~%.0f shares/s); "
@@ -3577,6 +3655,12 @@ void stratum_server_free(stratum_server_t *s) {
     pthread_mutex_destroy(&s->recent_lock);
     pthread_mutex_destroy(&s->conns_lock);
     pthread_mutex_destroy(&s->auth_fail_lock);
+    /* Owners whose connection is already gone are freed with their last
+     * key; one whose connection is still around is that connection's. */
+    for (size_t i = 0; i < SHARE_DEDUPE_RING; ++i) {
+        struct dd_owner *o = s->share_dedupe_owner[i];
+        if (o && --o->live == 0 && o->conn_gone) free(o);
+    }
     pthread_mutex_destroy(&s->share_dedupe_lock);
     free(s);
 }
