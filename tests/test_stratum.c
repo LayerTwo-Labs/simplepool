@@ -45,6 +45,8 @@ typedef struct {
     int   found_calls;
     int   last_accepted;
     char  last_submit_error[128];
+    int64_t last_reward;
+    int64_t last_fee;
     /* pplns-coinbase payout queue: the deltas the last found block staged. */
     int     frac_calls;
     size_t  frac_n;
@@ -96,9 +98,10 @@ static void on_block_found(void *ctx, const char *w, const char *addr,
                            int64_t reward, int64_t fee,
                            int accepted, const char *submit_error) {
     (void)w; (void)addr; (void)ts; (void)height; (void)hash;
-    (void)reward; (void)fee;
     obs_t *o = ctx;
     o->found_calls++;
+    o->last_reward = reward;
+    o->last_fee = fee;
     o->last_accepted = accepted;
     snprintf(o->last_submit_error, sizeof(o->last_submit_error), "%s",
              submit_error ? submit_error : "");
@@ -2202,6 +2205,64 @@ static void test_accepted_candidate_reports_accepted(void) {
     CHECK(obs.found_calls == 1);
     CHECK(obs.last_accepted == 1);
     CHECK(obs.last_submit_error[0] == '\0');
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* A server-provided coinbase (CUSF enforcer), as test_coinbase.c uses: a
+ * BIP301 commitment, a 50 BTC reward output, and the witness commitment. */
+#define ENF_COINBASE_HEX \
+    "02000000" "0001" "01" \
+    "0000000000000000000000000000000000000000000000000000000000000000" \
+    "ffffffff" "04" "0300350c" "ffffffff" "03" \
+    "0000000000000000" "06" "6a04deadbeef" \
+    "00f2052a01000000" "16" "0014" "1111111111111111111111111111111111111111" \
+    "0000000000000000" "26" "6a24aa21a9ed" \
+    "2222222222222222222222222222222222222222222222222222222222222222" \
+    "0120" "0000000000000000000000000000000000000000000000000000000000000000" \
+    "00000000"
+
+/* What blocks_found says a block paid comes from the coinbase that was mined,
+ * not the template's value. A template that ships its coinbase may state no
+ * fee at all (value 0), and the row then had no reward and no fee. */
+static void test_found_block_reward_comes_from_the_coinbase(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e12, .fee_bps = 200,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block,
+                           .on_block_found = on_block_found };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    snprintf(cfg.operator_address, sizeof(cfg.operator_address), "%s", TEST_ADDR2);
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    uint8_t prev[32] = {0};
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, stratum_job_new("J1", 0x20000000, prev,
+                                              /*value_sats*/ 0, NULL,
+                                              STRATUM_EXTRANONCE1_SIZE,
+                                              STRATUM_EXTRANONCE2_SIZE,
+                                              NULL, 0, 0x1d00ffffu, 0x60000000u,
+                                              net, 800000, NULL, 0,
+                                              ENF_COINBASE_HEX, 1), 1);
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"deadbeefcafebabe\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(obs.found_calls == 1);
+    CHECK(obs.last_fee == 100000000LL);       /* 2% of the 50 BTC output */
+    CHECK(obs.last_reward == 4900000000LL);
     free(out);
     stratum_conn_free_for_test(c);
     stratum_server_free(s);
@@ -5006,6 +5067,7 @@ int main(void) {
     test_dedupe_full_report_interval_and_flush();
     test_rejected_candidate_is_not_a_block();
     test_accepted_candidate_reports_accepted();
+    test_found_block_reward_comes_from_the_coinbase();
     test_job_survives_retirement_while_held();
     test_held_job_is_freed_on_release();
     test_gated_pps_refuses_authorize_and_submits();

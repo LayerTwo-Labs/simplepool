@@ -3030,12 +3030,22 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         }
     }
     if (is_block && s->cfg.on_block_found) {
+        /* What the reward output pays before the split. On a server-provided
+         * coinbase that is the transaction's one spendable output, the value
+         * the builder split; job->value_sats is the template's sum of every
+         * output, and 0 when the template states no fee. */
+        int64_t value_sats = job->value_sats;
+        if (job->coinbasetxn_hex) {
+            int64_t from_tx = 0;
+            if (coinbase_template_reward(job->coinbasetxn_hex, &from_tx) == 0)
+                value_sats = from_tx;
+        }
         int64_t fee_sats = 0;
         if (s->cfg.fee_bps > 0 && s->cfg.operator_address[0]) {
-            fee_sats = (job->value_sats * (int64_t)s->cfg.fee_bps) / 10000;
+            fee_sats = (value_sats * (int64_t)s->cfg.fee_bps) / 10000;
             if (fee_sats < COINBASE_DUST_SATS) fee_sats = 0; /* the coinbase dust rule */
         }
-        int64_t reward_sats = job->value_sats - fee_sats;
+        int64_t reward_sats = value_sats - fee_sats;
         s->cfg.on_block_found(s->cfg.ctx, c->worker_name,
                               c->payout_address, ts_now, job->height,
                               block_hash_hex, reward_sats, fee_sats,
