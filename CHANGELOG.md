@@ -56,6 +56,45 @@ parent and will be stale. Use it only on a port where the clean flag does more
 harm. The first notify after authorize keeps `clean_jobs=true`. Any value other
 than `tip` or `never` is a startup error.
 
+### A share can no longer be credited twice after the duplicate ring turns over
+
+The server-wide duplicate check forgot its oldest hash whenever a new one
+arrived, whatever its age. Jobs stay solvable for up to 5 minutes, so on a pool
+taking more than about 55 shares/s a share's hash could leave the ring while
+its job could still be named, and the same share sent again was credited
+again. A hash is now forgotten only once its job can no longer be named, and
+only shares that met their share target (or the network target) are recorded.
+When every hash in the ring still covers a solvable job, a connection holding a
+quarter of the ring or more has its new share refused with `duplicate check
+full, share not credited` (still counted toward its vardiff, so it climbs out);
+every other connection is still credited, the oldest hash being forgotten for
+it as before. One connection filling the ring therefore cannot stop the rest
+of the pool being paid. A share that meets the network target is always
+submitted as a block and recorded. The ring
+now holds 262144 hashes (12 MB, up from 640 KB), enough for about 790 shares/s
+sustained pool-wide at the default 30 s job cadence; with no new job, a stall
+fills it after 262144 shares (about 44 min at 100 shares/s).
+
+**Capacity, and why it refuses.** The ring holds 262144 hashes for up to
+~330 s each, so it covers about 790 shares/s. The hashrate that fills it is
+790 × the lowest difficulty a connection can have (`initial_diff`, or
+`vardiff_min` with vardiff on) × 2^32: at difficulty 1, the default, that is
+only ~3.4 TH/s of real work, e.g. from connections reopened before vardiff
+raises them. Set `vardiff_min` / `initial_diff` so this is well above any
+single miner the pool expects; the pool logs the figure at startup and warns
+below 1 PH/s. A bounded memory must either forget keys of live jobs
+(and risk paying a share twice) or refuse when full; this refuses the
+connection that is filling it and no one else.
+
+**Operators: watch the log for `duplicate check full`.** It is reported once
+per 10 s per connection, with the count refused, and means the pool is taking
+shares faster than the ring covers. It also appears if no new job arrives for
+a long time (template source down): the current and recent jobs then never
+expire, so once the ring has filled, the connections holding most of it are
+refused until a new job comes. On a network whose target is easier than the share target
+(e.g. regtest) every share is a block, so the oldest hash is always dropped
+and the ring behaves as before.
+
 ### Jobs built from an unchanged template are now distinct work
 
 The pool re-issues a job every 30 s even when the template has not moved, and
