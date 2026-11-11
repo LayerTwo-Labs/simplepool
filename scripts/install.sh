@@ -152,6 +152,10 @@ SVC_USER=""
 REPO_SLUG="LayerTwo-Labs/simplepool"
 REPO_URL="https://github.com/${REPO_SLUG}.git"
 BRANCH="main"
+# Set when --branch is on the command line, i.e. somebody asked for specific
+# code (simplepoolctl upgrade <tag> passes it). A saved or default BRANCH is
+# not a request: on a tree with no .git it was never going to be fetched.
+BRANCH_ASKED=0
 # release = download a published tarball; source = git clone + make.
 # Left empty so the interview can pick a context-aware default (a checkout
 # you are standing in means source; a piped one-liner means release) without
@@ -208,7 +212,7 @@ while [[ $# -gt 0 ]]; do
         --root)              ROOT="$2"; shift 2 ;;
         --user)              SVC_USER="$2"; shift 2 ;;
         --repo)              REPO_URL="$2"; shift 2 ;;
-        --branch)            BRANCH="$2"; shift 2 ;;
+        --branch)            BRANCH="$2"; BRANCH_ASKED=1; shift 2 ;;
         --mode)              MODE="$2"; shift 2 ;;
         --stratum-port)      STRATUM_PORT="$2"; shift 2 ;;
         --bitcoind-url)      BITCOIND_URL="$2"; shift 2 ;;
@@ -765,15 +769,36 @@ else
     [[ -d "$ROOT" ]] && chown -R "$SVC_USER:$SVC_USER" "$ROOT"
     if [[ -d "$ROOT/.git" ]]; then
         if [[ -n "$BRANCH" ]]; then
-            say "fetching origin/$BRANCH"
-            as_user git -C "$ROOT" fetch origin --prune
-            as_user git -C "$ROOT" checkout "$BRANCH"
-            as_user git -C "$ROOT" reset --hard "origin/$BRANCH"
+            say "fetching $BRANCH from origin"
+            # --tags --force: a tag that was moved upstream must move here too,
+            # or a re-run would keep building the old commit under the new name.
+            as_user git -C "$ROOT" fetch origin --prune --tags --force
+            # BRANCH may name a release tag (simplepoolctl upgrade v0.5.1) as
+            # well as a branch. A tag has no origin/<tag> ref, so resetting to
+            # one would fail; check it out detached instead.
+            if as_user git -C "$ROOT" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+                as_user git -C "$ROOT" checkout "$BRANCH"
+                as_user git -C "$ROOT" reset --hard "origin/$BRANCH"
+            elif as_user git -C "$ROOT" show-ref --verify --quiet "refs/tags/$BRANCH"; then
+                as_user git -C "$ROOT" checkout --force --detach "refs/tags/$BRANCH^{commit}"
+            else
+                die "origin has no branch or tag named '$BRANCH'"
+            fi
         else
             say "working tree left as-is"
         fi
     elif [[ -f "$ROOT/Makefile" ]]; then
-        say "non-git checkout — left as-is"
+        # Without .git there is nothing to fetch: make would rebuild exactly
+        # the files already here. When specific code was asked for, building
+        # the old tree and carrying on would report an upgrade that never
+        # happened, so stop and say how to get it.
+        if [[ "$BRANCH_ASKED" == "1" ]]; then
+            die "$ROOT is not a git checkout, so '$BRANCH' cannot be fetched into it.
+    Building it would only rebuild the code already here.
+    To install a published release over it (proxy.conf and the database are kept):
+        sudo bash $ROOT/scripts/install.sh --non-interactive --yes --from-release $([[ "$BRANCH" =~ ^v[0-9] ]] && echo "$BRANCH" || echo "<tag>")"
+        fi
+        say "non-git checkout — building the files as they are"
     else
         install -d -o "$SVC_USER" -g "$SVC_USER" "$ROOT"
         say "cloning $REPO_URL ($BRANCH)"
@@ -805,6 +830,7 @@ else
     as_user make -C "$ROOT" -j"$(nproc)"
     [[ -x "$ROOT/build/simplepool" ]] || die "build produced no binary at $ROOT/build/simplepool"
     say "built $ROOT/build/simplepool ($(stat -c %s "$ROOT/build/simplepool") bytes)"
+    say "$("$ROOT/build/simplepool" --version 2>/dev/null | head -1)"
     # A source install has no RELEASE file, and a stale one left over from a
     # previous release install would misreport what is running.
     rm -f "$ROOT/RELEASE"
@@ -1192,7 +1218,11 @@ say "database:           $DB_PATH"
 if [[ "$SOURCE" == "release" ]]; then
     say "installed:          release ${RELEASE_TAG} (${ROOT}/RELEASE)"
 else
-    say "installed:          built from source (${BRANCH:-working tree})"
+    # What the binary says it is, not what was asked for: the two differ
+    # exactly when something went wrong, and that is when this line matters.
+    BUILT="$("$ROOT/build/simplepool" --version 2>/dev/null | head -1)"
+    BUILT_COMMIT="$("$ROOT/build/simplepool" --version 2>/dev/null | sed -n 's/^ *commit: *//p' | cut -c1-12)"
+    say "installed:          built from source: ${BUILT:-unknown} (commit ${BUILT_COMMIT:-unknown})"
 fi
 [[ "$DO_PAYOUT" == "1" ]] && say "payouts:            every ${PAYOUT_INTERVAL_HOURS}h"
 echo
