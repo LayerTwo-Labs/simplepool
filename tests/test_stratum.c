@@ -687,6 +687,15 @@ static void *bc_job_thread(void *arg) {
  * about one budget (300 ms); a deadline per write would make that four, and
  * the old per-socket timeout forty seconds. The stalled miners are dropped. */
 static void test_stalled_miners_cost_the_broadcast_one_budget(void) {
+#ifndef __linux__
+    /* The deadline rests on send(MSG_DONTWAIT) returning EAGAIN on a full
+     * socket. Darwin's sendto() blocks anyway, for the whole SO_SNDTIMEO
+     * (sampled: the thread sits in __sendto), so off Linux each stalled miner
+     * still costs SEND_TIMEOUT_SEC and this measures the kernel, not the
+     * code. Linux is the only deployment target (scripts/install.sh). */
+    printf("skip: the broadcast deadline needs send(MSG_DONTWAIT) (Linux only)\n");
+    return;
+#endif
     stratum_server_t *s = bc_server(300);
     int rfd[2], sfd[BC_STALLED][2];
     stratum_conn_t *reader = bc_conn(s, rfd, 0);
