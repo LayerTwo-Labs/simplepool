@@ -1540,6 +1540,16 @@ int main(int argc, char **argv) {
     stcfg.max_submits_per_sec = cfg.max_submits_per_sec;
     stcfg.auth_max_failures     = cfg.auth_max_failures;
     stcfg.auth_fail_lockout_sec = cfg.auth_fail_lockout_sec;
+    stcfg.reject_guard_pct              = cfg.reject_guard_pct;
+    stcfg.reject_guard_min_samples      = cfg.reject_guard_min_samples;
+    stcfg.reject_guard_cooldown_sec     = cfg.reject_guard_cooldown_sec;
+    stcfg.reject_guard_max_cooldown_sec = cfg.reject_guard_max_cooldown_sec;
+    if (stcfg.reject_guard_pct > 0)
+        LOG_INFO("stratum: reject guard ON: more than %d%% of %d judged "
+                 "submits closes the connection; cooldown %ds, doubling to %ds",
+                 stcfg.reject_guard_pct, stcfg.reject_guard_min_samples,
+                 stcfg.reject_guard_cooldown_sec,
+                 stcfg.reject_guard_max_cooldown_sec);
     stcfg.listener_count     = cfg.listener_count;
     for (int i = 0; i < cfg.listener_count; ++i) {
         stcfg.listeners[i] = cfg.listeners[i];

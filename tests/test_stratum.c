@@ -4023,6 +4023,321 @@ static void test_authorize_call_ceiling(void) {
     stratum_server_free(s);
 }
 
+/* ---- reject guard -------------------------------------------------------- */
+
+#define RG_NAME1 TEST_ADDR ".rig1"
+#define RG_NAME2 TEST_ADDR ".rig2"
+#define RG_EN2 "deadbeefcafebabe"
+
+/* `diff` decides what a submit comes to: 1e12 against an all-zero network
+ * target rejects every hash as low difficulty, 1e-12 accepts every one. */
+static stratum_server_t *rg_server(obs_t *obs, int pct, int min, double diff) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 8, .initial_diff = diff,
+                          .auth_max_failures = 1,
+                          .auth_fail_lockout_sec = 60,
+                          .reject_guard_pct = pct,
+                          .reject_guard_min_samples = min,
+                          .reject_guard_cooldown_sec = 600,
+                          .reject_guard_max_cooldown_sec = 86400,
+                          .ctx = obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    return s;
+}
+
+/* Subscribe and authorize `name` from `ip`. */
+static stratum_conn_t *rg_conn(stratum_server_t *s, const char *ip,
+                               const char *name, int *rc_out,
+                               char *msg, size_t mcap) {
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    stratum_conn_set_peer_ip_for_test(c, ip);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen);
+    free(out); out = NULL; olen = 0;
+    char line[256];
+    snprintf(line, sizeof line,
+             "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}", name);
+    int rc = stratum_handle_message(s, c, line, &out, &olen);
+    if (rc_out) *rc_out = rc;
+    if (msg && mcap) snprintf(msg, mcap, "%s", out ? out : "");
+    free(out);
+    return c;
+}
+
+static int rg_submit(stratum_server_t *s, stratum_conn_t *c, const char *job,
+                     unsigned nonce, char *msg, size_t mcap) {
+    char line[320];
+    snprintf(line, sizeof line,
+             "{\"id\":9,\"method\":\"mining.submit\","
+             "\"params\":[\"w\",\"%s\",\"" RG_EN2 "\",\"60000000\",\"%08x\"]}",
+             job, nonce);
+    char *out = NULL; size_t olen = 0;
+    int rc = stratum_handle_message(s, c, line, &out, &olen);
+    if (msg && mcap) snprintf(msg, mcap, "%s", out ? out : "");
+    free(out);
+    return rc;
+}
+
+/* Submit rejects (low difficulty) until the connection closes; returns how
+ * many submits it took, or -1 if it never closed within `max`. */
+static int rg_until_closed(stratum_server_t *s, stratum_conn_t *c,
+                           unsigned base, int max, char *msg, size_t mcap) {
+    for (int i = 0; i < max; ++i)
+        if (rg_submit(s, c, "J1", base + (unsigned)i, msg, mcap) < 0) return i + 1;
+    return -1;
+}
+
+/* Trip `name` from `ip` once, on a fresh connection; 1 if it closed. */
+static int rg_trip(stratum_server_t *s, const char *ip, const char *name,
+                   unsigned base) {
+    int rc = 0;
+    stratum_conn_t *c = rg_conn(s, ip, name, &rc, NULL, 0);
+    int closed = rc == 0 && rg_until_closed(s, c, base, 60, NULL, 0) > 0;
+    stratum_conn_free_for_test(c);
+    return closed;
+}
+
+/* Whether `name` from `ip` is let in; the reply goes to msg. */
+static int rg_admitted(stratum_server_t *s, const char *ip, const char *name,
+                       char *msg, size_t mcap) {
+    int rc = 0;
+    stratum_conn_t *c = rg_conn(s, ip, name, &rc, msg, mcap);
+    int ok = stratum_conn_authorized_for_test(c);
+    stratum_conn_free_for_test(c);
+    return ok;
+}
+
+/* A connection that crosses the threshold is answered with the error and
+ * closed; its worker is refused for the cooldown on the same address, and
+ * neither another worker on that address nor the same name elsewhere is. */
+static void test_reject_guard_closes_and_refuses_the_worker(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = rg_server(&obs, 90, 200, 1e12);
+    int rc = 0; char msg[512];
+    stratum_conn_t *c = rg_conn(s, "203.0.113.20", RG_NAME1, &rc, msg, sizeof msg);
+    CHECK(rc == 0 && stratum_conn_authorized_for_test(c));
+    CHECK(rg_until_closed(s, c, 0x1000, 400, msg, sizeof msg) == 200);
+    CHECK(strstr(msg, "too many rejected shares") != NULL);
+    CHECK(strstr(msg, "\"code\":20") != NULL || strstr(msg, "[20,") != NULL);
+    CHECK(obs.rejects == 200 && obs.shares == 0);
+    stratum_conn_free_for_test(c);
+
+    /* Same name, same address: refused, closed, no reject row for it. */
+    stratum_conn_t *d = rg_conn(s, "203.0.113.20", RG_NAME1, &rc, msg, sizeof msg);
+    CHECK(rc == -1 && !stratum_conn_authorized_for_test(d));
+    CHECK(strstr(msg, "retry in 600s") != NULL);
+    CHECK(obs.rejects == 200);
+    stratum_conn_free_for_test(d);
+
+    /* Another rig behind the same address, and the same name from elsewhere. */
+    CHECK(rg_admitted(s, "203.0.113.20", RG_NAME2, msg, sizeof msg));
+    CHECK(rg_admitted(s, "203.0.113.21", RG_NAME1, msg, sizeof msg));
+    stratum_server_free(s);
+}
+
+/* The refusal ends with the cooldown, and a repeat inside 24 h doubles it,
+ * capped; an entry past its cooldown plus 24 h starts again at the base. */
+static void test_reject_guard_cooldown_expires_doubles_and_resets(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = rg_server(&obs, 90, 50, 1e12);
+    const char *ip = "203.0.113.22";
+    char msg[512];
+    CHECK(rg_trip(s, ip, RG_NAME1, 0x2000) == 1);
+    CHECK(!rg_admitted(s, ip, RG_NAME1, msg, sizeof msg));
+    CHECK(strstr(msg, "retry in 600s") != NULL);
+    stratum_reject_guard_advance_for_test(300u * 1000u);
+    CHECK(!rg_admitted(s, ip, RG_NAME1, msg, sizeof msg));
+    CHECK(strstr(msg, "retry in 300s") != NULL);          /* still counting down */
+    stratum_reject_guard_advance_for_test(301u * 1000u);
+    CHECK(rg_admitted(s, ip, RG_NAME1, msg, sizeof msg)); /* accepted after it */
+
+    CHECK(rg_trip(s, ip, RG_NAME1, 0x3000) == 1);
+    CHECK(!rg_admitted(s, ip, RG_NAME1, msg, sizeof msg));
+    CHECK(strstr(msg, "retry in 1200s") != NULL);          /* doubled */
+    stratum_reject_guard_advance_for_test(1201u * 1000u);
+    CHECK(rg_trip(s, ip, RG_NAME1, 0x4000) == 1);
+    CHECK(!rg_admitted(s, ip, RG_NAME1, msg, sizeof msg));
+    CHECK(strstr(msg, "retry in 2400s") != NULL);
+    stratum_reject_guard_advance_for_test((2400u + 86400u + 1u) * 1000ull);
+    CHECK(rg_trip(s, ip, RG_NAME1, 0x5000) == 1);
+    CHECK(!rg_admitted(s, ip, RG_NAME1, msg, sizeof msg));
+    CHECK(strstr(msg, "retry in 600s") != NULL);           /* forgotten */
+    stratum_server_free(s);
+}
+
+/* The doubling stops at reject_guard_max_cooldown_sec. */
+static void test_reject_guard_cooldown_is_capped(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 8, .initial_diff = 1e12,
+                          .auth_max_failures = 1, .auth_fail_lockout_sec = 60,
+                          .reject_guard_pct = 90, .reject_guard_min_samples = 50,
+                          .reject_guard_cooldown_sec = 600,
+                          .reject_guard_max_cooldown_sec = 1000,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    char msg[512];
+    CHECK(rg_trip(s, "203.0.113.23", RG_NAME1, 0x6000) == 1);
+    stratum_reject_guard_advance_for_test(601u * 1000u);
+    CHECK(rg_trip(s, "203.0.113.23", RG_NAME1, 0x7000) == 1);
+    CHECK(!rg_admitted(s, "203.0.113.23", RG_NAME1, msg, sizeof msg));
+    CHECK(strstr(msg, "retry in 1000s") != NULL);          /* 1200 capped */
+    stratum_server_free(s);
+}
+
+/* A miner that sends mostly good shares with the odd bad one is never
+ * closed: 85 % rejected is under a 90 % threshold, over 600 submits. */
+static void test_reject_guard_spares_a_healthy_miner(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = rg_server(&obs, 90, 200, 1e-12);
+    int rc = 0; char msg[512];
+    stratum_conn_t *c = rg_conn(s, "203.0.113.24", RG_NAME1, &rc, msg, sizeof msg);
+    CHECK(rc == 0);
+    int closed = 0;
+    for (unsigned i = 0; i < 600 && !closed; ++i) {
+        const char *job = (i % 20) < 17 ? "ZZ" : "J1";   /* ZZ: unknown job */
+        if (rg_submit(s, c, job, 0x8000 + i, msg, sizeof msg) < 0) closed = 1;
+    }
+    CHECK(!closed);
+    CHECK(obs.shares == 90 && obs.rejects == 510);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* Only share attempts count. A request with bad params is not one, and nor
+ * is a submit before authorize: 400 of each leave the connection open. */
+static void test_reject_guard_ignores_what_is_not_a_share(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = rg_server(&obs, 90, 50, 1e12);
+    int rc = 0; char msg[512];
+    stratum_conn_t *c = rg_conn(s, "203.0.113.25", RG_NAME1, &rc, msg, sizeof msg);
+    int closed = 0;
+    for (int i = 0; i < 400 && !closed; ++i) {
+        char *out = NULL; size_t olen = 0;
+        if (stratum_handle_message(s, c,
+                "{\"id\":9,\"method\":\"mining.submit\",\"params\":[\"w\"]}",
+                &out, &olen) < 0) closed = 1;
+        CHECK(closed || (out && strstr(out, "bad params") != NULL));
+        free(out);
+    }
+    CHECK(!closed);
+    stratum_conn_free_for_test(c);
+
+    stratum_conn_t *u = stratum_conn_new_for_test(s);   /* never authorized */
+    for (unsigned i = 0; i < 400 && !closed; ++i)
+        if (rg_submit(s, u, "J1", 0x9000 + i, msg, sizeof msg) < 0) closed = 1;
+    CHECK(!closed);
+    CHECK(strstr(msg, "unauthorized") != NULL);
+    stratum_conn_free_for_test(u);
+
+    /* The same connection still trips on real share attempts afterwards. */
+    c = rg_conn(s, "203.0.113.25", RG_NAME2, &rc, msg, sizeof msg);
+    CHECK(rg_until_closed(s, c, 0xA000, 100, msg, sizeof msg) == 50);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* The counts restart every 2 x min_samples while below the threshold: 100
+ * submits at 80 % rejected (under 90 %) are forgotten, so a run of pure
+ * rejects trips on the 50th, not later on the strength of the old ones. */
+static void test_reject_guard_counts_restart_below_the_threshold(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = rg_server(&obs, 90, 50, 1e-12);
+    int rc = 0; char msg[512];
+    stratum_conn_t *c = rg_conn(s, "203.0.113.26", RG_NAME1, &rc, msg, sizeof msg);
+    for (unsigned i = 0; i < 100; ++i)
+        CHECK(rg_submit(s, c, (i % 5) ? "ZZ" : "J1", 0xB000 + i, msg, sizeof msg) == 0);
+    /* Now nothing but rejects (an unknown job). */
+    int n = -1;
+    for (int i = 0; i < 200; ++i)
+        if (rg_submit(s, c, "ZZ", 0xC000 + (unsigned)i, msg, sizeof msg) < 0) { n = i + 1; break; }
+    CHECK(n == 50);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* The counts belong to the connection: 49 rejects, a fresh
+ * mining.authorize for the same name, and the 50th reject still trips; the
+ * same with a switch to another name. */
+static void test_reject_guard_reauthorize_keeps_the_counts(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = rg_server(&obs, 90, 50, 1e12);
+    int rc = 0; char msg[512];
+    stratum_conn_t *c = rg_conn(s, "203.0.113.28", RG_NAME1, &rc, msg, sizeof msg);
+    for (unsigned i = 0; i < 49; ++i)
+        CHECK(rg_submit(s, c, "J1", 0xD000 + i, msg, sizeof msg) == 0);
+    char *out = NULL; size_t olen = 0;
+    CHECK(stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.authorize\",\"params\":[\"" RG_NAME1 "\",\"x\"]}",
+        &out, &olen) == 0);
+    free(out); out = NULL; olen = 0;
+    CHECK(rg_submit(s, c, "J1", 0xD100, msg, sizeof msg) < 0);
+    stratum_conn_free_for_test(c);
+
+    /* Switching names does not restart them either: 49 + a new name + 1. */
+    c = rg_conn(s, "203.0.113.29", RG_NAME1, &rc, msg, sizeof msg);
+    for (unsigned i = 0; i < 49; ++i)
+        CHECK(rg_submit(s, c, "J1", 0xD200 + i, msg, sizeof msg) == 0);
+    CHECK(stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.authorize\",\"params\":[\"" RG_NAME2 "\",\"x\"]}",
+        &out, &olen) == 0);
+    free(out);
+    CHECK(rg_submit(s, c, "J1", 0xD300, msg, sizeof msg) < 0);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* Unknown job ids before the connection's first accepted share are not
+ * judged: a reconnecting proxy may forward hundreds of shares for jobs it
+ * got elsewhere. 300 of them leave it open; after one accepted share they
+ * count, and pure unknown jobs then trip at the threshold. */
+static void test_reject_guard_spares_unknown_jobs_before_the_first_accept(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = rg_server(&obs, 90, 50, 1e-12);
+    int rc = 0; char msg[512];
+    stratum_conn_t *c = rg_conn(s, "203.0.113.30", RG_NAME1, &rc, msg, sizeof msg);
+    for (unsigned i = 0; i < 300; ++i)
+        CHECK(rg_submit(s, c, "ZZ", 0xE000 + i, msg, sizeof msg) == 0);
+    CHECK(rg_submit(s, c, "J1", 0xE400, msg, sizeof msg) == 0);   /* accepted */
+    int n = -1;
+    for (int i = 0; i < 200; ++i)
+        if (rg_submit(s, c, "ZZ", 0xE500 + (unsigned)i, msg, sizeof msg) < 0) { n = i + 1; break; }
+    CHECK(n == 49);   /* 1 accepted + 49 rejected = 50 judged, 98 % */
+    stratum_conn_free_for_test(c);
+
+    /* With no accepted share at all, the spare runs out after 10 x 50 and
+     * pure unknown jobs are then judged: the 550th trips. */
+    c = rg_conn(s, "203.0.113.31", RG_NAME1, &rc, msg, sizeof msg);
+    n = -1;
+    for (int i = 0; i < 700; ++i)
+        if (rg_submit(s, c, "ZZ", 0xF000 + (unsigned)i, msg, sizeof msg) < 0) { n = i + 1; break; }
+    CHECK(n == 550);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* pct 0, the default, is off: nothing closes and nothing is refused. */
+static void test_reject_guard_is_off_by_default(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = rg_server(&obs, 0, 50, 1e12);
+    int rc = 0; char msg[512];
+    stratum_conn_t *c = rg_conn(s, "203.0.113.27", RG_NAME1, &rc, msg, sizeof msg);
+    CHECK(rg_until_closed(s, c, 0xD000, 300, msg, sizeof msg) == -1);
+    CHECK(obs.rejects == 300);
+    stratum_conn_free_for_test(c);
+    CHECK(rg_admitted(s, "203.0.113.27", RG_NAME1, msg, sizeof msg));
+    stratum_server_free(s);
+}
+
 int main(void) {
     test_password_diff_raises();
     test_password_diff_never_lowers();
@@ -4099,6 +4414,15 @@ int main(void) {
     test_authorize_lockout_is_per_address();
     test_authorize_budget_zero_disables();
     test_authorize_call_ceiling();
+    test_reject_guard_closes_and_refuses_the_worker();
+    test_reject_guard_cooldown_expires_doubles_and_resets();
+    test_reject_guard_cooldown_is_capped();
+    test_reject_guard_spares_a_healthy_miner();
+    test_reject_guard_ignores_what_is_not_a_share();
+    test_reject_guard_counts_restart_below_the_threshold();
+    test_reject_guard_is_off_by_default();
+    test_reject_guard_reauthorize_keeps_the_counts();
+    test_reject_guard_spares_unknown_jobs_before_the_first_accept();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

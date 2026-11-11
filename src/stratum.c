@@ -116,6 +116,19 @@ _Static_assert((uint64_t)RECENT_JOBS * 30000u >= RECENT_JOB_TTL_MS,
 #define AUTH_FAIL_SLOTS 1024
 #define AUTH_FAIL_PROBE 8
 
+/* Reject-guard cooldown table (reject_guard_pct): the same shape as the
+ * per-address table above -- fixed, hashed, linear probe, evict the entry
+ * that expires first -- keyed on (worker name, peer address). */
+#define RG_SLOTS 1024
+#define RG_PROBE 8
+#define RG_REPEAT_WINDOW_MS (24ull * 3600u * 1000u)
+/* What the submit in flight came to. Only share attempts are judged;
+ * RG_V_NONE = not judged (malformed request, rate limiter, pool-side
+ * failure, unauthorized). Order matches rg_reason_name. */
+enum { RG_V_NONE = 0, RG_V_LOWDIFF, RG_V_INVALID, RG_V_DUP, RG_V_JOB,
+       RG_V_ACCEPT };
+#define RG_N_REASONS 4
+
 /* mining.authorize calls per connection per window, success or failure. A
  * successful authorize is not free either -- it validates an address and
  * seeds the connection's difficulty -- and a client holding one valid address
@@ -367,6 +380,16 @@ struct stratum_server {
         int      reported;               /* the lockout has been logged once */
     } auth_fail[AUTH_FAIL_SLOTS];
 
+    /* Reject-guard cooldowns by (worker name, peer address). */
+    pthread_mutex_t rg_lock;
+    struct rg_entry {
+        char     name[129];              /* empty = free */
+        char     ip[INET6_ADDRSTRLEN];
+        uint64_t until_mono;             /* authorize refused before this */
+        uint64_t cooldown_ms;            /* the cooldown last given */
+        uint32_t offences;
+    } rg[RG_SLOTS];
+
     pthread_mutex_t share_dedupe_lock;
     /* Two structures over one set of keys. The ring is what bounds memory and
      * decides which hash is forgotten next (the oldest, FIFO). The index is
@@ -455,6 +478,16 @@ struct stratum_conn {
     uint32_t auth_failures;          /* failures on this connection */
     uint64_t auth_call_window_ms;    /* AUTH_CALL_WINDOW_MS accounting */
     uint32_t auth_calls_in_window;
+
+    /* Reject guard (reject_guard_pct): the verdict of the submit in flight,
+     * and the counts for the current worker. Touched only by this
+     * connection's own thread. */
+    int      rg_verdict;         /* RG_V_* */
+    uint32_t rg_judged;
+    uint32_t rg_rejected;
+    uint32_t rg_reason[RG_N_REASONS];   /* by RG_V_* - 1, reject kinds only */
+    int      rg_seen_accept;     /* an accepted share on this connection yet */
+    uint32_t rg_job_spared;      /* unknown-job submits not judged before it */
 
     uint32_t version_mask;         /* negotiated version-rolling bits; 0 = off */
     char     worker_name[129];     /* full stratum username (sanitized) */
@@ -1815,6 +1848,146 @@ void stratum_conn_set_peer_ip_for_test(stratum_conn_t *c, const char *ip) {
     snprintf(c->peer_ip, sizeof c->peer_ip, "%s", ip ? ip : "");
 }
 
+/* ---- reject guard -------------------------------------------------------- */
+
+static const char *const rg_reason_name[RG_N_REASONS] = {
+    "low difficulty", "invalid share", "duplicate share", "unknown job",
+};
+
+/* The guard's clock: monotonic, plus a skew only tests move (cooldown expiry
+ * and doubling cannot be tested in real time). */
+static _Atomic uint64_t g_rg_skew_ms;
+static uint64_t rg_now(void) { return mono_ms() + atomic_load(&g_rg_skew_ms); }
+void stratum_reject_guard_advance_for_test(uint64_t ms) {
+    atomic_fetch_add(&g_rg_skew_ms, ms);
+}
+
+/* An entry is free once its cooldown AND the 24-h repeat window after it have
+ * both passed: a later offence then starts again at the base cooldown. */
+static int rg_entry_free(const struct rg_entry *e, uint64_t now) {
+    return !e->name[0] || now >= e->until_mono + RG_REPEAT_WINDOW_MS;
+}
+
+/* As auth_fail_find, keyed on (worker name, peer address): a name alone would
+ * let anyone lock a public worker name out, an address alone would punish
+ * every rig behind one NAT. Caller holds rg_lock. */
+static struct rg_entry *rg_find(stratum_server_t *s, const char *name,
+                                const char *ip, uint64_t now, int create) {
+    size_t home = (size_t)((fnv1a(name) ^ (fnv1a(ip) * 0x9E3779B97F4A7C15ull))
+                           & (RG_SLOTS - 1));
+    struct rg_entry *free_slot = NULL, *oldest = NULL;
+    for (size_t k = 0; k < RG_PROBE; ++k) {
+        struct rg_entry *e = &s->rg[(home + k) & (RG_SLOTS - 1)];
+        if (e->name[0] && strcmp(e->name, name) == 0 && strcmp(e->ip, ip) == 0) {
+            if (rg_entry_free(e, now)) {
+                if (!create) return NULL;
+                e->offences = 0; e->cooldown_ms = 0; e->until_mono = 0;
+            }
+            return e;
+        }
+        if (rg_entry_free(e, now) && !free_slot) free_slot = e;
+        if (!oldest || e->until_mono < oldest->until_mono) oldest = e;
+    }
+    if (!create) return NULL;
+    struct rg_entry *e = free_slot ? free_slot : oldest;
+    snprintf(e->name, sizeof e->name, "%s", name);
+    snprintf(e->ip, sizeof e->ip, "%s", ip);
+    e->offences = 0; e->cooldown_ms = 0; e->until_mono = 0;
+    return e;
+}
+
+/* Record an offence; returns the cooldown given (ms): the base, doubled for
+ * each repeat while the entry is live, capped. */
+static uint64_t rg_offence(stratum_server_t *s, const char *name,
+                           const char *ip, uint64_t now) {
+    uint64_t base = (uint64_t)(s->cfg.reject_guard_cooldown_sec > 0
+                               ? s->cfg.reject_guard_cooldown_sec : 600) * 1000u;
+    uint64_t cap  = (uint64_t)(s->cfg.reject_guard_max_cooldown_sec > 0
+                               ? s->cfg.reject_guard_max_cooldown_sec : 86400) * 1000u;
+    if (cap < base) cap = base;
+    pthread_mutex_lock(&s->rg_lock);
+    struct rg_entry *e = rg_find(s, name, ip, now, 1);
+    uint64_t cd = e->offences ? e->cooldown_ms * 2 : base;
+    if (cd < base) cd = base;
+    if (cd > cap) cd = cap;
+    e->cooldown_ms = cd;
+    e->offences++;
+    e->until_mono = now + cd;
+    pthread_mutex_unlock(&s->rg_lock);
+    return cd;
+}
+
+/* Milliseconds (name, ip) is still refused for; 0 = not refused. */
+static uint64_t rg_refused_ms(stratum_server_t *s, const char *name,
+                              const char *ip) {
+    if (s->cfg.reject_guard_pct <= 0 || !name[0]) return 0;
+    uint64_t now = rg_now(), left = 0;
+    pthread_mutex_lock(&s->rg_lock);
+    struct rg_entry *e = rg_find(s, name, ip, now, 0);
+    if (e && now < e->until_mono) left = e->until_mono - now;
+    pthread_mutex_unlock(&s->rg_lock);
+    return left;
+}
+
+#define RG_JOB_SPARE 10u
+
+static void rg_reset_counts(stratum_conn_t *c) {
+    c->rg_judged = 0;
+    c->rg_rejected = 0;
+    memset(c->rg_reason, 0, sizeof c->rg_reason);
+}
+
+/* Runs after every mining.submit with the reply already in buf. Counts the
+ * verdict and, once min_samples are judged and more than reject_guard_pct %
+ * of them were rejected, replaces the reply with one error, puts (worker,
+ * peer address) on cooldown and returns -1: the connection thread closes
+ * after writing, as for the authorize budget. The counts restart whenever
+ * 2 x min_samples are judged below the threshold. An accepted share never
+ * trips: its reply stands. */
+static int reject_guard_judge(stratum_server_t *s, stratum_conn_t *c,
+                              cJSON *id, char **buf, size_t *len, int rc) {
+    int v = c->rg_verdict;
+    c->rg_verdict = RG_V_NONE;
+    int pct = s->cfg.reject_guard_pct;
+    if (pct <= 0 || v == RG_V_NONE || rc < 0) return rc;
+    uint32_t min = s->cfg.reject_guard_min_samples > 0
+                     ? (uint32_t)s->cfg.reject_guard_min_samples : 200u;
+    /* Unknown or stale job ids are spared until this connection has had an
+     * accepted share, for at most RG_JOB_SPARE x min_samples of them. A proxy
+     * that reconnects may forward a burst of shares for jobs the pool never
+     * sent on this socket; judged at once, they would trip the guard on an
+     * honest miner. A connection that sends nothing else is judged after the
+     * spare runs out, so it cannot write reject rows for ever. */
+    if (v == RG_V_ACCEPT) c->rg_seen_accept = 1;
+    else if (v == RG_V_JOB && !c->rg_seen_accept &&
+             (uint64_t)c->rg_job_spared < (uint64_t)RG_JOB_SPARE * min) {
+        c->rg_job_spared++;
+        return rc;
+    }
+    c->rg_judged++;
+    if (v != RG_V_ACCEPT) { c->rg_rejected++; c->rg_reason[v - 1]++; }
+    if (c->rg_judged < min) return rc;
+    if (v == RG_V_ACCEPT ||
+        (uint64_t)c->rg_rejected * 100u <= (uint64_t)pct * c->rg_judged) {
+        if (c->rg_judged >= 2u * min) rg_reset_counts(c);
+        return rc;
+    }
+    int top = 0;
+    for (int i = 1; i < RG_N_REASONS; ++i)
+        if (c->rg_reason[i] > c->rg_reason[top]) top = i;
+    uint64_t cd = rg_offence(s, c->worker_name, c->peer_ip, rg_now());
+    LOG_WARN("stratum: reject guard closing worker='%s' ip=%s: %u accepted, "
+             "%u rejected (top: %s); refused for %llus from this address",
+             c->worker_name, c->peer_ip[0] ? c->peer_ip : "?",
+             c->rg_judged - c->rg_rejected, c->rg_rejected,
+             rg_reason_name[top], (unsigned long long)(cd / 1000u));
+    rg_reset_counts(c);
+    free(*buf); *buf = NULL; *len = 0;
+    emit_response(buf, len, id, NULL,
+                  make_error(20, "too many rejected shares; reconnect later"));
+    return -1;
+}
+
 static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                             cJSON *params, char **buf, size_t *len) {
     int over_ceiling = 0;
@@ -1857,6 +2030,24 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         cJSON *err = make_error(24,
             "stratum username must be <bitcoin_address>[.<rig_label>]");
         return auth_failed(s, c, emit_response(buf, len, id, NULL, err));
+    }
+    /* Reject-guard cooldown. Not counted against the authorize budgets (a
+     * refusal here is not a typo the miner can fix) and no reject row: it is
+     * a limiter, and a row per refused call would be the cost it removes.
+     * A connection that has not authorized is closed; one that has keeps
+     * its current worker. */
+    if (s->cfg.reject_guard_pct > 0) {
+        char gname[sizeof(c->worker_name)];
+        sanitize_worker(worker, gname, sizeof gname);
+        uint64_t left = rg_refused_ms(s, gname, c->peer_ip);
+        if (left) {
+            char emsg[160];
+            snprintf(emsg, sizeof emsg,
+                     "worker refused after too many rejected shares; "
+                     "retry in %llus", (unsigned long long)((left + 999) / 1000));
+            int erc = emit_response(buf, len, id, NULL, make_error(24, emsg));
+            return c->authorized ? erc : -1;
+        }
     }
     /* Refuse before taking the address: the miner learns at connect time,
      * which is the only point at which they can still do something about it. */
@@ -1917,6 +2108,9 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
 
     sanitize_worker(worker, c->worker_name, sizeof(c->worker_name));
+    /* The reject guard's counts belong to the connection and are NOT restarted
+     * here: re-authorizing, or switching between names, would otherwise let a
+     * client stay under reject_guard_min_samples for ever. */
     auth_succeeded(s, c);
     c->authorized = 1;
     if (c->difficulty <= 0) c->difficulty = c->pol_initial_diff;
@@ -2140,6 +2334,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         cJSON *v = cJSON_GetArrayItem(params, 5);
         uint32_t rolled = 0;
         if (!cJSON_IsString(v) || parse_u32_hex(v->valuestring, &rolled) != 0) {
+            c->rg_verdict = RG_V_INVALID;
             cJSON *err = make_error(20, "bad version hex");
             return emit_response(buf, len, id, NULL, err);
         }
@@ -2157,12 +2352,14 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
                              "duplicate share");
         }
+        c->rg_verdict = RG_V_DUP;
         cJSON *err = make_error(22, "duplicate share");
         return emit_response(buf, len, id, NULL, err);
     }
 
     uint32_t ntime_v, nonce_v;
     if (parse_u32_hex(ntime, &ntime_v) != 0 || parse_u32_hex(nonce, &nonce_v) != 0) {
+        c->rg_verdict = RG_V_INVALID;
         cJSON *err = make_error(20, "bad ntime/nonce hex");
         return emit_response(buf, len, id, NULL, err);
     }
@@ -2191,6 +2388,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                 s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
                                  "ntime out of range");
             }
+            c->rg_verdict = RG_V_INVALID;
             cJSON *err = make_error(20, "ntime out of range");
             return emit_response(buf, len, id, NULL, err);
         }
@@ -2199,6 +2397,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     size_t en2_len = 0;
     uint8_t *en2_bytes = hex_to_bytes_alloc(en2, &en2_len);
     if (!en2_bytes) {
+        c->rg_verdict = RG_V_INVALID;
         cJSON *err = make_error(20, "bad extranonce2 hex");
         return emit_response(buf, len, id, NULL, err);
     }
@@ -2221,6 +2420,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         LOG_WARN("submit from %s: extranonce2 is %zu bytes, expected %zu "
                  "(miner ignored the size from mining.subscribe)",
                  c->worker_name, en2_len, job->en2_size);
+        c->rg_verdict = RG_V_INVALID;
         cJSON *err = make_error(20, "wrong extranonce2 size");
         return emit_response(buf, len, id, NULL, err);
     }
@@ -2285,6 +2485,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
                              "duplicate share");
         }
+        c->rg_verdict = RG_V_DUP;
         cJSON *err = make_error(22, "duplicate share");
         return emit_response(buf, len, id, NULL, err);
     }
@@ -2362,6 +2563,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                              "low difficulty");
         }
         free(cb);
+        c->rg_verdict = RG_V_LOWDIFF;
         cJSON *err = make_error(23, "low difficulty");
         return emit_response(buf, len, id, NULL, err);
     }
@@ -2559,11 +2761,12 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                               block_hash_hex, reward_sats, fee_sats,
                               block_accepted, submit_err);
     }
+    c->rg_verdict = RG_V_ACCEPT;
     return emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
 }
 
-static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
-                         cJSON *params, char **buf, size_t *len) {
+static int handle_submit_judged(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
+                                cJSON *params, char **buf, size_t *len) {
     if (!c->authorized) {
         cJSON *err = make_error(24, "unauthorized");
         return emit_response(buf, len, id, NULL, err);
@@ -2608,6 +2811,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
                              "stale or unknown job");
         }
+        c->rg_verdict = RG_V_JOB;
         cJSON *err = make_error(21, "stale or unknown job");
         return emit_response(buf, len, id, NULL, err);
     }
@@ -2615,6 +2819,18 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     int rc = submit_with_job(s, c, id, params, job, en2, ntime, nonce, buf, len);
     stratum_job_free(job);
     return rc;
+}
+
+/* Every mining.submit goes through the reject guard once its reply is built.
+ * Judged (rg_verdict set on the way): accepted, low difficulty, invalid,
+ * duplicate, unknown or stale job. Left unjudged: unauthorized, bad params
+ * (a malformed request, not a share attempt), the submit rate limiter,
+ * the pool-side gates, a coinbase render failure. */
+static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
+                         cJSON *params, char **buf, size_t *len) {
+    c->rg_verdict = RG_V_NONE;
+    int rc = handle_submit_judged(s, c, id, params, buf, len);
+    return reject_guard_judge(s, c, id, buf, len, rc);
 }
 
 /* One line we could not act on. Answer it and stay connected; only a run of
@@ -3259,6 +3475,7 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     pthread_mutex_init(&s->conns_lock, NULL);
     pthread_cond_init(&s->conns_cond, NULL);
     pthread_mutex_init(&s->auth_fail_lock, NULL);
+    pthread_mutex_init(&s->rg_lock, NULL);
     pthread_mutex_init(&s->share_dedupe_lock, NULL);
     atomic_init(&s->stop, 0);
     atomic_init(&s->conn_count, 0);
@@ -3499,6 +3716,7 @@ void stratum_server_free(stratum_server_t *s) {
     pthread_mutex_destroy(&s->conns_lock);
     pthread_cond_destroy(&s->conns_cond);
     pthread_mutex_destroy(&s->auth_fail_lock);
+    pthread_mutex_destroy(&s->rg_lock);
     pthread_mutex_destroy(&s->share_dedupe_lock);
     free(s);
 }

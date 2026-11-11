@@ -2584,6 +2584,10 @@ simplepool --help | -h</code></pre>
         <tr><td><code>max_submits_per_sec</code></td><td><code>20000</code></td><td>≥ 0; 0 disables</td><td>Per-connection ceiling, fixed 1 s window. Excess submits are refused before parsing; logged to <code>rejects</code> at most every 10 s.</td></tr>
         <tr><td><code>auth_max_failures</code></td><td><code>3</code></td><td>≥ 0; 0 disables the budget</td><td>Failed authorizes allowed per connection (then it is closed) and per peer IP within the lockout window.</td></tr>
         <tr><td><code>auth_fail_lockout_sec</code></td><td><code>60</code></td><td>&gt; 0 when failures &gt; 0</td><td>How long an IP that spent its budget is refused. A success clears it.</td></tr>
+        <tr><td><code>reject_guard_pct</code></td><td><code>0</code></td><td>0&ndash;99; 0 disables</td><td>Close a connection once more than this percentage of its judged share attempts (accepted, low difficulty, invalid, duplicate, unknown or stale job) were rejected, after <code>reject_guard_min_samples</code> of them. Malformed requests and rate-limited submits are not judged; unknown or stale job ids count only after the connection's first accepted share, or after 10 &times; <code>reject_guard_min_samples</code> of them. The counts belong to the connection: re-authorizing or changing the worker name does not restart them.</td></tr>
+        <tr><td><code>reject_guard_min_samples</code></td><td><code>200</code></td><td>≥ 50</td><td>Judged attempts needed before the guard can trip. The counts restart every 2&times; this while below the threshold.</td></tr>
+        <tr><td><code>reject_guard_cooldown_sec</code></td><td><code>600</code></td><td>&gt; 0</td><td>How long a tripped worker is refused at authorize, keyed on (worker name, peer address). Doubles for each repeat while the last offence is remembered (24 h after its cooldown ends).</td></tr>
+        <tr><td><code>reject_guard_max_cooldown_sec</code></td><td><code>86400</code></td><td>≥ <code>reject_guard_cooldown_sec</code></td><td>Cap on the doubling.</td></tr>
       </tbody>
     </table>
   </div>

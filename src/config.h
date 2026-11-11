@@ -35,6 +35,13 @@ typedef struct {
     int  auth_max_failures;
     int  auth_fail_lockout_sec;
 
+    /* Reject guard, see stratum.h. pct 0 = off (default), else 1..99;
+     * min_samples >= 50 (default 200); cooldowns default 600 / 86400 s. */
+    int  reject_guard_pct;
+    int  reject_guard_min_samples;
+    int  reject_guard_cooldown_sec;
+    int  reject_guard_max_cooldown_sec;
+
     /* vardiff — auto-adjust each connection's difficulty to keep the
      * share rate near `target_spm` shares/minute. Set vardiff_enabled = 0
      * to pin every connection to initial_diff (the legacy behaviour). */
