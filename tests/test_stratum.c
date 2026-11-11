@@ -1,3 +1,5 @@
+#include <errno.h>
+#include <poll.h>
 #include "../src/stratum.h"
 #include "../src/share.h"
 #include "../src/sha256.h"
@@ -2224,6 +2226,69 @@ static int notify_clean_flag(const char *buf, size_t len) {
     return result;
 }
 
+
+/* Read exactly one JSONL message from a stream socket.
+ * This prevents partial reads and avoids consuming the next notification. */
+static ssize_t read_notify_line(int fd, char *buf, size_t cap) {
+    size_t used = 0;
+
+    if (cap < 2) return -1;
+
+    while (used + 1 < cap) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int ready;
+
+        do {
+            ready = poll(&pfd, 1, 2000);
+        } while (ready < 0 && errno == EINTR);
+
+        if (ready != 1 || !(pfd.revents & POLLIN))
+            return -1;
+
+        ssize_t nr = read(fd, buf + used, 1);
+        if (nr < 0 && errno == EINTR)
+            continue;
+        if (nr != 1)
+            return -1;
+
+        if (buf[used++] == '\n') {
+            buf[used] = '\0';
+            return (ssize_t)used;
+        }
+    }
+
+    return -1;
+}
+
+/* Return a copy of a string parameter from a wire-format mining.notify. */
+static char *notify_string_param(const char *buf, size_t len, int index) {
+    char *copy = malloc(len + 1);
+    if (!copy) return NULL;
+    memcpy(copy, buf, len);
+    copy[len] = '\0';
+
+    char *result = NULL;
+    for (char *line = strtok(copy, "\n"); line;
+         line = strtok(NULL, "\n")) {
+        cJSON *msg = cJSON_Parse(line);
+        if (!msg) continue;
+
+        cJSON *method = cJSON_GetObjectItem(msg, "method");
+        if (cJSON_IsString(method) &&
+            strcmp(method->valuestring, "mining.notify") == 0) {
+            cJSON *params = cJSON_GetObjectItem(msg, "params");
+            cJSON *value = cJSON_GetArrayItem(params, index);
+            if (cJSON_IsString(value))
+                result = strdup(value->valuestring);
+            cJSON_Delete(msg);
+            break;
+        }
+        cJSON_Delete(msg);
+    }
+    free(copy);
+    return result;
+}
+
 /* clean_jobs is an instruction to throw work away, so it may only be sent
  * when the work is genuinely dead — a new tip. The periodic template refresh
  * (a fresher ntime, newly arrived transactions) leaves the miner's job
@@ -2258,14 +2323,42 @@ static void test_clean_jobs_only_on_a_new_tip(void) {
 
     /* Periodic refresh: same tip, new template. The miner keeps its work. */
     stratum_server_set_job(s, make_test_job("J2", net), 0);
-    ssize_t n = read(sv[1], rx, sizeof rx);
+    ssize_t n = read_notify_line(sv[1], rx, sizeof rx);
     CHECK(n > 0);
     CHECK(n > 0 && notify_clean_flag(rx, (size_t)n) == 0);
 
+    /* Inspect actual mining.notify fields from the first refresh. */
+    char *id2 = n > 0 ? notify_string_param(rx, (size_t)n, 0) : NULL;
+    char *cb1_2 = n > 0 ? notify_string_param(rx, (size_t)n, 2) : NULL;
+    char *cb2_2 = n > 0 ? notify_string_param(rx, (size_t)n, 3) : NULL;
+
+    /* Refresh the identical template again, without clearing old work. */
+    stratum_server_set_job(s, make_test_job("J3", net), 0);
+    n = read_notify_line(sv[1], rx, sizeof rx);
+    CHECK(n > 0);
+    if (n > 0) {
+        CHECK(notify_clean_flag(rx, (size_t)n) == 0);
+    }
+
+    char *id3 = n > 0 ? notify_string_param(rx, (size_t)n, 0) : NULL;
+    char *cb1_3 = n > 0 ? notify_string_param(rx, (size_t)n, 2) : NULL;
+    char *cb2_3 = n > 0 ? notify_string_param(rx, (size_t)n, 3) : NULL;
+
+    CHECK(id2 && id3 && strcmp(id2, id3) != 0);
+    CHECK(id2 && strcmp(id2, "J2") == 0);
+    CHECK(id3 && strcmp(id3, "J3") == 0);
+    CHECK(cb1_2 && cb1_3 && strcmp(cb1_2, cb1_3) != 0);
+    CHECK(cb2_2 && cb2_3 && strcmp(cb2_2, cb2_3) == 0);
+
+    free(id2); free(id3);
+    free(cb1_2); free(cb1_3);
+    free(cb2_2); free(cb2_3);
+
+
     /* New tip: every job in every miner's hands builds on a parent that is no
      * longer the tip, so this one really does mean start over. */
-    stratum_server_set_job(s, make_test_job("J3", net), 1);
-    n = read(sv[1], rx, sizeof rx);
+    stratum_server_set_job(s, make_test_job("J4", net), 1);
+    n = read_notify_line(sv[1], rx, sizeof rx);
     CHECK(n > 0);
     CHECK(n > 0 && notify_clean_flag(rx, (size_t)n) == 1);
 
