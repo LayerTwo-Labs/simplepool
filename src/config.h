@@ -107,6 +107,13 @@ typedef struct {
      * Negative disables; 0 uses the default. */
     int    idle_timeout_authorized_sec;  /* default 7200 (2 h) */
 
+    /* How long one job broadcast may spend writing to every connection
+     * together. The deadline is shared, so N miners that stopped reading
+     * delay everyone else's notify by at most this, not N times a per-socket
+     * timeout. A miner whose socket is still full at the deadline is dropped;
+     * one that is reading drains a notify in microseconds. 50..10000. */
+    int    bcast_send_budget_ms;         /* default 300 */
+
     /* bitcoind */
     char bitcoind_url[512];
     char bitcoind_user[128];

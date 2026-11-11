@@ -10,6 +10,20 @@ somebody money if they go unread.
 
 ## Unreleased
 
+### A miner that stops reading no longer delays everyone else's new job
+
+A job broadcast wrote to each miner in turn while holding the connection-list
+lock, and each write was bounded only by the 10 s socket send timeout. N
+miners that had stopped reading delayed the new job for every other miner by
+up to N x 10 s, and no connection could be accepted or torn down meanwhile.
+The broadcast now writes outside that lock, and all its writes share one
+deadline, `bcast_send_budget_ms` (default 300). A miner whose notify cannot be
+written by then is disconnected, as one past the old timeout was; so is one
+whose own reply write has held its socket for more than 20 ms (each such
+miner reached after the budget is spent adds up to 20 ms). A miner that is
+reading is unaffected. A failed reply write now also closes the connection
+instead of carrying on after a possibly partial line. Nothing to configure.
+
 ### Jobs built from an unchanged template are now distinct work
 
 The pool re-issues a job every 30 s even when the template has not moved, and

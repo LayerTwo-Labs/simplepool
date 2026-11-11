@@ -618,6 +618,216 @@ static void test_job_rotation_races_submits(void) {
     for (int i = 0; i < RACE_CONNS; ++i) stratum_conn_free_for_test(conns[i]);
 }
 
+/* ---- broadcast vs. miners that stopped reading --------------------------
+ *
+ * A miner that stops reading fills its socket buffer, and from then on every
+ * write to it waits. The broadcast must bound that wait for the whole job,
+ * not per connection, and must not hold conns_lock while it waits. */
+
+static uint64_t bc_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* A subscribed, authorized connection on the pool end (fds[0]) of a fresh
+ * socketpair, linked into the broadcast list. SO_SNDTIMEO is armed the way
+ * accept does it, so even without the broadcast's own budget a write here
+ * fails after SEND_TIMEOUT_SEC instead of hanging the test. With `stall` the
+ * pool end is filled until the kernel refuses more: a miner that stopped
+ * reading. */
+static stratum_conn_t *bc_conn(stratum_server_t *s, int fds[2], int stall) {
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    CHECK(stratum_socket_setup_for_test(fds[0], 0) == 0);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+        &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out);
+    CHECK(stratum_conn_authorized_for_test(c) == 1);
+    CHECK(stratum_conn_subscribed_for_test(c) == 1);
+    if (stall) {
+        static char junk[4096];
+        while (send(fds[0], junk, sizeof junk, MSG_DONTWAIT) > 0) {}
+    }
+    stratum_conn_attach_for_test(s, c, fds[0]);
+    return c;
+}
+
+static stratum_server_t *bc_server(int budget_ms) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 16,
+                          .initial_diff = 1.0, .vardiff_enabled = 0,
+                          .bcast_send_budget_ms = budget_ms };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    return s;
+}
+
+struct bc_job_arg { stratum_server_t *s; const char *jid; atomic_int done; };
+
+static void *bc_job_thread(void *arg) {
+    struct bc_job_arg *a = arg;
+    uint8_t net[32];
+    memset(net, 0xff, sizeof net);
+    stratum_server_set_job(a->s, make_test_job(a->jid, net), 1);
+    atomic_store(&a->done, 1);
+    return NULL;
+}
+
+#define BC_STALLED 4
+
+/* Four stalled miners and one that reads. The list is walked newest first,
+ * so the reader, linked first, is reached last — behind every stalled write.
+ * With one deadline for the whole broadcast it still gets the notify after
+ * about one budget (300 ms); a deadline per write would make that four, and
+ * the old per-socket timeout forty seconds. The stalled miners are dropped. */
+static void test_stalled_miners_cost_the_broadcast_one_budget(void) {
+    stratum_server_t *s = bc_server(300);
+    int rfd[2], sfd[BC_STALLED][2];
+    stratum_conn_t *reader = bc_conn(s, rfd, 0);
+    stratum_conn_t *stalled[BC_STALLED];
+    for (int i = 0; i < BC_STALLED; ++i) stalled[i] = bc_conn(s, sfd[i], 1);
+
+    uint8_t net[32];
+    memset(net, 0xff, sizeof net);
+    uint64_t t0 = bc_now_ms();
+    stratum_server_set_job(s, make_test_job("B1", net), 1);
+    uint64_t took = bc_now_ms() - t0;
+    CHECK(took < 900);
+
+    char buf[8192];
+    ssize_t n = recv(rfd[1], buf, sizeof buf - 1, MSG_DONTWAIT);
+    CHECK(n > 0);
+    if (n > 0) { buf[n] = '\0'; CHECK(strstr(buf, "\"B1\"") != NULL); }
+
+    /* Dropped: once the junk is drained the miner's end reads EOF. */
+    for (int i = 0; i < BC_STALLED; ++i) {
+        ssize_t r;
+        while ((r = recv(sfd[i][1], buf, sizeof buf, MSG_DONTWAIT)) > 0) {}
+        CHECK(r == 0);
+    }
+
+    stratum_server_free(s);
+    stratum_conn_free_for_test(reader);
+    close(rfd[0]); close(rfd[1]);
+    for (int i = 0; i < BC_STALLED; ++i) {
+        stratum_conn_free_for_test(stalled[i]);
+        close(sfd[i][0]); close(sfd[i][1]);
+    }
+}
+
+/* A miner stuck writing its OWN reply holds its write_lock (here: a helper
+ * thread holds it). The broadcast must not wait out that reply's 10 s timeout:
+ * it waits at most the budget (300 ms, floor 20 ms), drops that miner, and
+ * the reader -- linked first, so reached last -- still gets the job. */
+struct bc_hold_arg { stratum_conn_t *c; atomic_int held; atomic_int release; };
+
+static void *bc_hold_thread(void *arg) {
+    struct bc_hold_arg *a = arg;
+    stratum_conn_write_lock_for_test(a->c, 1);
+    atomic_store(&a->held, 1);
+    while (!atomic_load(&a->release)) nanosleep(&(struct timespec){ .tv_nsec = 1000000L }, NULL);
+    stratum_conn_write_lock_for_test(a->c, 0);
+    return NULL;
+}
+
+static void test_a_stuck_reply_costs_the_broadcast_one_budget(void) {
+    stratum_server_t *s = bc_server(300);
+    int rfd[2], hfd[2];
+    stratum_conn_t *reader = bc_conn(s, rfd, 0);
+    stratum_conn_t *held   = bc_conn(s, hfd, 0);
+
+    struct bc_hold_arg h = { .c = held };
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, bc_hold_thread, &h) == 0);
+    while (!atomic_load(&h.held)) nanosleep(&(struct timespec){ .tv_nsec = 1000000L }, NULL);
+
+    uint8_t net[32];
+    memset(net, 0xff, sizeof net);
+    uint64_t t0 = bc_now_ms();
+    stratum_server_set_job(s, make_test_job("B4", net), 1);
+    uint64_t took = bc_now_ms() - t0;
+    CHECK(took < 900);
+
+    char buf[8192];
+    ssize_t n = recv(rfd[1], buf, sizeof buf - 1, MSG_DONTWAIT);
+    CHECK(n > 0);
+    if (n > 0) { buf[n] = '\0'; CHECK(strstr(buf, "\"B4\"") != NULL); }
+
+    /* Dropped: the held miner's end reads EOF, with no notify before it. */
+    ssize_t r = recv(hfd[1], buf, sizeof buf, MSG_DONTWAIT);
+    CHECK(r == 0);
+
+    atomic_store(&h.release, 1);
+    pthread_join(th, NULL);
+    stratum_server_free(s);
+    stratum_conn_free_for_test(reader);
+    stratum_conn_free_for_test(held);
+    close(rfd[0]); close(rfd[1]); close(hfd[0]); close(hfd[1]);
+}
+
+/* While a broadcast waits on a stalled miner, a new connection can still be
+ * linked: conns_lock is not held across socket writes. A long budget keeps
+ * the broadcast waiting while the lock is probed. */
+static void test_the_broadcast_waits_without_conns_lock(void) {
+    stratum_server_t *s = bc_server(2000);
+    int sfd[2];
+    stratum_conn_t *stalled = bc_conn(s, sfd, 1);
+
+    struct bc_job_arg a = { .s = s, .jid = "B2" };
+    atomic_init(&a.done, 0);
+    pthread_t thr;
+    pthread_create(&thr, NULL, bc_job_thread, &a);
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000000L };
+    nanosleep(&ts, NULL);
+
+    stratum_conn_t *late = stratum_conn_new_for_test(s);
+    uint64_t t0 = bc_now_ms();
+    stratum_conn_attach_for_test(s, late, -1);
+    uint64_t took = bc_now_ms() - t0;
+    CHECK(atomic_load(&a.done) == 0);   /* the broadcast was still waiting */
+    CHECK(took < 500);
+    stratum_conn_detach_for_test(s, late);
+
+    pthread_join(thr, NULL);
+    stratum_server_free(s);
+    stratum_conn_free_for_test(late);
+    stratum_conn_free_for_test(stalled);
+    close(sfd[0]); close(sfd[1]);
+}
+
+/* The lifetime rule: a broadcast writing to a connection outside conns_lock
+ * holds a reference, and unregistering that connection waits for it. If it
+ * did not, teardown would close and free a connection mid-write. */
+static void test_unregister_waits_for_a_broadcast_writing_to_it(void) {
+    stratum_server_t *s = bc_server(1000);
+    int sfd[2];
+    stratum_conn_t *stalled = bc_conn(s, sfd, 1);
+
+    struct bc_job_arg a = { .s = s, .jid = "B3" };
+    atomic_init(&a.done, 0);
+    pthread_t thr;
+    uint64_t t0 = bc_now_ms();
+    pthread_create(&thr, NULL, bc_job_thread, &a);
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000000L };
+    nanosleep(&ts, NULL);
+
+    stratum_conn_detach_for_test(s, stalled);
+    uint64_t took = bc_now_ms() - t0;
+    /* Returned only once the broadcast's write had given up (~1000 ms). */
+    CHECK(took >= 900);
+
+    pthread_join(thr, NULL);
+    stratum_server_free(s);
+    stratum_conn_free_for_test(stalled);
+    close(sfd[0]); close(sfd[1]);
+}
+
 /* Invalid Bitcoin address as the username must be rejected outright. */
 static void test_authorize_rejects_non_address(void) {
     obs_t obs = {0};
@@ -3828,6 +4038,10 @@ int main(void) {
     test_submit_rejects_wrong_extranonce2_size();
     test_accept_churn_peer_gone();
     test_job_rotation_races_submits();
+    test_stalled_miners_cost_the_broadcast_one_budget();
+    test_the_broadcast_waits_without_conns_lock();
+    test_a_stuck_reply_costs_the_broadcast_one_budget();
+    test_unregister_waits_for_a_broadcast_writing_to_it();
     test_authorize_rejects_non_address();
     test_authorize_address_with_label();
     test_block_wins_over_low_difficulty();

@@ -534,6 +534,44 @@ static void test_a_negative_listen_backlog_is_refused(void) {
     CHECK(strstr(err, "listen_backlog") != NULL);
 }
 
+/* ---- broadcast send budget ---------------------------------------------- */
+
+/* Ships at 300 ms and takes an explicit value. */
+static void test_the_broadcast_budget_defaults_and_parses(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body, "operator_address = %s\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.bcast_send_budget_ms == 300);
+    snprintf(body, sizeof body,
+             "operator_address = %s\nbcast_send_budget_ms = 1500\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.bcast_send_budget_ms == 1500);
+}
+
+/* Outside 50..10000 is refused, both ends, and the message names the key. */
+static void test_a_broadcast_budget_out_of_range_is_refused(void) {
+    const char *bad[] = { "0", "49", "10001", "-1" };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i) {
+        proxy_config_t cfg; char err[256] = {0};
+        char body[512];
+        snprintf(body, sizeof body,
+                 "operator_address = %s\nbcast_send_budget_ms = %s\n",
+                 VALID_ADDR, bad[i]);
+        CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+        CHECK(strstr(err, "bcast_send_budget_ms") != NULL);
+    }
+    const char *good[] = { "50", "10000" };
+    for (size_t i = 0; i < sizeof good / sizeof good[0]; ++i) {
+        proxy_config_t cfg; char err[256] = {0};
+        char body[512];
+        snprintf(body, sizeof body,
+                 "operator_address = %s\nbcast_send_budget_ms = %s\n",
+                 VALID_ADDR, good[i]);
+        CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    }
+}
+
 int main(void) {
     printf("running test_config...\n");
     test_hash_inside_value_is_kept();
@@ -568,6 +606,8 @@ int main(void) {
     test_listen_backlog_defaults_to_sentinel();
     test_listen_backlog_parses();
     test_a_negative_listen_backlog_is_refused();
+    test_the_broadcast_budget_defaults_and_parses();
+    test_a_broadcast_budget_out_of_range_is_refused();
     if (failures) { printf("test_config: %d failed\n", failures); return 1; }
     printf("test_config: all tests passed\n");
     return 0;

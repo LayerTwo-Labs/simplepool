@@ -2493,6 +2493,7 @@ simplepool --help | -h</code></pre>
         <tr><td><code>max_conns</code></td><td><code>500</code></td><td>≤0 → 500</td><td>Concurrent connections across all ports. Past it, accept closes the socket immediately, silently. One thread and one fd each.</td></tr>
         <tr><td><code>idle_timeout_sec</code></td><td><code>600</code></td><td>0 → default · negative disables</td><td>Reap a socket that has sent nothing and has <em>not</em> authorized.</td></tr>
         <tr><td><code>idle_timeout_authorized_sec</code></td><td><code>7200</code></td><td>0 → default · negative disables</td><td>Reap an authorized miner that has sent nothing. Long on purpose — silence between shares is normal.</td></tr>
+        <tr><td><code>bcast_send_budget_ms</code></td><td><code>300</code></td><td>50..10000, refused outside</td><td>Time one job broadcast may spend writing to every miner together. Shared, so miners that stopped reading delay everyone else's new job by at most this; a miner still not accepting the notify when it passes is disconnected.</td></tr>
       </tbody>
     </table>
   </div>

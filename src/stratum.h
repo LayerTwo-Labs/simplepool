@@ -294,6 +294,11 @@ typedef struct {
      * never reaps an authorized miner. See config.h. */
     int    idle_timeout_authorized_sec;
 
+    /* Time, in ms, one job broadcast may spend writing to all connections
+     * together. A connection whose notify cannot be written by then (a miner
+     * that stopped reading) is dropped. <= 0 applies the 300 ms default. */
+    int    bcast_send_budget_ms;
+
     /* Ceiling on mining.submit per second, per connection. 0 disables.
      *
      * A connection's share rate is its hashrate divided by the difficulty it
@@ -436,6 +441,9 @@ void        stratum_conn_rearm_vardiff_for_test(stratum_conn_t *c);
 void stratum_conn_attach_for_test(stratum_server_t *s, stratum_conn_t *c,
                                   int fd);
 void stratum_conn_detach_for_test(stratum_server_t *s, stratum_conn_t *c);
+/* Hold (lock=1) or release (lock=0) a connection's write_lock from a test
+ * thread: a connection thread stuck writing its reply to a full socket. */
+void stratum_conn_write_lock_for_test(stratum_conn_t *c, int lock);
 
 /* Seconds of silence this connection is allowed before the reaper closes it.
  * Differs by whether it has authorized; 0 means never reaped. */
