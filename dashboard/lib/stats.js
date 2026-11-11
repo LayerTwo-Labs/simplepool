@@ -214,20 +214,29 @@ export function leaderboardByAddress(handle, windowSec = 86400, limit = 50) {
     const nowSec = Math.floor(Date.now() / 1000);
     const since = nowSec - windowSec;
 
-    // Aggregate shares per (payout_address). Workers with no payout_address
-    // recorded (legacy rows) fall back to their `name` as the key so they
-    // still show up rather than collapsing into one nameless bucket.
+    // Aggregate recent shares by worker before joining payout addresses.
+    // The timestamp index avoids scanning unrelated historical shares.
+    // Workers without an address retain their name as the grouping key.
     const rows = d.prepare(`
+        WITH worker_totals AS (
+            SELECT worker_id,
+                   COUNT(*) AS shares,
+                   MAX(ts) AS last_seen,
+                   MIN(ts) AS first_ts,
+                   SUM(difficulty) AS sum_diff
+              FROM shares INDEXED BY shares_ts_idx
+             WHERE ts >= ?
+             GROUP BY worker_id
+        )
         SELECT COALESCE(NULLIF(w.payout_address, ''), w.name) AS addr,
-               COUNT(s.id)                                    AS shares,
-               MAX(s.ts)                                      AS last_seen,
-               MIN(s.ts)                                      AS first_ts,
-               COALESCE(SUM(s.difficulty), 0)                 AS sum_diff,
-               COUNT(DISTINCT w.id)                           AS rigs,
-               GROUP_CONCAT(DISTINCT w.name)                  AS worker_names
-          FROM shares s
-          JOIN workers w ON w.id = s.worker_id
-         WHERE s.ts >= ?
+               SUM(t.shares) AS shares,
+               MAX(t.last_seen) AS last_seen,
+               MIN(t.first_ts) AS first_ts,
+               COALESCE(SUM(t.sum_diff), 0) AS sum_diff,
+               COUNT(*) AS rigs,
+               GROUP_CONCAT(DISTINCT w.name) AS worker_names
+          FROM worker_totals t
+          JOIN workers w ON w.id = t.worker_id
          GROUP BY addr
          ORDER BY sum_diff DESC
          LIMIT ?
