@@ -858,10 +858,9 @@ static void on_share_cb(void *ctx, const char *worker_name,
                         ts_ms, difficulty, is_block, block_hash_or_null);
     }
     if (delta > 0) {
-        if (s->store) {
-            store_record_credit(s->store, worker_name, payout_address,
-                                ts_ms, delta);
-        }
+        /* This is a provisional notification, not committed credit.
+         * The asynchronous writer may skip a duplicate or fail a batch.
+         * Consumers must query SQLite for authoritative balances. */
         if (s->bcast) {
             /* accrued_total is the running balance after this credit.
              * Since the writer thread is async we don't know it

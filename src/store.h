@@ -371,7 +371,8 @@ int store_record_node_tip(store_t *s, int height, const char *hash,
 
 /* Flush and wait until all currently-queued events are committed. Useful
  * for tests and clean shutdown before exit. Returns 0 ok, negative on
- * timeout (default 5s). */
+ * timeout (default 5s), -2 if a queued batch permanently failed.
+ * Such failures remain visible until the store is reopened. */
 int store_flush(store_t *s);
 
 /* Stats for /metrics / health endpoints. Lockless reads of atomics. */
