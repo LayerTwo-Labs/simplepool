@@ -8,7 +8,29 @@ Anything that changes what a miner is paid, or what an operator has to tell
 their miners, is called out explicitly — those are the changes that cost
 somebody money if they go unread.
 
-## Unreleased
+## 0.5.0 — a share is paid once, and one miner can no longer hold up the pool
+
+The headline is accounting: a share is now credited exactly once, in memory
+and on disk, and the guards that make that true cannot be turned against the
+rest of the pool by one connection. Three operator options arrive, all off by
+default: the reject guard, per-listener `clean_jobs=never`, and vardiff's fast
+first climb.
+
+### Miners on pps-classic: a replayed share is no longer credited twice on disk
+
+The share writer now skips a share whose hash is already in `shares`, and
+writes the PPS credit for a share in the same transaction as the share itself:
+a share that is not written is not credited, and a credit cannot land without
+its share. Before, the credit was a separate event, so a replayed hash (for
+example across a pool restart, which empties the in-memory duplicate check)
+was stored and credited again. A batch that fails is rolled back and retried
+as a whole; one that keeps failing is dropped and reported, where before only
+its failing rows were lost. Rows and balances already in the database are left
+as they are.
+
+**Operators: the first start after upgrading builds an index** on
+`shares(block_hash)`. On a large `shares.db` that takes a while, during which
+the pool is not yet accepting connections; plan the restart for it.
 
 ### A miner that stops reading no longer delays everyone else's new job
 
