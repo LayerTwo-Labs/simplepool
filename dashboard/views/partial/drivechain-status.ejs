@@ -1,0 +1,183 @@
+<%# Drivechain status: the sidechains holding a slot, the proposals in vote,
+    the withdrawal bundles pending — and, for the last two, how this pool is
+    voting. Read from the enforcer by lib/drivechain.js on a timer; this
+    partial only renders the snapshot.
+
+    Renders nothing until a pass has succeeded. A pool with no enforcer — a
+    solo pool on plain bitcoind — has no drivechain status to report, and a
+    card explaining the absence of a feature is a card nobody needs. Once a
+    pass has succeeded the card stays: an enforcer that stops answering leaves
+    the last snapshot in place with its age and the error, because "the vote
+    table went missing" hides exactly the moment someone should look.
+
+    Folded shut, like the about card: the summary line carries the three
+    counts, which is all most refreshes want.
+
+    Locals: drivechain (from lib/drivechain.js currentDrivechain()). %>
+<%
+const _dc = (typeof drivechain !== 'undefined' && drivechain && drivechain.available) ? drivechain : null;
+if (_dc) {
+const _d      = _dc.data;
+const _pol    = _d.policy;
+const _nBund  = _d.withdrawals.reduce((n, w) => n + w.bundles.length, 0);
+const _unqueried = _d.withdrawals.filter(w => !w.queried).length;
+const _name   = (s) => s.title || ('slot ' + s.slot);
+const _short  = (h) => h ? (h.slice(0, 10) + '…' + h.slice(-8)) : '—';
+const _plural = (n, one, many) => fmtN(n) + ' ' + (n === 1 ? one : many);
+const _ackLabel = { 'all': 'approve every proposal', 'new-slots': 'approve proposals for empty slots',
+                    'none': 'approve only hand-picked proposals', 'unknown': 'unknown' };
+const _bundleLabel = { 'all': 'back the first pending bundle of every sidechain',
+                       'known': 'back bundles this node holds the transaction for',
+                       'none': 'back only hand-picked bundles',
+                       'alarm': 'alarm — vote down every bundle', 'unknown': 'unknown' };
+const _verdict = (v, yes, no) => v === true  ? '<span class="ok">' + yes + '</span>'
+                               : v === false ? '<span class="muted">' + no + '</span>'
+                               :               '<span class="warn-text" title="the block producer\'s policy does not settle this from here">unknown</span>';
+%>
+<details class="card" id="drivechain">
+    <summary>
+        Drivechain status
+        <span class="summary-hint muted">
+            <span class="ok"><%= _plural(_d.active.length, 'sidechain', 'sidechains') %> active</span>
+            · <%= fmtN(_d.proposals.length) %> in vote
+            · <%= _plural(_nBund, 'withdrawal', 'withdrawals') %> pending
+            <% if (_dc.error) { %>· <span class="warn-text">stale, <%= ago(_dc.fetched_at) %></span><% } %>
+        </span>
+    </summary>
+
+    <p class="muted small">
+        What the BIP300 enforcer this pool builds its blocks with sees on the
+        chain<% if (_d.tip.height != null) { %> at height <%= fmtN(_d.tip.height) %><% } %>,
+        and how this pool votes. Every block a miner here finds carries these
+        votes. Read <%= ago(_dc.fetched_at) %>.
+    </p>
+    <% if (_dc.error) { %>
+    <p class="small callout">
+        The enforcer has not answered since — showing the last reading.
+        <span class="muted">(<%= _dc.error %>)</span>
+    </p>
+    <% } %>
+
+    <h3 class="subhead">How this pool votes</h3>
+    <% if (!_pol) { %>
+    <p class="muted small">
+        This enforcer does not report its block-producer policy, so the
+        “are we voting” columns below read unknown.
+    </p>
+    <% } else { %>
+    <div class="grid grid-sub">
+        <div><label>Sidechain proposals</label>
+            <strong class="dc-policy"><%= _ackLabel[_pol.ack_policy] %></strong>
+            <small><%= _pol.explicit_acks.length
+                ? _plural(_pol.explicit_acks.length, 'proposal', 'proposals') + ' approved by hand'
+                : 'none approved by hand' %></small></div>
+        <div><label>Withdrawal bundles</label>
+            <strong class="dc-policy"><%= _bundleLabel[_pol.bundle_policy] %></strong>
+            <small><%= _pol.explicit_bundle_acks.length
+                ? _plural(_pol.explicit_bundle_acks.length, 'bundle', 'bundles') + ' backed by hand'
+                : 'none backed by hand' %></small></div>
+    </div>
+    <% } %>
+
+    <h3 class="subhead">Sidechains holding a slot</h3>
+    <% if (_d.active.length === 0) { %>
+    <p class="muted small">No sidechain is active on this chain.</p>
+    <% } else { %>
+    <div class="tablewrap"><table>
+        <thead><tr><th>Slot</th><th>Sidechain</th><th>What it does</th>
+            <th title="Whether recent blocks carried this sidechain's merged-mining commitment, over the last <%= _d.liveness_window_blocks %> blocks">Merged mining</th>
+            <th>Activated</th></tr></thead>
+        <tbody>
+        <% _d.active.forEach(s => { const a = s.activity || {}; %>
+            <tr>
+                <td class="mono"><%= s.slot ?? '—' %></td>
+                <td class="nowrap"><% if (s.title) { %><%= s.title %><% } else { %><span class="muted">unnamed</span><% } %></td>
+                <td class="small dc-desc"><%= s.description || '—' %></td>
+                <td class="nowrap">
+                    <% if (!a.checked) { %>
+                        <span class="warn-text"<% if (a.error) { %> title="<%= a.error %>"<% } %>>could not check</span>
+                    <% } else if (a.blocks_since_last == null) { %>
+                        <span class="muted" title="no commitment in the last <%= a.blocks_examined %> blocks">none in <%= a.blocks_examined %> blocks</span>
+                    <% } else { %>
+                        <span class="ok" title="<%= a.commitments %> of the last <%= a.blocks_examined %> blocks carried its commitment"><%=
+                            a.blocks_since_last === 0 ? 'this block'
+                            : a.blocks_since_last === 1 ? '1 block ago'
+                            : a.blocks_since_last + ' blocks ago' %></span>
+                        <span class="muted small"><%= a.commitments %>/<%= a.blocks_examined %></span>
+                    <% } %>
+                </td>
+                <td class="mono"><%= s.activation_height != null ? fmtN(s.activation_height) : '—' %></td>
+            </tr>
+        <% }) %>
+        </tbody>
+    </table></div>
+    <% } %>
+
+    <h3 class="subhead">Proposals in vote</h3>
+    <% if (_d.proposals.length === 0) { %>
+    <p class="muted small">No sidechain proposal is being voted on.</p>
+    <% } else { %>
+    <div class="tablewrap"><table>
+        <thead><tr><th>Slot</th><th>Sidechain</th>
+            <th title="Blocks that have approved it, of the number it needs">Approvals</th>
+            <th title="Blocks until the proposal expires">Blocks left</th>
+            <th>Are we approving?</th></tr></thead>
+        <tbody>
+        <% _d.proposals.forEach(p => { const g = p.progress; %>
+            <tr>
+                <td class="mono"><%= p.slot ?? '—' %></td>
+                <td<% if (p.description) { %> title="<%= p.description %>"<% } %>>
+                    <% if (p.title) { %><%= p.title %><% } else { %><span class="muted">unnamed</span><% } %>
+                    <% if (p.replaces_active) { %><span class="warn-text small">would replace the sidechain in this slot</span><% } %>
+                </td>
+                <td class="nowrap">
+                    <%= fmtN(p.votes) %><% if (g) { %> <span class="muted">/ <%= fmtN(g.needed) %></span>
+                    <% if (!g.can_still_pass) { %><span class="warn-text small">cannot pass</span><% } %><% } %>
+                </td>
+                <td class="nowrap"<% if (g) { %> title="it can miss <%= fmtN(g.fails_remaining) %> more blocks (<%= fmtN(g.fails) %> of <%= fmtN(g.max_fails) %> used)"<% } %>><%= g ? fmtN(g.blocks_left) : '—' %></td>
+                <td class="nowrap"><%- _verdict(p.approving, 'yes', 'no') %></td>
+            </tr>
+        <% }) %>
+        </tbody>
+    </table></div>
+    <% } %>
+
+    <h3 class="subhead">Withdrawal bundles pending</h3>
+    <% if (_nBund === 0) { %>
+    <p class="muted small">
+        <% if (_d.active.length && _unqueried === _d.active.length) { %>
+            Could not ask the enforcer for pending withdrawal bundles.
+        <% } else { %>
+            No withdrawal bundle is pending<% if (_unqueried) { %> on the
+            <%= _d.active.length - _unqueried %> of <%= _d.active.length %> sidechains that could be checked<% } %>.
+        <% } %>
+    </p>
+    <% } else { %>
+    <div class="tablewrap"><table>
+        <thead><tr><th>Sidechain</th><th>Bundle</th>
+            <th title="Blocks that have voted for it, of the number it needs">Votes</th>
+            <th title="Blocks until the bundle expires">Blocks left</th>
+            <th>Are we backing it?</th></tr></thead>
+        <tbody>
+        <% _d.withdrawals.forEach(w => w.bundles.forEach(b => { const g = b.progress; %>
+            <tr>
+                <td class="nowrap"><%= _name(w) %> <span class="muted small">#<%= w.slot %></span></td>
+                <td class="mono small nowrap" title="m6id <%= b.m6id %>"><%= _short(b.m6id) %></td>
+                <td class="nowrap">
+                    <%= fmtN(b.votes) %><% if (g) { %> <span class="muted">/ <%= fmtN(g.needed) %></span>
+                    <% if (!g.can_still_pass) { %><span class="warn-text small">cannot pass</span><% } %><% } %>
+                </td>
+                <td class="nowrap"><%= g ? fmtN(g.blocks_left) : '—' %></td>
+                <td class="nowrap"><%- _verdict(b.backing, 'yes', 'no') %></td>
+            </tr>
+        <% })) %>
+        </tbody>
+    </table></div>
+    <% if (_unqueried) { %>
+    <p class="muted small"><%= _unqueried %> of <%= _d.active.length %> sidechains could not be checked for bundles.</p>
+    <% } %>
+    <% } %>
+
+    <p class="muted small">Machine-readable at <a href="/api/drivechain">/api/drivechain</a>.</p>
+</details>
+<% } %>

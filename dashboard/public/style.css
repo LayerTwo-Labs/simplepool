@@ -467,6 +467,16 @@ table.lb td.nowrap, .card table td.nowrap { white-space: nowrap; }
     padding-left: 0.75em;
 }
 
+/* ------------------------------------------------------- drivechain card */
+
+/* The policy tiles hold a sentence, not a figure, so they must not inherit
+ * the big-number treatment of the stat grids. */
+.dc-policy { display: block; font-size: 13px; font-weight: 600; line-height: 1.35; }
+/* A sidechain's own description is free text of any length; cap the column
+ * so it wraps instead of pushing the vote columns off the card. */
+.card table td.dc-desc { max-width: 380px; color: var(--fg-soft); }
+#drivechain .subhead { margin-top: 18px; }
+
 /* ------------------------------------------------------------ about card */
 
 .about-h3 {

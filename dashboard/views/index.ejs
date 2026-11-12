@@ -73,6 +73,8 @@ const _feeOut  = pool && pool.operator_address && pool.operator_address !== pool
 
         <%- include('partial/about-numbers') %>
 
+        <%- include('partial/drivechain-status') %>
+
         <section class="card">
             <h2>Bitcoin node tip</h2>
             <% if (!node || node.tip_height == null) { %>
