@@ -66,6 +66,7 @@ snapshot cron — SQLite's WAL mode makes that safe too, just less isolated.
 | `/api/node`           | Mainchain tip and the network difficulty behind it      |
 | `/api/worker/:name`   | JSON                                                    |
 | `/api/blocks`         | JSON paginated, `?limit=N&before=<ts>` (default 50)     |
+| `/api/drivechain`     | Sidechains, proposals, withdrawal bundles, and how the pool votes |
 | `/api/versions`       | Build provenance of every component (see below)         |
 | `/api/status`         | Everything at once: pool, node, health, versions        |
 | `/healthz`            | `{ ok: true, db_ready: bool }`                          |
@@ -89,6 +90,27 @@ stands. `PUBLIC_SLIPSTREAM_URL` is the address shown to submitters.
 The page reads the service's API, never `slipstream.db`, so the service stays
 the only owner of its schema; if it is down, the page says so and the rest of
 the dashboard is unaffected.
+
+## Drivechain status
+
+The overview carries a folded **Drivechain status** card, read from the
+enforcer at `ENFORCER_GRPC_ADDR` (default `127.0.0.1:50051`):
+
+- **How this pool votes** — the block producer's policy for sidechain
+  proposals and for withdrawal bundles, plus anything approved by hand.
+- **Sidechains holding a slot** — each active sidechain, and whether the last
+  12 blocks carried its merged-mining commitment.
+- **Proposals in vote** — approvals against the number needed, blocks left,
+  and whether this pool is approving.
+- **Withdrawal bundles pending** — votes against the number needed, blocks
+  left, and whether this pool is backing the bundle.
+
+It is polled in the background every `DRIVECHAIN_POLL_MS` (default `30000`;
+`0` disables it), never per request. The card appears once the enforcer has
+answered; if it later stops answering, the last reading stays up, marked
+stale. A pool with no enforcer simply never shows the card. The vote columns
+read *unknown* rather than guess when the enforcer is too old to report its
+block-producer state. The same data is at `/api/drivechain`.
 
 ## Network difficulty
 

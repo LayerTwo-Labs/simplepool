@@ -20,6 +20,7 @@ import { versions } from './lib/versions.js';
 import * as fmt from './lib/fmt.js';
 import { createAdminRouter } from './lib/admin-router.js';
 import { fetchSlipstream } from './lib/slipstream.js';
+import { startDrivechainMonitor, currentDrivechain } from './lib/drivechain.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT     = parseInt(process.env.PORT || '8081', 10);
@@ -67,6 +68,8 @@ app.use((_req, res, next) => {
     res.locals.sidechainId = THUNDER_SIDECHAIN_ID;
     /* The Slipstream nav link appears only on a pool that runs it. */
     res.locals.slipstreamEnabled = !!SLIPSTREAM_API_URL;
+    /* The drivechain card on the overview. A snapshot, like health. */
+    res.locals.drivechain = currentDrivechain();
     next();
 });
 
@@ -83,6 +86,17 @@ const dbRw = openAdminDb(path.resolve(__dirname, DB_PATH));
  * dashboard on every 15s auto-refresh. */
 const HEALTH_INTERVAL_MS = parseInt(process.env.HEALTH_INTERVAL_MS || '300000', 10);
 startHealthMonitor(db, { intervalMs: HEALTH_INTERVAL_MS });
+
+/* Drivechain status (sidechains, proposals, withdrawal bundles, and how the
+ * pool votes), read from the enforcer on a timer for the same reason: the
+ * overview reloads every 15s per visitor, and one pass is a dozen RPCs.
+ * DRIVECHAIN_POLL_MS=0 turns it off; a pool with no enforcer need not, since
+ * the card only appears once a pass has succeeded. */
+const DRIVECHAIN_POLL_MS = parseInt(process.env.DRIVECHAIN_POLL_MS || '30000', 10);
+if (DRIVECHAIN_POLL_MS > 0) {
+    startDrivechainMonitor(process.env.ENFORCER_GRPC_ADDR || '127.0.0.1:50051',
+                           { intervalMs: DRIVECHAIN_POLL_MS });
+}
 
 /* --- public-side config ------------------------------------------------- */
 const PUBLIC_STRATUM_URL = process.env.PUBLIC_STRATUM_URL || 'stratum+tcp://<pool-host>:3334';
@@ -245,6 +259,11 @@ app.get('/api/templates', (req, res) => {
     const limit = req.query.limit ? Number(req.query.limit) : 50;
     res.json(stats.templates(db, { limit }) || { current: null, history: [], total: 0 });
 });
+
+/* What the drivechain card shows, as JSON. `available: false` until the
+ * enforcer has answered once; after that `error` is set while it is not
+ * answering and `data` is the last good reading, `fetched_at` its age. */
+app.get('/api/drivechain', (_req, res) => res.json(currentDrivechain()));
 
 app.get('/api/blocks', (req, res) => {
     const beforeTs = req.query.before ? Number(req.query.before) : null;
