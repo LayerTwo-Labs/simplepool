@@ -507,11 +507,23 @@ int bitcoind_submit_block(bitcoind_client_t *c, const char *block_hex,
     int rc = rpc_call(c, "submitblock", params, &result, errbuf, errlen);
     if (rc != 0) return rc;
 
-    /* submitblock returns null on success; non-null string == reject reason */
+    /* submitblock returns null on success; non-null string == reject reason.
+     * Except these: "duplicate" means the node already has the block (an
+     * earlier attempt got through), and "inconclusive" that it is valid but
+     * not (yet) on the best chain. Neither is a refusal; the chain decides. */
+    if (result && cJSON_IsString(result) && result->valuestring &&
+        (strcmp(result->valuestring, "duplicate") == 0 ||
+         strcmp(result->valuestring, "duplicate-inconclusive") == 0 ||
+         strcmp(result->valuestring, "inconclusive") == 0)) {
+        LOG_WARN("submitblock: node answered \"%s\"; recording the block as "
+                 "pending", result->valuestring);
+        cJSON_Delete(result);
+        return 0;
+    }
     if (result && cJSON_IsString(result) && result->valuestring && result->valuestring[0] != '\0') {
         set_err(errbuf, errlen, "rejected: %s", result->valuestring);
         cJSON_Delete(result);
-        return -30;
+        return BITCOIND_SUBMIT_REFUSED;
     }
     if (result) cJSON_Delete(result);
     return 0;

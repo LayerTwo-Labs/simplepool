@@ -24,6 +24,15 @@ bitcoind_pass = drivepool
 # (5000-10000) if sidechains need to merge-mine reliably; the cost is one extra
 # getblocktemplate call per interval.
 bitcoind_poll_interval_ms = 30000
+# A found block that bitcoind_url gives no answer for (down, restarting, timing
+# out) is retried for up to 120 s, and on each failed attempt also offered to
+# this second node, if set. The block is saved to <db dir>/found-blocks/ first
+# either way. With the CUSF enforcer as bitcoind_url, the node behind it is the
+# natural fallback; a submitblock-only user keeps the credential harmless:
+#   rpcauth=pool:<salt>$<hash>  rpcwhitelist=pool:submitblock  rpcwhitelistdefault=0
+# submit_fallback_url  = http://127.0.0.1:8332
+# submit_fallback_user = pool
+# submit_fallback_pass = ...
 
 # Miners are paid directly: the stratum username must be the miner's
 # bitcoin address (`<address>` or `<address>.<rig_label>`). The configured

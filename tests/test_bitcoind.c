@@ -227,6 +227,7 @@ static void test_client_init_validates(void) {
 #define STUB_FULL_NODE     0   /* answers getblockchaininfo (real bitcoind) */
 #define STUB_TEMPLATE_ONLY 1   /* only getblocktemplate (the CUSF enforcer) */
 #define STUB_DEAD          2   /* answers nothing (backend is broken) */
+#define STUB_SUBMIT        3   /* answers submitblock with submit_result */
 
 typedef struct {
     int listen_fd;
@@ -235,6 +236,7 @@ typedef struct {
     int requests;      /* how many to serve before returning */
     int saw_gbt;       /* did a getblocktemplate request arrive? */
     int saw_getblockhash;
+    const char *submit_result;   /* STUB_SUBMIT: the JSON result */
 } stub_t;
 
 #define STUB_BLOCK_HASH \
@@ -275,7 +277,11 @@ static void *stub_thread(void *arg) {
         if (wants_hash) st->saw_getblockhash = 1;
 
         char body[2048];
-        if (st->mode == STUB_FULL_NODE && wants_hash) {
+        if (st->mode == STUB_SUBMIT) {
+            snprintf(body, sizeof body,
+                     "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":%s,\"error\":null}",
+                     st->submit_result);
+        } else if (st->mode == STUB_FULL_NODE && wants_hash) {
             snprintf(body, sizeof body,
                      "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"%s\","
                      "\"error\":null}", STUB_BLOCK_HASH);
@@ -456,6 +462,48 @@ static void test_getblockhash_returns_the_hash(void) {
     close(st.listen_fd);
 }
 
+static int submit_with_answer(const char *result_json) {
+    stub_t st;
+    if (stub_start(&st, STUB_SUBMIT, 1) != 0) return 99;
+    st.submit_result = result_json;
+    pthread_t th;
+    pthread_create(&th, NULL, stub_thread, &st);
+    bitcoind_client_t c;
+    bitcoind_cfg_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    snprintf(cfg.url, sizeof cfg.url, "http://127.0.0.1:%d", st.port);
+    cfg.timeout_ms = 5000;
+    bitcoind_client_init(&c, &cfg);
+    char err[256] = {0};
+    int rc = bitcoind_submit_block(&c, "00", err, sizeof err);
+    bitcoind_client_free(&c);
+    pthread_join(th, NULL);
+    close(st.listen_fd);
+    return rc;
+}
+
+/* "duplicate" and "inconclusive" are not refusals: the block may well be in
+ * the chain. Only a reject reason is final, and no answer is not a refusal. */
+static void test_submit_answers(void) {
+    CHECK(submit_with_answer("null") == 0);
+    CHECK(submit_with_answer("\"duplicate\"") == 0);
+    CHECK(submit_with_answer("\"duplicate-inconclusive\"") == 0);
+    CHECK(submit_with_answer("\"inconclusive\"") == 0);
+    CHECK(submit_with_answer("\"bad-txnmrklroot\"") == BITCOIND_SUBMIT_REFUSED);
+    CHECK(submit_with_answer("\"duplicate-invalid\"") == BITCOIND_SUBMIT_REFUSED);
+
+    bitcoind_client_t c;
+    bitcoind_cfg_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    snprintf(cfg.url, sizeof cfg.url, "http://127.0.0.1:1");
+    cfg.timeout_ms = 2000;
+    bitcoind_client_init(&c, &cfg);
+    char err[256] = {0};
+    int rc = bitcoind_submit_block(&c, "00", err, sizeof err);
+    CHECK(rc != 0 && rc != BITCOIND_SUBMIT_REFUSED);
+    bitcoind_client_free(&c);
+}
+
 int main(void) {
     test_parse_ok();
     test_parse_coinbasetxn();
@@ -468,6 +516,7 @@ int main(void) {
     test_ping_fails_when_nothing_is_served();
     test_getblockhash_unsupported_is_distinguished();
     test_getblockhash_returns_the_hash();
+    test_submit_answers();
 
     printf("test_bitcoind: %d passed, %d failed\n", g_pass, g_fail);
     if (g_fail == 0) {
