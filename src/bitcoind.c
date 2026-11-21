@@ -373,7 +373,10 @@ int bitcoind_parse_template(void *result_json,
     copy_hex64(t->prev_hash_hex, jp->valuestring);
     copy_hex64(t->target_hex, jt->valuestring);
 
-    if (has_value) {
+    /* BIP22 lets a template carry both. A server that ships its own coinbase
+     * (the CUSF enforcer) puts mandatory outputs in it, so building our own
+     * from coinbasevalue would drop them: coinbasetxn always wins. */
+    if (has_value && !has_cbtxn) {
         t->coinbase_value_sats = (int64_t)jc->valuedouble;
     } else {
         /* coinbasetxn: keep the raw coinbase hex; the value is reported as a
