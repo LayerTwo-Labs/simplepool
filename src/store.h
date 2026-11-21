@@ -15,6 +15,9 @@ typedef struct {
      * new template row is opened, so a busy pool trims itself and an idle
      * one leaves the table alone. */
     int  templates_retention_days;
+    /* Most reject rows written per second, pool-wide; the rest are dropped
+     * (rejects cost a miner nothing to send). 0 = no limit. */
+    int  rejects_max_per_sec;
 } store_cfg_t;
 
 /* Open the DB (creates file + applies schema if missing). Starts a writer

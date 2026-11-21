@@ -374,6 +374,32 @@ static void test_rejects(void) {
     printf("  ok test_rejects\n");
 }
 
+/* rejects_max_per_sec bounds the rows a reject flood can write: rejects cost
+ * the sender no work. Only the per-second budget lands; the next second has a
+ * fresh one. */
+static void test_rejects_rate_limited(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+    cfg.rejects_max_per_sec = 5;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    for (int i = 0; i < 50; ++i)
+        assert(store_record_reject(s, "flood", 5000 + (uint64_t)i, "unknown job") == 0);
+    assert(store_record_reject(s, "flood", 6000, "unknown job") == 0);
+    assert(store_flush(s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT count(*) FROM rejects") == 6);
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_rejects_rate_limited\n");
+}
+
 typedef struct {
     store_t *s;
     int      tid;
@@ -2513,6 +2539,7 @@ int main(void) {
     printf("running test_store...\n");
     test_basic();
     test_rejects();
+    test_rejects_rate_limited();
     test_concurrent();
     test_drop();
     test_credited_sats();
